@@ -5,11 +5,31 @@
 //!   GET  `/sparql?query=<encoded>`                              — query via URL param
 //!   POST `/sparql`  Content-Type: application/sparql-query      — query in body
 //!   POST `/sparql`  Content-Type: application/x-www-form-urlencoded; `query=` field
-//!   POST `/sparql/update`                                       — SPARQL Update (stub)
+//!   POST `/sparql/update`                                       — SPARQL 1.1 Update
+//!
+//! Also implements the SPARQL 1.1 Graph Store HTTP Protocol (W3C Rec):
+//!
+//!   GET    `/store?graph=<iri>` / `?default`                    — read a graph
+//!   PUT    `/store?graph=<iri>` / `?default`                    — replace a graph
+//!   POST   `/store?graph=<iri>` / `?default`                    — merge into a graph
+//!   DELETE `/store?graph=<iri>` / `?default`                    — clear a graph
+//!
+//! Extra/unrecognised query parameters (e.g. BSBM's `?no_transaction`) are
+//! silently ignored rather than rejected, since `axum::extract::Query` does
+//! not enable `#[serde(deny_unknown_fields)]`.
 //!
 //! Result serialisation:
-//!   SELECT / ASK  → `application/sparql-results+json`  (via `sparesults`)
-//!   CONSTRUCT     → `application/n-triples`             (via oxrdf Display)
+//!   SELECT / ASK        → `application/sparql-results+json`  (via `sparesults`)
+//!   CONSTRUCT/DESCRIBE   → content-negotiated via `Accept`: `text/turtle` (via
+//!                          `oxttl::TurtleSerializer`) or `application/n-triples`
+//!                          (default, and used whenever `Accept` doesn't ask for
+//!                          Turtle specifically). JSON-LD is out of scope — no
+//!                          workspace dependency provides a JSON-LD serializer.
+//!
+//! Bulk-load / Graph Store PUT/POST bodies are parsed by Content-Type:
+//!   `text/turtle` (default / unrecognised) → `oxttl::TurtleParser`
+//!   `application/n-triples`                → `oxttl::NTriplesParser`
+//!   `application/rdf+xml`                  → `oxrdfxml::RdfXmlParser`
 //!
 //! # Usage
 //! ```no_run
@@ -25,18 +45,26 @@
 //! ```
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Query as AxumQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use oxigraph_nova_core::QuadStore;
-use oxigraph_nova_query::{Evaluator, QueryResult, Solution, StoreDataset};
-use oxrdf::Variable;
+use oxigraph_nova_query::{
+    Evaluator, QueryResult, Solution, StoreDataset, clear_graph, execute_update,
+};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
+use oxrdfxml::RdfXmlParser;
+use oxttl::{NTriplesParser, NTriplesSerializer, TurtleParser, TurtleSerializer};
+
 use serde::Deserialize;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use spargebra::algebra::GraphPattern;
 use spargebra::{Query, SparqlParser};
 use std::sync::Arc;
+
+
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -62,6 +90,18 @@ pub struct SparqlQueryParams {
     pub query: Option<String>,
 }
 
+/// Query parameters for the SPARQL 1.1 Graph Store HTTP Protocol endpoints
+/// (`/store`). Exactly one of `graph` / `default` should be given to name the
+/// target graph; any other query parameters (e.g. BSBM's `?no_transaction`,
+/// `?lenient`) are silently ignored since `axum::extract::Query` does not
+/// enable `#[serde(deny_unknown_fields)]`.
+#[derive(Deserialize)]
+pub struct GraphStoreParams {
+    pub graph: Option<String>,
+    pub default: Option<String>,
+}
+
+
 // ── Server ────────────────────────────────────────────────────────────────────
 
 /// Oxigraph Nova SPARQL server.
@@ -83,8 +123,16 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
         Router::new()
             .route("/sparql", get(sparql_get::<S>).post(sparql_post::<S>))
             .route("/sparql/update", post(sparql_update::<S>))
+            .route(
+                "/store",
+                get(store_get::<S>)
+                    .put(store_put::<S>)
+                    .post(store_post::<S>)
+                    .delete(store_delete::<S>),
+            )
             .with_state(state)
     }
+
 
     /// Bind to `addr` and serve until the process is killed.
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
@@ -102,12 +150,14 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
 async fn sparql_get<S: QuadStore + 'static>(
     State(state): State<AppState<S>>,
     AxumQuery(params): AxumQuery<SparqlQueryParams>,
+    headers: HeaderMap,
 ) -> Response {
     match params.query {
         None => (StatusCode::BAD_REQUEST, "Missing ?query= parameter").into_response(),
-        Some(q) => execute_sparql_query(&state.store, &q),
+        Some(q) => execute_sparql_query(&state.store, &q, accept_header(&headers)),
     }
 }
+
 
 /// `POST /sparql`
 ///
@@ -153,30 +203,346 @@ async fn sparql_post<S: QuadStore + 'static>(
             .into_response();
     };
 
-    execute_sparql_query(&state.store, &query_str)
+    execute_sparql_query(&state.store, &query_str, accept_header(&headers))
 }
 
-/// `POST /sparql/update` — SPARQL Update (stub for future implementation).
+
+/// `POST /sparql/update` — SPARQL 1.1 Update.
+///
+/// Accepted content-types (SPARQL 1.1 Protocol § 2.2):
+///   - `application/sparql-update`         — body is the update text
+///   - `application/x-www-form-urlencoded` — body contains `update=<encoded>`
+///   - `text/plain` / no content-type      — lenient: body treated as update text
+///
+/// See `oxigraph_nova_query::update` for the operations implemented
+/// (`INSERT DATA`/`DELETE DATA`/`DELETE WHERE`/`INSERT`+`DELETE ... WHERE`/
+/// `LOAD`/`CLEAR`/`CREATE`/`DROP`) and documented limitations (Update
+/// atomicity across a multi-statement request; `LOAD` requires a fetchable
+/// HTTP client which is not wired up).
 async fn sparql_update<S: QuadStore + 'static>(
-    State(_state): State<AppState<S>>,
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "Empty request body").into_response();
     }
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "SPARQL Update not yet implemented",
-    )
-        .into_response()
+
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let update_str: String = if ct.starts_with("application/sparql-update") {
+        body
+    } else if ct.starts_with("application/x-www-form-urlencoded") {
+        match form_param(&body, "update") {
+            Some(u) => u,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Missing 'update' field in form body",
+                )
+                    .into_response();
+            }
+        }
+    } else if ct.is_empty() || ct.starts_with("text/plain") {
+        body
+    } else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Use Content-Type: application/sparql-update or application/x-www-form-urlencoded",
+        )
+            .into_response();
+    };
+
+    execute_sparql_update(&state.store, &update_str)
+}
+
+/// Parse → execute a SPARQL Update request against the store.
+fn execute_sparql_update<S: QuadStore + 'static>(store: &Arc<S>, sparql: &str) -> Response {
+    let update = match SparqlParser::new().parse_update(sparql) {
+        Ok(u) => u,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("SPARQL parse error: {e}")).into_response();
+        }
+    };
+
+    match execute_update(store, &update) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Update execution error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+// ── SPARQL 1.1 Graph Store HTTP Protocol ─────────────────────────────────────
+
+/// Resolve `?graph=<iri>` / `?default` query params into a target [`GraphName`].
+///
+/// Per the W3C Graph Store HTTP Protocol, exactly one direct-reference query
+/// parameter must identify the target graph. `?default` wins if both are
+/// somehow present. Indirect referencing (naming a graph via the request URL
+/// path itself, e.g. `/store/mygraph`) is out of scope — only `/store` with a
+/// query parameter is implemented.
+fn resolve_target_graph(params: &GraphStoreParams) -> Result<GraphName, Box<Response>> {
+    if params.default.is_some() {
+        Ok(GraphName::DefaultGraph)
+    } else if let Some(iri) = &params.graph {
+        match NamedNode::new(iri) {
+            Ok(n) => Ok(GraphName::NamedNode(n)),
+            Err(e) => Err(Box::new(
+                (StatusCode::BAD_REQUEST, format!("Invalid graph IRI: {e}")).into_response(),
+            )),
+        }
+    } else {
+        Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                "Missing '?graph=<iri>' or '?default' query parameter",
+            )
+                .into_response(),
+        ))
+    }
+}
+
+
+/// Returns `true` if `g` is either explicitly registered or has at least one
+/// quad. The default graph always "exists". Mirrors
+/// `oxigraph_nova_query::update`'s private `named_graph_exists` helper —
+/// duplicated here (rather than exposed) since it's a small, self-contained
+/// check and keeps `nova-query`'s update-specific internals private.
+fn graph_exists<S: QuadStore>(store: &Arc<S>, g: &GraphName) -> Result<bool, Box<Response>> {
+    if matches!(g, GraphName::DefaultGraph) {
+        return Ok(true);
+    }
+    let known = store.known_named_graphs().map_err(|e| {
+        Box::new((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+    })?;
+    for kg in known {
+        let kg = kg.map_err(|e| {
+            Box::new((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+        })?;
+        if &kg == g {
+            return Ok(true);
+        }
+    }
+    let mut matches = store.quads_for_pattern(None, None, None, Some(g)).map_err(|e| {
+        Box::new((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+    })?;
+    Ok(matches.next().is_some())
+}
+
+/// Parse an RDF body into `Triple`s, dispatching on `Content-Type`:
+///   - `application/n-triples`  → `oxttl::NTriplesParser`
+///   - `application/rdf+xml`    → `oxrdfxml::RdfXmlParser`
+///   - `text/turtle` / anything else (default) → `oxttl::TurtleParser`
+fn parse_body_triples(content_type: &str, body: &[u8]) -> Result<Vec<Triple>, Box<Response>> {
+    let err = |e: String| {
+        Box::new((StatusCode::BAD_REQUEST, format!("RDF parse error: {e}")).into_response())
+    };
+
+    if content_type.starts_with("application/n-triples") {
+        NTriplesParser::new()
+            .for_reader(body)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| err(e.to_string()))
+    } else if content_type.starts_with("application/rdf+xml") {
+        RdfXmlParser::new()
+            .for_reader(body)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| err(e.to_string()))
+    } else {
+        // Default: Turtle (also used for text/turtle and unrecognised types).
+        TurtleParser::new()
+            .for_reader(body)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| err(e.to_string()))
+    }
+}
+
+/// Insert parsed `Triple`s into `graph` as `Quad`s.
+fn insert_triples_into_graph<S: QuadStore>(
+    store: &Arc<S>,
+    graph: &GraphName,
+    triples: Vec<Triple>,
+) -> Result<(), Box<Response>> {
+    // Ensure the target named graph is registered (so it shows up in
+    // `known_named_graphs()`/exists-checks even if the body was empty).
+    if !matches!(graph, GraphName::DefaultGraph) {
+        store.register_named_graph(graph).map_err(|e| {
+            Box::new((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+        })?;
+    }
+    for t in triples {
+        let quad = Quad::new(t.subject, t.predicate, t.object, graph.clone());
+        store.insert(&quad).map_err(|e| {
+            Box::new((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+        })?;
+    }
+    Ok(())
+}
+
+
+/// `GET /store?graph=<iri>` / `?default` — read a graph's triples.
+///
+/// Always returns 200 OK (even for an empty/unregistered graph — mirrors the
+/// original oxigraph server's leniency for GET, reserving 404 for DELETE on a
+/// missing named graph only).
+async fn store_get<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+    AxumQuery(params): AxumQuery<GraphStoreParams>,
+    headers: HeaderMap,
+) -> Response {
+    let graph = match resolve_target_graph(&params) {
+        Ok(g) => g,
+        Err(resp) => return *resp,
+    };
+    let stored = match state
+        .store
+        .quads_for_pattern(None, None, None, Some(&graph))
+    {
+
+        Ok(iter) => match iter.collect::<Result<Vec<_>, _>>() {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let triples: Vec<Triple> = stored
+        .into_iter()
+        .filter_map(|sq| {
+            let subject = match sq.subject {
+                Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
+                Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
+                _ => return None,
+            };
+            Some(Triple::new(subject, sq.predicate, sq.object))
+        })
+        .collect();
+    serialize_triples(&triples, accept_header(&headers))
+}
+
+/// `PUT /store?graph=<iri>` / `?default` — replace a graph's contents.
+///
+/// Clears the target graph first (replace semantics), then loads the body.
+/// Returns `201 CREATED` if the named graph did not previously exist, else
+/// `204 NO_CONTENT` (the default graph always "exists", so PUT on it is
+/// always `204`).
+async fn store_put<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+    AxumQuery(params): AxumQuery<GraphStoreParams>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let graph = match resolve_target_graph(&params) {
+        Ok(g) => g,
+        Err(resp) => return *resp,
+    };
+    let existed = match graph_exists(&state.store, &graph) {
+        Ok(b) => b,
+        Err(resp) => return *resp,
+    };
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let triples = match parse_body_triples(ct, &body) {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+    if let Err(e) = clear_graph(&state.store, &graph) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    if let Err(resp) = insert_triples_into_graph(&state.store, &graph, triples) {
+        return *resp;
+    }
+    if existed {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::CREATED.into_response()
+    }
+}
+
+
+/// `POST /store?graph=<iri>` / `?default` — merge triples into a graph.
+///
+/// Like `PUT` but does not clear the target graph first. Returns `201
+/// CREATED` if the named graph did not previously exist, else `204
+/// NO_CONTENT`.
+async fn store_post<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+    AxumQuery(params): AxumQuery<GraphStoreParams>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let graph = match resolve_target_graph(&params) {
+        Ok(g) => g,
+        Err(resp) => return *resp,
+    };
+    let existed = match graph_exists(&state.store, &graph) {
+        Ok(b) => b,
+        Err(resp) => return *resp,
+    };
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let triples = match parse_body_triples(ct, &body) {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = insert_triples_into_graph(&state.store, &graph, triples) {
+        return *resp;
+    }
+    if existed {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::CREATED.into_response()
+    }
+}
+
+/// `DELETE /store?graph=<iri>` / `?default` — clear a graph.
+///
+/// The default graph always "exists" so `DELETE` on it always succeeds
+/// (`204`). `DELETE` on a nonexistent named graph returns `404 NOT_FOUND`.
+async fn store_delete<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+    AxumQuery(params): AxumQuery<GraphStoreParams>,
+) -> Response {
+    let graph = match resolve_target_graph(&params) {
+        Ok(g) => g,
+        Err(resp) => return *resp,
+    };
+    if !matches!(graph, GraphName::DefaultGraph) {
+        match graph_exists(&state.store, &graph) {
+            Ok(true) => {}
+            Ok(false) => {
+                return (StatusCode::NOT_FOUND, "The graph does not exist").into_response();
+            }
+            Err(resp) => return *resp,
+        }
+    }
+
+    match clear_graph(&state.store, &graph) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 // ── Core execution pipeline ───────────────────────────────────────────────────
 
+
 /// Parse → adapt store → evaluate → serialise.
 ///
 /// This is sync because the evaluator is sync; the async handlers just call it.
-fn execute_sparql_query<S: QuadStore + 'static>(store: &Arc<S>, sparql: &str) -> Response {
+fn execute_sparql_query<S: QuadStore + 'static>(
+    store: &Arc<S>,
+    sparql: &str,
+    accept: &str,
+) -> Response {
     // 1. Parse
     let query = match SparqlParser::new().parse_query(sparql) {
         Ok(q) => q,
@@ -201,9 +567,10 @@ fn execute_sparql_query<S: QuadStore + 'static>(store: &Arc<S>, sparql: &str) ->
             let vars = query_select_vars(&query);
             serialize_solutions(&vars, &solutions)
         }
-        Ok(QueryResult::Triples(triples)) => serialize_triples(&triples),
+        Ok(QueryResult::Triples(triples)) => serialize_triples(&triples, accept),
     }
 }
+
 
 // ── Result serialization ──────────────────────────────────────────────────────
 
@@ -263,18 +630,28 @@ fn serialize_solutions(variables: &[Variable], solutions: &[Solution]) -> Respon
     }
 }
 
-/// Serialize a CONSTRUCT result as `application/n-triples`.
+/// Serialize a CONSTRUCT/DESCRIBE result, content-negotiated via `Accept`:
+///   - `Accept` contains `text/turtle`  → Turtle (`oxttl::TurtleSerializer`)
+///   - anything else (default)         → `application/n-triples`
 ///
-/// oxrdf's `Display` implementations produce syntactically correct N-Triples:
-///   IRI        → `<http://…>`
-///   blank node → `_:label`
-///   literal    → `"value"` / `"value"@lang` / `"value"^^<dt>`
-fn serialize_triples(triples: &[oxrdf::Triple]) -> Response {
-    let mut buf = String::new();
-    for t in triples {
-        // N-Triples format: subject predicate object .
-        buf.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
+/// Also used directly by the Graph Store Protocol's `GET /store` handler so
+/// both code paths share one serializer.
+fn serialize_triples(triples: &[Triple], accept: &str) -> Response {
+    if accept.contains("text/turtle") {
+        serialize_triples_turtle(triples)
+    } else {
+        serialize_triples_ntriples(triples)
     }
+}
+
+fn serialize_triples_ntriples(triples: &[Triple]) -> Response {
+    let mut writer = NTriplesSerializer::new().for_writer(Vec::new());
+    for t in triples {
+        if let Err(e) = writer.serialize_triple(t) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    let buf = writer.finish();
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/n-triples; charset=utf-8")],
@@ -282,6 +659,33 @@ fn serialize_triples(triples: &[oxrdf::Triple]) -> Response {
     )
         .into_response()
 }
+
+fn serialize_triples_turtle(triples: &[Triple]) -> Response {
+    let mut writer = TurtleSerializer::new().for_writer(Vec::new());
+    for t in triples {
+        if let Err(e) = writer.serialize_triple(t) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    match writer.finish() {
+        Ok(buf) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/turtle; charset=utf-8")],
+            buf,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Extract the `Accept` header as a `&str` (empty string if absent/invalid).
+fn accept_header(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 
 // ── SPARQL algebra helpers ────────────────────────────────────────────────────
 
@@ -639,4 +1043,612 @@ mod tests {
     fn test_percent_decode_passthrough() {
         assert_eq!(percent_decode("plain"), "plain");
     }
+
+    // ── POST /sparql/update ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_update_insert_data() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let sparql = r#"INSERT DATA { <http://ex/carol> <http://ex/name> "Carol" }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            store
+                .contains(&Quad::new(
+                    NamedNode::new_unchecked("http://ex/carol"),
+                    NamedNode::new_unchecked("http://ex/name"),
+                    Term::Literal(Literal::new_simple_literal("Carol")),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_delete_data() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let sparql = r#"DELETE DATA { <http://ex/alice> <http://ex/name> "Alice" }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            !store
+                .contains(&Quad::new(
+                    NamedNode::new_unchecked("http://ex/alice"),
+                    NamedNode::new_unchecked("http://ex/name"),
+                    Term::Literal(Literal::new_simple_literal("Alice")),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_delete_where() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let sparql = r#"DELETE WHERE { ?s <http://ex/name> ?n }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // only the alice-age quad should remain
+        assert_eq!(store.len().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_insert_delete_where() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let sparql = r#"DELETE { ?s <http://ex/age> ?a }
+                         INSERT { ?s <http://ex/ageOld> ?a }
+                         WHERE { ?s <http://ex/age> ?a }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            store
+                .contains(&Quad::new(
+                    NamedNode::new_unchecked("http://ex/alice"),
+                    NamedNode::new_unchecked("http://ex/ageOld"),
+                    Term::Literal(Literal::new_typed_literal(
+                        "30",
+                        NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
+                    )),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_clear_default() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let sparql = "CLEAR DEFAULT";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(store.len().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_create_and_drop_graph() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let sparql = "CREATE GRAPH <http://ex/g1>";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(sparql))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let graphs: Vec<_> = store
+            .known_named_graphs()
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(graphs.contains(&GraphName::NamedNode(NamedNode::new_unchecked(
+            "http://ex/g1"
+        ))));
+
+        let router2 = Server::new(Arc::clone(&store)).into_router();
+        let sparql2 = "DROP GRAPH <http://ex/g1>";
+        let req2 = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(sparql2))
+            .unwrap();
+        let resp2 = router2.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_update_form_urlencoded() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        // update=INSERT+DATA+%7B+%3Chttp%3A%2F%2Fex%2Fd%3E+%3Chttp%3A%2F%2Fex%2Fp%3E+%22v%22+%7D
+        let form = "update=INSERT+DATA+%7B+%3Chttp%3A%2F%2Fex%2Fd%3E+%3Chttp%3A%2F%2Fex%2Fp%3E+%22v%22+%7D";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(form))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            store
+                .contains(&Quad::new(
+                    NamedNode::new_unchecked("http://ex/d"),
+                    NamedNode::new_unchecked("http://ex/p"),
+                    Term::Literal(Literal::new_simple_literal("v")),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_empty_body_returns_400() {
+        let router = make_router();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_parse_error_returns_400() {
+        let router = make_router();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from("NOT AN UPDATE"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_unsupported_content_type_returns_415() {
+        let router = make_router();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_update_drop_missing_graph_errors() {
+        let router = make_router();
+        let sparql = "DROP GRAPH <http://ex/nonexistent>";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_update_drop_silent_missing_graph_ok() {
+        let router = make_router();
+        let sparql = "DROP SILENT GRAPH <http://ex/nonexistent>";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql/update")
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Content-negotiated CONSTRUCT/DESCRIBE serialization ───────────────────
+
+    #[tokio::test]
+    async fn test_construct_default_ntriples() {
+        let sparql = r#"CONSTRUCT { ?s <http://ex/name> ?n } WHERE { ?s <http://ex/name> ?n }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("n-triples"), "wrong content-type: {ct}");
+        let body = body_text(resp).await;
+        assert!(body.contains("<http://ex/alice>"));
+        assert!(body.trim_end().ends_with('.'));
+    }
+
+    #[tokio::test]
+    async fn test_construct_turtle_via_accept() {
+        let sparql = r#"CONSTRUCT { ?s <http://ex/name> ?n } WHERE { ?s <http://ex/name> ?n }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .header("accept", "text/turtle")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/turtle"), "wrong content-type: {ct}");
+        let body = body_text(resp).await;
+        assert!(body.contains("http://ex/alice"));
+    }
+
+    // ── Graph Store HTTP Protocol: GET /store ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_store_get_default_graph() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/store?default")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        // 3 quads inserted into the default graph by make_store()
+        assert_eq!(body.lines().filter(|l| !l.trim().is_empty()).count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_store_get_missing_target_returns_400() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/store")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_store_get_named_graph_turtle_accept() {
+        let store = make_store();
+        store
+            .insert(&Quad::new(
+                NamedNode::new_unchecked("http://ex/dave"),
+                NamedNode::new_unchecked("http://ex/name"),
+                Term::Literal(Literal::new_simple_literal("Dave")),
+                GraphName::NamedNode(NamedNode::new_unchecked("http://ex/g1")),
+            ))
+            .unwrap();
+        let router = Server::new(store).into_router();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fg1")
+            .header("accept", "text/turtle")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/turtle"));
+        let body = body_text(resp).await;
+        assert!(body.contains("Dave"));
+    }
+
+    // ── Graph Store HTTP Protocol: PUT /store ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_store_put_new_named_graph_returns_201() {
+        let router = make_router();
+        let ttl = "<http://ex/eve> <http://ex/name> \"Eve\" .";
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fnew")
+            .header("content-type", "text/turtle")
+            .body(Body::from(ttl))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_store_put_existing_graph_returns_204_and_replaces() {
+        let store = make_store();
+        let g = GraphName::NamedNode(NamedNode::new_unchecked("http://ex/g1"));
+        store
+            .insert(&Quad::new(
+                NamedNode::new_unchecked("http://ex/old"),
+                NamedNode::new_unchecked("http://ex/p"),
+                Term::Literal(Literal::new_simple_literal("old")),
+                g.clone(),
+            ))
+            .unwrap();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let ttl = "<http://ex/newsubj> <http://ex/p> \"new\" .";
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fg1")
+            .header("content-type", "text/turtle")
+            .body(Body::from(ttl))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Old triple should be gone (replace semantics), new triple present.
+        assert!(
+            !store
+                .contains(&Quad::new(
+                    NamedNode::new_unchecked("http://ex/old"),
+                    NamedNode::new_unchecked("http://ex/p"),
+                    Term::Literal(Literal::new_simple_literal("old")),
+                    g.clone(),
+                ))
+                .unwrap()
+        );
+        assert!(
+            store
+                .contains(&Quad::new(
+                    NamedNode::new_unchecked("http://ex/newsubj"),
+                    NamedNode::new_unchecked("http://ex/p"),
+                    Term::Literal(Literal::new_simple_literal("new")),
+                    g,
+                ))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_put_ntriples_content_type() {
+        let router = make_router();
+        let nt = "<http://ex/frank> <http://ex/name> \"Frank\" .\n";
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fnt")
+            .header("content-type", "application/n-triples")
+            .body(Body::from(nt))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_store_put_tolerates_extra_query_params() {
+        let router = make_router();
+        let ttl = "<http://ex/x> <http://ex/p> \"v\" .";
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fextra&no_transaction&lenient")
+            .header("content-type", "text/turtle")
+            .body(Body::from(ttl))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ── Graph Store HTTP Protocol: POST /store ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_store_post_merges_without_clearing() {
+        let store = make_store();
+        let g = GraphName::NamedNode(NamedNode::new_unchecked("http://ex/g1"));
+        store
+            .insert(&Quad::new(
+                NamedNode::new_unchecked("http://ex/existing"),
+                NamedNode::new_unchecked("http://ex/p"),
+                Term::Literal(Literal::new_simple_literal("keepme")),
+                g.clone(),
+            ))
+            .unwrap();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let ttl = "<http://ex/added> <http://ex/p> \"added\" .";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fg1")
+            .header("content-type", "text/turtle")
+            .body(Body::from(ttl))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Graph already existed → 204
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Both old and new triples should be present (merge, no clear).
+        assert!(
+            store
+                .contains(&Quad::new(
+                    NamedNode::new_unchecked("http://ex/existing"),
+                    NamedNode::new_unchecked("http://ex/p"),
+                    Term::Literal(Literal::new_simple_literal("keepme")),
+                    g.clone(),
+                ))
+                .unwrap()
+        );
+        assert!(
+            store
+                .contains(&Quad::new(
+                    NamedNode::new_unchecked("http://ex/added"),
+                    NamedNode::new_unchecked("http://ex/p"),
+                    Term::Literal(Literal::new_simple_literal("added")),
+                    g,
+                ))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_post_new_graph_returns_201() {
+        let router = make_router();
+        let ttl = "<http://ex/g> <http://ex/p> \"v\" .";
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fbrandnew")
+            .header("content-type", "text/turtle")
+            .body(Body::from(ttl))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ── Graph Store HTTP Protocol: DELETE /store ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_store_delete_default_graph_always_204() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/store?default")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(store.len().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_store_delete_nonexistent_named_graph_returns_404() {
+        let router = make_router();
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fnonexistent")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_store_delete_existing_named_graph_returns_204() {
+        let store = make_store();
+        let g = GraphName::NamedNode(NamedNode::new_unchecked("http://ex/g1"));
+        store
+            .insert(&Quad::new(
+                NamedNode::new_unchecked("http://ex/s"),
+                NamedNode::new_unchecked("http://ex/p"),
+                Term::Literal(Literal::new_simple_literal("v")),
+                g.clone(),
+            ))
+            .unwrap();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fg1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            !store
+                .contains(&Quad::new(
+                    NamedNode::new_unchecked("http://ex/s"),
+                    NamedNode::new_unchecked("http://ex/p"),
+                    Term::Literal(Literal::new_simple_literal("v")),
+                    g,
+                ))
+                .unwrap()
+        );
+    }
 }
+

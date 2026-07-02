@@ -4,6 +4,7 @@ pub mod extensions;
 pub mod lftj;
 pub mod path;
 pub mod solution;
+pub mod update;
 
 pub use dataset::{
     Dataset, GraphSelector, InMemoryDataset, PatternTerm, QuadIter, QuadMatch, QuadPattern,
@@ -15,3 +16,5 @@ pub use extensions::{
     ValueType,
 };
 pub use solution::{Solution, Solutions, SparqlVariable};
+pub use update::{clear_graph, execute_update};
+

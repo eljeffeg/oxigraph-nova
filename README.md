@@ -187,8 +187,23 @@ QLever (C++) is a high-performance RDF store optimized for bulk-loaded static da
 
 **Conformance ceiling:** All 328 SPARQL 1.1 tests pass (100%); 265/269 SPARQL 1.2 tests pass (98%)
 
+---
+
+## Remaining RDF 1.2 test issues
+
+Oxigraph Nova reuses the Oxigraph project's own parsing/RDF crates (see the table at the top of this README), which means any gap in those crates shows up here too. `spargebra`, `oxrdf`, and the rest of the Oxigraph crates are published from the single `oxigraph/oxigraph` monorepo, so all of the below belong on the same tracker: https://github.com/oxigraph/oxigraph/issues.  Remaining issues are already fix in the repository and slated for release in v0.5.
+
+### Other RDF ecosystems evaluated
+
+**[`rdf-reader-jelly`](https://crates.io/crates/rdf-reader-jelly) 0.4.4 — not viable yet.** Evaluated as a reader for [Jelly](https://jelly-rdf.github.io), a binary/protobuf RDF format, as a possible additional bulk-load format. The published crate has no actual decoding implementation yet (its own README says "under heavy construction"), and its `oxrdf` interop feature currently fails to compile. Revisit once it ships a real decoder.
+
+**Dataset canonicalization (URDNA2015/RDFC-1.0) — no drop-in Oxi-compatible option yet.** [`rdf-canon`](https://crates.io/crates/rdf-canon) 0.15.3 explicitly advertises itself as "compatible with Oxigraph and Oxrdf" and has a real, substantial implementation with a full W3C RDFC-1.0 conformance test suite, but its `Cargo.toml` currently pins the old `oxrdf = "0.2.4"` (pre-RDF-1.2, no `rdf-12` feature), so adopting it today would pull a second, conflicting `oxrdf` version into the dependency tree. Revisit once it bumps to `oxrdf` 0.3.x/`rdf-12`.
+
+---
+
 
 ### Planned: OWL 2 RL reasoning via `reasonable`
+
 
 The planned reasoning layer adds forward-chaining OWL 2 RL inference as an **opt-in `Dataset` decorator** — zero changes to the evaluator or storage layer:
 
