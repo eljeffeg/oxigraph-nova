@@ -54,7 +54,7 @@
 //! vocabulary arrays (`vocab[0]`, `vocab[1]`, `vocab[2]`) map local → global
 //! (u64 term IDs) for each depth.
 
-use crate::louds::{LoudsTrie, build_louds_from_sorted};
+use crate::louds::{LoudsMemBreakdown, LoudsTrie, build_louds_from_sorted};
 use crate::ring::SortOrder;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 use std::sync::Arc;
@@ -83,6 +83,45 @@ impl CltjTrie {
     pub fn vocab_len(&self, d: usize) -> usize {
         if d < 3 { self.vocab[d].len() } else { 0 }
     }
+
+    /// Real allocated byte size of this trie's LOUDS structure (T + L +
+    /// sidecar), **excluding** vocab (vocab is `Arc`-shared across multiple
+    /// tries within a [`CltjData`]; see [`CltjData::mem_size_bytes`] for the
+    /// correctly deduped total).
+    pub fn louds_mem_size_bytes(&self) -> usize {
+        self.louds.mem_size_bytes()
+    }
+
+    /// Per-component (T/L/sidecar) memory breakdown of this trie's LOUDS
+    /// structure, for the Phase A.1 diagnostic (see `CLAUDE.md`'s "Memory
+    /// footprint investigation" section).  Excludes vocab — see
+    /// [`CltjData::mem_breakdown_per_ordering`] for per-field vocab bytes.
+    pub fn mem_breakdown(&self) -> LoudsMemBreakdown {
+        self.louds.mem_breakdown()
+    }
+
+    /// Byte size of this trie's three vocab arrays, **without** Arc-dedup
+    /// (i.e. counted once per trie, even if shared with other tries).  Used
+    /// by [`CltjData::mem_breakdown_per_ordering`] to report a per-ordering
+    /// "as if not shared" vocab figure alongside the deduped grand total.
+    pub fn vocab_bytes_undeduped(&self) -> usize {
+        self.vocab
+            .iter()
+            .map(|v| std::mem::size_of::<Vec<u64>>() + v.len() * std::mem::size_of::<u64>())
+            .sum()
+    }
+
+
+    /// Pointer identities of this trie's three vocab `Arc` allocations, for
+    /// dedup accounting at the `CltjData` level.
+    pub(crate) fn vocab_arc_ptrs(&self) -> [*const Vec<u64>; 3] {
+        [
+            Arc::as_ptr(&self.vocab[0]),
+            Arc::as_ptr(&self.vocab[1]),
+            Arc::as_ptr(&self.vocab[2]),
+        ]
+    }
+
 
     /// Create a depth-0 `CltjTrieIter` positioned at the first root child.
     ///
@@ -136,7 +175,77 @@ impl CltjData {
         // SPO trie: vocab[0]=subjects, vocab[1]=predicates, vocab[2]=objects.
         self.tries[Self::idx(SortOrder::Spo)].vocab_len(field)
     }
+
+    /// Real allocated byte size of all six LOUDS tries plus the vocab arrays,
+    /// for memory-breakdown diagnostics.
+    ///
+    /// Vocab arrays (`orig_s`/`orig_p`/`orig_o`) are `Arc`-shared across all
+    /// six tries (18 references but only 3 unique backing allocations) — this
+    /// method dedupes by `Arc` pointer identity so the returned total reflects
+    /// real heap usage, not an 18x-inflated naive sum.
+    pub fn mem_size_bytes(&self) -> usize {
+        use std::collections::HashSet;
+
+        // Sum each trie's LOUDS-only bytes (never shared — unique per trie).
+        let louds_total: usize = self.tries.iter().map(|t| t.louds_mem_size_bytes()).sum();
+
+        // Dedup vocab Arcs by pointer identity, then sum each unique Vec<u64>'s
+        // real heap size once.
+        let mut seen: HashSet<*const Vec<u64>> = HashSet::new();
+        let mut vocab_total = 0usize;
+        for trie in &self.tries {
+            for (ptr, arc) in trie.vocab_arc_ptrs().into_iter().zip(trie.vocab.iter()) {
+                if seen.insert(ptr) {
+                    vocab_total += std::mem::size_of::<Vec<u64>>() + arc.len() * std::mem::size_of::<u64>();
+                }
+            }
+        }
+
+        louds_total + vocab_total
+    }
+
+    /// Per-ordering memory breakdown (Phase A.1 diagnostic — see `CLAUDE.md`'s
+    /// "Memory footprint investigation" section).
+    ///
+    /// Returns one `(SortOrder, LoudsMemBreakdown, vocab_bytes_undeduped)` tuple
+    /// per of the six tries, in the fixed order SPO/SOP/PSO/POS/OPS/OSP.  The
+    /// vocab figure is **not** deduped (each trie's three vocab arrays are
+    /// counted in full even though they are `Arc`-shared with other tries) —
+    /// this is intentional, so callers can see each ordering's "full" memory
+    /// footprint as well as the deduped grand total from [`Self::mem_size_bytes`].
+    pub fn mem_breakdown_per_ordering(&self) -> [(SortOrder, LoudsMemBreakdown, usize); 6] {
+        let orders = [
+            SortOrder::Spo,
+            SortOrder::Sop,
+            SortOrder::Pso,
+            SortOrder::Pos,
+            SortOrder::Ops,
+            SortOrder::Osp,
+        ];
+        std::array::from_fn(|i| {
+            let trie = &self.tries[i];
+            (orders[i], trie.mem_breakdown(), trie.vocab_bytes_undeduped())
+        })
+    }
+
+    /// Deduped total vocab bytes across all six tries' shared `Arc<Vec<u64>>`
+    /// arrays (3 unique allocations, regardless of the 18 references).
+    pub fn vocab_bytes_deduped(&self) -> usize {
+        use std::collections::HashSet;
+        let mut seen: HashSet<*const Vec<u64>> = HashSet::new();
+        let mut total = 0usize;
+        for trie in &self.tries {
+            for (ptr, arc) in trie.vocab_arc_ptrs().into_iter().zip(trie.vocab.iter()) {
+                if seen.insert(ptr) {
+                    total += std::mem::size_of::<Vec<u64>>() + arc.len() * std::mem::size_of::<u64>();
+                }
+            }
+        }
+        total
+    }
 }
+
+
 
 // ── Pair builder ──────────────────────────────────────────────────────────────
 

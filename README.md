@@ -199,6 +199,10 @@ Oxigraph Nova reuses the Oxigraph project's own parsing/RDF crates (see the tabl
 
 **Dataset canonicalization (URDNA2015/RDFC-1.0) — no drop-in Oxi-compatible option yet.** [`rdf-canon`](https://crates.io/crates/rdf-canon) 0.15.3 explicitly advertises itself as "compatible with Oxigraph and Oxrdf" and has a real, substantial implementation with a full W3C RDFC-1.0 conformance test suite, but its `Cargo.toml` currently pins the old `oxrdf = "0.2.4"` (pre-RDF-1.2, no `rdf-12` feature), so adopting it today would pull a second, conflicting `oxrdf` version into the dependency tree. Revisit once it bumps to `oxrdf` 0.3.x/`rdf-12`.
 
+**Lakehouse native graph engine with git-style workflows** [`omnigraph`](https://github.com/ModernRelay/omnigraph) interesting project that we might be able to learn from
+
+**OxiRS** [oxirs](https://github.com/cool-japan/oxirs) is an AI sloppy mess, but it has some really cool ideas and features that could be used.
+
 ---
 
 

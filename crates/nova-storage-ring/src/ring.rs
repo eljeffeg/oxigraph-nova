@@ -33,6 +33,8 @@
 //! [`CltjTrieIter`] in `cltj.rs`.
 
 use crate::cltj::{CltjData, build_cltj_data};
+use crate::louds::LoudsMemBreakdown;
+
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,13 +71,15 @@ impl SortOrder {
 
 /// All immutable data for one graph's Ring index.
 struct RingData {
-    /// SPO-sorted global triples for `spo_triples()` / `match_triples()` /
-    /// `contains()`.
-    spo: Vec<[u64; 3]>,
-
     /// Six LOUDS tries (one per ordering) — O(1) navigation per step.
+    /// `contains()`, `match_triples()`, and `spo_triples()` are all derived
+    /// from these tries via O(1)-per-step LOUDS navigation (Phase A.2 —
+    /// removed the redundant `spo: Vec<[u64;3]>` raw copy that used to
+    /// account for ~53% of Ring memory; see `CLAUDE.md`'s "Memory footprint
+    /// investigation" section).
     cltj: CltjData,
 }
+
 
 // ── LFTJ ordering selection ───────────────────────────────────────────────────
 
@@ -116,15 +120,71 @@ pub struct GraphRing {
 
 impl GraphRing {
     /// All triples in SPO order (for testing / serialisation).
+    ///
+    /// Derived by a full depth-3 traversal of the SPO LOUDS trie (O(n) over
+    /// the triple count) — Phase A.2 removed the redundant `spo: Vec<[u64;3]>`
+    /// raw copy this used to clone from (see `CLAUDE.md`'s "Memory footprint
+    /// investigation" section).
     pub fn spo_triples(&self) -> Vec<[u64; 3]> {
+        let data = match &self.data {
+            None => return Vec::new(),
+            Some(d) => d,
+        };
+        let mut results = Vec::new();
+        let mut it0 = data.cltj.trie_iter(SortOrder::Spo);
+        while !it0.at_end() {
+            let s = it0.key();
+            let mut it1 = it0.open();
+            while !it1.at_end() {
+                let p = it1.key();
+                let mut it2 = it1.open();
+                while !it2.at_end() {
+                    results.push([s, p, it2.key()]);
+                    it2.advance();
+                }
+                it1.advance();
+            }
+            it0.advance();
+        }
+        results
+    }
+
+    /// Real allocated byte size of this graph's Ring index, for
+    /// memory-breakdown diagnostics.  This is now just the deduped
+    /// six-LOUDS-trie + vocab total from [`CltjData::mem_size_bytes`] (Phase
+    /// A.2 removed the redundant `spo: Vec<[u64;3]>` raw copy).
+    pub fn mem_size_bytes(&self) -> usize {
         match &self.data {
-            None => Vec::new(),
-            Some(d) => d.spo.clone(),
+            None => 0,
+            Some(d) => d.cltj.mem_size_bytes(),
+        }
+    }
+
+
+    /// Per-ordering memory breakdown (Phase A.1 diagnostic — see `CLAUDE.md`'s
+    /// "Memory footprint investigation" section).  Returns `None` for an
+    /// empty graph.  See [`CltjData::mem_breakdown_per_ordering`] for details.
+    pub fn mem_breakdown_per_ordering(
+        &self,
+    ) -> Option<[(SortOrder, LoudsMemBreakdown, usize); 6]> {
+        self.data.as_ref().map(|d| d.cltj.mem_breakdown_per_ordering())
+    }
+
+    /// Deduped vocab bytes (3 unique `Arc<Vec<u64>>` allocations across all
+    /// six tries), for the Phase A.1 diagnostic.  Returns `(spo_bytes,
+    /// vocab_deduped_bytes)` — `spo_bytes` is always `0` now that Phase A.2
+    /// removed the redundant `spo: Vec<[u64;3]>` raw copy; the tuple shape is
+    /// kept for the `nova_serve.rs` diagnostic print's benefit.
+    pub fn spo_and_vocab_bytes(&self) -> (usize, usize) {
+        match &self.data {
+            None => (0, 0),
+            Some(d) => (0, d.cltj.vocab_bytes_deduped()),
         }
     }
 
     /// Depth-0 `TrieIterator` for the given ordering.
     pub fn trie_iter(&self, ordering: SortOrder) -> Box<dyn TrieIterator> {
+
         match &self.data {
             None => Box::new(EmptyTrieIter),
             Some(d) => d.cltj.trie_iter(ordering),
@@ -132,31 +192,97 @@ impl GraphRing {
     }
 
     /// `true` if the triple `(s, p, o)` exists in this graph.
+    ///
+    /// Navigates the SPO LOUDS trie directly (3 O(1)-amortised seek+open
+    /// steps) rather than binary-searching a redundant raw `Vec<[u64;3]>`
+    /// (Phase A.2 — see `CLAUDE.md`'s "Memory footprint investigation"
+    /// section).
     pub fn contains(&self, s: u64, p: u64, o: u64) -> bool {
         let data = match &self.data {
             None => return false,
             Some(d) => d,
         };
-        data.spo.binary_search(&[s, p, o]).is_ok()
+        let mut it = data.cltj.trie_iter(SortOrder::Spo);
+        if it.at_end() {
+            return false;
+        }
+        it.seek(s);
+        if it.at_end() || it.key() != s {
+            return false;
+        }
+        let mut it = it.open();
+        if it.at_end() {
+            return false;
+        }
+        it.seek(p);
+        if it.at_end() || it.key() != p {
+            return false;
+        }
+        let mut it = it.open();
+        if it.at_end() {
+            return false;
+        }
+        it.seek(o);
+        !it.at_end() && it.key() == o
     }
 
     /// Return all triples matching the optional `s`/`p`/`o` pattern.
+    ///
+    /// Chooses one of the six LOUDS-trie orderings whose depth-0 (and
+    /// depth-1, if 2 fields are bound) exactly matches the bound field(s),
+    /// seeks/opens through the bound prefix, then enumerates the remaining
+    /// unbound depth(s).  Replaces the old binary search + linear filter over
+    /// the redundant `spo: Vec<[u64;3]>` (Phase A.2 — see `CLAUDE.md`'s
+    /// "Memory footprint investigation" section).
     pub fn match_triples(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> Vec<[u64; 3]> {
         let data = match &self.data {
             None => return Vec::new(),
             Some(d) => d,
         };
-        let (lo, hi) = spo_range(&data.spo, s, p);
-        data.spo[lo..hi]
-            .iter()
-            .filter(|&&[sg, pg, og]| {
-                s.is_none_or(|sv| sv == sg)
-                    && p.is_none_or(|pv| pv == pg)
-                    && o.is_none_or(|ov| ov == og)
-            })
-            .copied()
-            .collect()
+
+        // 3 bound: exact-match lookup via contains().
+        if let (Some(sv), Some(pv), Some(ov)) = (s, p, o) {
+            return if self.contains(sv, pv, ov) {
+                vec![[sv, pv, ov]]
+            } else {
+                Vec::new()
+            };
+        }
+
+        // Pick an ordering whose leading depth(s) are exactly the bound
+        // field(s), and the seek values in trie-column order.
+        let (order, seeks): (SortOrder, Vec<u64>) = match (s, p, o) {
+            (None, None, None) => (SortOrder::Spo, vec![]),
+            (Some(sv), None, None) => (SortOrder::Spo, vec![sv]),
+            (None, Some(pv), None) => (SortOrder::Pso, vec![pv]),
+            (None, None, Some(ov)) => (SortOrder::Ops, vec![ov]),
+            (Some(sv), Some(pv), None) => (SortOrder::Spo, vec![sv, pv]),
+            (Some(sv), None, Some(ov)) => (SortOrder::Sop, vec![sv, ov]),
+            (None, Some(pv), Some(ov)) => (SortOrder::Pos, vec![pv, ov]),
+            (Some(_), Some(_), Some(_)) => unreachable!("handled above"),
+        };
+
+        let mut it: Box<dyn TrieIterator> = data.cltj.trie_iter(order);
+        let mut prefix = [0u64; 3];
+        for (i, val) in seeks.iter().enumerate() {
+            if it.at_end() {
+                return Vec::new();
+            }
+            it.seek(*val);
+            if it.at_end() || it.key() != *val {
+                return Vec::new();
+            }
+            prefix[i] = *val;
+            it = it.open();
+        }
+
+        let mut results = Vec::new();
+        enumerate_suffix(it, seeks.len(), &mut prefix, order, &mut results);
+        results
     }
+
+
+
 
     /// Estimate the number of distinct values for `target_field` given the other
     /// bound fields — used by the adaptive VEO predictor in LFTJ.
@@ -242,24 +368,49 @@ impl GraphRing {
     }
 }
 
-// ── SPO range helper ──────────────────────────────────────────────────────────
+// ── Trie suffix enumeration helper ────────────────────────────────────────────
 
-/// Return the `[lo, hi)` range in the SPO-sorted array for a given `(s, p)` prefix.
-fn spo_range(spo: &[[u64; 3]], s: Option<u64>, p: Option<u64>) -> (usize, usize) {
-    match (s, p) {
-        (Some(sv), Some(pv)) => {
-            let lo = spo.partition_point(|&[sg, pg, _]| (sg, pg) < (sv, pv));
-            let hi = spo.partition_point(|&[sg, pg, _]| (sg, pg) <= (sv, pv));
-            (lo, hi)
+/// Enumerate all leaf triples reachable from `it` (positioned at trie-column
+/// depth `depth_reached`), recursively `open()`-ing through the remaining
+/// depths, converting each leaf's trie-column values back to canonical
+/// `[s, p, o]` order via [`SortOrder::to_spo`].
+///
+/// Used by [`GraphRing::match_triples`] to enumerate the unbound suffix of a
+/// pattern match after seeking through the bound prefix (Phase A.2 — see
+/// `CLAUDE.md`'s "Memory footprint investigation" section).
+fn enumerate_suffix(
+    mut it: Box<dyn TrieIterator>,
+    depth_reached: usize,
+    prefix: &mut [u64; 3],
+    order: SortOrder,
+    results: &mut Vec<[u64; 3]>,
+) {
+    match depth_reached {
+        0 => {
+            while !it.at_end() {
+                prefix[0] = it.key();
+                enumerate_suffix(it.open(), 1, prefix, order, results);
+                it.advance();
+            }
         }
-        (Some(sv), None) => {
-            let lo = spo.partition_point(|&[sg, _, _]| sg < sv);
-            let hi = spo.partition_point(|&[sg, _, _]| sg <= sv);
-            (lo, hi)
+        1 => {
+            while !it.at_end() {
+                prefix[1] = it.key();
+                enumerate_suffix(it.open(), 2, prefix, order, results);
+                it.advance();
+            }
         }
-        _ => (0, spo.len()),
+        2 => {
+            while !it.at_end() {
+                prefix[2] = it.key();
+                results.push(order.to_spo(prefix[0], prefix[1], prefix[2]));
+                it.advance();
+            }
+        }
+        _ => unreachable!("trie depth is always 0..=2"),
     }
 }
+
 
 // ── RingBuilder ───────────────────────────────────────────────────────────────
 
@@ -323,9 +474,11 @@ impl RingBuilder {
         );
 
         // orig_s/p/o and map_s/p/o are consumed by build_cltj_data above.
-        // RingData only keeps the SPO-sorted array and the six LOUDS tries.
+        // RingData only keeps the six LOUDS tries (Phase A.2 removed the
+        // redundant `spo: Vec<[u64;3]>` raw copy of `triples`).
         let _ = (map_s, map_p, map_o); // explicitly consumed above
-        let data = Arc::new(RingData { spo: triples, cltj });
+        let data = Arc::new(RingData { cltj });
+
 
         GraphRing {
             n,

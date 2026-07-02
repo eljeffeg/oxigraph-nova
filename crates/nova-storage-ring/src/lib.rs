@@ -47,5 +47,8 @@ pub mod louds;
 pub mod ring;
 pub mod store;
 
-pub use ring::{GraphRing, RingBuilder};
-pub use store::RingStore;
+pub use louds::LoudsMemBreakdown;
+pub use ring::{GraphRing, RingBuilder, SortOrder};
+pub use store::{MemoryBreakdown, PerOrderingBreakdown, RingStore};
+
+

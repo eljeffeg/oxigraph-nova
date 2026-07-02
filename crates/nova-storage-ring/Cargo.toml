@@ -25,6 +25,9 @@ thiserror     = { workspace = true }
 sucds         = "0.8.3"   # CompactVector + Rank9Sel fallback backend (--no-default-features)
 sux           = "0.14"    # Required: L array uses BitFieldVec; default T backend SelectAdapt
 value-traits  = "0.2.0"  # SliceByValue::index_value for safe BitFieldVec reads
+mem_dbg       = "0.4"     # MemSize trait — sux's Rank9/SelectAdapt/BitFieldVec already derive it;
+                           # used for real per-component memory-breakdown diagnostics.
+
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

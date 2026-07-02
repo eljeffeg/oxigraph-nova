@@ -7,8 +7,9 @@ license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-oxigraph-nova-core  = { path = "../nova-core" }
-oxigraph-nova-query = { path = "../nova-query" }
+oxigraph-nova-core         = { path = "../nova-core" }
+oxigraph-nova-query        = { path = "../nova-query" }
+oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
 oxrdf          = { workspace = true }
 oxttl          = { workspace = true }
 oxrdfxml       = { workspace = true }
@@ -20,6 +21,11 @@ tower-http     = { workspace = true }
 serde          = { workspace = true }
 anyhow         = { workspace = true }
 tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "nova_serve"
+path = "src/bin/nova_serve.rs"
 
 [dev-dependencies]
 oxigraph-nova-storage-memory = { path = "../nova-storage-memory" }

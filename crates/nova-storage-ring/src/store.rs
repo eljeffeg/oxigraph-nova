@@ -15,7 +15,9 @@
 //!    snapshot the delta, release the lock, rebuild Ring, `Arc::swap`, clear delta.
 
 use crate::delta::Delta;
-use crate::ring::{GraphRing, RingBuilder};
+use crate::louds::LoudsMemBreakdown;
+use crate::ring::{GraphRing, RingBuilder, SortOrder};
+
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, NamedNode, Oxigraph, Quad,
     QuadStore, StoredQuad, Subject, Term, TermId,
@@ -143,7 +145,73 @@ impl RingStore {
         Ok(())
     }
 
+    /// Bulk-load quads directly into the Ring, **bypassing the delta
+    /// `BTreeMap` entirely** (Phase A.3 — see `CLAUDE.md`'s "Memory
+    /// footprint investigation" section).
+    ///
+    /// Intended for initial dataset loads (e.g. `nova_serve`'s startup path)
+    /// where every quad is known to be a fresh insert and there is no need to
+    /// absorb writes into an LSM delta first.  Interning + per-graph triple
+    /// collection happens directly against `Vec<[u64;3]>` buffers, then each
+    /// graph's `RingBuilder` is built once — avoiding the O(n) `BTreeMap<u128,
+    /// bool>` node-allocation overhead (~4-8x the logical 17 bytes/entry) that
+    /// `insert()` + `compact()` would otherwise incur for the same data.
+    ///
+    /// Any quads already present in `self` (from a prior `insert`/`compact`)
+    /// are preserved and merged in via `spo_triples()`, so this is safe to
+    /// call on a non-empty store, but for the common "fresh store, one big
+    /// load" case it will not have to touch `spo_triples()`/`per_graph`
+    /// merging at all (no existing graphs ⇒ that loop is a no-op).
+    pub fn bulk_load(&self, quads: impl IntoIterator<Item = Quad>) -> Result<usize, Oxigraph> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+
+        // Start from whatever's already compacted into the Ring (usually
+        // empty for a fresh store — this loop is then a no-op).
+        let mut per_graph: HashMap<GraphId, Vec<[u64; 3]>> = HashMap::new();
+        for (&g_id, ring) in &inner.graphs {
+            per_graph.insert(g_id, ring.spo_triples());
+        }
+
+        let mut count = 0usize;
+        for quad in quads {
+            let g_id = inner.dict.intern_graph(&quad.graph_name)?;
+            let s_id = inner.dict.intern(&subject_to_term(&quad.subject))?;
+            let p_id = inner.dict.intern_predicate(&quad.predicate)?;
+            let o_id = inner.dict.intern(&quad.object)?;
+
+            per_graph
+                .entry(g_id)
+                .or_default()
+                .push([s_id.as_u64(), p_id.as_u64(), o_id.as_u64()]);
+
+            if let GraphName::NamedNode(_) = &quad.graph_name {
+                inner.named_graph_ids.insert(g_id);
+            }
+            count += 1;
+        }
+
+        let mut new_graphs: HashMap<GraphId, Arc<GraphRing>> = HashMap::new();
+        for (g_id, mut t) in per_graph {
+            t.sort_unstable();
+            t.dedup();
+            if !t.is_empty() {
+                let mut builder = RingBuilder::new();
+                for [s, p, o] in t {
+                    builder.add(s, p, o);
+                }
+                new_graphs.insert(g_id, Arc::new(builder.build()));
+            }
+        }
+
+        inner.graphs = new_graphs;
+        Ok(count)
+    }
+
     /// Number of triples stored across all graphs (approximation during merge).
+
     pub fn triple_count(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         let ring_total: usize = inner.graphs.values().map(|r| r.n).sum();
@@ -151,7 +219,132 @@ impl RingStore {
         let delta_tombstones = inner.delta.tombstone_count();
         ring_total.saturating_sub(delta_tombstones) + delta_inserts
     }
+
+    /// Real per-component memory breakdown across all graphs' Ring indexes
+    /// plus the dictionary, for memory-breakdown diagnostics (see
+    /// `benches/external/RESULTS.md`).
+    ///
+    /// Returned counts are **measured** heap byte totals (via `mem_dbg`'s
+    /// `MemSize` trait and direct capacity accounting), not theoretical
+    /// estimates — see `GraphRing::mem_size_bytes` / `Dictionary::mem_size_bytes`.
+    pub fn memory_breakdown(&self) -> MemoryBreakdown {
+        let inner = self.inner.lock().unwrap();
+        let ring_bytes: usize = inner.graphs.values().map(|r| r.mem_size_bytes()).sum();
+        let dict_bytes = inner.dict.mem_size_bytes();
+        let triple_count: usize = inner.graphs.values().map(|r| r.n).sum();
+        MemoryBreakdown {
+            ring_bytes,
+            dict_bytes,
+            triple_count,
+        }
+    }
+
+    /// Per-ordering (SPO/SOP/PSO/POS/OPS/OSP) memory breakdown, summed across
+    /// all graphs — the Phase A.1 diagnostic (see `CLAUDE.md`'s "Memory
+    /// footprint investigation" section).  Also returns the summed redundant
+    /// `spo: Vec<[u64;3]>` bytes and the summed deduped-vocab bytes (both
+    /// summed across graphs, since dedup only applies within one graph's
+    /// six tries).
+    pub fn per_ordering_breakdown(&self) -> PerOrderingBreakdown {
+        let inner = self.inner.lock().unwrap();
+        let orders = [
+            SortOrder::Spo,
+            SortOrder::Sop,
+            SortOrder::Pso,
+            SortOrder::Pos,
+            SortOrder::Ops,
+            SortOrder::Osp,
+        ];
+        let mut per_order: [LoudsMemBreakdown; 6] = Default::default();
+        let mut vocab_undeduped: [usize; 6] = Default::default();
+        let mut spo_bytes_total = 0usize;
+        let mut vocab_deduped_total = 0usize;
+
+        for ring in inner.graphs.values() {
+            if let Some(breakdown) = ring.mem_breakdown_per_ordering() {
+                for (i, (_ord, b, vocab_u)) in breakdown.iter().enumerate() {
+                    per_order[i].t_bytes += b.t_bytes;
+                    per_order[i].l_bytes += b.l_bytes;
+                    per_order[i].sidecar_bytes += b.sidecar_bytes;
+                    vocab_undeduped[i] += vocab_u;
+                }
+            }
+            let (spo_bytes, vocab_deduped) = ring.spo_and_vocab_bytes();
+            spo_bytes_total += spo_bytes;
+            vocab_deduped_total += vocab_deduped;
+        }
+
+        PerOrderingBreakdown {
+            orders,
+            per_order,
+            vocab_undeduped,
+            spo_bytes_total,
+            vocab_deduped_total,
+        }
+    }
 }
+
+/// Per-ordering memory breakdown across all graphs (Phase A.1 diagnostic).
+///
+/// See [`RingStore::per_ordering_breakdown`].
+#[derive(Clone, Debug)]
+pub struct PerOrderingBreakdown {
+    /// The six orderings, in fixed order (index-aligned with `per_order` and
+    /// `vocab_undeduped`).
+    pub orders: [SortOrder; 6],
+    /// T/L/sidecar breakdown per ordering, summed across all graphs.
+    pub per_order: [LoudsMemBreakdown; 6],
+    /// Undeduped vocab bytes per ordering (i.e. as if each ordering's three
+    /// vocab arrays were NOT shared with the other five orderings), summed
+    /// across all graphs.  Useful for seeing "what would this ordering cost
+    /// alone" but double/triple-counts shared allocations — see
+    /// `vocab_deduped_total` for the real total.
+    pub vocab_undeduped: [usize; 6],
+    /// Always `0` now that Phase A.2 removed the redundant
+    /// `spo: Vec<[u64;3]>` raw copy; retained for print-layout stability in
+    /// `nova_serve.rs`.
+    pub spo_bytes_total: usize,
+
+    /// Summed deduped vocab bytes across all graphs (3 unique allocations
+    /// per graph, regardless of the 18 references across six tries).
+    pub vocab_deduped_total: usize,
+}
+
+
+/// Real, measured per-component memory breakdown for a [`RingStore`].
+///
+/// See [`RingStore::memory_breakdown`].
+#[derive(Copy, Clone, Debug)]
+pub struct MemoryBreakdown {
+    /// Total bytes across all graphs' `GraphRing` indexes (six-LOUDS-trie
+    /// CompactLTJ structure, Arc-deduped vocab; Phase A.2 removed the
+    /// formerly-redundant `spo: Vec<[u64;3]>` raw copy).
+    pub ring_bytes: usize,
+
+    /// Total bytes in the `Dictionary` (`id_to_term` + `term_to_id` + side
+    /// tables) — every term's string content counted per the real oxrdf
+    /// `Term` representation (no `Arc` sharing).
+    pub dict_bytes: usize,
+    /// Total number of triples currently in the Ring (post-compaction).
+    pub triple_count: usize,
+}
+
+impl MemoryBreakdown {
+    /// Grand total: `ring_bytes + dict_bytes`.
+    pub fn total_bytes(&self) -> usize {
+        self.ring_bytes + self.dict_bytes
+    }
+
+    /// Grand total bytes per triple (0.0 if `triple_count == 0`).
+    pub fn bytes_per_triple(&self) -> f64 {
+        if self.triple_count == 0 {
+            0.0
+        } else {
+            self.total_bytes() as f64 / self.triple_count as f64
+        }
+    }
+}
+
 
 impl Default for RingStore {
     fn default() -> Self {

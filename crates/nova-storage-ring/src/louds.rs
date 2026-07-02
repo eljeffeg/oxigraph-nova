@@ -83,6 +83,7 @@
 // EliasFanoBuilder/Succ are always available — no conditional compilation needed
 // for the imports.  The feature flag `l-opt-ef` only controls the crossover
 // threshold (EF_THRESH_EFFECTIVE), enabling per-degree A/B benchmarking.
+use mem_dbg::{MemSize, SizeFlags};
 use sux::dict::{EfDict, EliasFanoBuilder};
 use sux::prelude::*;
 use sux::traits::Succ;
@@ -124,6 +125,7 @@ mod t_backend {
     //! O(1) select via binary search over Rank9
     //! superblocks; 64-byte block layout with known cache overhead vs. newer
     //! interleaved designs.  Benchmark result: ~53 ms triangle (aarch64 dev).
+    use sucds::Serializable;
     use sucds::bit_vectors::{Build, Rank, Rank9Sel, Select};
 
     pub(super) struct TBitvec(Rank9Sel);
@@ -149,8 +151,15 @@ mod t_backend {
         pub(super) fn select1(&self, k: usize) -> Option<usize> {
             self.0.select1(k)
         }
+
+        /// Real allocated byte size of the T bitvector structure, for
+        /// memory-breakdown diagnostics.
+        pub(super) fn mem_size_bytes(&self) -> usize {
+            self.0.size_in_bytes()
+        }
     }
 }
+
 
 // ── Default: sux Rank9 + SelectAdapt ──────────────────────────────────────────
 #[cfg(feature = "t-sux")]
@@ -190,6 +199,7 @@ mod t_backend {
     //! `AddNumBits<Rank9<SuxBV>>` (which satisfies `SelectAdapt`'s `NumBits`
     //! bound).  `SelectAdapt` then Derefs to `AddNumBits` → `Rank9`, so
     //! `rs.rank(k)` forwards to `Rank9::rank` at zero overhead.
+    use mem_dbg::{MemSize, SizeFlags};
     use sux::prelude::*;
 
     type SuxBV = BitVec<Vec<u64>>;
@@ -197,6 +207,7 @@ mod t_backend {
     /// Deref chain: SelectAdapt → AddNumBits → Rank9 → BitVec<Vec<u64>>.
     /// One backing store; no clone; both rank() and select() work on `rs`.
     type SuxRS = SelectAdapt<AddNumBits<Rank9<SuxBV>>>;
+
 
     pub(super) struct TBitvec {
         rs: SuxRS,
@@ -236,8 +247,17 @@ mod t_backend {
                 None
             }
         }
+
+        /// Real allocated byte size of the T bitvector structure (bitvec +
+        /// Rank9 counters + SelectAdapt inventory), for memory-breakdown
+        /// diagnostics.  Uses `sux`'s derived `MemSize` (accounts for every
+        /// heap allocation in the nested Deref chain).
+        pub(super) fn mem_size_bytes(&self) -> usize {
+            self.rs.mem_size(SizeFlags::default())
+        }
     }
 }
+
 
 // ── LoudsTrie ─────────────────────────────────────────────────────────────────
 
@@ -294,10 +314,32 @@ const EF_THRESH_EFFECTIVE: usize = SIDECAR_THRESH;
 #[cfg(not(feature = "l-opt-ef"))]
 const EF_THRESH_EFFECTIVE: usize = EF_THRESH;
 
+/// Per-component memory breakdown of a single [`LoudsTrie`] (Phase A.1
+/// diagnostic — see `CLAUDE.md`'s "Memory footprint investigation" section).
+/// Does not include the shared vocab arrays, which live one level up in
+/// [`crate::cltj::CltjData`] (Arc-deduped across all six tries).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct LoudsMemBreakdown {
+    /// T bitvector: raw bits + Rank9 counters + SelectAdapt inventory.
+    pub t_bytes: usize,
+    /// L label array: bit-packed `BitFieldVec`.
+    pub l_bytes: usize,
+    /// High-degree sidecar (Slice or Elias-Fano payloads).
+    pub sidecar_bytes: usize,
+}
+
+impl LoudsMemBreakdown {
+    /// Sum of all three components.
+    pub fn total(&self) -> usize {
+        self.t_bytes + self.l_bytes + self.sidecar_bytes
+    }
+}
+
 /// A LOUDS-encoded height-3 trie.
 ///
 /// Both T (bitvector) and L (label array) include a dummy entry at index 0 so
 /// that the virtual root has identifier v = 0.  All paper formulas hold as-is.
+
 ///
 /// ## Label storage
 ///
@@ -496,6 +538,40 @@ impl LoudsTrie {
     pub fn is_empty(&self) -> bool {
         self.n_edges() == 0
     }
+
+    /// Real allocated byte size of this trie's T + L + sidecar structures,
+    /// for memory-breakdown diagnostics (does not include shared vocab —
+    /// see `CltjTrie::mem_size_bytes` / `CltjData::mem_size_bytes` for the
+    /// Arc-deduped vocab accounting).
+    pub fn mem_size_bytes(&self) -> usize {
+        let b = self.mem_breakdown();
+        b.t_bytes + b.l_bytes + b.sidecar_bytes
+    }
+
+    /// Per-component breakdown of this trie's memory (T bitvector / L label
+    /// array / sidecar), for the Phase A.1 diagnostic (see `CLAUDE.md`'s
+    /// "Memory footprint investigation" section). Does not include shared
+    /// vocab — see `CltjData::mem_size_bytes` for the Arc-deduped vocab total.
+    pub fn mem_breakdown(&self) -> LoudsMemBreakdown {
+        let sidecar_bytes: usize = self
+            .sidecar
+            .values()
+            .map(|(_, payload)| {
+                std::mem::size_of::<usize>() * 2 // (key, node_lo) overhead approx
+                    + match payload {
+                        SidecarPayload::Slice(b) => std::mem::size_of_val(&**b),
+                        SidecarPayload::Ef(ef) => ef.mem_size(SizeFlags::default()),
+                    }
+            })
+            .sum();
+        LoudsMemBreakdown {
+            t_bytes: self.t.mem_size_bytes(),
+            l_bytes: self.l.mem_size(SizeFlags::default()),
+            sidecar_bytes,
+        }
+    }
+
+
 
     /// Position of the first 1-bit at T-index ≥ `k`.
     ///

@@ -57,14 +57,11 @@ use oxigraph_nova_query::{
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
 use oxrdfxml::RdfXmlParser;
 use oxttl::{NTriplesParser, NTriplesSerializer, TurtleParser, TurtleSerializer};
-
 use serde::Deserialize;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use spargebra::algebra::GraphPattern;
 use spargebra::{Query, SparqlParser};
 use std::sync::Arc;
-
-
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -101,7 +98,6 @@ pub struct GraphStoreParams {
     pub default: Option<String>,
 }
 
-
 // ── Server ────────────────────────────────────────────────────────────────────
 
 /// Oxigraph Nova SPARQL server.
@@ -133,7 +129,6 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             .with_state(state)
     }
 
-
     /// Bind to `addr` and serve until the process is killed.
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
         let app = self.into_router();
@@ -157,7 +152,6 @@ async fn sparql_get<S: QuadStore + 'static>(
         Some(q) => execute_sparql_query(&state.store, &q, accept_header(&headers)),
     }
 }
-
 
 /// `POST /sparql`
 ///
@@ -205,7 +199,6 @@ async fn sparql_post<S: QuadStore + 'static>(
 
     execute_sparql_query(&state.store, &query_str, accept_header(&headers))
 }
-
 
 /// `POST /sparql/update` — SPARQL 1.1 Update.
 ///
@@ -308,7 +301,6 @@ fn resolve_target_graph(params: &GraphStoreParams) -> Result<GraphName, Box<Resp
     }
 }
 
-
 /// Returns `true` if `g` is either explicitly registered or has at least one
 /// quad. The default graph always "exists". Mirrors
 /// `oxigraph_nova_query::update`'s private `named_graph_exists` helper —
@@ -329,9 +321,11 @@ fn graph_exists<S: QuadStore>(store: &Arc<S>, g: &GraphName) -> Result<bool, Box
             return Ok(true);
         }
     }
-    let mut matches = store.quads_for_pattern(None, None, None, Some(g)).map_err(|e| {
-        Box::new((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
-    })?;
+    let mut matches = store
+        .quads_for_pattern(None, None, None, Some(g))
+        .map_err(|e| {
+            Box::new((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+        })?;
     Ok(matches.next().is_some())
 }
 
@@ -385,7 +379,6 @@ fn insert_triples_into_graph<S: QuadStore>(
     Ok(())
 }
 
-
 /// `GET /store?graph=<iri>` / `?default` — read a graph's triples.
 ///
 /// Always returns 200 OK (even for an empty/unregistered graph — mirrors the
@@ -404,7 +397,6 @@ async fn store_get<S: QuadStore + 'static>(
         .store
         .quads_for_pattern(None, None, None, Some(&graph))
     {
-
         Ok(iter) => match iter.collect::<Result<Vec<_>, _>>() {
             Ok(v) => v,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -465,7 +457,6 @@ async fn store_put<S: QuadStore + 'static>(
         StatusCode::CREATED.into_response()
     }
 }
-
 
 /// `POST /store?graph=<iri>` / `?default` — merge triples into a graph.
 ///
@@ -534,7 +525,6 @@ async fn store_delete<S: QuadStore + 'static>(
 
 // ── Core execution pipeline ───────────────────────────────────────────────────
 
-
 /// Parse → adapt store → evaluate → serialise.
 ///
 /// This is sync because the evaluator is sync; the async handlers just call it.
@@ -570,7 +560,6 @@ fn execute_sparql_query<S: QuadStore + 'static>(
         Ok(QueryResult::Triples(triples)) => serialize_triples(&triples, accept),
     }
 }
-
 
 // ── Result serialization ──────────────────────────────────────────────────────
 
@@ -685,7 +674,6 @@ fn accept_header(headers: &HeaderMap) -> &str {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
 }
-
 
 // ── SPARQL algebra helpers ────────────────────────────────────────────────────
 
@@ -1189,9 +1177,11 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert!(graphs.contains(&GraphName::NamedNode(NamedNode::new_unchecked(
-            "http://ex/g1"
-        ))));
+        assert!(
+            graphs.contains(&GraphName::NamedNode(NamedNode::new_unchecked(
+                "http://ex/g1"
+            )))
+        );
 
         let router2 = Server::new(Arc::clone(&store)).into_router();
         let sparql2 = "DROP GRAPH <http://ex/g1>";
@@ -1651,4 +1641,3 @@ mod tests {
         );
     }
 }
-

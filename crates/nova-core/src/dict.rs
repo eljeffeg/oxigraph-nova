@@ -27,6 +27,8 @@
 use crate::Oxigraph;
 use oxrdf::{GraphName, NamedNode, Term};
 use std::collections::HashMap;
+use std::sync::Arc;
+
 
 // ── TermId ───────────────────────────────────────────────────────────────────
 
@@ -101,10 +103,18 @@ impl GraphId {
 /// `Mutex<RingStoreInner>` (as `RingStore` does) rather than using separate locks.
 pub struct Dictionary {
     // ── Term ↔ TermId ──────────────────────────────────────────────────────
-    /// Reverse: `id_to_term[id.as_u64()]` → `Term`
-    id_to_term: Vec<Term>,
-    /// Forward: `Term` → `TermId`
-    term_to_id: HashMap<Term, TermId>,
+    /// Reverse: `id_to_term[id.as_u64()]` → `Term`.
+    ///
+    /// Stored as `Arc<Term>` (Phase A.4 — see `CLAUDE.md`'s "Memory footprint
+    /// investigation" section) so the same heap-allocated term content is
+    /// shared with the `term_to_id` HashMap key below, instead of being
+    /// duplicated. This halves the Dictionary's real memory footprint versus
+    /// storing two independent owned `Term`s per interned value.
+    id_to_term: Vec<Arc<Term>>,
+    /// Forward: `Term` → `TermId`. The key `Arc<Term>` is the *same*
+    /// allocation as the corresponding `id_to_term` entry (Phase A.4).
+    term_to_id: HashMap<Arc<Term>, TermId>,
+
 
     // ── GraphName ↔ GraphId ─────────────────────────────────────────────────
     /// Forward: `GraphName` → `GraphId`
@@ -156,6 +166,93 @@ impl Dictionary {
         self.id_to_term.is_empty()
     }
 
+    /// Real allocated byte size of this dictionary, for memory-breakdown
+    /// diagnostics.
+    ///
+    /// **Phase A.4** (see `CLAUDE.md`'s "Memory footprint investigation"
+    /// section): `id_to_term` and `term_to_id` now share the *same*
+    /// `Arc<Term>` heap allocation per interned term — `oxrdf` 0.3.3's `Term`
+    /// variants don't do this sharing natively (owned `String`s, no `Arc`),
+    /// so we wrap each interned `Term` in our own `Arc` once and clone the
+    /// `Arc` (cheap refcount bump) into both tables. This halves the prior
+    /// "pays for every term's string content twice" cost down to once per
+    /// term, plus a small fixed `Arc` control-block + pointer overhead.
+    ///
+    /// This is a diagnostic estimate, not exact `malloc` accounting: it uses
+    /// `String::len()` (not allocator capacity, which is usually equal or only
+    /// slightly larger for strings built once via `to_owned`/`String::from`)
+    /// plus fixed struct/enum overhead per field.
+    pub fn mem_size_bytes(&self) -> usize {
+        use std::mem::size_of;
+
+        /// Owned-`String` heap-content bytes (plus the 24-byte `String` struct
+        /// itself: ptr + len + cap) for one `Term`'s variant payload.
+        fn term_heap_bytes(t: &Term) -> usize {
+            const STRING_OVERHEAD: usize = size_of::<String>();
+            match t {
+                Term::NamedNode(n) => STRING_OVERHEAD + n.as_str().len(),
+                Term::BlankNode(b) => STRING_OVERHEAD + b.as_str().len(),
+                Term::Literal(l) => {
+                    let mut bytes = STRING_OVERHEAD + l.value().len();
+                    if let Some(lang) = l.language() {
+                        bytes += STRING_OVERHEAD + lang.len();
+                    }
+                    // `datatype()` returns a `NamedNodeRef` — for typed literals
+                    // oxrdf stores an owned `NamedNode` internally, so count it.
+                    bytes += STRING_OVERHEAD + l.datatype().as_str().len();
+                    bytes
+                }
+                // Quoted-triple components are stored by TermId in the
+                // `triple_terms` side table, not re-embedded here.
+                Term::Triple(_) => 3 * size_of::<TermId>(),
+            }
+        }
+
+        let enum_overhead = size_of::<Term>();
+        // `ArcInner<T>` prepends two refcounts (strong + weak) before `T`.
+        const ARC_CTRL_OVERHEAD: usize = size_of::<usize>() * 2;
+
+        // Each interned term now has exactly ONE heap allocation, shared
+        // (via `Arc::clone`) between `id_to_term` and `term_to_id` — Phase
+        // A.4. Iterating `id_to_term` visits each unique term exactly once.
+        let unique_term_bytes: usize = self
+            .id_to_term
+            .iter()
+            .map(|t| enum_overhead + term_heap_bytes(t) + ARC_CTRL_OVERHEAD)
+            .sum();
+
+        // `id_to_term: Vec<Arc<Term>>` — one 8-byte pointer per slot (content
+        // already counted above via `unique_term_bytes`).
+        let id_to_term_ptrs = self.id_to_term.len() * size_of::<Arc<Term>>();
+
+        // `term_to_id: HashMap<Arc<Term>, TermId>` — one 8-byte `Arc` pointer
+        // (a clone of the same allocation, no new heap content) + the
+        // `TermId` value per entry, plus per-bucket overhead.
+        let term_to_id_bytes =
+            self.term_to_id.len() * (size_of::<Arc<Term>>() + size_of::<TermId>());
+        let term_to_id_bucket_overhead = self.term_to_id.capacity() * size_of::<usize>();
+
+        // Graph side tables (small — typically well under 255 entries).
+        let graph_bytes = self.graph_to_id.len() * (size_of::<GraphName>() + size_of::<GraphId>())
+            + self.id_to_graph.len() * (size_of::<u8>() + size_of::<GraphName>());
+
+        // Quoted-triple side tables (usually empty for plain RDF datasets).
+        let triple_terms_bytes =
+            self.triple_terms.len() * (size_of::<TermId>() + size_of::<[TermId; 3]>());
+        let triple_index_bytes =
+            self.triple_index.len() * (size_of::<[TermId; 3]>() + size_of::<TermId>());
+
+        unique_term_bytes
+            + id_to_term_ptrs
+            + term_to_id_bytes
+            + term_to_id_bucket_overhead
+            + graph_bytes
+            + triple_terms_bytes
+            + triple_index_bytes
+    }
+
+
+
     // ── Term interning ────────────────────────────────────────────────────────
 
     /// Get or assign a `TermId` for the given `Term`.
@@ -186,20 +283,26 @@ impl Dictionary {
 
             let raw = self.id_to_term.len() as u64;
             let id = TermId::new(raw)?;
-            self.id_to_term.push(term.clone());
-            self.term_to_id.insert(term.clone(), id);
+            let arc = Arc::new(term.clone());
+            self.id_to_term.push(Arc::clone(&arc));
+            self.term_to_id.insert(arc, id);
             self.triple_terms.insert(id, components);
             self.triple_index.insert(components, id);
             return Ok(id);
         }
 
         // Regular terms: IRI, blank node, literal.
+        // Phase A.4: wrap in one `Arc` and clone the (cheap) refcounted
+        // pointer into both tables, instead of cloning the full `Term`
+        // (and its heap-allocated `String` content) twice.
         let raw = self.id_to_term.len() as u64;
         let id = TermId::new(raw)?;
-        self.id_to_term.push(term.clone());
-        self.term_to_id.insert(term.clone(), id);
+        let arc = Arc::new(term.clone());
+        self.id_to_term.push(Arc::clone(&arc));
+        self.term_to_id.insert(arc, id);
         Ok(id)
     }
+
 
     /// Look up a `TermId` **without** creating a new entry.
     ///
@@ -214,8 +317,9 @@ impl Dictionary {
     /// Returns `None` only for IDs that were never assigned by this dictionary
     /// (should never happen in correct usage).
     pub fn get_term(&self, id: TermId) -> Option<&Term> {
-        self.id_to_term.get(id.as_u64() as usize)
+        self.id_to_term.get(id.as_u64() as usize).map(|v| v.as_ref())
     }
+
 
     // ── Graph interning ───────────────────────────────────────────────────────
 

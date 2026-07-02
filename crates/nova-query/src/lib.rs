@@ -17,4 +17,3 @@ pub use extensions::{
 };
 pub use solution::{Solution, Solutions, SparqlVariable};
 pub use update::{clear_graph, execute_update};
-

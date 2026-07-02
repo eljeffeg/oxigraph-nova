@@ -292,10 +292,8 @@ fn term_pattern_to_term(
         TermPattern::BlankNode(b) => Some(Term::BlankNode(fresh_bnode_for(b, bnode_map))),
         TermPattern::Literal(l) => Some(Term::Literal(l.clone())),
         TermPattern::Variable(v) => sol.get(v).cloned(),
-        TermPattern::Triple(inner) => {
-            instantiate_triple_pattern_for_insert(inner, sol, bnode_map)
-                .map(|t| Term::Triple(Box::new(t)))
-        }
+        TermPattern::Triple(inner) => instantiate_triple_pattern_for_insert(inner, sol, bnode_map)
+            .map(|t| Term::Triple(Box::new(t))),
     }
 }
 
@@ -363,7 +361,6 @@ pub fn clear_graph<S: QuadStore>(store: &Arc<S>, g: &GraphName) -> Result<()> {
 }
 
 fn clear_one_graph<S: QuadStore>(store: &Arc<S>, g: &GraphName) -> Result<()> {
-
     let stored: Vec<_> = store
         .quads_for_pattern(None, None, None, Some(g))
         .map_err(|e| anyhow!("{e}"))?

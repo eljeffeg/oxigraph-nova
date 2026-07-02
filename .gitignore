@@ -34,3 +34,4 @@ tests/w3c/data/
 /louds-rs
 /profile*.json*
 profile.json.gz
+*.pyc
