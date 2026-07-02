@@ -1,0 +1,398 @@
+//! Dictionary — bidirectional Term ↔ TermId (40-bit) and GraphName ↔ GraphId (8-bit) mapping.
+//!
+//! ## Design rationale
+//!
+//! All internal computation runs over **40-bit integer IDs**, not cloned `Term`s.
+//! There is no native `u40` type in Rust; IDs are carried in `u64` with the upper 24 bits
+//! always zero and a hard ceiling enforced at insertion time.
+//!
+//! ## ID layout in the delta u128 key
+//!
+//! ```text
+//! g[127:120] | s[119:80] | p[79:40] | o[39:0]   (8 + 40 + 40 + 40 = 128 bits exactly)
+//! ```
+//!
+//! The graph field in the high byte means the BTreeMap orders graph-major — all triples
+//! in the same named graph are contiguous — enabling efficient per-graph range queries.
+//!
+//! ## Reserved GraphIds
+//!
+//! | `GraphId` | Meaning |
+//! |---|---|
+//! | `0` | Default graph (always present) |
+//! | `1` | Ontology graph — TBox input for reasoner |
+//! | `2–254` | User named graphs |
+//! | `255` | Inference graph — OWL 2 RL closure written by the reasoner |
+
+use crate::Oxigraph;
+use oxrdf::{GraphName, NamedNode, Term};
+use std::collections::HashMap;
+
+// ── TermId ───────────────────────────────────────────────────────────────────
+
+/// A 40-bit term identifier carried in a `u64`.
+///
+/// Valid range: `0 ..= MAX_TERM_ID` (≈ 1.1 trillion distinct terms).
+/// The upper 24 bits of the carrier are always zero; `new()` enforces this.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct TermId(u64);
+
+/// Upper bound on valid TermIds: 2^40 − 1 ≈ 1.1 trillion.
+pub const MAX_TERM_ID: u64 = (1u64 << 40) - 1; // 1_099_511_627_775
+
+impl TermId {
+    /// Create a `TermId`, returning `Err(IdSpaceExhausted)` if `id > MAX_TERM_ID`.
+    #[inline]
+    pub fn new(id: u64) -> Result<Self, Oxigraph> {
+        if id > MAX_TERM_ID {
+            return Err(Oxigraph::IdSpaceExhausted);
+        }
+        Ok(TermId(id))
+    }
+
+    /// The raw 40-bit value (upper 24 bits are always zero).
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+// ── GraphId ──────────────────────────────────────────────────────────────────
+
+/// An 8-bit named-graph identifier.
+///
+/// The default graph is `GraphId(0)`; user named graphs occupy `2..=254`.
+/// `1` is reserved for the ontology TBox; `255` is reserved for the OWL 2 RL
+/// inference closure written by the reasoner.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct GraphId(pub u8);
+
+/// Default graph (SPARQL default, always present).
+pub const GRAPH_DEFAULT: GraphId = GraphId(0);
+/// Ontology graph — loads OWL TBox axioms for reasoning.
+pub const GRAPH_ONTOLOGY: GraphId = GraphId(1);
+/// Inference graph — written by the OWL 2 RL materializing reasoner.
+pub const GRAPH_INFERENCE: GraphId = GraphId(255);
+
+impl GraphId {
+    /// The raw 8-bit value.
+    #[inline]
+    pub fn as_u8(self) -> u8 {
+        self.0
+    }
+
+    /// `true` iff this is the default graph (`GraphId(0)`).
+    #[inline]
+    pub fn is_default(self) -> bool {
+        self.0 == 0
+    }
+}
+
+// ── Dictionary ────────────────────────────────────────────────────────────────
+
+/// Bidirectional mapping: `Term ↔ TermId` (40-bit) and `GraphName ↔ GraphId` (8-bit).
+///
+/// All Ring and delta operations work over integer IDs; the dictionary encodes at
+/// ingest/query-plan time and decodes only when producing final result rows.
+///
+/// ## Thread safety
+///
+/// `Dictionary` is `!Sync` by design — callers are expected to wrap it in a
+/// `Mutex<RingStoreInner>` (as `RingStore` does) rather than using separate locks.
+pub struct Dictionary {
+    // ── Term ↔ TermId ──────────────────────────────────────────────────────
+    /// Reverse: `id_to_term[id.as_u64()]` → `Term`
+    id_to_term: Vec<Term>,
+    /// Forward: `Term` → `TermId`
+    term_to_id: HashMap<Term, TermId>,
+
+    // ── GraphName ↔ GraphId ─────────────────────────────────────────────────
+    /// Forward: `GraphName` → `GraphId`
+    graph_to_id: HashMap<GraphName, GraphId>,
+    /// Reverse: `GraphId.as_u8()` → `GraphName`
+    id_to_graph: HashMap<u8, GraphName>,
+    /// Next available user GraphId (range `2..=254`; `0/1/255` are reserved).
+    next_graph_id: u8,
+
+    // ── Quoted-triple side table (RDF 1.2 / RDF-star) ──────────────────────
+    /// `triple_terms[id]` = `[s_id, p_id, o_id]` — fast component access for
+    /// `SUBJECT()` / `PREDICATE()` / `OBJECT()` built-in functions.
+    pub triple_terms: HashMap<TermId, [TermId; 3]>,
+    /// Inverse: `[s_id, p_id, o_id]` → `TermId` — deduplication on intern.
+    triple_index: HashMap<[TermId; 3], TermId>,
+}
+
+impl Default for Dictionary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Dictionary {
+    /// Create an empty dictionary with the default graph pre-registered.
+    pub fn new() -> Self {
+        let mut d = Self {
+            id_to_term: Vec::new(),
+            term_to_id: HashMap::new(),
+            graph_to_id: HashMap::new(),
+            id_to_graph: HashMap::new(),
+            next_graph_id: 2, // 0=default, 1=ontology — both reserved
+            triple_terms: HashMap::new(),
+            triple_index: HashMap::new(),
+        };
+        // Pre-register the default graph so GraphId(0) is always valid.
+        d.graph_to_id.insert(GraphName::DefaultGraph, GRAPH_DEFAULT);
+        d.id_to_graph.insert(0, GraphName::DefaultGraph);
+        d
+    }
+
+    /// Total number of interned terms.
+    pub fn len(&self) -> usize {
+        self.id_to_term.len()
+    }
+
+    /// `true` iff no terms have been interned yet.
+    pub fn is_empty(&self) -> bool {
+        self.id_to_term.is_empty()
+    }
+
+    // ── Term interning ────────────────────────────────────────────────────────
+
+    /// Get or assign a `TermId` for the given `Term`.
+    ///
+    /// For quoted triples (`Term::Triple`), recursively interns the components
+    /// and populates the `triple_terms` / `triple_index` side tables so that
+    /// `SUBJECT()` / `PREDICATE()` / `OBJECT()` can look up components by ID.
+    pub fn intern(&mut self, term: &Term) -> Result<TermId, Oxigraph> {
+        // Fast path: already interned.
+        if let Some(&id) = self.term_to_id.get(term) {
+            return Ok(id);
+        }
+
+        // Handle quoted triples (RDF 1.2 / RDF-star).
+        if let Term::Triple(t) = term {
+            // Recursively intern each component first.
+            let s_id = self.intern(&Term::from(t.subject.clone()))?;
+            let p_id = self.intern(&Term::NamedNode(t.predicate.clone()))?;
+            let o_id = self.intern(&t.object.clone())?;
+            let components = [s_id, p_id, o_id];
+
+            // Re-check after recursive interns (the triple itself may have been
+            // inserted as a side-effect if the same quoted triple appears inside
+            // a component — pathological but possible).
+            if let Some(&id) = self.term_to_id.get(term) {
+                return Ok(id);
+            }
+
+            let raw = self.id_to_term.len() as u64;
+            let id = TermId::new(raw)?;
+            self.id_to_term.push(term.clone());
+            self.term_to_id.insert(term.clone(), id);
+            self.triple_terms.insert(id, components);
+            self.triple_index.insert(components, id);
+            return Ok(id);
+        }
+
+        // Regular terms: IRI, blank node, literal.
+        let raw = self.id_to_term.len() as u64;
+        let id = TermId::new(raw)?;
+        self.id_to_term.push(term.clone());
+        self.term_to_id.insert(term.clone(), id);
+        Ok(id)
+    }
+
+    /// Look up a `TermId` **without** creating a new entry.
+    ///
+    /// Returns `None` if the term has never been interned — which for query
+    /// evaluation means the pattern cannot match anything (early-out, no scan).
+    pub fn get_id(&self, term: &Term) -> Option<TermId> {
+        self.term_to_id.get(term).copied()
+    }
+
+    /// Decode a `TermId` back to the original `Term`.
+    ///
+    /// Returns `None` only for IDs that were never assigned by this dictionary
+    /// (should never happen in correct usage).
+    pub fn get_term(&self, id: TermId) -> Option<&Term> {
+        self.id_to_term.get(id.as_u64() as usize)
+    }
+
+    // ── Graph interning ───────────────────────────────────────────────────────
+
+    /// Get or assign a `GraphId` for the given `GraphName`.
+    ///
+    /// `GraphName::DefaultGraph` always maps to `GRAPH_DEFAULT` (`GraphId(0)`).
+    /// User named graphs are assigned IDs in `2..=254`; returning
+    /// `Err(GraphSpaceExhausted)` when all 253 slots are consumed.
+    pub fn intern_graph(&mut self, graph: &GraphName) -> Result<GraphId, Oxigraph> {
+        if let Some(&id) = self.graph_to_id.get(graph) {
+            return Ok(id);
+        }
+        if *graph == GraphName::DefaultGraph {
+            // Should already be pre-registered but handle defensively.
+            self.graph_to_id.insert(graph.clone(), GRAPH_DEFAULT);
+            self.id_to_graph.insert(0, graph.clone());
+            return Ok(GRAPH_DEFAULT);
+        }
+        if self.next_graph_id > 254 {
+            return Err(Oxigraph::GraphSpaceExhausted);
+        }
+        let id = GraphId(self.next_graph_id);
+        self.next_graph_id += 1;
+        self.graph_to_id.insert(graph.clone(), id);
+        self.id_to_graph.insert(id.as_u8(), graph.clone());
+        Ok(id)
+    }
+
+    /// Look up a `GraphId` without registering a new entry.
+    pub fn get_graph_id(&self, graph: &GraphName) -> Option<GraphId> {
+        self.graph_to_id.get(graph).copied()
+    }
+
+    /// Decode a `GraphId` back to the original `GraphName`.
+    pub fn get_graph(&self, id: GraphId) -> Option<&GraphName> {
+        self.id_to_graph.get(&id.as_u8())
+    }
+
+    /// Enumerate all interned `(GraphId, GraphName)` pairs (including default).
+    pub fn all_graphs(&self) -> impl Iterator<Item = (GraphId, &GraphName)> {
+        self.id_to_graph.iter().map(|(&raw, g)| (GraphId(raw), g))
+    }
+
+    // ── u128 quad key packing ─────────────────────────────────────────────────
+
+    /// Pack `(GraphId, TermId, TermId, TermId)` into a single `u128` key.
+    ///
+    /// Bit layout: `g[127:120] | s[119:80] | p[79:40] | o[39:0]`  
+    /// (8 + 40 + 40 + 40 = 128 bits exactly).
+    ///
+    /// Because the graph is in the high byte, `BTreeMap` orders graph-major —
+    /// all quads in the same named graph are contiguous, enabling efficient
+    /// per-graph range queries.
+    #[inline]
+    pub fn pack_quad(g: GraphId, s: TermId, p: TermId, o: TermId) -> u128 {
+        ((g.as_u8() as u128) << 120)
+            | ((s.as_u64() as u128) << 80)
+            | ((p.as_u64() as u128) << 40)
+            | (o.as_u64() as u128)
+    }
+
+    /// Unpack a `u128` key back to `(GraphId, s: TermId, p: TermId, o: TermId)`.
+    #[inline]
+    pub fn unpack_quad(key: u128) -> (GraphId, TermId, TermId, TermId) {
+        let g = GraphId(((key >> 120) & 0xFF) as u8);
+        let s = TermId(((key >> 80) & MAX_TERM_ID as u128) as u64);
+        let p = TermId(((key >> 40) & MAX_TERM_ID as u128) as u64);
+        let o = TermId((key & MAX_TERM_ID as u128) as u64);
+        (g, s, p, o)
+    }
+
+    // ── Quoted-triple component access (SPARQL 1.2 built-ins) ────────────────
+
+    /// If `id` is a quoted-triple term, return its `[s_id, p_id, o_id]`.
+    pub fn triple_components(&self, id: TermId) -> Option<[TermId; 3]> {
+        self.triple_terms.get(&id).copied()
+    }
+
+    /// Given `[s_id, p_id, o_id]`, return the interned `TermId` for that quoted triple.
+    pub fn lookup_triple(&self, components: [TermId; 3]) -> Option<TermId> {
+        self.triple_index.get(&components).copied()
+    }
+
+    // ── Helper: intern a Subject as a Term ───────────────────────────────────
+
+    /// Convenience wrapper used by storage backends that receive `oxrdf::Subject`.
+    pub fn intern_subject(
+        &mut self,
+        subject: &oxrdf::NamedOrBlankNode,
+    ) -> Result<TermId, Oxigraph> {
+        let t: Term = subject.clone().into();
+        self.intern(&t)
+    }
+
+    /// Convenience wrapper for predicates.
+    pub fn intern_predicate(&mut self, pred: &NamedNode) -> Result<TermId, Oxigraph> {
+        self.intern(&Term::NamedNode(pred.clone()))
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxrdf::{Literal, NamedNode};
+
+    fn nn(s: &str) -> Term {
+        Term::NamedNode(NamedNode::new_unchecked(s))
+    }
+    fn lit(s: &str) -> Term {
+        Term::Literal(Literal::new_simple_literal(s))
+    }
+
+    #[test]
+    fn intern_and_decode() {
+        let mut d = Dictionary::new();
+        let id_a = d.intern(&nn("http://ex/a")).unwrap();
+        let id_b = d.intern(&lit("hello")).unwrap();
+        let id_a2 = d.intern(&nn("http://ex/a")).unwrap();
+        assert_eq!(id_a, id_a2, "same term must yield same TermId");
+        assert_ne!(id_a, id_b, "different terms must yield different TermIds");
+        assert_eq!(d.get_term(id_a), Some(&nn("http://ex/a")));
+        assert_eq!(d.get_term(id_b), Some(&lit("hello")));
+    }
+
+    #[test]
+    fn get_id_returns_none_for_unknown() {
+        let d = Dictionary::new();
+        assert!(d.get_id(&nn("http://ex/unknown")).is_none());
+    }
+
+    #[test]
+    fn intern_graph_default() {
+        let mut d = Dictionary::new();
+        let id = d.intern_graph(&GraphName::DefaultGraph).unwrap();
+        assert_eq!(id, GRAPH_DEFAULT);
+        // Idempotent
+        assert_eq!(
+            d.intern_graph(&GraphName::DefaultGraph).unwrap(),
+            GRAPH_DEFAULT
+        );
+    }
+
+    #[test]
+    fn intern_graph_named() {
+        let mut d = Dictionary::new();
+        let g = GraphName::NamedNode(NamedNode::new_unchecked("http://ex/g1"));
+        let id1 = d.intern_graph(&g).unwrap();
+        let id2 = d.intern_graph(&g).unwrap();
+        assert_eq!(id1, id2);
+        assert_ne!(id1, GRAPH_DEFAULT);
+        assert_eq!(d.get_graph(id1), Some(&g));
+    }
+
+    #[test]
+    fn pack_unpack_roundtrip() {
+        let g = GraphId(3);
+        let s = TermId(1_234_567);
+        let p = TermId(89);
+        let o = TermId(MAX_TERM_ID);
+        let packed = Dictionary::pack_quad(g, s, p, o);
+        let (g2, s2, p2, o2) = Dictionary::unpack_quad(packed);
+        assert_eq!(g, g2);
+        assert_eq!(s, s2);
+        assert_eq!(p, p2);
+        assert_eq!(o, o2);
+    }
+
+    #[test]
+    fn max_term_id_roundtrip() {
+        let id = TermId::new(MAX_TERM_ID).unwrap();
+        assert_eq!(id.as_u64(), MAX_TERM_ID);
+    }
+
+    #[test]
+    fn term_id_overflow_rejected() {
+        assert!(TermId::new(MAX_TERM_ID + 1).is_err());
+    }
+}

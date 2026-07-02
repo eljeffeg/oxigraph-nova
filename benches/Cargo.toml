@@ -1,0 +1,45 @@
+[package]
+name        = "oxigraph-nova-bench"
+description = "Criterion benchmarks: Ring+LFTJ vs MemoryStore on a synthetic Wikidata slice"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+publish      = false
+
+[features]
+default  = []
+# Elias-Fano O(1) succ() for high-degree sidecar nodes
+l-opt-ef = ["oxigraph-nova-storage-ring/l-opt-ef"]
+
+# ── Runtime deps (needed by both [[bench]] and [[example]] targets) ──────────
+[dependencies]
+oxigraph-nova-core           = { path = "../crates/nova-core" }
+oxigraph-nova-query          = { path = "../crates/nova-query" }
+oxigraph-nova-storage-memory = { path = "../crates/nova-storage-memory" }
+oxigraph-nova-storage-ring   = { path = "../crates/nova-storage-ring" }
+oxrdf                   = { workspace = true }
+oxttl                   = { workspace = true }   # N-Triples parsing for optional BSBM file load
+spargebra               = { workspace = true }
+anyhow                  = { workspace = true }
+
+# ── Benchmark harness ────────────────────────────────────────────────────────
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ── Benchmark targets ────────────────────────────────────────────────────────
+[[bench]]
+name    = "wikidata_slice"
+harness = false   # use criterion's harness, not libtest
+
+# Large-scale BSBM-mirrored benchmark (validates sidecar optimization)
+# N=50k entities, FAN_OUT=20 features/entity → 1.25M triples.
+# Every entity's feature leaf node has degree=20 ≥ SIDECAR_THRESH=16 → sidecar fires.
+# Run: cargo bench -p oxigraph-nova-bench -- large/
+[[bench]]
+name    = "bsbm_large"
+harness = false
+
+# ── Example: memory footprint estimator ─────────────────────────────────────
+[[example]]
+name = "memory_report"

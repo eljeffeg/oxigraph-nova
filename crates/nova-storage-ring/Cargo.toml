@@ -1,0 +1,30 @@
+[package]
+name        = "oxigraph-nova-storage-ring"
+description = "CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + LSM delta for Oxigraph Nova"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+# sux Rank9+SelectAdapt is the default T bitvector backend (benchmarked winner, −10% vs Rank9Sel).
+# The sucds::Rank9Sel fallback is available when built with --no-default-features.
+default      = ["t-sux"]
+t-sux        = []
+
+# Elias-Fano O(1) succ() for high-degree sidecar nodes (A/B benchmarking).
+# Overrides the adaptive threshold to force EF for all sidecar nodes.
+# Usage: cargo bench -p oxigraph-nova-bench --features l-opt-ef -- large/feature_lookup
+l-opt-ef     = []
+
+[dependencies]
+oxigraph-nova-core = { path = "../nova-core" }
+oxrdf         = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+sucds         = "0.8.3"   # CompactVector + Rank9Sel fallback backend (--no-default-features)
+sux           = "0.14"    # Required: L array uses BitFieldVec; default T backend SelectAdapt
+value-traits  = "0.2.0"  # SliceByValue::index_value for safe BitFieldVec reads
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

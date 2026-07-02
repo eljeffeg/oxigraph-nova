@@ -1,0 +1,27 @@
+[package]
+name        = "oxigraph-nova-server"
+description = "SPARQL 1.2 HTTP endpoint for Oxigraph Nova (SPARQL Protocol)"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+oxigraph-nova-core  = { path = "../nova-core" }
+oxigraph-nova-query = { path = "../nova-query" }
+oxrdf          = { workspace = true }
+spargebra      = { workspace = true }
+sparesults     = { workspace = true }
+tokio          = { workspace = true }
+axum           = { workspace = true }
+tower-http     = { workspace = true }
+serde          = { workspace = true }
+anyhow         = { workspace = true }
+tracing        = { workspace = true }
+
+[dev-dependencies]
+oxigraph-nova-storage-memory = { path = "../nova-storage-memory" }
+tower             = { workspace = true }   # Router::oneshot for integration tests
+serde_json        = { workspace = true }
+pretty_assertions = { workspace = true }
+tokio             = { workspace = true }

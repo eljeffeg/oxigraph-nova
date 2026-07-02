@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Unit tests
+        run: cargo test --workspace
+
+      # The W3C harness (`tests/w3c/tests/harness.rs`) is self-contained: it
+      # downloads each manifest/query/data/result file it needs on first
+      # access via `fetch_cached` (a plain `ureq::get`, no separate script or
+      # tarball), and caches them under `tests/w3c/data/` (gitignored). No
+      # download step is required beyond running the test itself — cache the
+      # directory across runs purely as a speed/flakiness optimization so CI
+      # doesn't re-fetch ~600 small files from w3.github.io every run.
+      - name: Cache W3C test data
+        uses: actions/cache@v4
+        with:
+          path: tests/w3c/data
+          key: w3c-test-data-v1
+
+      # SPARQL 1.1 is a full Recommendation — hard-fail CI on any unexpected
+      # (non-cataloged) failure.
+      - name: W3C SPARQL 1.1 conformance
+        run: cargo test -p oxigraph-nova-w3c-harness w3c_sparql11_query -- --nocapture
+        env:
+          OXIGRAPH_W3C11_FAIL: "1"
+
+      # SPARQL 1.2 is still a Working Draft — run for visibility only, do not
+      # gate CI on it (see harness.rs doc comment on `w3c_sparql12_query`).
+      - name: W3C SPARQL 1.2 conformance (Working Draft, non-blocking)
+        run: cargo test -p oxigraph-nova-w3c-harness w3c_sparql12_query -- --nocapture
+        continue-on-error: true
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings

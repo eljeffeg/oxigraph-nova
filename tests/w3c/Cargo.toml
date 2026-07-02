@@ -1,0 +1,24 @@
+[package]
+name    = "oxigraph-nova-w3c-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# This crate has no library target — it is a test-only workspace member.
+# All its code lives in tests/harness.rs and is compiled only when running
+# `cargo test -p oxigraph-nova-w3c-harness`.
+
+[dependencies]
+oxigraph-nova-core           = { path = "../../crates/nova-core" }
+oxigraph-nova-query          = { path = "../../crates/nova-query" }
+oxigraph-nova-storage-memory = { path = "../../crates/nova-storage-memory" }
+oxigraph-nova-storage-ring   = { path = "../../crates/nova-storage-ring" }
+oxrdf      = { workspace = true }
+oxttl      = { workspace = true }
+oxrdfxml   = { workspace = true }  # some W3C SPARQL 1.1 subquery fixtures ship .rdf (RDF/XML) data
+spargebra  = { workspace = true }
+sparesults = { workspace = true }
+
+anyhow     = { workspace = true }
+ureq       = "2"           # blocking HTTP for fetch+cache of W3C test files
+

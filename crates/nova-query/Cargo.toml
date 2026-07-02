@@ -1,0 +1,23 @@
+[package]
+name        = "oxigraph-nova-query"
+description = "SPARQL 1.2 evaluator, Dataset trait, Solution type, and extension registry for Oxigraph Nova"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+oxigraph-nova-core = { path = "../nova-core" }
+oxrdf         = { workspace = true }
+spargebra     = { workspace = true }
+oxsdatatypes  = { workspace = true }   # Correct XSD value semantics for comparison / arithmetic
+anyhow        = { workspace = true }
+sha2          = { workspace = true }   # SHA-256/384/512 hash functions
+sha1          = { workspace = true }   # SHA-1 hash function
+md-5          = { workspace = true }   # MD5 hash function
+regex         = { workspace = true }   # SPARQL REGEX() / REPLACE() built-ins
+uuid          = { workspace = true }   # SPARQL UUID() / STRUUID() built-ins
+rand          = { workspace = true }   # SPARQL RAND() built-in
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

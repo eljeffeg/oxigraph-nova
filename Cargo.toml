@@ -1,0 +1,90 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nova-core",
+    "crates/nova-query",
+    "crates/nova-storage-memory",
+    "crates/nova-storage-ring",
+    "crates/nova-server",
+    "tests/w3c",
+    "benches",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+license      = "MIT"
+repository   = "https://github.com/jgentes/oxigraph-nova"
+
+[workspace.dependencies]
+# ── RDF / SPARQL 1.2 stack ─────────────────────────────────────────────────
+# spargebra 0.4 and sparesults 0.3 both hard-pin oxrdf =0.3.3, so the three
+# versions must stay in lock-step.  The sparql-12 / rdf-12 features enable
+# quoted-triple (RDF 1.2) support throughout the entire parsing stack.
+oxrdf         = { version = "0.3.3",  features = ["rdf-12"] }
+oxttl         = { version = "0.2.3",  features = ["rdf-12"] }
+# rdf-12 feature must match oxrdf's — oxrdfxml's serializer match arms on
+# TermRef are only exhaustive (compile-clean) when built with the same
+# rdf-12 feature flag oxrdf itself is compiled with workspace-wide.
+oxrdfxml      = { version = "0.2",    features = ["rdf-12"] } # RDF/XML parser — needed by the W3C harness for .rdf test fixtures
+
+
+spargebra     = { version = "0.4.6",  features = ["sparql-12"] }
+sparesults    = { version = "0.3.3",  features = ["sparql-12"] }  # .srx / .srj / .tsv result I/O
+oxsdatatypes  = { version = "0.2" }    # Correct XSD typed-value semantics; route evaluator comparison through this
+sparopt       = { version = "0.3",     features = ["sparql-12"] } # SPARQL algebra normalizer/optimizer
+
+# ── Full-text search ────────────────────────────────────────────────────────
+tantivy = "0.26"   # Full-text search engine; listed here for version coordination
+
+# ── Async runtime + HTTP ────────────────────────────────────────────────────
+tokio      = { version = "1.52",  features = ["full"] }
+axum       = { version = "0.8",   features = ["json"] }
+tower      = "0.5"
+tower-http = { version = "0.7",   features = ["cors", "trace"] }
+
+# ── Serialization ───────────────────────────────────────────────────────────
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── Error handling ──────────────────────────────────────────────────────────
+anyhow    = "1"
+thiserror = "2"    # 2.x: same #[error] / #[from] derive API, stricter trait bounds
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Hashing ─────────────────────────────────────────────────────────────────
+sha2  = "0.10"
+sha1  = "0.10"
+md-5  = "0.10"
+
+# ── Regex ───────────────────────────────────────────────────────────────────
+regex = "1"
+
+# ── UUID generation ──────────────────────────────────────────────────────────
+uuid = { version = "1", features = ["v4"] }
+
+# ── Random number generation ─────────────────────────────────────────────────
+rand = "0.9"   # SPARQL RAND() built-in
+
+# ── Testing utilities ───────────────────────────────────────────────────────
+pretty_assertions = "1.4"
+# spareval is NOT listed here: spareval 0.2.x is incompatible with oxrdf 0.3.3
+# (Literal::destruct() now returns a 4-tuple) and spargebra 0.4.6 sparql-12
+# (unhandled Triple variants).  Re-add when a compatible version ships.
+
+[profile.release]
+opt-level      = 3
+lto            = "thin"
+codegen-units  = 1       # maximise inlining + cross-crate optimisation (slower compile)
+
+# Bench profile: same opts as release + debug symbols embedded in-binary for samply profiling.
+# split-debuginfo = "off" keeps DWARF in the binary (not a .dSYM bundle), which samply resolves
+# reliably on macOS.  debug = 1 adds line tables + function names; debug = 2 adds full type info.
+# Remove or set debug = false to get the smallest stripped binary for production use.
+[profile.bench]
+inherits        = "release"
+debug           = 1
+split-debuginfo = "off"
