@@ -193,6 +193,21 @@ pub trait Dataset: Send + Sync {
         u64::MAX
     }
 
+    /// Zero-allocation cardinality probe for adaptive VEO — see
+    /// `QuadStore::lftj_real_count`. Returns `None` when unsupported
+    /// (non-CLTJ backends, or `AnyNamed`/`Union` graph selectors), in which
+    /// case the caller falls back to `lftj_estimate_count`.
+    fn lftj_real_count(
+        &self,
+        _s: Option<u64>,
+        _p: Option<u64>,
+        _o: Option<u64>,
+        _target_field: usize,
+        _graph: &GraphSelector,
+    ) -> Option<u64> {
+        None
+    }
+
     /// Return a seek-capable [`TrieIterator`][oxigraph_nova_core::TrieIterator] for
     /// one join variable, given currently-bound field values.
     ///
@@ -416,6 +431,22 @@ impl<S: QuadStore + 'static> Dataset for StoreDataset<S> {
             _ => return None, // AnyNamed/Union → fallback
         };
         self.store.lftj_join_scan(s, p, o, target_field, graph_id)
+    }
+
+    fn lftj_real_count(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+        graph: &GraphSelector,
+    ) -> Option<u64> {
+        let graph_id: u8 = match graph {
+            GraphSelector::Default => 0u8,
+            GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
+            _ => return None, // AnyNamed/Union → fallback
+        };
+        self.store.lftj_real_count(s, p, o, target_field, graph_id)
     }
 
     // ─────────────────────────────────────────────────────────────────────────

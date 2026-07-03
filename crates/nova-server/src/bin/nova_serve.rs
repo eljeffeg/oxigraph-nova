@@ -17,7 +17,6 @@
 //! `--location`) for a fair memory-vs-memory comparison.
 
 use oxigraph_nova_core::{GraphName, Quad};
-
 use oxigraph_nova_server::Server;
 use oxigraph_nova_storage_ring::RingStore;
 use oxttl::NTriplesParser;
@@ -96,7 +95,6 @@ async fn main() {
         store.triple_count()
     );
 
-
     // ── Real per-component memory breakdown (diagnostic) ────────────────────
     {
         let mb = store.memory_breakdown();
@@ -144,11 +142,8 @@ async fn main() {
                 mib(bd.vocab_undeduped[i]),
             );
         }
+        eprintln!("[nova_serve]   (*Vocab is undeduped per-ordering; deduped total below)");
         eprintln!(
-            "[nova_serve]   (*Vocab is undeduped per-ordering; deduped total below)"
-        );
-        eprintln!(
-
             "[nova_serve]   Vocab (deduped, real total):                   {:>10.2} MiB",
             mib(bd.vocab_deduped_total)
         );
@@ -156,7 +151,6 @@ async fn main() {
     }
 
     eprintln!("[nova_serve] Ready. Serving on http://{bind}/sparql");
-
 
     let store = Arc::new(store);
     Server::new(store).run(&bind).await.expect("server failed");

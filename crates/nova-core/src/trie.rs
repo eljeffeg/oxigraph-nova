@@ -88,6 +88,36 @@ pub trait TrieIterator: Send {
 
     /// `true` when the iterator has no more keys at the current depth level.
     fn at_end(&self) -> bool;
+
+    /// Number of distinct keys remaining at the current depth level, from the
+    /// current position (inclusive) to the end of this node's range.
+    ///
+    /// ## Purpose: adaptive VEO cardinality estimation
+    ///
+    /// Reference: Arroyuelo, Navarro, Gómez-Brandón et al., "CompactLTJ: Space
+    /// and Time Efficient Leapfrog Triejoin on Graph Databases", VLDB Journal
+    /// 2025, §3.5 "Adaptive Variable Elimination Order" — CLTJ*'s
+    /// `subtree_size_fixed1/2` (see `ltj_iterator_basic.hpp`) computes the
+    /// real leaf-descendant count under the *currently bound* trie position,
+    /// rather than a static, dataset-wide vocabulary-size heuristic.  This
+    /// method is Nova's equivalent hook: once a `TrieIterator` has been
+    /// navigated to a bound-context position (via `seek`/`open` through the
+    /// already-bound fields), `remaining_count()` reports the exact number of
+    /// distinct values left to iterate for the *next* variable — i.e. the
+    /// real bound-context subtree size, not a global proxy.
+    ///
+    /// Backends whose underlying structure makes this an O(1) computation
+    /// (e.g. LOUDS `hi − pos + 1`) should override this method. The default
+    /// returns `u64::MAX` ("unknown"), which callers should treat the same as
+    /// they already treat a `u64::MAX` result from a dataset-level cardinality
+    /// estimate: a signal to fall back to a stable (first-appearance)
+    /// ordering.
+    ///
+    /// **Precondition:** none — safe to call even when `at_end()` (should
+    /// return `0` in that case).
+    fn remaining_count(&self) -> u64 {
+        u64::MAX
+    }
 }
 
 // ── Sentinel iterator ─────────────────────────────────────────────────────────
@@ -111,5 +141,10 @@ impl TrieIterator for EmptyTrieIter {
     }
     fn at_end(&self) -> bool {
         true
+    }
+    fn remaining_count(&self) -> u64 {
+        // Always exhausted — the real (known) remaining count is exactly 0,
+        // unlike the trait default's u64::MAX "unsupported" sentinel.
+        0
     }
 }

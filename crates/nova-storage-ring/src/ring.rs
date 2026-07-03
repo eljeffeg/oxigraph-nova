@@ -34,7 +34,6 @@
 
 use crate::cltj::{CltjData, build_cltj_data};
 use crate::louds::LoudsMemBreakdown;
-
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,7 +78,6 @@ struct RingData {
     /// investigation" section).
     cltj: CltjData,
 }
-
 
 // ── LFTJ ordering selection ───────────────────────────────────────────────────
 
@@ -160,14 +158,13 @@ impl GraphRing {
         }
     }
 
-
     /// Per-ordering memory breakdown (Phase A.1 diagnostic — see `CLAUDE.md`'s
     /// "Memory footprint investigation" section).  Returns `None` for an
     /// empty graph.  See [`CltjData::mem_breakdown_per_ordering`] for details.
-    pub fn mem_breakdown_per_ordering(
-        &self,
-    ) -> Option<[(SortOrder, LoudsMemBreakdown, usize); 6]> {
-        self.data.as_ref().map(|d| d.cltj.mem_breakdown_per_ordering())
+    pub fn mem_breakdown_per_ordering(&self) -> Option<[(SortOrder, LoudsMemBreakdown, usize); 6]> {
+        self.data
+            .as_ref()
+            .map(|d| d.cltj.mem_breakdown_per_ordering())
     }
 
     /// Deduped vocab bytes (3 unique `Arc<Vec<u64>>` allocations across all
@@ -184,7 +181,6 @@ impl GraphRing {
 
     /// Depth-0 `TrieIterator` for the given ordering.
     pub fn trie_iter(&self, ordering: SortOrder) -> Box<dyn TrieIterator> {
-
         match &self.data {
             None => Box::new(EmptyTrieIter),
             Some(d) => d.cltj.trie_iter(ordering),
@@ -280,9 +276,6 @@ impl GraphRing {
         enumerate_suffix(it, seeks.len(), &mut prefix, order, &mut results);
         results
     }
-
-
-
 
     /// Estimate the number of distinct values for `target_field` given the other
     /// bound fields — used by the adaptive VEO predictor in LFTJ.
@@ -411,7 +404,6 @@ fn enumerate_suffix(
     }
 }
 
-
 // ── RingBuilder ───────────────────────────────────────────────────────────────
 
 /// Accumulates `(s_id, p_id, o_id)` tuples and builds a `GraphRing`.
@@ -478,7 +470,6 @@ impl RingBuilder {
         // redundant `spo: Vec<[u64;3]>` raw copy of `triples`).
         let _ = (map_s, map_p, map_o); // explicitly consumed above
         let data = Arc::new(RingData { cltj });
-
 
         GraphRing {
             n,

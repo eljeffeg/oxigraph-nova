@@ -17,7 +17,6 @@
 use crate::delta::Delta;
 use crate::louds::LoudsMemBreakdown;
 use crate::ring::{GraphRing, RingBuilder, SortOrder};
-
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, NamedNode, Oxigraph, Quad,
     QuadStore, StoredQuad, Subject, Term, TermId,
@@ -211,7 +210,6 @@ impl RingStore {
     }
 
     /// Number of triples stored across all graphs (approximation during merge).
-
     pub fn triple_count(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         let ring_total: usize = inner.graphs.values().map(|r| r.n).sum();
@@ -310,7 +308,6 @@ pub struct PerOrderingBreakdown {
     pub vocab_deduped_total: usize,
 }
 
-
 /// Real, measured per-component memory breakdown for a [`RingStore`].
 ///
 /// See [`RingStore::memory_breakdown`].
@@ -344,7 +341,6 @@ impl MemoryBreakdown {
         }
     }
 }
-
 
 impl Default for RingStore {
     fn default() -> Self {

@@ -160,7 +160,6 @@ mod t_backend {
     }
 }
 
-
 // ── Default: sux Rank9 + SelectAdapt ──────────────────────────────────────────
 #[cfg(feature = "t-sux")]
 mod t_backend {
@@ -207,7 +206,6 @@ mod t_backend {
     /// Deref chain: SelectAdapt → AddNumBits → Rank9 → BitVec<Vec<u64>>.
     /// One backing store; no clone; both rank() and select() work on `rs`.
     type SuxRS = SelectAdapt<AddNumBits<Rank9<SuxBV>>>;
-
 
     pub(super) struct TBitvec {
         rs: SuxRS,
@@ -257,7 +255,6 @@ mod t_backend {
         }
     }
 }
-
 
 // ── LoudsTrie ─────────────────────────────────────────────────────────────────
 
@@ -339,7 +336,6 @@ impl LoudsMemBreakdown {
 ///
 /// Both T (bitvector) and L (label array) include a dummy entry at index 0 so
 /// that the virtual root has identifier v = 0.  All paper formulas hold as-is.
-
 ///
 /// ## Label storage
 ///
@@ -570,8 +566,6 @@ impl LoudsTrie {
             sidecar_bytes,
         }
     }
-
-
 
     /// Position of the first 1-bit at T-index ≥ `k`.
     ///

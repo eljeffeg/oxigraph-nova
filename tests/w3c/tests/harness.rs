@@ -15,7 +15,7 @@
 //!   OXIGRAPH_W3C_DEBUG=1          — print got/expected triples on CONSTRUCT mismatches
 
 use anyhow::{Context, Result, anyhow};
-use oxigraph_nova_core::{GraphName, Quad, QuadStore};
+use oxigraph_nova_core::{GraphName, Oxigraph, Quad, QuadStore};
 use oxigraph_nova_query::{Evaluator, QueryResult, Solution, StoreDataset};
 use oxigraph_nova_storage_ring::RingStore;
 use oxrdf::{NamedNode, NamedOrBlankNode, Term, Triple, Variable};
@@ -1138,7 +1138,21 @@ fn sparql_parser_for(query_url: &str) -> SparqlParser {
         .unwrap_or_else(|_| SparqlParser::new())
 }
 
-fn run_test(tc: &TestCase) -> Result<bool> {
+/// A `QuadStore` that can also be freshly constructed and explicitly
+/// compacted (merging its LSM delta into the read-optimized index) —
+/// implemented for every Ring-family backend under test so `run_test` can be
+/// generic over which storage engine is being exercised by the W3C harness.
+trait TestStore: QuadStore + Default {
+    fn compact_store(&self) -> Result<(), Oxigraph>;
+}
+
+impl TestStore for RingStore {
+    fn compact_store(&self) -> Result<(), Oxigraph> {
+        self.compact()
+    }
+}
+
+fn run_test<S: TestStore + 'static>(tc: &TestCase) -> Result<bool> {
     match tc.kind {
         TestKind::PosSyntax => {
             let url = tc.query_url.as_deref().unwrap_or("");
@@ -1175,7 +1189,7 @@ fn run_test(tc: &TestCase) -> Result<bool> {
             let expected = parse_expected(result_url)?;
 
             // Build store and load data.
-            let store = Arc::new(RingStore::new());
+            let store = Arc::new(S::default());
             for url in &tc.data_urls {
                 load_into_store(store.as_ref(), url, &GraphName::DefaultGraph)?;
             }
@@ -1186,7 +1200,7 @@ fn run_test(tc: &TestCase) -> Result<bool> {
             // Compact the delta into the Ring so LFTJ can fire.
             // Without this, lftj_has_delta() returns true and every query falls
             // back to the nested-loop evaluator — LFTJ would never be exercised.
-            store.compact().map_err(|e| anyhow!("compact: {e}"))?;
+            store.compact_store().map_err(|e| anyhow!("compact: {e}"))?;
 
             // Parse and evaluate. See `sparql_parser_for` — the base IRI must
             // be the query's own URL so relative IRIs in FROM/GRAPH clauses
@@ -1246,12 +1260,14 @@ struct RunSummary {
 
 /// Run every test case in `tests`, recording a plain pass/fail outcome for
 /// each. Shared between the SPARQL 1.1 and SPARQL 1.2 harness entry points.
-fn run_all(tests: &[TestCase]) -> RunSummary {
+/// Generic over the storage engine under test (kept generic for possible
+/// future engines even though `RingStore` is the sole production backend).
+fn run_all<S: TestStore + 'static>(tests: &[TestCase]) -> RunSummary {
     let mut n_pass = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
     for tc in tests {
-        match run_test(tc) {
+        match run_test::<S>(tc) {
             Ok(true) => {
                 n_pass += 1;
             }
@@ -1318,8 +1334,11 @@ fn w3c_sparql11_query() {
 
     eprintln!("[W3C] {} test cases found", tests.len());
 
-    let summary = run_all(&tests);
-    let (n_fail, _pct) = report_summary("W3C SPARQL 1.1 Query Conformance Results", &summary);
+    let summary = run_all::<RingStore>(&tests);
+    let (n_fail, _pct) = report_summary(
+        "W3C SPARQL 1.1 Query Conformance Results (RingStore)",
+        &summary,
+    );
 
     // Hard-fail in CI only when the env var is set.
     if std::env::var("OXIGRAPH_W3C11_FAIL").is_ok() {
@@ -1355,8 +1374,11 @@ fn w3c_sparql12_query() {
 
     eprintln!("[W3C] {} test cases found", tests.len());
 
-    let summary = run_all(&tests);
-    let (n_fail, _pct) = report_summary("W3C SPARQL 1.2 Query Conformance Results (WD)", &summary);
+    let summary = run_all::<RingStore>(&tests);
+    let (n_fail, _pct) = report_summary(
+        "W3C SPARQL 1.2 Query Conformance Results (WD, RingStore)",
+        &summary,
+    );
 
     // SPARQL 1.2 is a Working Draft — never hard-fail CI on it unless
     // explicitly opted in via a distinct env var.

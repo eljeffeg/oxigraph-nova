@@ -29,7 +29,6 @@ use oxrdf::{GraphName, NamedNode, Term};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-
 // ── TermId ───────────────────────────────────────────────────────────────────
 
 /// A 40-bit term identifier carried in a `u64`.
@@ -114,7 +113,6 @@ pub struct Dictionary {
     /// Forward: `Term` → `TermId`. The key `Arc<Term>` is the *same*
     /// allocation as the corresponding `id_to_term` entry (Phase A.4).
     term_to_id: HashMap<Arc<Term>, TermId>,
-
 
     // ── GraphName ↔ GraphId ─────────────────────────────────────────────────
     /// Forward: `GraphName` → `GraphId`
@@ -251,8 +249,6 @@ impl Dictionary {
             + triple_index_bytes
     }
 
-
-
     // ── Term interning ────────────────────────────────────────────────────────
 
     /// Get or assign a `TermId` for the given `Term`.
@@ -303,7 +299,6 @@ impl Dictionary {
         Ok(id)
     }
 
-
     /// Look up a `TermId` **without** creating a new entry.
     ///
     /// Returns `None` if the term has never been interned — which for query
@@ -317,9 +312,10 @@ impl Dictionary {
     /// Returns `None` only for IDs that were never assigned by this dictionary
     /// (should never happen in correct usage).
     pub fn get_term(&self, id: TermId) -> Option<&Term> {
-        self.id_to_term.get(id.as_u64() as usize).map(|v| v.as_ref())
+        self.id_to_term
+            .get(id.as_u64() as usize)
+            .map(|v| v.as_ref())
     }
-
 
     // ── Graph interning ───────────────────────────────────────────────────────
 

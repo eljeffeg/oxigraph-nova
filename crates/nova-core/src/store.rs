@@ -77,6 +77,26 @@ pub trait QuadStore: Send + Sync {
         None
     }
 
+    /// Zero-allocation cardinality probe for adaptive VEO.
+    ///
+    /// Unlike `lftj_join_scan`, this never constructs a
+    /// `Box<dyn TrieIterator>` — backends that can answer it cheaply (e.g.
+    /// the LOUDS-based CLTJ/Ring implementation, which reuses its
+    /// `seek`/`open` navigation logic on raw locals instead of iterator
+    /// objects) should override it to return `Some(count)`. Returns `None`
+    /// when unsupported, in which case the caller falls back to
+    /// `lftj_estimate_count`.
+    fn lftj_real_count(
+        &self,
+        _s: Option<u64>,
+        _p: Option<u64>,
+        _o: Option<u64>,
+        _target_field: usize,
+        _graph_id: u8,
+    ) -> Option<u64> {
+        None
+    }
+
     /// Returns `true` if `lftj_estimate_count` provides real sub-`u64::MAX` values.
     ///
     /// Non-CLTJ stores (MemoryStore, any custom backend) return `false` (the

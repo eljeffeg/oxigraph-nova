@@ -111,7 +111,6 @@ impl CltjTrie {
             .sum()
     }
 
-
     /// Pointer identities of this trie's three vocab `Arc` allocations, for
     /// dedup accounting at the `CltjData` level.
     pub(crate) fn vocab_arc_ptrs(&self) -> [*const Vec<u64>; 3] {
@@ -121,7 +120,6 @@ impl CltjTrie {
             Arc::as_ptr(&self.vocab[2]),
         ]
     }
-
 
     /// Create a depth-0 `CltjTrieIter` positioned at the first root child.
     ///
@@ -137,6 +135,65 @@ impl CltjTrie {
             pos: 1,
             depth: 0,
         })
+    }
+
+    /// Zero-allocation equivalent of `iter_d0()` followed by a `seek`/`open`
+    /// sequence for each value in `bound_vals` (in trie-column order), ending
+    /// with a `remaining_count()` read at the resulting depth.
+    ///
+    /// Unlike navigating via `Box<dyn TrieIterator>` (which allocates one
+    /// heap `CltjTrieIter` per depth), this walks the raw `(hi, pos, depth)`
+    /// LOUDS-navigation state entirely on the stack — used by adaptive VEO's
+    /// cardinality probe (`GraphRing::real_count_no_alloc`), which needs to
+    /// evaluate this for *every* candidate variable at *every* recursion
+    /// depth, most of which are discarded immediately (only the winning
+    /// candidate's scan is actually retained and used for leapfrogging).
+    ///
+    /// Returns `0` if the trie is empty, any bound value is not found, or
+    /// `bound_vals.len() >= 3` (deeper than this height-3 trie supports).
+    pub fn real_count_no_alloc(&self, bound_vals: &[u64]) -> u64 {
+        let degree = self.louds.root_degree();
+        if degree == 0 {
+            return 0;
+        }
+        let mut hi = degree;
+        let mut pos = 1usize;
+
+        for (depth, &val) in bound_vals.iter().enumerate() {
+            if depth >= 3 || pos > hi {
+                return 0;
+            }
+            let vocab = &self.vocab[depth];
+            // seek: no-op if val <= current key, else exponential-search leap.
+            let cur_local = self.louds.label_at(pos) as usize;
+            if val > vocab[cur_local] {
+                let local_target = vocab.partition_point(|&v| v < val);
+                if local_target >= vocab.len() {
+                    return 0;
+                }
+                pos = self.louds.leap(pos, hi, local_target as u32);
+                if pos > hi {
+                    return 0;
+                }
+            }
+            let local_id = self.louds.label_at(pos) as usize;
+            if vocab[local_id] != val {
+                return 0;
+            }
+            // open: descend into the child range.
+            if depth >= 2 {
+                return 0; // leaf level has no children
+            }
+            let child_v = self.louds.child_from_label_pos(pos);
+            let child_degree = self.louds.degree(child_v);
+            if child_degree == 0 {
+                return 0;
+            }
+            hi = child_v + child_degree;
+            pos = child_v + 1;
+        }
+
+        (hi - pos + 1) as u64
     }
 }
 
@@ -164,6 +221,18 @@ impl CltjData {
     /// Depth-0 `CltjTrieIter` for the given ordering.
     pub fn trie_iter(&self, ord: SortOrder) -> Box<dyn TrieIterator> {
         self.tries[Self::idx(ord)].iter_d0()
+    }
+
+    /// Zero-allocation cardinality probe: navigate `ord`'s trie through
+    /// `bound_vals` (in trie-column order) and return the number of distinct
+    /// values remaining at the resulting depth — the same value
+    /// `join_scan(...).remaining_count()` would report, but without
+    /// constructing any `Box<dyn TrieIterator>`.
+    ///
+    /// See [`CltjTrie::real_count_no_alloc`] and adaptive VEO's usage in
+    /// `crates/nova-query/src/lftj.rs`'s `veo_sort`.
+    pub fn real_count_no_alloc(&self, ord: SortOrder, bound_vals: &[u64]) -> u64 {
+        self.tries[Self::idx(ord)].real_count_no_alloc(bound_vals)
     }
 
     /// Number of distinct global values for the given SPO field (0=S, 1=P, 2=O).
@@ -196,7 +265,8 @@ impl CltjData {
         for trie in &self.tries {
             for (ptr, arc) in trie.vocab_arc_ptrs().into_iter().zip(trie.vocab.iter()) {
                 if seen.insert(ptr) {
-                    vocab_total += std::mem::size_of::<Vec<u64>>() + arc.len() * std::mem::size_of::<u64>();
+                    vocab_total +=
+                        std::mem::size_of::<Vec<u64>>() + arc.len() * std::mem::size_of::<u64>();
                 }
             }
         }
@@ -224,7 +294,11 @@ impl CltjData {
         ];
         std::array::from_fn(|i| {
             let trie = &self.tries[i];
-            (orders[i], trie.mem_breakdown(), trie.vocab_bytes_undeduped())
+            (
+                orders[i],
+                trie.mem_breakdown(),
+                trie.vocab_bytes_undeduped(),
+            )
         })
     }
 
@@ -237,15 +311,14 @@ impl CltjData {
         for trie in &self.tries {
             for (ptr, arc) in trie.vocab_arc_ptrs().into_iter().zip(trie.vocab.iter()) {
                 if seen.insert(ptr) {
-                    total += std::mem::size_of::<Vec<u64>>() + arc.len() * std::mem::size_of::<u64>();
+                    total +=
+                        std::mem::size_of::<Vec<u64>>() + arc.len() * std::mem::size_of::<u64>();
                 }
             }
         }
         total
     }
 }
-
-
 
 // ── Pair builder ──────────────────────────────────────────────────────────────
 

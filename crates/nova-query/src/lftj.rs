@@ -14,13 +14,31 @@
 //! estimated leaf-descendant counts:
 //!
 //! ```text
-//!     wj = min over patterns containing j of estimate_count(bound_ctx, j)
+//!     wj = min over patterns containing j of subtree_size(bound_ctx, j)
 //! ```
 //!
 //! The variable with the smallest `wj` is iterated next.  This avoids exploring
 //! large subtrees when a more selective variable is available.  In the paper
 //! (§5.2, Table 1) adaptive VEO achieves almost an order of magnitude lower
 //! average query time vs. static VEO on Wikidata.
+//!
+//! ## Real bound-context subtree sizes via a zero-allocation probe
+//!
+//! The C++ reference's `subtree_size_fixed1/2` (`ltj_iterator_basic.hpp`)
+//! computes the *actual* leaf-descendant count under the currently bound trie
+//! position — not a static, dataset-wide vocabulary-size heuristic.
+//!
+//! Nova's `veo_sort` mirrors this via [`Dataset::lftj_real_count`], which
+//! performs the same LOUDS navigation as opening a real scan (`seek`/`open`)
+//! but returns just a `u64` count, **without ever allocating a
+//! `Box<dyn TrieIterator>`**. This is cheap enough to call for *every*
+//! candidate variable/pattern at *every* recursion depth — only the winning
+//! candidate then gets a real `lftj_join_scan(...)` call, made once by
+//! `lftj_step`.
+//!
+//! When `lftj_real_count` returns `None` (non-CLTJ backends, or `AnyNamed`/
+//! `Union` graph selectors), `veo_sort` falls back to the coarser
+//! `dataset.lftj_estimate_count(...)` dataset-level heuristic.
 //!
 //! ## Implementation details
 //!
@@ -30,7 +48,7 @@
 //! | Bindings storage | `Vec<Option<u64>>` indexed by var_idx |
 //! | `PatternSpec` method | `is_active_for_var(var_idx)` |
 //! | `lftj_step` signature | `unbound: &[usize]` |
-//! | Estimate method | `dataset.lftj_estimate_count(...)` |
+//! | Estimate method | real `Dataset::lftj_real_count(...)` (no allocation), falling back to `dataset.lftj_estimate_count(...)` |
 //!
 //! ## Algorithm sketch
 //!
@@ -42,9 +60,10 @@
 //!    - `Const(id)` — a constant RDF term interned to its TermId
 //!    - `JoinVar(var_idx)` — a variable at its stable index
 //! 3. Recurse with `lftj_step(unbound = 0..k)`:
-//!    a. Sort `unbound` by `wj` via `dataset.lftj_estimate_count(...)`.
+//!    a. Sort `unbound` by `wj` via `dataset.lftj_real_count(...)` (falling
+//!    back to `dataset.lftj_estimate_count(...)`).
 //!    b. Pick `j* = unbound[0]` (minimum wj).
-//!    c. Collect active patterns for `j*`; open one scan per pattern.
+//!    c. Open one scan per active pattern for `j*`.
 //!    d. Leapfrog-sync to find common key.
 //!    e. Bind `bindings[j*] = val`, recurse with `unbound[1..]`, advance.
 //! 4. At `unbound.is_empty()`, emit a solution from `bindings`.
@@ -262,31 +281,55 @@ fn build_spec<D: Dataset>(
 // ── Adaptive VEO sort ─────────────────────────────────────────────────────────
 
 /// Sort `unbound` (var indices into `join_vars`) ascending by the minimum
-/// estimated count across all patterns that contain each variable.
+/// **real bound-context subtree size** across all patterns that contain each
+/// variable — CLTJ*'s adaptive VEO (§3.5).
 ///
-/// The estimate is obtained from `dataset.lftj_estimate_count(...)` using the
-/// current bindings as context.  For non-CLTJ backends all estimates are
-/// `u64::MAX`, so the sort is stable (preserves first-appearance order).
+/// For each candidate variable/pattern this calls
+/// [`Dataset::lftj_real_count`], a zero-allocation probe that performs the
+/// same LOUDS navigation as opening a real scan but never constructs a
+/// `Box<dyn TrieIterator>`. This is the *actual* leaf-descendant count under
+/// the current binding, matching the C++ reference's `subtree_size_fixed1/2`,
+/// not a static dataset-wide vocabulary-size proxy.
+///
+/// Falls back to `dataset.lftj_estimate_count(...)` when `lftj_real_count`
+/// returns `None` (non-CLTJ backends, or `AnyNamed`/`Union` graph selectors).
+/// For non-CLTJ backends all estimates are `u64::MAX`, so the sort is stable
+/// (preserves first-appearance order).
 ///
 /// Sorting 3–6 elements is O(1) — the overhead is negligible.
 fn veo_sort<D: Dataset>(
-    unbound: &mut [usize],
+    unbound: &[usize],
     specs: &[PatternSpec],
     bindings: &[Option<u64>],
     dataset: &D,
     graph: &GraphSelector,
-) {
-    unbound.sort_by_key(|&vi| {
-        specs
-            .iter()
-            .filter(|sp| sp.is_active_for_var(vi))
-            .map(|sp| {
+) -> Vec<usize> {
+    struct Candidate {
+        var_idx: usize,
+        weight: u64,
+    }
+
+    let mut candidates: Vec<Candidate> = unbound
+        .iter()
+        .map(|&vi| {
+            let mut weight = u64::MAX;
+            for sp in specs.iter().filter(|sp| sp.is_active_for_var(vi)) {
                 let (sv, pv, ov, tf) = sp.resolve_for_var(vi, bindings);
-                dataset.lftj_estimate_count(sv, pv, ov, tf, graph)
-            })
-            .min()
-            .unwrap_or(u64::MAX)
-    });
+                let w = dataset
+                    .lftj_real_count(sv, pv, ov, tf, graph)
+                    .unwrap_or_else(|| dataset.lftj_estimate_count(sv, pv, ov, tf, graph));
+                weight = weight.min(w);
+            }
+            Candidate {
+                var_idx: vi,
+                weight,
+            }
+        })
+        .collect();
+
+    candidates.sort_by_key(|c| c.weight);
+
+    candidates.into_iter().map(|c| c.var_idx).collect()
 }
 
 // ── Leapfrog synchronization ──────────────────────────────────────────────────
@@ -369,9 +412,7 @@ fn lftj_step<D: Dataset>(
     // non-CLTJ backends without regressing CLTJ* behaviour.
     let veo_buf: Vec<usize>;
     let order: &[usize] = if dataset.supports_veo_estimates() && unbound.len() > 1 {
-        let mut buf = unbound.to_vec();
-        veo_sort(&mut buf, specs, bindings, dataset, graph);
-        veo_buf = buf;
+        veo_buf = veo_sort(unbound, specs, bindings, dataset, graph);
         &veo_buf
     } else {
         unbound
@@ -395,7 +436,7 @@ fn lftj_step<D: Dataset>(
         return;
     }
 
-    // ── Open one scan per active pattern ────────────────────────────────────
+    // ── Obtain one scan per active pattern ───────────────────────────────────
     let mut scans: Vec<Box<dyn oxigraph_nova_core::TrieIterator>> =
         Vec::with_capacity(active.len());
     for sp in &active {
@@ -648,8 +689,9 @@ mod tests {
             vals.dedup();
             Some(Box::new(VecTrieIter { vals, pos: 0 }))
         }
-        // lftj_estimate_count uses the default (u64::MAX) — VEO sort is stable
-        // for equal estimates, so first-appearance order is preserved in tests.
+        // lftj_estimate_count and lftj_real_count both use their default
+        // (u64::MAX / None) — VEO sort is stable for equal estimates, so
+        // first-appearance order is preserved in tests.
     }
 
     struct VecTrieIter {
@@ -722,8 +764,10 @@ mod tests {
 
     /// Verify VEO sort is stable (preserves first-appearance) for equal estimates.
     ///
-    /// The StubDataset returns u64::MAX for all estimates, so `veo_sort` must
-    /// not reorder the input when all wj values are equal.
+    /// `StubDataset` doesn't override `lftj_real_count` (inherits the trait
+    /// default `None`), so `veo_sort` falls back to `lftj_estimate_count`,
+    /// which also defaults to `u64::MAX` — all estimates equal, so `veo_sort`
+    /// must not reorder the input.
     #[test]
     fn veo_sort_stable_equal_estimates() {
         let ds = StubDataset::new();
@@ -742,9 +786,83 @@ mod tests {
             },
         ];
         let bindings = vec![None, None];
-        let mut unbound = vec![0usize, 1usize];
-        veo_sort(&mut unbound, &specs, &bindings, &ds, &graph);
+        let unbound = vec![0usize, 1usize];
+        let order = veo_sort(&unbound, &specs, &bindings, &ds, &graph);
         // All estimates are u64::MAX (equal) → stable → original order preserved.
-        assert_eq!(unbound, vec![0, 1]);
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    /// Verify VEO sort prefers the variable with the smaller **real
+    /// bound-context subtree size** (via `Dataset::lftj_real_count`), not just
+    /// a static estimate — demonstrating the actual behavioural effect of the
+    /// real-subtree-size logic (not merely a plumbing change).
+    ///
+    /// `RemainingCountDataset` returns a real count that differs per target
+    /// field: var 0 (S field) has a large remaining count (10), var 1 (O
+    /// field) has a small one (2). VEO must pick var 1 first regardless of
+    /// first-appearance order.
+    #[test]
+    fn veo_sort_prefers_smaller_real_subtree_size() {
+        struct RemainingCountDataset;
+        impl Dataset for RemainingCountDataset {
+            fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
+                Ok(Box::new(std::iter::empty()))
+            }
+            fn named_graphs<'a>(
+                &'a self,
+            ) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+                Ok(Box::new(std::iter::empty()))
+            }
+            fn supports_lftj(&self) -> bool {
+                true
+            }
+            fn lftj_has_delta(&self) -> bool {
+                false
+            }
+            fn lftj_intern_term(&self, _: &Term, _: &GraphSelector) -> Option<u64> {
+                None
+            }
+            fn lftj_decode_term(&self, _: u64) -> Option<Term> {
+                None
+            }
+            fn lftj_real_count(
+                &self,
+                _s: Option<u64>,
+                _p: Option<u64>,
+                _o: Option<u64>,
+                target_field: usize,
+                _: &GraphSelector,
+            ) -> Option<u64> {
+                // target_field 0 (var 0's S field) → large remaining count.
+                // target_field 2 (var 1's O field) → small remaining count.
+                if target_field == 0 { Some(10) } else { Some(2) }
+            }
+        }
+
+        let ds = RemainingCountDataset;
+        let graph = GraphSelector::Default;
+        // var 0 appears first (S field, large subtree), var 1 second (O field,
+        // small subtree) — first-appearance order would pick var 0 first, but
+        // real subtree size must override that and pick var 1 first.
+        let specs = vec![
+            PatternSpec {
+                s: FieldSpec::JoinVar(0),
+                p: FieldSpec::Const(2),
+                o: FieldSpec::Const(3),
+            },
+            PatternSpec {
+                s: FieldSpec::Const(1),
+                p: FieldSpec::Const(2),
+                o: FieldSpec::JoinVar(1),
+            },
+        ];
+        let bindings = vec![None, None];
+        let unbound = vec![0usize, 1usize];
+        let order = veo_sort(&unbound, &specs, &bindings, &ds, &graph);
+        assert_eq!(
+            order,
+            vec![1, 0],
+            "VEO must prefer var 1 (real subtree size 2) over var 0 (real subtree size 10)"
+        );
     }
 }
