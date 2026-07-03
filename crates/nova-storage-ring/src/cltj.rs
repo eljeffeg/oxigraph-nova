@@ -54,8 +54,9 @@
 //! vocabulary arrays (`vocab[0]`, `vocab[1]`, `vocab[2]`) map local → global
 //! (u64 term IDs) for each depth.
 
-use crate::louds::{LoudsMemBreakdown, LoudsTrie, build_louds_from_sorted};
+use crate::louds::{LoudsCore, LoudsMemBreakdown, LoudsTrie, build_louds_from_sorted};
 use crate::ring::SortOrder;
+use epserde::Epserde;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 use std::sync::Arc;
 
@@ -119,6 +120,19 @@ impl CltjTrie {
             Arc::as_ptr(&self.vocab[1]),
             Arc::as_ptr(&self.vocab[2]),
         ]
+    }
+
+    /// Consume this trie, discarding the vocab `Arc`s (vocab is hoisted to
+    /// the top-level [`CltjSnapshot`], deduped across all six tries) and
+    /// keeping only the ε-serde-serializable [`LoudsCore`].
+    ///
+    /// Used by the persistent snapshot format (item 1b in `CLAUDE.md`'s
+    /// "What's Next").  Requires unique ownership of the trie (i.e. the
+    /// enclosing `Arc<CltjTrie>` must have refcount 1) — true for a freshly
+    /// built [`CltjData`] that has not yet been shared, per the "always
+    /// mapped" design (see `RingStore::compact`).
+    pub(crate) fn into_core(self) -> LoudsCore {
+        self.louds.into_core()
     }
 
     /// Create a depth-0 `CltjTrieIter` positioned at the first root child.
@@ -318,6 +332,119 @@ impl CltjData {
         }
         total
     }
+
+    /// Consume this `CltjData`, producing the ε-serde-serializable
+    /// [`CltjSnapshot`] (3 deduped vocab arrays + 6 [`LoudsCore`]s).
+    ///
+    /// Used by the persistent snapshot format (item 1b in `CLAUDE.md`'s
+    /// "What's Next").  Requires that no other `Arc<CltjTrie>` clones exist
+    /// (true for a freshly built `CltjData` per the "always mapped" design —
+    /// see `RingStore::compact`); panics otherwise via `expect`.
+    ///
+    /// The three vocab arrays are read from the SPO trie (index 0, whose
+    /// `vocab` is `[orig_s, orig_p, orig_o]` — see [`build_cltj_data`]) before
+    /// any trie is consumed, since all six tries share the same three `Arc`
+    /// allocations.
+    pub(crate) fn into_snapshot(self) -> CltjSnapshot {
+        // Extract the three shared vocab arrays via the SPO trie (index 0)
+        // before consuming any trie (all six share the same three Arcs).
+        let vocab_s = (*self.tries[0].vocab[0]).clone();
+        let vocab_p = (*self.tries[0].vocab[1]).clone();
+        let vocab_o = (*self.tries[0].vocab[2]).clone();
+
+        let tries = self.tries.map(|trie| {
+            Arc::try_unwrap(trie)
+                .unwrap_or_else(|_| panic!("into_snapshot: CltjTrie Arc is shared"))
+                .into_core()
+        });
+
+        CltjSnapshot {
+            vocab_s,
+            vocab_p,
+            vocab_o,
+            tries,
+        }
+    }
+
+    /// Reconstruct a `CltjData` from a [`CltjSnapshot`] loaded from disk (or
+    /// from an in-memory round-trip buffer; see item 1b's "always mapped"
+    /// design in `CLAUDE.md`).
+    ///
+    /// Rebuilds each `CltjTrie`'s sidecar via [`LoudsTrie::from_core`] and
+    /// redistributes the three vocab arrays across the six tries per the
+    /// static ordering permutation documented in [`build_cltj_data`] (18
+    /// references, 3 unique `Arc` allocations — matching the runtime
+    /// hot-path layout exactly).
+    pub(crate) fn from_snapshot(snap: CltjSnapshot) -> CltjData {
+        let orig_s = Arc::new(snap.vocab_s);
+        let orig_p = Arc::new(snap.vocab_p);
+        let orig_o = Arc::new(snap.vocab_o);
+
+        // Static per-ordering vocab assignment — must exactly match
+        // `build_cltj_data`'s vocab_primary/vocab_secondary arguments.
+        let vocabs: [[Arc<Vec<u64>>; 3]; 6] = [
+            [
+                Arc::clone(&orig_s),
+                Arc::clone(&orig_p),
+                Arc::clone(&orig_o),
+            ], // SPO
+            [
+                Arc::clone(&orig_s),
+                Arc::clone(&orig_o),
+                Arc::clone(&orig_p),
+            ], // SOP
+            [
+                Arc::clone(&orig_p),
+                Arc::clone(&orig_s),
+                Arc::clone(&orig_o),
+            ], // PSO
+            [
+                Arc::clone(&orig_p),
+                Arc::clone(&orig_o),
+                Arc::clone(&orig_s),
+            ], // POS
+            [
+                Arc::clone(&orig_o),
+                Arc::clone(&orig_p),
+                Arc::clone(&orig_s),
+            ], // OPS
+            [
+                Arc::clone(&orig_o),
+                Arc::clone(&orig_s),
+                Arc::clone(&orig_p),
+            ], // OSP
+        ];
+
+        let mut cores = snap.tries.into_iter();
+        let tries: [Arc<CltjTrie>; 6] = vocabs.map(|vocab| {
+            let core = cores.next().expect("CltjSnapshot always has 6 tries");
+            Arc::new(CltjTrie {
+                louds: LoudsTrie::from_core(core),
+                vocab,
+            })
+        });
+
+        CltjData { tries }
+    }
+}
+
+/// ε-serde-serializable snapshot of a [`CltjData`]: three deduped vocab
+/// arrays (plain `Vec<u64>`, not `Arc`-wrapped — `Arc` is not directly
+/// epserde-serializable) plus six [`LoudsCore`]s (T+L only, sidecar
+/// excluded), one per [`SortOrder`] in the fixed order
+/// SPO/SOP/PSO/POS/OPS/OSP.
+///
+/// This is the persistent on-disk representation for item 1b in
+/// `CLAUDE.md`'s "What's Next".  Loading redistributes the three vocab
+/// arrays across the six tries per the static ordering permutation in
+/// [`build_cltj_data`], and rebuilds each trie's sidecar via
+/// [`LoudsTrie::from_core`] — see [`CltjData::from_snapshot`].
+#[derive(Epserde)]
+pub(crate) struct CltjSnapshot {
+    vocab_s: Vec<u64>,
+    vocab_p: Vec<u64>,
+    vocab_o: Vec<u64>,
+    tries: [LoudsCore; 6],
 }
 
 // ── Pair builder ──────────────────────────────────────────────────────────────
@@ -784,6 +911,85 @@ mod tests {
         assert_eq!(it1.key(), 3);
         it1.advance();
         assert!(it1.at_end());
+    }
+
+    /// End-to-end round-trip of the persistent snapshot format (item 1b):
+    /// build a `CltjData`, convert to `CltjSnapshot`, serialize via ε-serde
+    /// into an in-memory buffer, deserialize back, reconstruct a `CltjData`
+    /// via `from_snapshot`, and verify identical `TrieIterator` behaviour
+    /// across all six orderings compared to the original.
+    #[test]
+    fn cltj_snapshot_round_trip() {
+        use epserde::deser::Deserialize;
+        use epserde::ser::Serialize;
+
+        let triples: &[[u64; 3]] = &[
+            [1, 2, 3],
+            [1, 2, 4],
+            [1, 3, 5],
+            [2, 2, 6],
+            [2, 5, 7],
+            [3, 5, 7],
+        ];
+        let original = make_cltj(triples);
+
+        // Collect full depth-3 traversal results (as (a,b,c) triples) for
+        // every ordering from the original, before consuming it.
+        fn collect_all(data: &CltjData, ord: SortOrder) -> Vec<(u64, u64, u64)> {
+            let mut out = Vec::new();
+            let mut it0 = data.trie_iter(ord);
+            while !it0.at_end() {
+                let a = it0.key();
+                let mut it1 = it0.open();
+                while !it1.at_end() {
+                    let b = it1.key();
+                    let mut it2 = it1.open();
+                    while !it2.at_end() {
+                        let c = it2.key();
+                        out.push((a, b, c));
+                        it2.advance();
+                    }
+                    it1.advance();
+                }
+                it0.advance();
+            }
+            out
+        }
+
+        let orders = [
+            SortOrder::Spo,
+            SortOrder::Sop,
+            SortOrder::Pso,
+            SortOrder::Pos,
+            SortOrder::Ops,
+            SortOrder::Osp,
+        ];
+
+        let expected: Vec<Vec<(u64, u64, u64)>> = orders
+            .iter()
+            .map(|&ord| collect_all(&original, ord))
+            .collect();
+
+        // Snapshot + ε-serde round-trip via an in-memory buffer.
+        let snap = original.into_snapshot();
+        let mut buf: Vec<u8> = Vec::new();
+        unsafe {
+            snap.serialize(&mut buf).expect("serialize CltjSnapshot");
+        }
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        let snap2 = unsafe {
+            CltjSnapshot::deserialize_full(&mut cursor).expect("deserialize CltjSnapshot")
+        };
+        let reconstructed = CltjData::from_snapshot(snap2);
+
+        for (i, &ord) in orders.iter().enumerate() {
+            let got = collect_all(&reconstructed, ord);
+            assert_eq!(
+                got, expected[i],
+                "ordering {:?} mismatch after snapshot round-trip",
+                ord
+            );
+        }
     }
 
     /// Cross-check: SPO and SOP each enumerate the same number of leaf triples.

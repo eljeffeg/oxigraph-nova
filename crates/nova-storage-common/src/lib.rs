@@ -1,0 +1,37 @@
+//! `oxigraph-nova-storage-common` — generic, backend-agnostic
+//! persistence machinery shared by any `QuadStore` implementation that wants
+//! WAL + MANIFEST + `Dictionary` durability.
+//!
+//! ## Why this crate exists
+//!
+//! `nova-storage-ring`'s WAL framing/replay engine, MANIFEST commit
+//! protocol, and `Dictionary`-persistence format have no dependency on the
+//! LOUDS/CLTJ/Ring index structures themselves — they operate purely on
+//! RDF quads/terms and abstract snapshot-generation/WAL-segment numbers.
+//! Pulling them out into their own crate means a hypothetical alternative
+//! `QuadStore` backend (e.g. a RocksDB-backed one) can reuse this exact
+//! crash-safe durability machinery without reimplementing it or depending
+//! on `nova-storage-ring`'s succinct-trie-specific code.
+//!
+//! ### Components
+//!
+//! | Module | Purpose |
+//! |---|---|
+//! | [`wal`] | Write-ahead log: crash-safe framing/replay engine + RDF quad/term byte encoders |
+//! | [`manifest`] | The crash-safe commit point tying a snapshot generation to a WAL segment |
+//! | [`dict_snapshot`] | Persistence for `oxigraph_nova_core::Dictionary` (term/graph interning state) |
+//!
+//! ### What's deliberately NOT here
+//!
+//! The actual index/snapshot format (e.g. `nova-storage-ring`'s ε-serde
+//! `StoreSnapshot`/`RingSnapshot`, or a RocksDB backend's native SST files)
+//! is backend-specific and stays in that backend's own crate. This crate
+//! only provides the generic surrounding machinery: durable intent logging,
+//! crash-safe generation/segment bookkeeping, and dictionary persistence.
+
+pub mod dict_snapshot;
+pub mod manifest;
+pub mod wal;
+
+pub use manifest::{MANIFEST_FILE_NAME, Manifest};
+pub use wal::{WalRecord, WalWriter};

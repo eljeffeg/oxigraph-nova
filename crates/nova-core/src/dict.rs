@@ -359,6 +359,91 @@ impl Dictionary {
         self.id_to_graph.iter().map(|(&raw, g)| (GraphId(raw), g))
     }
 
+    /// The next available user `GraphId` (range `2..=254`). Exposed for
+    /// on-disk `Dictionary` persistence (see `oxigraph_nova_storage_ring`'s
+    /// `dict_snapshot` module — item 1c in `CLAUDE.md`'s "What's Next").
+    pub fn next_graph_id_raw(&self) -> u8 {
+        self.next_graph_id
+    }
+
+    /// All interned terms in `TermId` order (index == `TermId::as_u64()`).
+    /// Exposed for on-disk `Dictionary` persistence.
+    pub fn terms_in_order(&self) -> impl Iterator<Item = &Term> {
+        self.id_to_term.iter().map(|t| t.as_ref())
+    }
+
+    /// Rebuild a `Dictionary` from persisted state, preserving `TermId`s
+    /// exactly (by insertion order in `terms`) and `GraphId`s exactly (via
+    /// `graphs`).
+    ///
+    /// Used by [`crate::store`]-adjacent persistence code (in
+    /// `oxigraph_nova_storage_ring`) to reconstruct the exact `Dictionary`
+    /// that was in effect when a snapshot was written, so that further WAL
+    /// replay (which uses `intern()`, appending new terms after whatever's
+    /// already present) continues assigning IDs correctly instead of
+    /// colliding with the snapshot's embedded IDs.
+    ///
+    /// Quoted-triple (`Term::Triple`) side tables (`triple_terms`/
+    /// `triple_index`) are **not** persisted separately — they are
+    /// re-derived here by re-decoding each `Term::Triple` entry in `terms`
+    /// and looking up its subject/predicate/object components, which are
+    /// guaranteed to already be present (interning always inserts a quoted
+    /// triple's components before the triple itself — see `intern()` — so
+    /// they appear earlier in `terms`).
+    pub fn rebuild(
+        terms: Vec<Term>,
+        graphs: Vec<(u8, GraphName)>,
+        next_graph_id: u8,
+    ) -> Result<Self, Oxigraph> {
+        let mut d = Self {
+            id_to_term: Vec::with_capacity(terms.len()),
+            term_to_id: HashMap::with_capacity(terms.len()),
+            graph_to_id: HashMap::new(),
+            id_to_graph: HashMap::new(),
+            next_graph_id,
+            triple_terms: HashMap::new(),
+            triple_index: HashMap::new(),
+        };
+
+        for (raw_id, term) in terms.into_iter().enumerate() {
+            let id = TermId::new(raw_id as u64)?;
+            if let Term::Triple(t) = &term {
+                let s_id = *d
+                    .term_to_id
+                    .get(&Term::from(t.subject.clone()))
+                    .expect("quoted-triple subject must already be interned (lower TermId)");
+                let p_id = *d
+                    .term_to_id
+                    .get(&Term::NamedNode(t.predicate.clone()))
+                    .expect("quoted-triple predicate must already be interned (lower TermId)");
+                let o_id = *d
+                    .term_to_id
+                    .get(&t.object)
+                    .expect("quoted-triple object must already be interned (lower TermId)");
+                let components = [s_id, p_id, o_id];
+                d.triple_terms.insert(id, components);
+                d.triple_index.insert(components, id);
+            }
+            let arc = Arc::new(term);
+            d.id_to_term.push(Arc::clone(&arc));
+            d.term_to_id.insert(arc, id);
+        }
+
+        for (raw, graph) in graphs {
+            d.graph_to_id.insert(graph.clone(), GraphId(raw));
+            d.id_to_graph.insert(raw, graph);
+        }
+        // Defensive: ensure the default graph is always present even if it
+        // was somehow missing from `graphs` (should never happen since
+        // `Dictionary::new()` always pre-registers it).
+        d.graph_to_id
+            .entry(GraphName::DefaultGraph)
+            .or_insert(GRAPH_DEFAULT);
+        d.id_to_graph.entry(0).or_insert(GraphName::DefaultGraph);
+
+        Ok(d)
+    }
+
     // ── u128 quad key packing ─────────────────────────────────────────────────
 
     /// Pack `(GraphId, TermId, TermId, TermId)` into a single `u128` key.

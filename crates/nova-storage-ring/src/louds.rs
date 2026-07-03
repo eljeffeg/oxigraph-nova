@@ -28,23 +28,27 @@
 //!
 //! L is stored as a `sux::bits::BitFieldVec<usize>` using ⌈log₂(U)⌉ bits per
 //! label, where U = alphabet size (max local ID + 1).  This provides bit-packed
-//! storage with direct index access (identical bit-width semantics to
-//! `sucds::CompactVector` but sux codegen, and a prerequisite for future ε-serde
-//! + mmap persistence). Typically 14–17 bits/label for real datasets.
+//! storage with direct index access, and — since sux 0.14's `BitFieldVec`
+//! derives `epserde::Epserde` — a zero-copy ε-serde + mmap persistence path
+//! (item 1b in `CLAUDE.md`'s "What's Next"). Typically 14–17 bits/label for
+//! real datasets.
 //!
 //! ## T bitvector substrate
 //!
 //! The LOUDS `T` bitvector is **select1-dominant** — every `child()` and
 //! `degree()` call issues one or two `select1` operations.
 //!
-//! Default: `sux 0.14` Rank9 + SelectAdapt (benchmarked winner, −10% vs Rank9Sel).
-//! Fallback (`--no-default-features`): `sucds::Rank9Sel` baseline.
+//! Backend: `sux 0.14` Rank9 + SelectAdapt (benchmarked winner, −10% vs the
+//! formerly-available `sucds::Rank9Sel` fallback — see Hard-Won Lesson #5 in
+//! `CLAUDE.md`; the fallback was removed as part of item 1b since a single
+//! sux-only T backend is a prerequisite for an unambiguous ε-serde/mmap
+//! snapshot format).
 //!
 //! The `T` substrate is fully encapsulated in the `t_backend` module below.
 //! All paper navigation formulas and all unit tests are substrate-independent.
 //!
 //! ## High-degree sidecar with SIMD `partition_point`
-//!
+
 //! `leap()` benefits from SIMD-vectorised scanning on `&[u32]` slices via
 //! `partition_point`, which the compiler can optimize to AVX2/NEON vector
 //! compares.  Bit-packed L storage improves memory but prevents direct SIMD
@@ -83,6 +87,7 @@
 // EliasFanoBuilder/Succ are always available — no conditional compilation needed
 // for the imports.  The feature flag `l-opt-ef` only controls the crossover
 // threshold (EF_THRESH_EFFECTIVE), enabling per-degree A/B benchmarking.
+use epserde::Epserde;
 use mem_dbg::{MemSize, SizeFlags};
 use sux::dict::{EfDict, EliasFanoBuilder};
 use sux::prelude::*;
@@ -108,71 +113,24 @@ enum SidecarPayload {
 
 // ── T bitvector backend ───────────────────────────────────────────────────────
 //
-// Exactly ONE `t_backend` module is compiled:
-//   t-sux (default)  →  Rank9Sel (--no-default-features)
-//
-// Each module exposes:
+// The `t_backend` module exposes:
 //   pub(super) struct TBitvec
 //   pub(super) fn build(bits: impl Iterator<Item = bool>) -> TBitvec
 //   pub(super) fn rank1(&self, k: usize) -> usize    // count of 1s in [0, k)
 //   pub(super) fn select1(&self, k: usize) -> Option<usize>  // 0-indexed k-th 1
-
-// ── Fallback: sucds::Rank9Sel (--no-default-features) ────────────────────────
-#[cfg(not(feature = "t-sux"))]
+//
+// sux Rank9+SelectAdapt is the sole T backend (the formerly-available
+// `sucds::Rank9Sel` `--no-default-features` fallback was removed as part of
+// item 1b in CLAUDE.md's "What's Next" — a single sux-only T backend is a
+// prerequisite for an unambiguous ε-serde/mmap snapshot format).
 mod t_backend {
-    //! Default T bitvector backend: `sucds::Rank9Sel`.
-    //!
-    //! O(1) select via binary search over Rank9
-    //! superblocks; 64-byte block layout with known cache overhead vs. newer
-    //! interleaved designs.  Benchmark result: ~53 ms triangle (aarch64 dev).
-    use sucds::Serializable;
-    use sucds::bit_vectors::{Build, Rank, Rank9Sel, Select};
-
-    pub(super) struct TBitvec(Rank9Sel);
-
-    impl TBitvec {
-        /// Build the LOUDS T bitvector from a bit iterator (includes dummy bit at 0).
-        pub(super) fn build(bits: impl Iterator<Item = bool>) -> Self {
-            TBitvec(
-                Rank9Sel::build_from_bits(bits, true, false, true)
-                    .expect("TBitvec(Rank9Sel): build failed"),
-            )
-        }
-
-        /// Count of 1-bits in `[0, k)`.
-        #[inline(always)]
-        pub(super) fn rank1(&self, k: usize) -> usize {
-            self.0.rank1(k).unwrap_or(0)
-        }
-
-        /// Position of the `k`-th 1-bit (0-indexed `k`).
-        /// Returns `None` if `k >= num_ones`.
-        #[inline(always)]
-        pub(super) fn select1(&self, k: usize) -> Option<usize> {
-            self.0.select1(k)
-        }
-
-        /// Real allocated byte size of the T bitvector structure, for
-        /// memory-breakdown diagnostics.
-        pub(super) fn mem_size_bytes(&self) -> usize {
-            self.0.size_in_bytes()
-        }
-    }
-}
-
-// ── Default: sux Rank9 + SelectAdapt ──────────────────────────────────────────
-#[cfg(feature = "t-sux")]
-mod t_backend {
-    //! Default T bitvector backend: `sux 0.14` Rank9 + SelectAdapt (Vigna).
-    //!
-    //! Activated by `default = ["t-sux"]` in Cargo.toml — all normal builds use this backend.
-    //! Use `--no-default-features` to switch to the `sucds::Rank9Sel` fallback.
+    //! T bitvector backend: `sux 0.14` Rank9 + SelectAdapt (Vigna).
     //!
     //! sux is the authoritative Rust implementation by Sebastiano Vigna (the
-    //! original Rank9 author).  SelectAdapt avoids the binary-search-over-
-    //! superblocks that sucds::Rank9Sel uses for `select` — it instead uses an
-    //! anchored linear scan over a smaller inventory, which is O(1) and typically
-    //! requires fewer cache misses.
+    //! original Rank9 author).  SelectAdapt avoids a binary-search-over-
+    //! superblocks approach for `select` — it instead uses an anchored linear
+    //! scan over a smaller inventory, which is O(1) and typically requires
+    //! fewer cache misses.
     //!
     //! ## API (sux 0.14 — verified against 0.14.0)
     //!
@@ -198,6 +156,7 @@ mod t_backend {
     //! `AddNumBits<Rank9<SuxBV>>` (which satisfies `SelectAdapt`'s `NumBits`
     //! bound).  `SelectAdapt` then Derefs to `AddNumBits` → `Rank9`, so
     //! `rs.rank(k)` forwards to `Rank9::rank` at zero overhead.
+    use epserde::Epserde;
     use mem_dbg::{MemSize, SizeFlags};
     use sux::prelude::*;
 
@@ -207,6 +166,14 @@ mod t_backend {
     /// One backing store; no clone; both rank() and select() work on `rs`.
     type SuxRS = SelectAdapt<AddNumBits<Rank9<SuxBV>>>;
 
+    // Item 1b (wired up, permanently): `#[derive(epserde::Epserde)]` composes
+    // cleanly through sux's nested Deref chain
+    // (SelectAdapt<AddNumBits<Rank9<BitVec<Vec<u64>>>>>) with zero extra
+    // trait-bound or lifetime work — confirmed by the throwaway spike
+    // (2026-07-03) and now enabled for real: `TBitvec` is the T-bitvector
+    // component of the ε-serde/mmap snapshot format (`LoudsCore`, see
+    // CLAUDE.md item 1b / `snapshot.rs`).
+    #[derive(Epserde)]
     pub(super) struct TBitvec {
         rs: SuxRS,
         num_ones: usize,
@@ -215,6 +182,7 @@ mod t_backend {
     impl TBitvec {
         pub(super) fn build(bits: impl Iterator<Item = bool>) -> Self {
             let bv: SuxBV = bits.collect();
+
             let num_ones = bv.count_ones();
             // No clone: Rank9 consumes bv; AddNumBits wraps the Rank9;
             // SelectAdapt builds its inventory on top — single allocation chain.
@@ -340,9 +308,9 @@ impl LoudsMemBreakdown {
 /// ## Label storage
 ///
 /// `l` is a `sux::bits::BitFieldVec` (backend `Vec<usize>`) storing ⌈log₂(U)⌉
-/// bits per label using bit-packed storage with direct index access — same
-/// bit-width semantics as `sucds::CompactVector` but sux codegen, and a
-/// prerequisite for future ε-serde mmap persistence.
+/// bits per label using bit-packed storage with direct index access.  Since
+/// `BitFieldVec` derives `epserde::Epserde`, this is also the basis for the
+/// ε-serde mmap persistence path (item 1b in `CLAUDE.md`'s "What's Next").
 /// `l_len` stores the logical length (= n_edges + 1 for the dummy) separately
 /// to avoid pulling in `value_traits::SliceByValue` as a direct dependency.
 ///
@@ -377,7 +345,51 @@ pub struct LoudsTrie {
     sidecar: std::collections::HashMap<usize, (usize, SidecarPayload)>,
 }
 
+/// T+L-only core of a [`LoudsTrie`], excluding the sidecar.
+///
+/// This is the ε-serde-serializable subset of `LoudsTrie` used by the
+/// persistent snapshot format (item 1b in `CLAUDE.md`'s "What's Next").  The
+/// sidecar is a purely derived index (rebuilt in O(n) from `t`/`l` via
+/// [`LoudsTrie::build_sidecar`]), so excluding it from the snapshot keeps the
+/// on-disk format smaller without losing any information.
+///
+/// Both `t_backend::TBitvec` and `sux::bits::BitFieldVec` derive
+/// `epserde::Epserde`, so this struct composes cleanly through
+/// `#[derive(Epserde)]` with zero extra trait-bound or lifetime work.
+#[derive(Epserde)]
+pub(crate) struct LoudsCore {
+    t: t_backend::TBitvec,
+    l: BitFieldVec,
+    l_len: usize,
+}
+
 impl LoudsTrie {
+    /// Consume this trie, discarding the sidecar (a derived index — see
+    /// [`LoudsCore`]), and keep only the ε-serde-serializable T+L core.
+    ///
+    /// Used by the persistent snapshot format (item 1b) to serialize a freshly
+    /// built trie without paying for sidecar storage on disk.
+    pub(crate) fn into_core(self) -> LoudsCore {
+        LoudsCore {
+            t: self.t,
+            l: self.l,
+            l_len: self.l_len,
+        }
+    }
+
+    /// Reconstruct a full `LoudsTrie` — including a freshly rebuilt sidecar —
+    /// from a [`LoudsCore`] loaded from disk (or from an in-memory round-trip
+    /// buffer; see item 1b's "always mapped" design in `CLAUDE.md`).
+    pub(crate) fn from_core(core: LoudsCore) -> Self {
+        let sidecar = Self::build_sidecar(&core.t, &core.l, core.l_len);
+        LoudsTrie {
+            t: core.t,
+            l: core.l,
+            l_len: core.l_len,
+            sidecar,
+        }
+    }
+
     /// Build from T bits and L labels in paper format (no dummy entries).
     ///
     /// Prepends dummy `false` / `0` entries automatically.

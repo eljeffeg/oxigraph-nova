@@ -45,8 +45,15 @@ pub mod cltj;
 pub mod delta;
 pub mod louds;
 pub mod ring;
+mod snapshot;
 pub mod store;
 
+// Generic WAL/MANIFEST/dict-persistence machinery now lives in
+// `oxigraph-nova-storage-common`, reusable by any `QuadStore` backend.
+// Re-exported here so existing callers (`nova_serve.rs`, tests, benches)
+// that referred to `oxigraph_nova_storage_ring::wal`/`WalRecord`/`WalWriter`
+// keep working unchanged.
 pub use louds::LoudsMemBreakdown;
+pub use oxigraph_nova_storage_common::{WalRecord, WalWriter, wal};
 pub use ring::{GraphRing, RingBuilder, SortOrder};
 pub use store::{MemoryBreakdown, PerOrderingBreakdown, RingStore};

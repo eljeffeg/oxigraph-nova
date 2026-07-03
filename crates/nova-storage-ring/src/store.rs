@@ -9,20 +9,77 @@
 //! before returning results.  For the W3C test suite datasets (< 10 K triples each)
 //! this is completely fine.
 //!
+//! Automatic compaction (see `maybe_auto_compact`) runs **inline, under the
+//! same lock**, when the delta crosses `auto_compact_threshold` for a
+//! persistent store. This is simple and correct but means a large delta can
+//! stall all other readers/writers for the duration of the merge + snapshot
+//! serialize + fsync. This is a known, accepted limitation for now.
+//!
 //! Production evolution path:
 //! 1. Split into `RwLock<Ring>` + `Mutex<Delta+Dict>` for concurrent reads.
-//! 2. Background merge thread: when `delta.len() > COMPACT_THRESHOLD` (1M),
-//!    snapshot the delta, release the lock, rebuild Ring, `Arc::swap`, clear delta.
+//! 2. Background merge thread: snapshot the delta, release the lock, rebuild
+//!    Ring, `Arc::swap`, clear delta — so compaction never blocks readers or
+//!    writers. This would replace the current inline `maybe_auto_compact`.
+//!
+//! ## Isolation semantics (CLAUDE.md item 1f)
+//!
+//! Every **single** `QuadStore` call (`insert`, `remove`, `contains`,
+//! `quads_for_pattern`, ...) is atomic: it acquires `Mutex<RingStoreInner>`
+//! exactly once and computes its entire result under that one critical
+//! section, so no other thread's write can be observed "half-applied" within
+//! one call.
+//!
+//! However, `RingStore` does **not** provide "repeatable read"/fixed-snapshot
+//! isolation across *multiple* calls that together implement one logical
+//! SPARQL operation:
+//!
+//! - A multi-triple-pattern `SELECT` query issues one `quads_for_pattern`
+//!   call per pattern (or, for the LFTJ path, a sequence of seek/estimate
+//!   calls); each is its own lock acquisition, so a concurrent writer's
+//!   commit that lands between two of those calls **is** visible to the
+//!   later one. There is no query-wide snapshot.
+//! - `DELETE/INSERT ... WHERE` (`nova-query`'s `execute_update`) evaluates
+//!   the WHERE clause fully into an in-memory `Vec<Solution>` first (itself
+//!   made up of possibly many individual lock acquisitions), then issues one
+//!   `remove`/`insert` call *per matched solution row* — again, each a
+//!   separate lock acquisition. A concurrent reader can therefore observe
+//!   the Update partially applied (some rows' deletes/inserts done, others
+//!   not yet).
+//!
+//! This is an accepted, documented limitation (not upstream Oxigraph's
+//! documented "repeatable read" guarantee) — see
+//! `store::tests::multi_call_scan_does_not_get_a_whole_query_repeatable_read_snapshot`
+
+//! for a deterministic (non-racy, `thread::join`-ordered) test that proves
+//! this gap directly, and `oxigraph_nova_query::update`'s module doc comment
+//! for the `Update`-atomicity side of the same limitation. Providing true
+//! snapshot isolation would require either an MVCC scheme or holding the
+//! single mutex for an entire multi-call operation (which would serialize
+//! all concurrent queries against the store, defeating the point of
+//! `RwLock`-style read concurrency) — out of scope for the current
+//! single-`Mutex` design; see the "Production evolution path" above for the
+//! direction a fix would take.
 
 use crate::delta::Delta;
 use crate::louds::LoudsMemBreakdown;
 use crate::ring::{GraphRing, RingBuilder, SortOrder};
+use crate::snapshot::StoreSnapshot;
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, NamedNode, Oxigraph, Quad,
     QuadStore, StoredQuad, Subject, Term, TermId,
 };
+use oxigraph_nova_storage_common::dict_snapshot;
+use oxigraph_nova_storage_common::manifest::{self, Manifest};
+use oxigraph_nova_storage_common::wal::{self, WalRecord, WalWriter};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Default delta-size threshold (number of live entries) that triggers an
+/// automatic inline compaction for a persistent (`RingStore::open`) store.
+/// See `maybe_auto_compact`. In-memory (`RingStore::new`) stores never
+/// auto-compact (no `data_dir` to persist to).
+const DEFAULT_AUTO_COMPACT_THRESHOLD: usize = 1_000_000;
 
 // ── Inner state ───────────────────────────────────────────────────────────────
 
@@ -35,6 +92,31 @@ struct RingStoreInner {
     delta: Delta,
     /// Named-graph IDs that have been explicitly registered (tracks empty graphs).
     named_graph_ids: HashSet<GraphId>,
+    /// WAL writer for the *currently active* segment, present only for
+    /// persistent stores opened via [`RingStore::open`]. `None` for
+    /// `RingStore::new()` (pure in-memory, used by unit tests and
+    /// benchmarks that must not touch disk).
+    wal: Option<WalWriter>,
+
+    /// Data directory root, present only for persistent stores opened via
+    /// [`RingStore::open`] (see `crate::manifest` — item 1c in `CLAUDE.md`'s
+    /// "What's Next"). `None` for `RingStore::new()`.
+    data_dir: Option<PathBuf>,
+    /// Generation number of the currently-installed snapshot
+    /// (`nova.snapshot.<snapshot_gen>`), `0` if none has been committed yet.
+    /// Kept in sync with the MANIFEST every time `commit_compaction` runs.
+    snapshot_gen: u64,
+    /// Segment number of the currently-active WAL file
+    /// (`nova.wal.<wal_seq>`), matching `wal`'s open file.
+    wal_seq: u64,
+    /// Delta-size threshold that triggers automatic inline compaction (see
+    /// `maybe_auto_compact`). Irrelevant for in-memory stores (`data_dir ==
+    /// None` gates auto-compaction off regardless of this value).
+    auto_compact_threshold: usize,
+    /// Whether automatic inline compaction is enabled at all. Defaults to
+    /// `true` for persistent stores; `RingStore::set_auto_compact_enabled`
+    /// lets callers (e.g. `nova_serve`) turn it off.
+    auto_compact_enabled: bool,
 }
 
 impl RingStoreInner {
@@ -44,8 +126,242 @@ impl RingStoreInner {
             graphs: HashMap::new(),
             delta: Delta::new(),
             named_graph_ids: HashSet::new(),
+            wal: None,
+            data_dir: None,
+            snapshot_gen: 0,
+            wal_seq: 1,
+            auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+            auto_compact_enabled: true,
         }
     }
+
+    /// Append `record` to the WAL if this store is persistent; no-op otherwise.
+    fn wal_append(&mut self, record: &WalRecord) -> Result<(), Oxigraph> {
+        if let Some(w) = &mut self.wal {
+            w.append(record)
+                .map_err(|e| Oxigraph::Storage(format!("WAL append failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Apply an already-durable `InsertQuad`/`RemoveQuad`/`RegisterGraph`
+    /// record to in-memory state, **without** touching the WAL (used both by
+    /// normal writes after `wal_append` and by WAL replay at startup, where
+    /// re-appending would be redundant/wrong).
+    fn apply_insert(&mut self, quad: &Quad) -> Result<bool, Oxigraph> {
+        let g_id = self.dict.intern_graph(&quad.graph_name)?;
+        let s_id = self.dict.intern(&subject_to_term(&quad.subject))?;
+        let p_id = self.dict.intern_predicate(&quad.predicate)?;
+        let o_id = self.dict.intern(&quad.object)?;
+
+        let key = Dictionary::pack_quad(g_id, s_id, p_id, o_id);
+
+        match self.delta.get(key) {
+            Some(true) => return Ok(false),
+            Some(false) => {
+                self.delta.insert_key(key);
+                return Ok(true);
+            }
+            None => {}
+        }
+
+        if let Some(ring) = self.graphs.get(&g_id)
+            && ring.contains(s_id.as_u64(), p_id.as_u64(), o_id.as_u64())
+        {
+            return Ok(false);
+        }
+
+        self.delta.insert_key(key);
+
+        if let GraphName::NamedNode(_) = &quad.graph_name {
+            self.named_graph_ids.insert(g_id);
+        }
+
+        Ok(true)
+    }
+
+    fn apply_remove(&mut self, quad: &Quad) -> Result<bool, Oxigraph> {
+        let g_id = match self.dict.get_graph_id(&quad.graph_name) {
+            None => return Ok(false),
+            Some(id) => id,
+        };
+        let s_id = match self.dict.get_id(&subject_to_term(&quad.subject)) {
+            None => return Ok(false),
+            Some(id) => id,
+        };
+        let p_id = match self.dict.get_id(&Term::NamedNode(quad.predicate.clone())) {
+            None => return Ok(false),
+            Some(id) => id,
+        };
+        let o_id = match self.dict.get_id(&quad.object) {
+            None => return Ok(false),
+            Some(id) => id,
+        };
+
+        let key = Dictionary::pack_quad(g_id, s_id, p_id, o_id);
+
+        match self.delta.get(key) {
+            Some(true) => {
+                self.delta.tombstone_key(key);
+                return Ok(true);
+            }
+            Some(false) => return Ok(false),
+            None => {}
+        }
+
+        if let Some(ring) = self.graphs.get(&g_id)
+            && ring.contains(s_id.as_u64(), p_id.as_u64(), o_id.as_u64())
+        {
+            self.delta.tombstone_key(key);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn apply_register_graph(&mut self, graph: &GraphName) -> Result<(), Oxigraph> {
+        if let GraphName::NamedNode(_) = graph {
+            let g_id = self.dict.intern_graph(graph)?;
+            self.named_graph_ids.insert(g_id);
+        }
+        Ok(())
+    }
+
+    /// Build the merged `new_graphs` map (Ring ∪ delta_inserts \ tombstones)
+    /// and commit it — used by `RingStore::compact()` and by
+    /// `maybe_auto_compact`. Assumes `self` is already locked (called with
+    /// `&mut self` from inside the single `Mutex<RingStoreInner>` critical
+    /// section — never re-enters the lock).
+    fn compact_locked(&mut self) -> Result<(), Oxigraph> {
+        let mut per_graph: HashMap<GraphId, Vec<[u64; 3]>> = HashMap::new();
+        for (&g_id, ring) in &self.graphs {
+            per_graph.insert(g_id, ring.spo_triples());
+        }
+
+        for (&key, &is_insert) in self.delta.iter() {
+            let (g_id, s_id, p_id, o_id) = Dictionary::unpack_quad(key);
+            let triples = per_graph.entry(g_id).or_default();
+            let triple = [s_id.as_u64(), p_id.as_u64(), o_id.as_u64()];
+            if is_insert {
+                triples.push(triple);
+            } else {
+                triples.retain(|t| t != &triple);
+            }
+        }
+
+        let new_graphs = build_graphs_from_triples(per_graph);
+        self.commit_compaction(new_graphs, true)
+    }
+
+    /// If this is a persistent store, auto-compaction is enabled, and the
+    /// delta has crossed `auto_compact_threshold`, compact inline (see
+    /// module docs for the "stalls writers" trade-off this accepts). No-op
+    /// otherwise (including always for in-memory stores, since `data_dir ==
+    /// None`).
+    fn maybe_auto_compact(&mut self) -> Result<(), Oxigraph> {
+        if self.data_dir.is_some()
+            && self.auto_compact_enabled
+            && self.delta.len() >= self.auto_compact_threshold
+        {
+            self.compact_locked()?;
+        }
+        Ok(())
+    }
+
+    /// Crash-safe compaction commit (item 1c): serialize `new_graphs` to a
+    /// fresh snapshot generation, rotate the WAL to a fresh segment, commit
+    /// both atomically via the MANIFEST, delete now-obsolete snapshot/WAL
+    /// files, then install the round-tripped graphs.
+    ///
+    /// For an in-memory store (`data_dir.is_none()`) this only performs the
+    /// in-memory ε-serde round-trip (see `snapshot.rs`'s "always mapped"
+    /// design) — no disk I/O at all.
+    ///
+    /// `clear_delta`: `compact()`'s merge already folds delta into
+    /// `new_graphs`, so it must clear the delta afterward. `bulk_load()`
+    /// never touches the delta in the first place (see its doc comment), so
+    /// it passes `false` to avoid clearing entries that were never part of
+    /// this merge.
+    fn commit_compaction(
+        &mut self,
+        new_graphs: HashMap<GraphId, Arc<GraphRing>>,
+        clear_delta: bool,
+    ) -> Result<(), Oxigraph> {
+        match self.data_dir.clone() {
+            None => {
+                self.graphs = StoreSnapshot::round_trip_and_maybe_save(new_graphs, None)?;
+            }
+            Some(dir) => {
+                let new_gen = self.snapshot_gen + 1;
+                let new_seq = self.wal_seq + 1;
+
+                // 1. Serialize the new snapshot generation in full before
+                //    anything references it.
+                let snap_path = manifest::snapshot_path(&dir, new_gen);
+                let graphs =
+                    StoreSnapshot::round_trip_and_maybe_save(new_graphs, Some(&snap_path))?;
+
+                // 1b. Persist the Dictionary alongside this snapshot
+                //     generation (see `dict_snapshot.rs` module docs for why
+                //     this is required under tail-only WAL replay).
+                let dict_path = manifest::dict_path(&dir, new_gen);
+                dict_snapshot::save(&self.dict, &dict_path)?;
+
+                // 2. Rotate the WAL: new writes land in a fresh empty segment.
+
+                let new_seg_path = manifest::wal_segment_path(&dir, new_seq);
+                let new_wal = WalWriter::create_or_open(&new_seg_path).map_err(|e| {
+                    Oxigraph::Storage(format!("failed to open new WAL segment: {e}"))
+                })?;
+
+                // 3. Single atomic commit point: MANIFEST now points at
+                //    (new_gen, new_seq). Before this line, a crash leaves the
+                //    previous MANIFEST (and thus the previous consistent
+                //    state) untouched — the new snapshot/segment are simply
+                //    orphans that `open()`/cleanup will delete later.
+                let manifest_path = dir.join(manifest::MANIFEST_FILE_NAME);
+                let m = Manifest {
+                    snapshot_gen: new_gen,
+                    wal_seq: new_seq,
+                };
+                m.save(&manifest_path)?;
+
+                // 4. Delete now-obsolete files (best-effort; see
+                //    `cleanup_orphans` doc comment).
+                manifest::cleanup_orphans(&dir, new_gen, new_seq);
+
+                self.graphs = graphs;
+                self.wal = Some(new_wal);
+                self.snapshot_gen = new_gen;
+                self.wal_seq = new_seq;
+            }
+        }
+        if clear_delta {
+            self.delta.clear();
+        }
+        Ok(())
+    }
+}
+
+/// Sort + dedup per-graph triples and build a `RingBuilder`-based
+/// `Arc<GraphRing>` map. Shared by `compact_locked` and `bulk_load`.
+fn build_graphs_from_triples(
+    per_graph: HashMap<GraphId, Vec<[u64; 3]>>,
+) -> HashMap<GraphId, Arc<GraphRing>> {
+    let mut new_graphs: HashMap<GraphId, Arc<GraphRing>> = HashMap::new();
+    for (g_id, triples) in per_graph {
+        let mut t = triples;
+        t.sort_unstable();
+        t.dedup();
+        if !t.is_empty() {
+            let mut builder = RingBuilder::new();
+            for [s, p, o] in t {
+                builder.add(s, p, o);
+            }
+            new_graphs.insert(g_id, Arc::new(builder.build()));
+        }
+    }
+    new_graphs
 }
 
 // ── RingStore ─────────────────────────────────────────────────────────────────
@@ -82,11 +398,132 @@ pub struct RingStore {
 }
 
 impl RingStore {
-    /// Create an empty `RingStore`.
+    /// Create an empty, purely in-memory `RingStore` with **no** WAL/disk
+    /// persistence — writes are never logged to disk. Used by unit tests,
+    /// benchmarks, and any caller that explicitly wants an ephemeral store.
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(RingStoreInner::new()),
         }
+    }
+
+    /// Open (or create) a persistent `RingStore` rooted at `dir` (created if
+    /// it doesn't exist), using the MANIFEST + generation-numbered
+    /// snapshot + segment-numbered WAL scheme (item 1c in `CLAUDE.md`'s
+    /// "What's Next").
+    ///
+    /// ## Recovery procedure
+    ///
+    /// 1. Load `nova.manifest` (absent ⇒ fresh store: `snapshot_gen = 0`,
+    ///    `wal_seq = 1`).
+    /// 2. If `snapshot_gen > 0`, load `nova.snapshot.<snapshot_gen>` to
+    ///    pre-populate `graphs`.
+    /// 3. Replay every `nova.wal.<seq>` segment with `seq >= wal_seq`, in
+    ///    ascending order — **not** the entire WAL history, since everything
+    ///    in earlier segments is already reflected in the loaded snapshot
+    ///    (this is the O(tail) startup cost item 1c introduces, replacing
+    ///    1b's O(total history) full replay).
+    /// 4. Open the highest such segment (or a fresh one at `wal_seq` if none
+    ///    exist yet) for appending, and delete any now-provably-obsolete
+    ///    snapshot/segment files (best-effort; see `manifest::cleanup_orphans`).
+    ///
+    /// Replaying a WAL record already reflected in the loaded snapshot is a
+    /// safe no-op: `apply_insert`/`apply_remove` both check
+    /// `ring.contains(...)` before touching the delta (see `snapshot.rs`
+    /// module docs for the full argument — still true here even though the
+    /// tail-only replay makes this redundancy rare in practice, e.g. a
+    /// segment that was rotated-into but had zero records appended before a
+    /// crash).
+    pub fn open(dir: &Path) -> Result<Self, Oxigraph> {
+        std::fs::create_dir_all(dir)?;
+        let manifest_path = dir.join(manifest::MANIFEST_FILE_NAME);
+        let m = Manifest::load(&manifest_path, dir)?;
+
+        let mut inner = RingStoreInner::new();
+        if m.snapshot_gen > 0 {
+            let snap_path = manifest::snapshot_path(dir, m.snapshot_gen);
+            inner.graphs = StoreSnapshot::load_from_file(&snap_path)?;
+
+            // Reconstruct the Dictionary's exact TermId/GraphId assignments
+            // from this snapshot generation BEFORE replaying the WAL tail,
+            // so replay's intern() calls only ever append new terms after
+            // the snapshot's high-water-mark (see `dict_snapshot.rs` module
+            // docs for why this is required).
+            let dict_path = manifest::dict_path(dir, m.snapshot_gen);
+            inner.dict = dict_snapshot::load(&dict_path)?;
+        }
+
+        // Discover every WAL segment at or after the MANIFEST's recorded
+        // `wal_seq`, replay them in ascending order.
+        let mut segments: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        name.strip_prefix("nova.wal.")
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .filter(|&seq| seq >= m.wal_seq)
+                            .map(|seq| (seq, entry.path()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        segments.sort_by_key(|(seq, _)| *seq);
+
+        for (_, path) in &segments {
+            wal::replay(path, |record| {
+                // Errors during replay of a single record are logged and
+                // skipped rather than aborting the whole replay — a bad
+                // Dictionary/GraphId-space-exhaustion error on one record
+                // should not prevent recovering the rest of a large store.
+                let result = match &record {
+                    WalRecord::InsertQuad(q) => inner.apply_insert(q).map(|_| ()),
+                    WalRecord::RemoveQuad(q) => inner.apply_remove(q).map(|_| ()),
+                    WalRecord::RegisterGraph(g) => inner.apply_register_graph(g),
+                };
+                if let Err(e) = result {
+                    eprintln!("[RingStore::open] WAL replay: skipping record due to error: {e}");
+                }
+            })
+            .map_err(|e| Oxigraph::Storage(format!("WAL replay I/O error: {e}")))?;
+        }
+
+        // The active segment is the highest one found, or a fresh segment at
+        // `m.wal_seq` if none exist yet (brand-new store, or a MANIFEST that
+        // was just committed by `commit_compaction` immediately before a
+        // crash that prevented the new segment file from being created —
+        // extremely unlikely given creation happens before the MANIFEST
+        // write, but `create_or_open` handles it correctly either way).
+        let active_seq = segments.last().map(|(seq, _)| *seq).unwrap_or(m.wal_seq);
+        let active_path = manifest::wal_segment_path(dir, active_seq);
+        inner.wal = Some(
+            WalWriter::create_or_open(&active_path)
+                .map_err(|e| Oxigraph::Storage(format!("failed to open WAL for writing: {e}")))?,
+        );
+
+        inner.data_dir = Some(dir.to_path_buf());
+        inner.snapshot_gen = m.snapshot_gen;
+        inner.wal_seq = active_seq;
+
+        // Best-effort cleanup of anything strictly older than what we just
+        // committed to using (handles orphans left by a crash between
+        // creating a new snapshot/segment and committing the MANIFEST that
+        // references them, or between committing the MANIFEST and the
+        // previous run's cleanup step).
+        manifest::cleanup_orphans(dir, inner.snapshot_gen, inner.wal_seq);
+
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// The on-disk path of the WAL segment `open(dir)` would create/use for
+    /// a **fresh** directory (segment `1`). Exposed for tests that need to
+    /// interact with the WAL file directly (e.g. to simulate a torn write)
+    /// before any compaction has rotated it.
+    pub fn wal_path(dir: &Path) -> PathBuf {
+        manifest::wal_segment_path(dir, 1)
     }
 
     /// Merge the delta into the Ring index.
@@ -95,53 +532,37 @@ impl RingStore {
     /// - All triples live in the per-graph `GraphRing` sorted arrays.
     /// - The delta is cleared.
     /// - Queries via `quads_for_pattern` continue to work (now scanning only the Ring).
+    /// - For a persistent store, a new snapshot generation + WAL segment are
+    ///   committed via the MANIFEST (see `commit_compaction`), and obsolete
+    ///   snapshot/segment files are deleted.
     ///
-    /// **When to call:** After a bulk load, or when the delta grows large (> 1M triples).
-    /// This can be triggered automatically by a background thread when needed.
+    /// **When to call:** After a bulk load, or manually/administratively.
+    /// For persistent stores this also happens automatically once the delta
+    /// crosses a configurable threshold — see `set_auto_compact_threshold`.
     pub fn compact(&self) -> Result<(), Oxigraph> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        inner.compact_locked()
+    }
 
-        // Collect per-graph triple sets.
-        // Start from what's already in the Ring (if any prior compaction ran).
-        let mut per_graph: HashMap<GraphId, Vec<[u64; 3]>> = HashMap::new();
-        for (&g_id, ring) in &inner.graphs {
-            per_graph.insert(g_id, ring.spo_triples());
+    /// Configure the delta-size threshold (number of live entries) that
+    /// triggers automatic inline compaction for a persistent store. Default
+    /// is 1,000,000. Has no effect on in-memory (`RingStore::new()`) stores.
+    pub fn set_auto_compact_threshold(&self, threshold: usize) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.auto_compact_threshold = threshold;
         }
+    }
 
-        // Apply delta: inserts add, tombstones remove.
-        for (&key, &is_insert) in inner.delta.iter() {
-            let (g_id, s_id, p_id, o_id) = Dictionary::unpack_quad(key);
-            let triples = per_graph.entry(g_id).or_default();
-            let triple = [s_id.as_u64(), p_id.as_u64(), o_id.as_u64()];
-            if is_insert {
-                triples.push(triple);
-            } else {
-                triples.retain(|t| t != &triple);
-            }
+    /// Enable/disable automatic inline compaction entirely (default:
+    /// enabled). Has no effect on in-memory (`RingStore::new()`) stores,
+    /// which never auto-compact regardless of this setting.
+    pub fn set_auto_compact_enabled(&self, enabled: bool) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.auto_compact_enabled = enabled;
         }
-
-        // Rebuild Ring for each graph.
-        let mut new_graphs: HashMap<GraphId, Arc<GraphRing>> = HashMap::new();
-        for (g_id, triples) in per_graph {
-            // sort_unstable + dedup for O(n log n) deduplication.
-            let mut t = triples;
-            t.sort_unstable();
-            t.dedup();
-            if !t.is_empty() {
-                let mut builder = RingBuilder::new();
-                for [s, p, o] in t {
-                    builder.add(s, p, o);
-                }
-                new_graphs.insert(g_id, Arc::new(builder.build()));
-            }
-        }
-
-        inner.graphs = new_graphs;
-        inner.delta.clear();
-        Ok(())
     }
 
     /// Bulk-load quads directly into the Ring, **bypassing the delta
@@ -161,6 +582,11 @@ impl RingStore {
     /// call on a non-empty store, but for the common "fresh store, one big
     /// load" case it will not have to touch `spo_triples()`/`per_graph`
     /// merging at all (no existing graphs ⇒ that loop is a no-op).
+    ///
+    /// For a persistent store, this also commits a new snapshot
+    /// generation + WAL segment via the MANIFEST (see `commit_compaction`),
+    /// same as `compact()` — so a bulk-loaded dataset is never left
+    /// WAL-only/un-snapshotted.
     pub fn bulk_load(&self, quads: impl IntoIterator<Item = Quad>) -> Result<usize, Oxigraph> {
         let mut inner = self
             .inner
@@ -192,20 +618,8 @@ impl RingStore {
             count += 1;
         }
 
-        let mut new_graphs: HashMap<GraphId, Arc<GraphRing>> = HashMap::new();
-        for (g_id, mut t) in per_graph {
-            t.sort_unstable();
-            t.dedup();
-            if !t.is_empty() {
-                let mut builder = RingBuilder::new();
-                for [s, p, o] in t {
-                    builder.add(s, p, o);
-                }
-                new_graphs.insert(g_id, Arc::new(builder.build()));
-            }
-        }
-
-        inner.graphs = new_graphs;
+        let new_graphs = build_graphs_from_triples(per_graph);
+        inner.commit_compaction(new_graphs, false)?;
         Ok(count)
     }
 
@@ -479,41 +893,12 @@ impl QuadStore for RingStore {
             .lock()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
-        // Intern all terms and the graph name.
-        let g_id = inner.dict.intern_graph(&quad.graph_name)?;
-        let s_id = inner.dict.intern(&subject_to_term(&quad.subject))?;
-        let p_id = inner.dict.intern_predicate(&quad.predicate)?;
-        let o_id = inner.dict.intern(&quad.object)?;
-
-        let key = Dictionary::pack_quad(g_id, s_id, p_id, o_id);
-
-        // Delta takes priority.
-        match inner.delta.get(key) {
-            Some(true) => return Ok(false), // already a live insert in delta
-            Some(false) => {
-                // Was tombstoned — re-inserting revives it.
-                inner.delta.insert_key(key);
-                return Ok(true);
-            }
-            None => {}
-        }
-
-        // Check in the Ring (immutable sorted arrays).
-        if let Some(ring) = inner.graphs.get(&g_id)
-            && ring.contains(s_id.as_u64(), p_id.as_u64(), o_id.as_u64())
-        {
-            return Ok(false); // already present in Ring, not tombstoned
-        }
-
-        // New triple — add to delta.
-        inner.delta.insert_key(key);
-
-        // Track named graphs (for known_named_graphs enumeration).
-        if let GraphName::NamedNode(_) = &quad.graph_name {
-            inner.named_graph_ids.insert(g_id);
-        }
-
-        Ok(true)
+        // Log intent durably BEFORE applying, so a crash between the two can
+        // always be recovered by replaying the WAL (see wal.rs module docs).
+        inner.wal_append(&WalRecord::InsertQuad(quad.clone()))?;
+        let result = inner.apply_insert(quad)?;
+        inner.maybe_auto_compact()?;
+        Ok(result)
     }
 
     fn remove(&self, quad: &Quad) -> Result<bool, Oxigraph> {
@@ -522,49 +907,10 @@ impl QuadStore for RingStore {
             .lock()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
-        // If the term isn't in the dict, it can't be in the store.
-        let g_id = match inner.dict.get_graph_id(&quad.graph_name) {
-            None => return Ok(false),
-            Some(id) => id,
-        };
-        let s_id = match inner.dict.get_id(&subject_to_term(&quad.subject)) {
-            None => return Ok(false),
-            Some(id) => id,
-        };
-        let p_id = match inner.dict.get_id(&Term::NamedNode(quad.predicate.clone())) {
-            None => return Ok(false),
-            Some(id) => id,
-        };
-        let o_id = match inner.dict.get_id(&quad.object) {
-            None => return Ok(false),
-            Some(id) => id,
-        };
-
-        let key = Dictionary::pack_quad(g_id, s_id, p_id, o_id);
-
-        // Delta takes priority.
-        match inner.delta.get(key) {
-            Some(true) => {
-                // In delta as insert — remove it (delete from delta entirely).
-                // We remove the delta entry rather than tombstoning, because the
-                // triple isn't in the Ring (it was only ever in the delta).
-                inner.delta.tombstone_key(key); // mark as deleted
-                return Ok(true);
-            }
-            Some(false) => return Ok(false), // already tombstoned
-            None => {}
-        }
-
-        // Check Ring.
-        if let Some(ring) = inner.graphs.get(&g_id)
-            && ring.contains(s_id.as_u64(), p_id.as_u64(), o_id.as_u64())
-        {
-            // In Ring — add a tombstone to the delta.
-            inner.delta.tombstone_key(key);
-            return Ok(true);
-        }
-
-        Ok(false)
+        inner.wal_append(&WalRecord::RemoveQuad(quad.clone()))?;
+        let result = inner.apply_remove(quad)?;
+        inner.maybe_auto_compact()?;
+        Ok(result)
     }
 
     fn quads_for_pattern(
@@ -796,8 +1142,8 @@ impl QuadStore for RingStore {
                 .inner
                 .lock()
                 .map_err(|e| Oxigraph::Storage(e.to_string()))?;
-            let g_id = inner.dict.intern_graph(graph)?;
-            inner.named_graph_ids.insert(g_id);
+            inner.wal_append(&WalRecord::RegisterGraph(graph.clone()))?;
+            inner.apply_register_graph(graph)?;
         }
         Ok(())
     }
@@ -1026,5 +1372,297 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(res.len(), 2);
+    }
+
+    // ── RingStore::open() persistence round-trip ────────────────────────────
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("nova_ringstore_test_{pid}_{n}_{name}"))
+    }
+
+    #[test]
+    fn open_reopen_round_trip() {
+        let dir = temp_dir("roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let g = ng("http://ex/g");
+        let q1 = make_quad("http://ex/s1", "http://ex/p", "a", dg());
+        let q2 = make_quad("http://ex/s2", "http://ex/p", "b", g.clone());
+
+        {
+            let store = RingStore::open(&dir).unwrap();
+            store.insert(&q1).unwrap();
+            store.insert(&q2).unwrap();
+            store.remove(&q1).unwrap();
+            store.insert(&q1).unwrap(); // re-insert after remove
+            assert_eq!(store.len().unwrap(), 2);
+        } // store dropped — WAL file remains on disk
+
+        {
+            let store = RingStore::open(&dir).unwrap();
+            assert_eq!(store.len().unwrap(), 2);
+            assert!(store.contains(&q1).unwrap());
+            assert!(store.contains(&q2).unwrap());
+
+            // Subsequent writes on the reopened store must also persist.
+            let q3 = make_quad("http://ex/s3", "http://ex/p", "c", dg());
+            store.insert(&q3).unwrap();
+            assert_eq!(store.len().unwrap(), 3);
+        }
+
+        {
+            let store = RingStore::open(&dir).unwrap();
+            assert_eq!(store.len().unwrap(), 3);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_fresh_dir_is_empty() {
+        let dir = temp_dir("fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RingStore::open(&dir).unwrap();
+        assert!(store.is_empty().unwrap());
+        assert!(RingStore::wal_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_reopen_after_compact_uses_snapshot() {
+        let dir = temp_dir("snapshot_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let g = ng("http://ex/g");
+        let q1 = make_quad("http://ex/s1", "http://ex/p", "a", dg());
+        let q2 = make_quad("http://ex/s2", "http://ex/p", "b", g.clone());
+        let q3 = make_quad("http://ex/s3", "http://ex/p", "c", dg());
+
+        {
+            let store = RingStore::open(&dir).unwrap();
+            store.insert(&q1).unwrap();
+            store.insert(&q2).unwrap();
+            store.compact().unwrap(); // writes nova.snapshot.1, rotates WAL, commits MANIFEST
+            store.insert(&q3).unwrap(); // lands back in delta, post-snapshot
+            assert_eq!(store.len().unwrap(), 3);
+        }
+
+        // The generation-1 snapshot file must exist after compact().
+        assert!(manifest::snapshot_path(&dir, 1).exists());
+        // The MANIFEST must exist and point at generation 1 / segment 2.
+        assert!(dir.join(manifest::MANIFEST_FILE_NAME).exists());
+
+        {
+            // Reopen: loads snapshot gen 1 (q1, q2) then replays only the
+            // post-compaction segment (q3) — not the whole WAL history.
+            let store = RingStore::open(&dir).unwrap();
+            assert_eq!(store.len().unwrap(), 3);
+            assert!(store.contains(&q1).unwrap());
+            assert!(store.contains(&q2).unwrap());
+            assert!(store.contains(&q3).unwrap());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_rotates_wal_and_deletes_old_segment() {
+        let dir = temp_dir("wal_rotation");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let q1 = make_quad("http://ex/s1", "http://ex/p", "a", dg());
+        let store = RingStore::open(&dir).unwrap();
+        store.insert(&q1).unwrap();
+
+        let old_segment = manifest::wal_segment_path(&dir, 1);
+        assert!(old_segment.exists());
+
+        store.compact().unwrap();
+
+        // Old segment (fully covered by the new snapshot) must be gone;
+        // a new segment must exist.
+        assert!(!old_segment.exists());
+        assert!(manifest::wal_segment_path(&dir, 2).exists());
+        assert!(manifest::snapshot_path(&dir, 1).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multiple_compactions_leave_only_latest_generation() {
+        let dir = temp_dir("multi_compact");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RingStore::open(&dir).unwrap();
+        for i in 0..5 {
+            let q = make_quad(&format!("http://ex/s{i}"), "http://ex/p", "v", dg());
+            store.insert(&q).unwrap();
+            store.compact().unwrap();
+        }
+
+        assert_eq!(store.len().unwrap(), 5);
+
+        // Only the latest snapshot generation (5) and latest WAL segment (6)
+        // should remain; everything older was cleaned up.
+        for generation in 1..5 {
+            assert!(!manifest::snapshot_path(&dir, generation).exists());
+        }
+
+        assert!(manifest::snapshot_path(&dir, 5).exists());
+        for seq in 1..6 {
+            assert!(!manifest::wal_segment_path(&dir, seq).exists());
+        }
+        assert!(manifest::wal_segment_path(&dir, 6).exists());
+
+        // Reopen must still see all 5 triples via just the latest snapshot.
+        drop(store);
+        let store2 = RingStore::open(&dir).unwrap();
+        assert_eq!(store2.len().unwrap(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_compact_triggers_at_threshold() {
+        let dir = temp_dir("auto_compact");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RingStore::open(&dir).unwrap();
+        store.set_auto_compact_threshold(3);
+
+        for i in 0..3 {
+            let q = make_quad(&format!("http://ex/s{i}"), "http://ex/p", "v", dg());
+            store.insert(&q).unwrap();
+        }
+
+        // The third insert should have triggered an automatic compaction:
+        // a snapshot generation should now exist and the delta should have
+        // been folded into it.
+        assert!(manifest::snapshot_path(&dir, 1).exists());
+        assert_eq!(store.len().unwrap(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_compact_disabled_never_triggers() {
+        let dir = temp_dir("auto_compact_disabled");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RingStore::open(&dir).unwrap();
+        store.set_auto_compact_threshold(1);
+        store.set_auto_compact_enabled(false);
+
+        let q = make_quad("http://ex/s", "http://ex/p", "v", dg());
+        store.insert(&q).unwrap();
+
+        // Even though the threshold (1) was crossed, auto-compaction is
+        // disabled, so no snapshot should have been written.
+        assert!(!manifest::snapshot_path(&dir, 1).exists());
+        assert_eq!(store.len().unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Isolation semantics (CLAUDE.md item 1f) ─────────────────────────────
+    //
+    // `RingStore` gives per-call atomicity for free (each `insert`/`remove`/
+    // `quads_for_pattern` call takes the single `Mutex<RingStoreInner>` once
+    // and returns a result computed entirely under that one lock
+    // acquisition), but it does **not** give "repeatable read" isolation
+    // across *multiple* calls that together make up one logical
+    // query/Update. This test deterministically demonstrates that: a write
+    // committed strictly between two `quads_for_pattern` calls belonging to
+    // the same hypothetical multi-pattern query **is** visible to the second
+    // call, even though — under a true "fixed snapshot for the whole
+    // operation" guarantee (the semantics upstream Oxigraph documents) — it
+    // should not be. See the module doc comment above and `CLAUDE.md`'s
+    // item 1f for the full write-up of why this is an accepted, documented
+    // limitation rather than a bug.
+    #[test]
+    fn multi_call_scan_does_not_get_a_whole_query_repeatable_read_snapshot() {
+        let store = Arc::new(RingStore::new());
+        let p = pred("http://ex/p");
+        let quad_a = Quad::new(nn("http://ex/a"), p.clone(), lit("a"), dg());
+        let quad_b = Quad::new(nn("http://ex/b"), p.clone(), lit("b"), dg());
+
+        store.insert(&quad_a).unwrap();
+
+        // First "triple pattern" scan of a logical multi-pattern query,
+        // matching only quad_a (quad_b doesn't exist yet).
+        let result1: Vec<_> = store
+            .quads_for_pattern(None, Some(&p), Some(&lit("a")), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(result1.len(), 1);
+
+        // A concurrent writer commits quad_b *between* the two scans that
+        // conceptually belong to the same logical query. `.join()` gives a
+        // real happens-before edge, so this is deterministic, not a timing
+        // race.
+        let store2 = Arc::clone(&store);
+        let quad_b2 = quad_b.clone();
+        std::thread::spawn(move || {
+            store2.insert(&quad_b2).unwrap();
+        })
+        .join()
+        .unwrap();
+
+        // Second "triple pattern" scan of the *same* logical query. Under a
+        // real repeatable-read/fixed-snapshot guarantee, quad_b — committed
+        // after the logical query began — must NOT be visible here. It
+        // demonstrably is, because each `quads_for_pattern` call is its own
+        // independent lock acquisition with no cross-call snapshot.
+        let result2: Vec<_> = store
+            .quads_for_pattern(None, Some(&p), Some(&lit("b")), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            result2.len(),
+            1,
+            "quad_b, inserted strictly between the two scans, is visible to the second \
+             scan — proving RingStore does NOT provide a repeatable-read/fixed-snapshot \
+             guarantee across multiple store calls belonging to one logical query or Update \
+             (see CLAUDE.md item 1f)"
+        );
+    }
+
+    #[test]
+    fn open_survives_torn_tail() {
+        let dir = temp_dir("torn");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let q1 = make_quad("http://ex/s1", "http://ex/p", "a", dg());
+        let q2 = make_quad("http://ex/s2", "http://ex/p", "b", dg());
+
+        {
+            let store = RingStore::open(&dir).unwrap();
+            store.insert(&q1).unwrap();
+            store.insert(&q2).unwrap();
+        }
+
+        // Simulate a crash mid-write: truncate the last few bytes of the
+        // (still-fresh, un-rotated) WAL segment.
+        let wal_path = RingStore::wal_path(&dir);
+        let full_len = std::fs::metadata(&wal_path).unwrap().len();
+        {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            file.set_len(full_len - 5).unwrap();
+        }
+
+        let store = RingStore::open(&dir).unwrap();
+        assert_eq!(store.len().unwrap(), 1);
+        assert!(store.contains(&q1).unwrap());
+        assert!(!store.contains(&q2).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

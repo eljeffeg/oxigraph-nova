@@ -20,17 +20,19 @@
 //!
 //! Result serialisation:
 //!   SELECT / ASK        → `application/sparql-results+json`  (via `sparesults`)
-//!   CONSTRUCT/DESCRIBE   → content-negotiated via `Accept`: `text/turtle` (via
-//!                          `oxttl::TurtleSerializer`) or `application/n-triples`
+//!   CONSTRUCT/DESCRIBE   → content-negotiated via `Accept`: `application/ld+json`
+//!                          (via `oxjsonld::JsonLdSerializer`), `text/turtle` (via
+//!                          `oxttl::TurtleSerializer`), or `application/n-triples`
 //!                          (default, and used whenever `Accept` doesn't ask for
-//!                          Turtle specifically). JSON-LD is out of scope — no
-//!                          workspace dependency provides a JSON-LD serializer.
+//!                          Turtle or JSON-LD specifically).
 //!
 //! Bulk-load / Graph Store PUT/POST bodies are parsed by Content-Type:
 //!   `text/turtle` (default / unrecognised) → `oxttl::TurtleParser`
 //!   `application/n-triples`                → `oxttl::NTriplesParser`
 //!   `application/rdf+xml`                  → `oxrdfxml::RdfXmlParser`
+//!   `application/ld+json`                  → `oxjsonld::JsonLdParser`
 //!
+
 //! # Usage
 //! ```no_run
 //! use oxigraph_nova_server::Server;
@@ -43,6 +45,27 @@
 //!     Server::new(store).run("0.0.0.0:3030").await.unwrap();
 //! }
 //! ```
+//!
+//! # Transactional isolation semantics (`CLAUDE.md` item 1f)
+//!
+//! Upstream Oxigraph documents a "repeatable read" isolation guarantee for
+//! every operation: a query, or an Update, observes one fixed snapshot of
+//! the store for its entire duration, and only fully-committed writes are
+//! ever visible. **This server does not currently provide that guarantee.**
+//! Each individual `QuadStore` call (one `quads_for_pattern`, one `insert`,
+//! one `remove`, ...) is atomic on its own, but a request that issues
+//! *several* such calls — a multi-triple-pattern `SELECT`, or a
+//! `DELETE/INSERT ... WHERE` Update applying its WHERE-clause solutions
+//! row-by-row (see `oxigraph_nova_query::update`'s module doc comment) — has
+//! no snapshot spanning those calls. A concurrent write landing between two
+//! of them is visible to the later one, and a concurrent reader can observe
+//! a multi-row Update partially applied.
+//!
+//! This is an accepted, documented limitation of the current
+//! single-`Mutex<RingStoreInner>` design (see
+//! `oxigraph_nova_storage_ring`'s `store.rs` module doc comment, "Isolation
+//! semantics", for the storage-level explanation), demonstrated directly by
+//! `crates/nova-server/tests/isolation.rs`'s two integration tests.
 
 use axum::Router;
 use axum::body::Bytes;
@@ -54,9 +77,11 @@ use oxigraph_nova_core::QuadStore;
 use oxigraph_nova_query::{
     Evaluator, QueryResult, Solution, StoreDataset, clear_graph, execute_update,
 };
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
+use oxjsonld::{JsonLdParser, JsonLdSerializer};
+use oxrdf::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, QuadRef, Term, Triple, Variable};
 use oxrdfxml::RdfXmlParser;
 use oxttl::{NTriplesParser, NTriplesSerializer, TurtleParser, TurtleSerializer};
+
 use serde::Deserialize;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use spargebra::algebra::GraphPattern;
@@ -332,7 +357,15 @@ fn graph_exists<S: QuadStore>(store: &Arc<S>, g: &GraphName) -> Result<bool, Box
 /// Parse an RDF body into `Triple`s, dispatching on `Content-Type`:
 ///   - `application/n-triples`  → `oxttl::NTriplesParser`
 ///   - `application/rdf+xml`    → `oxrdfxml::RdfXmlParser`
+///   - `application/ld+json`    → `oxjsonld::JsonLdParser`
 ///   - `text/turtle` / anything else (default) → `oxttl::TurtleParser`
+///
+/// JSON-LD parses to `Quad`s (it can express named graphs); since this
+/// function only returns `Triple`s (per the Graph Store Protocol / bulk-load
+/// callers, which always target one specific graph), any non-default-graph
+/// component on a parsed quad is simply dropped and only its triple is kept —
+/// mirroring how a JSON-LD document's own `@graph` nesting still ultimately
+/// gets inserted into the one target graph named by the request.
 fn parse_body_triples(content_type: &str, body: &[u8]) -> Result<Vec<Triple>, Box<Response>> {
     let err = |e: String| {
         Box::new((StatusCode::BAD_REQUEST, format!("RDF parse error: {e}")).into_response())
@@ -348,6 +381,12 @@ fn parse_body_triples(content_type: &str, body: &[u8]) -> Result<Vec<Triple>, Bo
             .for_reader(body)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| err(e.to_string()))
+    } else if content_type.starts_with("application/ld+json") {
+        JsonLdParser::new()
+            .for_reader(body)
+            .map(|r| r.map(|q| Triple::new(q.subject, q.predicate, q.object)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| err(e.to_string()))
     } else {
         // Default: Turtle (also used for text/turtle and unrecognised types).
         TurtleParser::new()
@@ -356,6 +395,7 @@ fn parse_body_triples(content_type: &str, body: &[u8]) -> Result<Vec<Triple>, Bo
             .map_err(|e| err(e.to_string()))
     }
 }
+
 
 /// Insert parsed `Triple`s into `graph` as `Quad`s.
 fn insert_triples_into_graph<S: QuadStore>(
@@ -620,18 +660,41 @@ fn serialize_solutions(variables: &[Variable], solutions: &[Solution]) -> Respon
 }
 
 /// Serialize a CONSTRUCT/DESCRIBE result, content-negotiated via `Accept`:
-///   - `Accept` contains `text/turtle`  → Turtle (`oxttl::TurtleSerializer`)
-///   - anything else (default)         → `application/n-triples`
+///   - `Accept` contains `application/ld+json` → JSON-LD (`oxjsonld::JsonLdSerializer`)
+///   - `Accept` contains `text/turtle`         → Turtle (`oxttl::TurtleSerializer`)
+///   - anything else (default)                 → `application/n-triples`
 ///
 /// Also used directly by the Graph Store Protocol's `GET /store` handler so
 /// both code paths share one serializer.
 fn serialize_triples(triples: &[Triple], accept: &str) -> Response {
-    if accept.contains("text/turtle") {
+    if accept.contains("application/ld+json") {
+        serialize_triples_jsonld(triples)
+    } else if accept.contains("text/turtle") {
         serialize_triples_turtle(triples)
     } else {
         serialize_triples_ntriples(triples)
     }
 }
+
+fn serialize_triples_jsonld(triples: &[Triple]) -> Response {
+    let mut writer = JsonLdSerializer::new().for_writer(Vec::new());
+    for t in triples {
+        let quad = QuadRef::new(&t.subject, &t.predicate, &t.object, GraphNameRef::DefaultGraph);
+        if let Err(e) = writer.serialize_quad(quad) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    match writer.finish() {
+        Ok(buf) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/ld+json; charset=utf-8")],
+            buf,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 
 fn serialize_triples_ntriples(triples: &[Triple]) -> Response {
     let mut writer = NTriplesSerializer::new().for_writer(Vec::new());
@@ -1346,6 +1409,58 @@ mod tests {
         let body = body_text(resp).await;
         assert!(body.contains("http://ex/alice"));
     }
+
+    #[tokio::test]
+    async fn test_construct_jsonld_via_accept() {
+        let sparql = r#"CONSTRUCT { ?s <http://ex/name> ?n } WHERE { ?s <http://ex/name> ?n }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .header("accept", "application/ld+json")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("application/ld+json"), "wrong content-type: {ct}");
+        let json = body_json(resp).await;
+        // JSON-LD output is a top-level object with an "@graph" array of node objects.
+        let graph = json["@graph"].as_array().expect("expected @graph array");
+        assert_eq!(graph.len(), 2, "expected 2 subjects with names");
+        let body = serde_json::to_string(&json).unwrap();
+        assert!(body.contains("http://ex/alice"));
+    }
+
+    // ── JSON-LD bulk-load (PUT /store) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_store_put_jsonld_content_type() {
+        let router = make_router();
+        let jsonld = r#"{
+            "@context": {"ex": "http://ex/"},
+            "@id": "http://ex/grace",
+            "ex:name": "Grace"
+        }"#;
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fjsonld")
+            .header("content-type", "application/ld+json")
+            .body(Body::from(jsonld))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
 
     // ── Graph Store HTTP Protocol: GET /store ─────────────────────────────────
 

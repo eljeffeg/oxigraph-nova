@@ -1,0 +1,17 @@
+[package]
+name        = "oxigraph-nova-storage-common"
+description = "Generic WAL/MANIFEST/dictionary persistence machinery reusable by any QuadStore backend"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+oxigraph-nova-core = { path = "../nova-core" }
+oxrdf         = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+crc32fast     = "1.5"     # WAL record + MANIFEST framing checksum
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

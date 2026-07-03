@@ -32,8 +32,9 @@
 //! The `TrieIterator` interface consumed by LFTJ is implemented by
 //! [`CltjTrieIter`] in `cltj.rs`.
 
-use crate::cltj::{CltjData, build_cltj_data};
+use crate::cltj::{CltjData, CltjSnapshot, build_cltj_data};
 use crate::louds::LoudsMemBreakdown;
+use epserde::Epserde;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -359,6 +360,49 @@ impl GraphRing {
 
         it
     }
+
+    /// Consume this `GraphRing`, producing the ε-serde-serializable
+    /// [`RingSnapshot`] (triple count + optional per-graph [`CltjSnapshot`]).
+    ///
+    /// Used by the persistent snapshot format (item 1b in `CLAUDE.md`'s
+    /// "What's Next").  Requires unique ownership of the underlying
+    /// `Arc<RingData>` (true for a freshly built `GraphRing` that has not yet
+    /// been shared, per the "always mapped" design — see `RingStore::compact`);
+    /// panics via `expect` otherwise.
+    pub(crate) fn into_snapshot(self) -> RingSnapshot {
+        let cltj = self.data.map(|data| {
+            Arc::try_unwrap(data)
+                .unwrap_or_else(|_| panic!("into_snapshot: RingData Arc is shared"))
+                .cltj
+                .into_snapshot()
+        });
+        RingSnapshot { n: self.n, cltj }
+    }
+
+    /// Reconstruct a `GraphRing` from a [`RingSnapshot`] loaded from disk (or
+    /// from an in-memory round-trip buffer; see item 1b's "always mapped"
+    /// design in `CLAUDE.md`).
+    pub(crate) fn from_snapshot(snap: RingSnapshot) -> GraphRing {
+        let data = snap.cltj.map(|cltj_snap| {
+            Arc::new(RingData {
+                cltj: CltjData::from_snapshot(cltj_snap),
+            })
+        });
+        GraphRing { n: snap.n, data }
+    }
+}
+
+/// ε-serde-serializable snapshot of a [`GraphRing`]: triple count plus an
+/// optional [`CltjSnapshot`] (`None` for an empty graph, matching
+/// `GraphRing`'s own `data: Option<Arc<RingData>>` representation).
+///
+/// This is the persistent on-disk representation for item 1b in
+/// `CLAUDE.md`'s "What's Next".  See [`GraphRing::into_snapshot`] and
+/// [`GraphRing::from_snapshot`].
+#[derive(Epserde)]
+pub(crate) struct RingSnapshot {
+    n: usize,
+    cltj: Option<CltjSnapshot>,
 }
 
 // ── Trie suffix enumeration helper ────────────────────────────────────────────

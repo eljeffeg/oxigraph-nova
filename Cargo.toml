@@ -4,6 +4,7 @@ members = [
     "crates/nova-core",
     "crates/nova-query",
     "crates/nova-storage-memory",
+    "crates/nova-storage-common",
     "crates/nova-storage-ring",
     "crates/nova-server",
     "tests/w3c",
@@ -27,9 +28,10 @@ oxttl         = { version = "0.2.3",  features = ["rdf-12"] }
 # TermRef are only exhaustive (compile-clean) when built with the same
 # rdf-12 feature flag oxrdf itself is compiled with workspace-wide.
 oxrdfxml      = { version = "0.2",    features = ["rdf-12"] } # RDF/XML parser — needed by the W3C harness for .rdf test fixtures
-
+oxjsonld      = { version = "0.2.5",  features = ["rdf-12"] } # JSON-LD parser/serializer — pins oxrdf =0.3.3, composes directly
 
 spargebra     = { version = "0.4.6",  features = ["sparql-12"] }
+
 sparesults    = { version = "0.3.3",  features = ["sparql-12"] }  # .srx / .srj / .tsv result I/O
 oxsdatatypes  = { version = "0.2" }    # Correct XSD typed-value semantics; route evaluator comparison through this
 sparopt       = { version = "0.3",     features = ["sparql-12"] } # SPARQL algebra normalizer/optimizer

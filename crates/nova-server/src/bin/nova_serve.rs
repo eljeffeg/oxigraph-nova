@@ -7,16 +7,33 @@
 //!
 //! # Usage
 //! ```bash
+//! # In-memory only (no persistence, matches Oxigraph's `serve` without `--location`):
 //! cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
+//!     --data /tmp/oxigraph-nova-bench/dataset.nt --bind 0.0.0.0:3030
+//!
+//! # Persistent (WAL-backed) store: writes survive restarts.
+//! cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
+//!     --location /tmp/oxigraph-nova-bench/data --bind 0.0.0.0:3030
+//!
+//! # Persistent store, bulk-loaded from a dataset on first run only (if the
+//! # WAL directory is empty/fresh; on subsequent runs the existing WAL is
+//! # replayed instead and --data is ignored):
+//! cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
+//!     --location /tmp/oxigraph-nova-bench/data \
 //!     --data /tmp/oxigraph-nova-bench/dataset.nt --bind 0.0.0.0:3030
 //! ```
 //!
-//! Storage model note: `RingStore` is always fully in-process heap memory —
-//! there is no disk persistence at all, so the entire dataset plus index
-//! must fit in RAM. This matches Oxigraph's `serve` (run without
-//! `--location`) for a fair memory-vs-memory comparison.
+//! Storage model note: without `--location`, `RingStore` is always fully
+//! in-process heap memory — there is no disk persistence at all, so the
+//! entire dataset plus index must fit in RAM (matches Oxigraph's `serve` run
+//! without `--location`, for a fair memory-vs-memory comparison). With
+//! `--location <dir>`, every `insert`/`remove`/`register_named_graph` call is
+//! first durably logged to a write-ahead log (WAL) file in `<dir>` before
+//! being applied in memory — see `oxigraph_nova_storage_ring::wal` and
+//! `RingStore::open` for details, and `CLAUDE.md` item 1 for the overall
+//! persistent-storage design.
 
-use oxigraph_nova_core::{GraphName, Quad};
+use oxigraph_nova_core::{GraphName, Quad, QuadStore};
 use oxigraph_nova_server::Server;
 use oxigraph_nova_storage_ring::RingStore;
 use oxttl::NTriplesParser;
@@ -32,7 +49,9 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let mut data: Option<PathBuf> = None;
+    let mut location: Option<PathBuf> = None;
     let mut bind: String = "0.0.0.0:3030".to_string();
+    let mut compact_threshold: Option<usize> = None;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -42,14 +61,35 @@ async fn main() {
                 i += 1;
                 data = Some(PathBuf::from(&args[i]));
             }
+            "--location" | "-l" => {
+                i += 1;
+                location = Some(PathBuf::from(&args[i]));
+            }
             "--bind" | "-b" => {
                 i += 1;
                 bind = args[i].clone();
             }
+            "--compact-threshold" => {
+                i += 1;
+                compact_threshold =
+                    Some(args[i].parse().unwrap_or_else(|_| {
+                        panic!("--compact-threshold must be a positive integer")
+                    }));
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: nova_serve --data <dataset.nt> [--bind 0.0.0.0:3030]\n\
-                     Loads an N-Triples file into a RingStore and serves SPARQL HTTP."
+                    "Usage: nova_serve [--data <dataset.nt>] [--location <dir>] [--bind 0.0.0.0:3030] \
+                     [--compact-threshold <n>]\n\
+                     \n\
+                     Without --location: purely in-memory RingStore, --data is required.\n\
+                     With --location <dir>: persistent WAL-backed RingStore rooted at <dir>.\n\
+                     If <dir> already has a WAL, it is replayed and --data is ignored.\n\
+                     If <dir> is empty/fresh and --data is given, the dataset is bulk-loaded\n\
+                     and then persisted (each triple logged to the WAL) for future restarts.\n\
+                     \n\
+                     --compact-threshold <n>: delta-size threshold (number of live entries)\n\
+                     that triggers automatic inline compaction for a persistent store.\n\
+                     Default: 1,000,000. Has no effect without --location."
                 );
                 return;
             }
@@ -58,42 +98,85 @@ async fn main() {
         i += 1;
     }
 
-    let data = data.expect("--data <dataset.nt> is required");
-
-    eprintln!("[nova_serve] Loading {} ...", data.display());
-    let t0 = Instant::now();
-    let file = File::open(&data).expect("failed to open dataset file");
-    let reader = BufReader::new(file);
-
-    // Phase A.3: parse quads and hand them to `bulk_load()`, which bypasses
-    // the delta `BTreeMap` entirely (avoids O(n) BTreeMap node-allocation
-    // overhead during the initial load) — see `CLAUDE.md`'s "Memory
-    // footprint investigation" section. We still log progress every 200K
-    // triples during parsing, via an iterator adapter (no separate
-    // `compact()` call needed — `bulk_load()` produces a compacted state
-    // directly).
-    let store = RingStore::new();
-    let mut parsed: usize = 0;
-    let quads = NTriplesParser::new().for_reader(reader).map(|result| {
-        let triple = result.expect("N-Triples parse error");
-        parsed += 1;
-        if parsed.is_multiple_of(200_000) {
-            eprintln!("[nova_serve]   ... {parsed} triples parsed");
+    // ── Construct the store: persistent (--location) or in-memory ──────────
+    let store = match &location {
+        Some(dir) => {
+            eprintln!(
+                "[nova_serve] Opening persistent store at {} ...",
+                dir.display()
+            );
+            let store = RingStore::open(dir).expect("RingStore::open failed");
+            if let Some(threshold) = compact_threshold {
+                store.set_auto_compact_threshold(threshold);
+                eprintln!("[nova_serve] Auto-compact threshold set to {threshold}.");
+            }
+            eprintln!(
+                "[nova_serve] Recovered {} triples from WAL.",
+                store.triple_count()
+            );
+            store
         }
-        Quad::new(
-            triple.subject,
-            triple.predicate,
-            triple.object,
-            GraphName::DefaultGraph,
-        )
-    });
+        None => RingStore::new(),
+    };
 
-    let count = store.bulk_load(quads).expect("bulk_load failed");
-    eprintln!(
-        "[nova_serve] Loaded + compacted {count} triples in {:.2}s. Ring triple_count={}",
-        t0.elapsed().as_secs_f64(),
-        store.triple_count()
-    );
+    // Bulk-load from --data only if the store came up empty (a fresh
+    // in-memory store, or a fresh/empty --location directory with no prior
+    // WAL history). If a persistent store already has data recovered from
+    // its WAL, --data is ignored — the WAL is the source of truth.
+    if let Some(data) = &data {
+        if store.triple_count() > 0 {
+            eprintln!(
+                "[nova_serve] Store already has {} triples (from --location); ignoring --data.",
+                store.triple_count()
+            );
+        } else {
+            eprintln!("[nova_serve] Loading {} ...", data.display());
+            let t0 = Instant::now();
+            let file = File::open(data).expect("failed to open dataset file");
+            let reader = BufReader::new(file);
+
+            let mut parsed: usize = 0;
+            let quads = NTriplesParser::new().for_reader(reader).map(|result| {
+                let triple = result.expect("N-Triples parse error");
+                parsed += 1;
+                if parsed.is_multiple_of(200_000) {
+                    eprintln!("[nova_serve]   ... {parsed} triples parsed");
+                }
+                Quad::new(
+                    triple.subject,
+                    triple.predicate,
+                    triple.object,
+                    GraphName::DefaultGraph,
+                )
+            });
+
+            if location.is_some() {
+                // Persistent store: go through the normal WAL-logging
+                // `insert()` path (via `extend()`) so every triple survives
+                // a restart, then compact for fast query performance.
+                let count = store.extend(quads).expect("extend failed");
+                eprintln!(
+                    "[nova_serve] Loaded {count} triples (WAL-logged) in {:.2}s.",
+                    t0.elapsed().as_secs_f64()
+                );
+                store.compact().expect("compact failed");
+            } else {
+                // Phase A.3: in-memory only — `bulk_load()` bypasses the
+                // delta `BTreeMap` entirely (avoids O(n) BTreeMap
+                // node-allocation overhead during the initial load) — see
+                // `CLAUDE.md`'s "Memory footprint investigation" section.
+                let count = store.bulk_load(quads).expect("bulk_load failed");
+                eprintln!(
+                    "[nova_serve] Loaded + compacted {count} triples in {:.2}s.",
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+        }
+    } else if location.is_none() {
+        panic!("either --data <dataset.nt> or --location <dir> is required");
+    }
+
+    eprintln!("[nova_serve] Ring triple_count={}", store.triple_count());
 
     // ── Real per-component memory breakdown (diagnostic) ────────────────────
     {
