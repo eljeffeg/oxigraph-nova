@@ -73,10 +73,9 @@ impl SortOrder {
 struct RingData {
     /// Six LOUDS tries (one per ordering) — O(1) navigation per step.
     /// `contains()`, `match_triples()`, and `spo_triples()` are all derived
-    /// from these tries via O(1)-per-step LOUDS navigation (Phase A.2 —
-    /// removed the redundant `spo: Vec<[u64;3]>` raw copy that used to
-    /// account for ~53% of Ring memory; see `CLAUDE.md`'s "Memory footprint
-    /// investigation" section).
+    /// from these tries via O(1)-per-step LOUDS navigation. There is no
+    /// redundant `spo: Vec<[u64;3]>` raw copy — that used to account for
+    /// ~53% of Ring memory before it was removed.
     cltj: CltjData,
 }
 
@@ -121,9 +120,8 @@ impl GraphRing {
     /// All triples in SPO order (for testing / serialisation).
     ///
     /// Derived by a full depth-3 traversal of the SPO LOUDS trie (O(n) over
-    /// the triple count) — Phase A.2 removed the redundant `spo: Vec<[u64;3]>`
-    /// raw copy this used to clone from (see `CLAUDE.md`'s "Memory footprint
-    /// investigation" section).
+    /// the triple count), rather than cloning from a redundant
+    /// `spo: Vec<[u64;3]>` raw copy.
     pub fn spo_triples(&self) -> Vec<[u64; 3]> {
         let data = match &self.data {
             None => return Vec::new(),
@@ -149,9 +147,9 @@ impl GraphRing {
     }
 
     /// Real allocated byte size of this graph's Ring index, for
-    /// memory-breakdown diagnostics.  This is now just the deduped
-    /// six-LOUDS-trie + vocab total from [`CltjData::mem_size_bytes`] (Phase
-    /// A.2 removed the redundant `spo: Vec<[u64;3]>` raw copy).
+    /// memory-breakdown diagnostics.  This is just the deduped
+    /// six-LOUDS-trie + vocab total from [`CltjData::mem_size_bytes`] (there
+    /// is no redundant `spo: Vec<[u64;3]>` raw copy).
     pub fn mem_size_bytes(&self) -> usize {
         match &self.data {
             None => 0,
@@ -159,8 +157,7 @@ impl GraphRing {
         }
     }
 
-    /// Per-ordering memory breakdown (Phase A.1 diagnostic — see `CLAUDE.md`'s
-    /// "Memory footprint investigation" section).  Returns `None` for an
+    /// Per-ordering memory breakdown.  Returns `None` for an
     /// empty graph.  See [`CltjData::mem_breakdown_per_ordering`] for details.
     pub fn mem_breakdown_per_ordering(&self) -> Option<[(SortOrder, LoudsMemBreakdown, usize); 6]> {
         self.data
@@ -169,9 +166,9 @@ impl GraphRing {
     }
 
     /// Deduped vocab bytes (3 unique `Arc<Vec<u64>>` allocations across all
-    /// six tries), for the Phase A.1 diagnostic.  Returns `(spo_bytes,
-    /// vocab_deduped_bytes)` — `spo_bytes` is always `0` now that Phase A.2
-    /// removed the redundant `spo: Vec<[u64;3]>` raw copy; the tuple shape is
+    /// six tries).  Returns `(spo_bytes,
+    /// vocab_deduped_bytes)` — `spo_bytes` is always `0` since there is no
+    /// redundant `spo: Vec<[u64;3]>` raw copy; the tuple shape is
     /// kept for the `nova_serve.rs` diagnostic print's benefit.
     pub fn spo_and_vocab_bytes(&self) -> (usize, usize) {
         match &self.data {
@@ -191,9 +188,7 @@ impl GraphRing {
     /// `true` if the triple `(s, p, o)` exists in this graph.
     ///
     /// Navigates the SPO LOUDS trie directly (3 O(1)-amortised seek+open
-    /// steps) rather than binary-searching a redundant raw `Vec<[u64;3]>`
-    /// (Phase A.2 — see `CLAUDE.md`'s "Memory footprint investigation"
-    /// section).
+    /// steps) rather than binary-searching a redundant raw `Vec<[u64;3]>`.
     pub fn contains(&self, s: u64, p: u64, o: u64) -> bool {
         let data = match &self.data {
             None => return false,
@@ -228,9 +223,8 @@ impl GraphRing {
     /// Chooses one of the six LOUDS-trie orderings whose depth-0 (and
     /// depth-1, if 2 fields are bound) exactly matches the bound field(s),
     /// seeks/opens through the bound prefix, then enumerates the remaining
-    /// unbound depth(s).  Replaces the old binary search + linear filter over
-    /// the redundant `spo: Vec<[u64;3]>` (Phase A.2 — see `CLAUDE.md`'s
-    /// "Memory footprint investigation" section).
+    /// unbound depth(s), rather than binary search + linear filter over
+    /// a redundant `spo: Vec<[u64;3]>`.
     pub fn match_triples(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> Vec<[u64; 3]> {
         let data = match &self.data {
             None => return Vec::new(),
@@ -364,8 +358,7 @@ impl GraphRing {
     /// Consume this `GraphRing`, producing the ε-serde-serializable
     /// [`RingSnapshot`] (triple count + optional per-graph [`CltjSnapshot`]).
     ///
-    /// Used by the persistent snapshot format (item 1b in `CLAUDE.md`'s
-    /// "What's Next").  Requires unique ownership of the underlying
+    /// Used by the persistent snapshot format.  Requires unique ownership of the underlying
     /// `Arc<RingData>` (true for a freshly built `GraphRing` that has not yet
     /// been shared, per the "always mapped" design — see `RingStore::compact`);
     /// panics via `expect` otherwise.
@@ -380,8 +373,7 @@ impl GraphRing {
     }
 
     /// Reconstruct a `GraphRing` from a [`RingSnapshot`] loaded from disk (or
-    /// from an in-memory round-trip buffer; see item 1b's "always mapped"
-    /// design in `CLAUDE.md`).
+    /// from an in-memory round-trip buffer using the "always mapped" design).
     pub(crate) fn from_snapshot(snap: RingSnapshot) -> GraphRing {
         let data = snap.cltj.map(|cltj_snap| {
             Arc::new(RingData {
@@ -396,8 +388,7 @@ impl GraphRing {
 /// optional [`CltjSnapshot`] (`None` for an empty graph, matching
 /// `GraphRing`'s own `data: Option<Arc<RingData>>` representation).
 ///
-/// This is the persistent on-disk representation for item 1b in
-/// `CLAUDE.md`'s "What's Next".  See [`GraphRing::into_snapshot`] and
+/// This is the persistent on-disk representation.  See [`GraphRing::into_snapshot`] and
 /// [`GraphRing::from_snapshot`].
 #[derive(Epserde)]
 pub(crate) struct RingSnapshot {
@@ -413,8 +404,7 @@ pub(crate) struct RingSnapshot {
 /// `[s, p, o]` order via [`SortOrder::to_spo`].
 ///
 /// Used by [`GraphRing::match_triples`] to enumerate the unbound suffix of a
-/// pattern match after seeking through the bound prefix (Phase A.2 — see
-/// `CLAUDE.md`'s "Memory footprint investigation" section).
+/// pattern match after seeking through the bound prefix.
 fn enumerate_suffix(
     mut it: Box<dyn TrieIterator>,
     depth_reached: usize,
@@ -510,8 +500,8 @@ impl RingBuilder {
         );
 
         // orig_s/p/o and map_s/p/o are consumed by build_cltj_data above.
-        // RingData only keeps the six LOUDS tries (Phase A.2 removed the
-        // redundant `spo: Vec<[u64;3]>` raw copy of `triples`).
+        // RingData only keeps the six LOUDS tries — there is no
+        // redundant `spo: Vec<[u64;3]>` raw copy of `triples`.
         let _ = (map_s, map_p, map_o); // explicitly consumed above
         let data = Arc::new(RingData { cltj });
 

@@ -19,21 +19,38 @@
 //! not enable `#[serde(deny_unknown_fields)]`.
 //!
 //! Result serialisation:
-//!   SELECT / ASK        → `application/sparql-results+json`  (via `sparesults`)
+//!   SELECT / ASK        → content-negotiated via `Accept`: `application/sparql-results+xml`
+//!                          (`sparesults` XML), `text/csv` (CSV), `text/tab-separated-values`
+//!                          (TSV), or `application/sparql-results+json` (default, and used
+//!                          whenever `Accept` doesn't specifically ask for one of the others).
 //!   CONSTRUCT/DESCRIBE   → content-negotiated via `Accept`: `application/ld+json`
 //!                          (via `oxjsonld::JsonLdSerializer`), `text/turtle` (via
-//!                          `oxttl::TurtleSerializer`), or `application/n-triples`
-//!                          (default, and used whenever `Accept` doesn't ask for
-//!                          Turtle or JSON-LD specifically).
+//!                          `oxttl::TurtleSerializer`), `application/rdf+xml` (via
+//!                          `oxrdfxml::RdfXmlSerializer`), `application/n-quads` (via
+//!                          `oxttl::NQuadsSerializer`), `application/trig` (via
+//!                          `oxttl::TriGSerializer`), or `application/n-triples`
+//!                          (default, and used whenever `Accept` doesn't ask for one of
+//!                          the others specifically). N-Quads/TriG output places every
+//!                          triple in the default graph, since CONSTRUCT/DESCRIBE results
+//!                          are graph-agnostic in this server's `QueryResult::Triples`
+//!                          representation.
 //!
 //! Bulk-load / Graph Store PUT/POST bodies are parsed by Content-Type:
 //!   `text/turtle` (default / unrecognised) → `oxttl::TurtleParser`
 //!   `application/n-triples`                → `oxttl::NTriplesParser`
+//!   `application/n-quads`                  → `oxttl::NQuadsParser`
+//!   `application/trig`                     → `oxttl::TriGParser`
 //!   `application/rdf+xml`                  → `oxrdfxml::RdfXmlParser`
 //!   `application/ld+json`                  → `oxjsonld::JsonLdParser`
 //!
-
+//! As with JSON-LD, N-Quads/TriG bulk-load bodies may carry their own named-graph
+//! information, but since `parse_body_triples` always returns plain `Triple`s for
+//! insertion into the *one* target graph named by the Graph Store Protocol request,
+//! any non-default-graph component on a parsed quad is dropped in favor of that
+//! target graph.
+//!
 //! # Usage
+
 //! ```no_run
 //! use oxigraph_nova_server::Server;
 //! use oxigraph_nova_storage_memory::MemoryStore;
@@ -46,7 +63,7 @@
 //! }
 //! ```
 //!
-//! # Transactional isolation semantics (`CLAUDE.md` item 1f)
+//! # Transactional isolation semantics
 //!
 //! Upstream Oxigraph documents a "repeatable read" isolation guarantee for
 //! every operation: a query, or an Update, observes one fixed snapshot of
@@ -68,25 +85,31 @@
 //! `crates/nova-server/tests/isolation.rs`'s two integration tests.
 
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Query as AxumQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use oxigraph_nova_core::QuadStore;
 use oxigraph_nova_query::{
-    Evaluator, QueryResult, Solution, StoreDataset, clear_graph, execute_update,
+    Evaluator, QueryResult, Solutions, StoreDataset, clear_graph, execute_update,
 };
 use oxjsonld::{JsonLdParser, JsonLdSerializer};
-use oxrdf::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, QuadRef, Term, Triple, Variable};
-use oxrdfxml::RdfXmlParser;
-use oxttl::{NTriplesParser, NTriplesSerializer, TurtleParser, TurtleSerializer};
-
+use oxrdf::{
+    GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, QuadRef, Term, Triple, Variable,
+};
+use oxrdfxml::{RdfXmlParser, RdfXmlSerializer};
+use oxttl::{
+    NQuadsParser, NQuadsSerializer, NTriplesParser, NTriplesSerializer, TriGParser, TriGSerializer,
+    TurtleParser, TurtleSerializer,
+};
 use serde::Deserialize;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use spargebra::algebra::GraphPattern;
 use spargebra::{Query, SparqlParser};
+use std::io::Write as _;
 use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -376,6 +399,18 @@ fn parse_body_triples(content_type: &str, body: &[u8]) -> Result<Vec<Triple>, Bo
             .for_reader(body)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| err(e.to_string()))
+    } else if content_type.starts_with("application/n-quads") {
+        NQuadsParser::new()
+            .for_reader(body)
+            .map(|r| r.map(|q| Triple::new(q.subject, q.predicate, q.object)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| err(e.to_string()))
+    } else if content_type.starts_with("application/trig") {
+        TriGParser::new()
+            .for_reader(body)
+            .map(|r| r.map(|q| Triple::new(q.subject, q.predicate, q.object)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| err(e.to_string()))
     } else if content_type.starts_with("application/rdf+xml") {
         RdfXmlParser::new()
             .for_reader(body)
@@ -395,7 +430,6 @@ fn parse_body_triples(content_type: &str, body: &[u8]) -> Result<Vec<Triple>, Bo
             .map_err(|e| err(e.to_string()))
     }
 }
-
 
 /// Insert parsed `Triple`s into `graph` as `Quad`s.
 fn insert_triples_into_graph<S: QuadStore>(
@@ -446,14 +480,16 @@ async fn store_get<S: QuadStore + 'static>(
     let triples: Vec<Triple> = stored
         .into_iter()
         .filter_map(|sq| {
-            let subject = match sq.subject {
-                Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
-                Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
+            let subject = match sq.subject.as_ref() {
+                Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n.clone()),
+                Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b.clone()),
                 _ => return None,
             };
-            Some(Triple::new(subject, sq.predicate, sq.object))
+            let object = Arc::unwrap_or_clone(sq.object);
+            Some(Triple::new(subject, sq.predicate, object))
         })
         .collect();
+
     serialize_triples(&triples, accept_header(&headers))
 }
 
@@ -592,77 +628,190 @@ fn execute_sparql_query<S: QuadStore + 'static>(
             format!("Evaluation error: {e}"),
         )
             .into_response(),
-        Ok(QueryResult::Boolean(b)) => serialize_boolean(b),
+        Ok(QueryResult::Boolean(b)) => serialize_boolean(b, accept),
         Ok(QueryResult::Solutions(solutions)) => {
             let vars = query_select_vars(&query);
-            serialize_solutions(&vars, &solutions)
+            serialize_solutions(&vars, solutions, accept)
         }
+
         Ok(QueryResult::Triples(triples)) => serialize_triples(&triples, accept),
     }
 }
 
 // ── Result serialization ──────────────────────────────────────────────────────
 
-/// Serialize an ASK boolean result as `application/sparql-results+json`.
-fn serialize_boolean(value: bool) -> Response {
+/// Resolve the `Accept` header to a [`QueryResultsFormat`] for SELECT/ASK
+/// serialization, content-negotiated across the four formats `sparesults`
+/// supports:
+///   - `Accept` contains `application/sparql-results+xml` → XML
+///   - `Accept` contains `text/csv`                       → CSV
+///   - `Accept` contains `text/tab-separated-values`      → TSV
+///   - anything else (default)                            → JSON
+///
+/// The SPARQL 1.1 Protocol requires servers to support at least JSON and XML
+/// for SELECT/ASK; this covers all four `sparesults`-supported formats.
+fn results_format_for_accept(accept: &str) -> QueryResultsFormat {
+    if accept.contains("application/sparql-results+xml") {
+        QueryResultsFormat::Xml
+    } else if accept.contains("text/csv") {
+        QueryResultsFormat::Csv
+    } else if accept.contains("text/tab-separated-values") {
+        QueryResultsFormat::Tsv
+    } else {
+        QueryResultsFormat::Json
+    }
+}
+
+/// Serialize an ASK boolean result, content-negotiated via `Accept` (see
+/// `results_format_for_accept`).
+fn serialize_boolean(value: bool, accept: &str) -> Response {
+    let format = results_format_for_accept(accept);
     let mut buf = Vec::new();
-    match QueryResultsSerializer::from_format(QueryResultsFormat::Json)
-        .serialize_boolean_to_writer(&mut buf, value)
-    {
+    match QueryResultsSerializer::from_format(format).serialize_boolean_to_writer(&mut buf, value) {
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         Ok(_) => (
             StatusCode::OK,
-            [(
-                header::CONTENT_TYPE,
-                "application/sparql-results+json; charset=utf-8",
-            )],
+            [(header::CONTENT_TYPE, results_content_type(format))],
             buf,
         )
             .into_response(),
     }
 }
 
-/// Serialize a SELECT result set as `application/sparql-results+json`.
+/// Chunk size threshold (bytes) at which a streamed response flushes its
+/// buffered output to the client. ~1 MiB, matching QLever's chunked
+/// streaming design: large enough to amortize channel-send overhead, small
+/// enough to bound peak memory for the serializer's output buffer.
+const STREAM_CHUNK_SIZE: usize = 1 << 20;
+
+/// A [`std::io::Write`] implementation that batches bytes and forwards them
+/// as `~1 MiB` [`Bytes`] chunks over a bounded `tokio` channel, so the
+/// (synchronous) `sparesults` serializer can run on a background thread
+/// while the response body is streamed to the client as it's produced,
+/// rather than being fully buffered in memory first.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    buf: Vec<u8>,
+}
+
+impl ChannelWriter {
+    fn new(tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>) -> Self {
+        Self {
+            tx,
+            buf: Vec::with_capacity(STREAM_CHUNK_SIZE),
+        }
+    }
+
+    /// Send the current buffer contents (if any) as one chunk.
+    fn flush_chunk(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        self.tx.blocking_send(Ok(chunk)).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "response receiver dropped")
+        })
+    }
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= STREAM_CHUNK_SIZE {
+            self.flush_chunk()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_chunk()
+    }
+}
+
+/// Serialize a SELECT result set, content-negotiated via `Accept` (see
+/// `results_format_for_accept`).
 ///
 /// `variables` is the ordered projection list from the query's `Project` node;
-/// it defines the JSON `"head": {"vars": [...]}` header and determines which
-/// bindings are emitted for each solution (unbound variables are omitted, per
-/// the W3C SPARQL 1.1 results format).
-fn serialize_solutions(variables: &[Variable], solutions: &[Solution]) -> Response {
-    let mut buf = Vec::<u8>::new();
-    let result: std::io::Result<()> = (|| {
-        let mut writer = QueryResultsSerializer::from_format(QueryResultsFormat::Json)
-            .serialize_solutions_to_writer(&mut buf, variables.to_vec())?;
-        for sol in solutions {
-            // Emit only bound variables; unbound are absent (SPARQL JSON § 3.2.1).
-            writer.serialize(
-                variables
-                    .iter()
-                    .filter_map(|v| sol.get(v).map(|t| (v.as_ref(), t.as_ref()))),
-            )?;
-        }
-        writer.finish()?;
-        Ok(())
-    })();
+/// it defines the results header (JSON `"head": {"vars": [...]}` / XML
+/// `<head><variable name=.../></head>` / CSV+TSV header row) and determines
+/// which bindings are emitted for each solution (unbound variables are
+/// omitted, per the W3C SPARQL 1.1 results format).
+///
+/// The response body is streamed: the (synchronous) `sparesults` serializer
+/// runs on a background thread and forwards `~1 MiB` chunks through a
+/// bounded channel as they're produced, so the full serialized output is
+/// never buffered in memory all at once (matches QLever's chunked-transfer
+/// design and avoids doubling peak memory for large result sets).
+fn serialize_solutions(variables: &[Variable], solutions: Solutions, accept: &str) -> Response {
+    let format = results_format_for_accept(accept);
+    let content_type = results_content_type(format);
+    let variables = variables.to_vec();
 
-    match result {
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        Ok(()) => (
-            StatusCode::OK,
-            [(
-                header::CONTENT_TYPE,
-                "application/sparql-results+json; charset=utf-8",
-            )],
-            buf,
-        )
-            .into_response(),
+    // `Solution` embeds an `Rc<RefCell<_>>` (its per-row `BNODE()` cache),
+    // so it isn't `Send` and can't be moved into a background thread as-is.
+    // Extract each row's bound (Variable, Term) pairs — plain owned data,
+    // no `Rc` — into a `Send`-safe intermediate before spawning; this is a
+    // shallow re-shape (the `Term`s themselves are moved, not deep-cloned).
+    let rows: Vec<Vec<(Variable, Term)>> = solutions
+        .into_iter()
+        .map(|sol| {
+            variables
+                .iter()
+                .filter_map(|v| sol.get(v).map(|t| (v.clone(), t.clone())))
+                .collect()
+        })
+        .collect();
+
+    // Bounded channel: a handful of ~1 MiB chunks in flight is enough to
+    // decouple producer/consumer speed without unbounded buffering.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+
+    std::thread::spawn(move || {
+        let writer = ChannelWriter::new(tx.clone());
+        let result: std::io::Result<()> = (|| {
+            let mut ser = QueryResultsSerializer::from_format(format)
+                .serialize_solutions_to_writer(writer, variables.clone())?;
+            for row in &rows {
+                // Emit only bound variables; unbound are absent (SPARQL JSON § 3.2.1).
+                ser.serialize(row.iter().map(|(v, t)| (v.as_ref(), t.as_ref())))?;
+            }
+            let mut writer = ser.finish()?;
+            writer.flush()?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            tracing::error!("error while streaming SPARQL solutions: {e}");
+            let _ = tx.blocking_send(Err(e));
+        }
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(rx));
+    (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+/// Content-Type header value for a given [`QueryResultsFormat`].
+fn results_content_type(format: QueryResultsFormat) -> &'static str {
+    match format {
+        QueryResultsFormat::Json => "application/sparql-results+json; charset=utf-8",
+        QueryResultsFormat::Xml => "application/sparql-results+xml; charset=utf-8",
+        QueryResultsFormat::Csv => "text/csv; charset=utf-8",
+        QueryResultsFormat::Tsv => "text/tab-separated-values; charset=utf-8",
+        _ => "application/sparql-results+json; charset=utf-8",
     }
 }
 
 /// Serialize a CONSTRUCT/DESCRIBE result, content-negotiated via `Accept`:
 ///   - `Accept` contains `application/ld+json` → JSON-LD (`oxjsonld::JsonLdSerializer`)
 ///   - `Accept` contains `text/turtle`         → Turtle (`oxttl::TurtleSerializer`)
+///   - `Accept` contains `application/rdf+xml` → RDF/XML (`oxrdfxml::RdfXmlSerializer`)
+///   - `Accept` contains `application/n-quads` → N-Quads (`oxttl::NQuadsSerializer`)
+///   - `Accept` contains `application/trig`    → TriG (`oxttl::TriGSerializer`)
 ///   - anything else (default)                 → `application/n-triples`
+///
+/// N-Quads/TriG output places every triple in the default graph, since
+/// CONSTRUCT/DESCRIBE results are graph-agnostic in this server's
+/// `QueryResult::Triples` representation.
 ///
 /// Also used directly by the Graph Store Protocol's `GET /store` handler so
 /// both code paths share one serializer.
@@ -671,6 +820,12 @@ fn serialize_triples(triples: &[Triple], accept: &str) -> Response {
         serialize_triples_jsonld(triples)
     } else if accept.contains("text/turtle") {
         serialize_triples_turtle(triples)
+    } else if accept.contains("application/rdf+xml") {
+        serialize_triples_rdfxml(triples)
+    } else if accept.contains("application/n-quads") {
+        serialize_triples_nquads(triples)
+    } else if accept.contains("application/trig") {
+        serialize_triples_trig(triples)
     } else {
         serialize_triples_ntriples(triples)
     }
@@ -679,7 +834,12 @@ fn serialize_triples(triples: &[Triple], accept: &str) -> Response {
 fn serialize_triples_jsonld(triples: &[Triple]) -> Response {
     let mut writer = JsonLdSerializer::new().for_writer(Vec::new());
     for t in triples {
-        let quad = QuadRef::new(&t.subject, &t.predicate, &t.object, GraphNameRef::DefaultGraph);
+        let quad = QuadRef::new(
+            &t.subject,
+            &t.predicate,
+            &t.object,
+            GraphNameRef::DefaultGraph,
+        );
         if let Err(e) = writer.serialize_quad(quad) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
@@ -694,7 +854,6 @@ fn serialize_triples_jsonld(triples: &[Triple]) -> Response {
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
-
 
 fn serialize_triples_ntriples(triples: &[Triple]) -> Response {
     let mut writer = NTriplesSerializer::new().for_writer(Vec::new());
@@ -723,6 +882,70 @@ fn serialize_triples_turtle(triples: &[Triple]) -> Response {
         Ok(buf) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/turtle; charset=utf-8")],
+            buf,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn serialize_triples_rdfxml(triples: &[Triple]) -> Response {
+    let mut writer = RdfXmlSerializer::new().for_writer(Vec::new());
+    for t in triples {
+        if let Err(e) = writer.serialize_triple(t) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    match writer.finish() {
+        Ok(buf) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/rdf+xml; charset=utf-8")],
+            buf,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn serialize_triples_nquads(triples: &[Triple]) -> Response {
+    let mut writer = NQuadsSerializer::new().for_writer(Vec::new());
+    for t in triples {
+        let quad = QuadRef::new(
+            &t.subject,
+            &t.predicate,
+            &t.object,
+            GraphNameRef::DefaultGraph,
+        );
+        if let Err(e) = writer.serialize_quad(quad) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    let buf = writer.finish();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/n-quads; charset=utf-8")],
+        buf,
+    )
+        .into_response()
+}
+
+fn serialize_triples_trig(triples: &[Triple]) -> Response {
+    let mut writer = TriGSerializer::new().for_writer(Vec::new());
+    for t in triples {
+        let quad = QuadRef::new(
+            &t.subject,
+            &t.predicate,
+            &t.object,
+            GraphNameRef::DefaultGraph,
+        );
+        if let Err(e) = writer.serialize_quad(quad) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    match writer.finish() {
+        Ok(buf) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/trig; charset=utf-8")],
             buf,
         )
             .into_response(),
@@ -1430,13 +1653,210 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert!(ct.contains("application/ld+json"), "wrong content-type: {ct}");
+        assert!(
+            ct.contains("application/ld+json"),
+            "wrong content-type: {ct}"
+        );
         let json = body_json(resp).await;
-        // JSON-LD output is a top-level object with an "@graph" array of node objects.
-        let graph = json["@graph"].as_array().expect("expected @graph array");
+        // With no `@context`/prefixes configured on the serializer, the output
+        // is a bare top-level JSON array of expanded node objects (no `@graph`
+        // wrapper — that only appears when a base IRI or prefix is set).
+        let graph = json.as_array().expect("expected top-level JSON array");
         assert_eq!(graph.len(), 2, "expected 2 subjects with names");
         let body = serde_json::to_string(&json).unwrap();
         assert!(body.contains("http://ex/alice"));
+    }
+
+    #[tokio::test]
+    async fn test_construct_rdfxml_via_accept() {
+        let sparql = r#"CONSTRUCT { ?s <http://ex/name> ?n } WHERE { ?s <http://ex/name> ?n }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .header("accept", "application/rdf+xml")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            ct.contains("application/rdf+xml"),
+            "wrong content-type: {ct}"
+        );
+        let body = body_text(resp).await;
+        assert!(body.contains("http://ex/alice"));
+    }
+
+    #[tokio::test]
+    async fn test_construct_nquads_via_accept() {
+        let sparql = r#"CONSTRUCT { ?s <http://ex/name> ?n } WHERE { ?s <http://ex/name> ?n }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .header("accept", "application/n-quads")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            ct.contains("application/n-quads"),
+            "wrong content-type: {ct}"
+        );
+        let body = body_text(resp).await;
+        assert!(body.contains("http://ex/alice"));
+    }
+
+    #[tokio::test]
+    async fn test_construct_trig_via_accept() {
+        let sparql = r#"CONSTRUCT { ?s <http://ex/name> ?n } WHERE { ?s <http://ex/name> ?n }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .header("accept", "application/trig")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("application/trig"), "wrong content-type: {ct}");
+        let body = body_text(resp).await;
+        assert!(body.contains("http://ex/alice"));
+    }
+
+    #[tokio::test]
+    async fn test_select_results_xml_via_accept() {
+        let sparql = "SELECT ?s WHERE { ?s <http://ex/name> ?n }";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .header("accept", "application/sparql-results+xml")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            ct.contains("application/sparql-results+xml"),
+            "wrong content-type: {ct}"
+        );
+        let body = body_text(resp).await;
+        assert!(body.contains("<?xml"));
+    }
+
+    #[tokio::test]
+    async fn test_select_results_csv_via_accept() {
+        let sparql = "SELECT ?s WHERE { ?s <http://ex/name> ?n }";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .header("accept", "text/csv")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/csv"), "wrong content-type: {ct}");
+        let body = body_text(resp).await;
+        assert!(body.starts_with('s'), "expected CSV header row: {body}");
+        assert_eq!(body.lines().count(), 3, "header + 2 rows expected");
+    }
+
+    #[tokio::test]
+    async fn test_select_results_tsv_via_accept() {
+        let sparql = "SELECT ?s WHERE { ?s <http://ex/name> ?n }";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .header("accept", "text/tab-separated-values")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            ct.contains("text/tab-separated-values"),
+            "wrong content-type: {ct}"
+        );
+        let body = body_text(resp).await;
+        assert!(body.starts_with('?'), "expected TSV header row: {body}");
+        assert_eq!(body.lines().count(), 3, "header + 2 rows expected");
+    }
+
+    #[tokio::test]
+    async fn test_ask_results_xml_via_accept() {
+        let sparql = r#"ASK { <http://ex/alice> <http://ex/name> "Alice" }"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .header("accept", "application/sparql-results+xml")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            ct.contains("application/sparql-results+xml"),
+            "wrong content-type: {ct}"
+        );
+        let body = body_text(resp).await;
+        assert!(body.contains("true"));
     }
 
     // ── JSON-LD bulk-load (PUT /store) ────────────────────────────────────────
@@ -1461,6 +1881,39 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
+    #[tokio::test]
+    async fn test_store_put_nquads_content_type() {
+        let router = make_router();
+        let nq = "<http://ex/heidi> <http://ex/name> \"Heidi\" <http://ex/somegraph> .\n";
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/store?graph=http%3A%2F%2Fex%2Fnq")
+            .header("content-type", "application/n-quads")
+            .body(Body::from(nq))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_store_put_trig_content_type() {
+        let router = make_router();
+        let trig = r#"<http://ex/somegraph> {
+            <http://ex/ivan> <http://ex/name> "Ivan" .
+        }"#;
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/store?graph=http%3A%2F%2Fex%2Ftrig")
+            .header("content-type", "application/trig")
+            .body(Body::from(trig))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
 
     // ── Graph Store HTTP Protocol: GET /store ─────────────────────────────────
 

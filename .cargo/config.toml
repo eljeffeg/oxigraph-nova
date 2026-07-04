@@ -1,8 +1,8 @@
 # ── Per-architecture codegen flags ─────────────────────────────────────────────
 #
 # Rust equivalents of the C++ -march / -fuse-ld=lld build flags.
-# See CLAUDE.md "Build Configuration" for rationale.
 #
+
 # PORTABLE FLOOR (committed default):
 #   x86_64  → -C target-cpu=x86-64-v3   (AVX2 + FMA + BMI2 + popcnt; Haswell 2013+, Zen1 2017+)
 #   aarch64 → -C target-feature=+dotprod,+aes,+sha2  (Graviton2 / Neoverse N1 / Ampere Altra 2018+)

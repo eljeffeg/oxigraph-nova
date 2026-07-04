@@ -14,6 +14,7 @@ pub use error::Oxigraph;
 pub use oxrdf::{
     BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable,
 };
+use std::sync::Arc;
 pub use store::QuadStore;
 pub use trie::{EmptyTrieIter, TrieIterator};
 
@@ -35,20 +36,31 @@ pub type Subject = NamedOrBlankNode;
 /// `QuadStore::insert(&oxrdf::Quad)` — inserting a quoted-triple subject
 /// requires the caller to pack the data via the dictionary directly (a
 /// limitation of oxrdf 0.3 that will be lifted in 0.5).
+///
+/// ## Memory footprint
+///
+/// `subject` and `object` are `Arc<Term>` rather than owned `Term`. The
+/// dictionary already stores each interned term as a shared `Arc<Term>`
+/// (see `Dictionary::get_term_arc`), so decoding a matched row can clone
+/// the `Arc` (a cheap refcount bump) instead of deep-cloning the term's
+/// heap-allocated string content. This matters most for join-heavy or
+/// large-result queries, where deep-cloning every subject/object for every
+/// matched row would otherwise be expensive.
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredQuad {
-    pub subject: Term,
+    pub subject: Arc<Term>,
     pub predicate: NamedNode,
-    pub object: Term,
+    pub object: Arc<Term>,
     pub graph_name: GraphName,
 }
 
 impl From<Quad> for StoredQuad {
     fn from(q: Quad) -> Self {
         Self {
-            subject: Term::from(q.subject),
+            subject: Arc::new(Term::from(q.subject)),
             predicate: q.predicate,
-            object: q.object,
+            object: Arc::new(q.object),
             graph_name: q.graph_name,
         }
     }

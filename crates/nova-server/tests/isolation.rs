@@ -1,4 +1,4 @@
-//! Transactional isolation semantics integration test (`CLAUDE.md` item 1f).
+//! Transactional isolation semantics integration test.
 //!
 //! Upstream Oxigraph documents a "repeatable read" isolation guarantee: any
 //! single read operation, or read/write operation, observes a fixed snapshot
@@ -99,7 +99,7 @@ fn concurrent_update_is_visible_mid_multi_pattern_query_no_repeatable_read() {
         "second scan (of the SAME logical multi-pattern query) observes the quad \
          inserted after the query began — this is the absence of a repeatable-read/ \
          fixed-snapshot guarantee across multiple store calls, documented in \
-         RingStore's module doc comment and CLAUDE.md item 1f. A true repeatable-read \
+         RingStore's module doc comment. A true repeatable-read \
          guarantee would require `second_count == first_count == 1`."
     );
 }

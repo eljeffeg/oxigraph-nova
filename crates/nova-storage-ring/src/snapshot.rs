@@ -1,21 +1,21 @@
-//! Whole-store persistent snapshot format (item 1b in `CLAUDE.md`'s "What's
-//! Next"): a single ε-serde-serializable [`StoreSnapshot`] capturing every
-//! graph's compacted [`GraphRing`] (via [`RingSnapshot`]).
+//! Whole-store persistent snapshot format: a single ε-serde-serializable
+//! [`StoreSnapshot`] capturing every graph's compacted [`GraphRing`] (via
+//! [`RingSnapshot`]).
 //!
 //! ## Design
 //!
 //! - **One file, whole-store.**  Rather than one file per graph (which would
-//!   need a manifest to enumerate them — deferred to item 1c), a single
+//!   need a manifest to enumerate them), a single
 //!   snapshot captures all graphs as parallel `graph_ids: Vec<u8>` /
 //!   `rings: Vec<RingSnapshot>` vectors (avoiding any need for `HashMap` or
 //!   tuple ε-serde support, neither of which epserde provides directly).
 //!
 //! - **Dictionary persistence (see `dict_snapshot.rs`).**  The
 //!   `RingSnapshot`s embed raw `u64` term IDs assigned by the `Dictionary` at
-//!   compaction time. Under item 1b's original full-WAL-replay model this
-//!   needed no separate persistence, because replaying every record from
-//!   byte 0 reconstructs a byte-identical `Dictionary` deterministically.
-//!   Item 1c changed this: `open()` now replays only the **tail** WAL
+//!   compaction time. A full-WAL-replay model needs no separate persistence,
+//!   because replaying every record from byte 0 reconstructs a
+//!   byte-identical `Dictionary` deterministically. Tail-only WAL replay
+//!   changes this: `open()` replays only the **tail** WAL
 //!   segment(s) on top of a loaded snapshot generation (see `manifest.rs`),
 //!   so a fresh, empty `Dictionary` used during replay would reassign
 //!   `TermId`s starting from `0`, colliding with the ID space the loaded
@@ -26,19 +26,18 @@
 //!   `Dictionary::rebuild` *before* the WAL tail is replayed, so replay's
 //!   `intern()` calls only ever append new terms after the snapshot's
 //!   high-water-mark.
-
+//!
 //! - **"Always mapped".**  [`StoreSnapshot::round_trip_and_maybe_save`] is
 //!   used by `RingStore::compact()` (and `bulk_load()`) to replace the
 //!   freshly-built `Arc<GraphRing>` map with the result of serializing it
 //!   and immediately deserializing it back — so the servable representation
 //!   is always literally "what ε-serde deserialized", matching what will
-//!   later be loaded from disk (Option A: `deserialize_full`) or eventually
-//!   mmap'd (Option B: `deserialize_eps`/`mmap`, deferred — see `CLAUDE.md`).
-//!   Since ε-serde's on-disk byte format is identical for both loading
-//!   strategies, Option B can be added later with **zero** file-format
-//!   migration.  This round-trip happens in `compact()`/`bulk_load()`, never
-//!   on the query hot path (`quads_for_pattern`/`join_scan`), so it cannot
-//!   affect query latency.
+//!   later be loaded from disk (`deserialize_full`) or eventually
+//!   mmap'd (`deserialize_eps`/`mmap`). Since ε-serde's on-disk byte format
+//!   is identical for both loading strategies, mmap loading can be added
+//!   later with **zero** file-format migration.  This round-trip happens in
+//!   `compact()`/`bulk_load()`, never on the query hot path
+//!   (`quads_for_pattern`/`join_scan`), so it cannot affect query latency.
 //!
 //! - **Snapshot writing is purely additive.**  `compact()` continues to
 //!   clear the delta and swap in the new `Ring` exactly as before; writing
@@ -109,13 +108,20 @@ impl StoreSnapshot {
                 .map_err(|e| Oxigraph::Storage(format!("snapshot serialize failed: {e}")))?;
         }
 
+        // Compress the on-disk copy with zstd (level 3) — the in-memory
+        // round-trip below always uses the uncompressed `buf` directly, so
+        // this has zero effect on servable-representation semantics (see
+        // module docs' "Always mapped" section); it only shrinks what
+        // actually hits disk.
         if let Some(path) = path {
+            let compressed = zstd::encode_all(&buf[..], 3)
+                .map_err(|e| Oxigraph::Storage(format!("snapshot compress failed: {e}")))?;
             let tmp_path = {
                 let mut s = path.as_os_str().to_os_string();
                 s.push(".tmp");
                 std::path::PathBuf::from(s)
             };
-            std::fs::write(&tmp_path, &buf)
+            std::fs::write(&tmp_path, &compressed)
                 .map_err(|e| Oxigraph::Storage(format!("snapshot write failed: {e}")))?;
             std::fs::rename(&tmp_path, path)
                 .map_err(|e| Oxigraph::Storage(format!("snapshot rename failed: {e}")))?;
@@ -130,7 +136,7 @@ impl StoreSnapshot {
     }
 
     /// Load a `StoreSnapshot` from `path` (if it exists) and reconstruct the
-    /// per-graph `Arc<GraphRing>` map.  Returns an empty map if `path`
+    /// per-graph `Arc<GraphRing>` map. Returns an empty map if `path`
     /// doesn't exist (fresh store, or a persistent store that has never
     /// been compacted).
     pub(crate) fn load_from_file(
@@ -139,8 +145,17 @@ impl StoreSnapshot {
         if !path.exists() {
             return Ok(HashMap::new());
         }
+        // The file on disk is zstd-compressed (see `round_trip_and_maybe_save`);
+        // decompress into an in-memory buffer first, then deserialize via
+        // ε-serde's `deserialize_full` (not `load_full`, which mmaps the file
+        // directly — not applicable once the on-disk bytes are compressed).
+        let compressed = std::fs::read(path)
+            .map_err(|e| Oxigraph::Storage(format!("snapshot read failed: {e}")))?;
+        let buf = zstd::decode_all(&compressed[..])
+            .map_err(|e| Oxigraph::Storage(format!("snapshot decompress failed: {e}")))?;
+        let mut cursor = std::io::Cursor::new(&buf[..]);
         let snap = unsafe {
-            StoreSnapshot::load_full(path)
+            StoreSnapshot::deserialize_full(&mut cursor)
                 .map_err(|e| Oxigraph::Storage(format!("snapshot load failed: {e}")))?
         };
         Ok(snap.into_graphs())

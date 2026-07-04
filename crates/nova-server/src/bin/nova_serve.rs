@@ -30,19 +30,18 @@
 //! `--location <dir>`, every `insert`/`remove`/`register_named_graph` call is
 //! first durably logged to a write-ahead log (WAL) file in `<dir>` before
 //! being applied in memory — see `oxigraph_nova_storage_ring::wal` and
-//! `RingStore::open` for details, and `CLAUDE.md` item 1 for the overall
-//! persistent-storage design.
+//! `RingStore::open` for details of the overall persistent-storage design.
 
-use oxigraph_nova_core::{GraphName, Quad, QuadStore};
+use oxigraph_nova_core::{GraphName, Quad};
 use oxigraph_nova_server::Server;
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::{RingStore, SyncPolicy};
 use oxttl::NTriplesParser;
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[tokio::main]
 async fn main() {
@@ -52,6 +51,7 @@ async fn main() {
     let mut location: Option<PathBuf> = None;
     let mut bind: String = "0.0.0.0:3030".to_string();
     let mut compact_threshold: Option<usize> = None;
+    let mut sync_interval_ms: Option<u64> = None;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -76,10 +76,17 @@ async fn main() {
                         panic!("--compact-threshold must be a positive integer")
                     }));
             }
+            "--sync-interval-ms" => {
+                i += 1;
+                sync_interval_ms =
+                    Some(args[i].parse().unwrap_or_else(|_| {
+                        panic!("--sync-interval-ms must be a positive integer")
+                    }));
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: nova_serve [--data <dataset.nt>] [--location <dir>] [--bind 0.0.0.0:3030] \
-                     [--compact-threshold <n>]\n\
+                     [--compact-threshold <n>] [--sync-interval-ms <n>]\n\
                      \n\
                      Without --location: purely in-memory RingStore, --data is required.\n\
                      With --location <dir>: persistent WAL-backed RingStore rooted at <dir>.\n\
@@ -89,10 +96,18 @@ async fn main() {
                      \n\
                      --compact-threshold <n>: delta-size threshold (number of live entries)\n\
                      that triggers automatic inline compaction for a persistent store.\n\
-                     Default: 1,000,000. Has no effect without --location."
+                     Default: 1,000,000. Has no effect without --location.\n\
+                     \n\
+                     --sync-interval-ms <n>: switch WAL durability policy from the default\n\
+                     `Always` (fsync every write) to `Interval(n ms)` — a background thread\n\
+                     fsyncs the WAL every n milliseconds instead ('group commit'), trading a\n\
+                     bounded durability window (writes acknowledged since the last flush can\n\
+                     be lost on a crash) for much higher write throughput. Has no effect\n\
+                     without --location. See oxigraph_nova_storage_ring::SyncPolicy docs."
                 );
                 return;
             }
+
             other => panic!("unknown argument: {other}"),
         }
         i += 1;
@@ -110,6 +125,14 @@ async fn main() {
                 store.set_auto_compact_threshold(threshold);
                 eprintln!("[nova_serve] Auto-compact threshold set to {threshold}.");
             }
+            if let Some(ms) = sync_interval_ms {
+                store.set_sync_policy(SyncPolicy::Interval(Duration::from_millis(ms)));
+                eprintln!(
+                    "[nova_serve] WAL sync policy set to Interval({ms}ms) — group commit \
+                     (bounded durability window; see --help)."
+                );
+            }
+
             eprintln!(
                 "[nova_serve] Recovered {} triples from WAL.",
                 store.triple_count()
@@ -150,27 +173,27 @@ async fn main() {
                 )
             });
 
-            if location.is_some() {
-                // Persistent store: go through the normal WAL-logging
-                // `insert()` path (via `extend()`) so every triple survives
-                // a restart, then compact for fast query performance.
-                let count = store.extend(quads).expect("extend failed");
-                eprintln!(
-                    "[nova_serve] Loaded {count} triples (WAL-logged) in {:.2}s.",
-                    t0.elapsed().as_secs_f64()
-                );
-                store.compact().expect("compact failed");
-            } else {
-                // Phase A.3: in-memory only — `bulk_load()` bypasses the
-                // delta `BTreeMap` entirely (avoids O(n) BTreeMap
-                // node-allocation overhead during the initial load) — see
-                // `CLAUDE.md`'s "Memory footprint investigation" section.
-                let count = store.bulk_load(quads).expect("bulk_load failed");
-                eprintln!(
-                    "[nova_serve] Loaded + compacted {count} triples in {:.2}s.",
-                    t0.elapsed().as_secs_f64()
-                );
-            }
+            // `bulk_load()` bypasses both the delta `BTreeMap` *and* the WAL
+            // entirely: it builds the Ring directly in memory, then commits
+            // via `commit_compaction`, which — for a persistent store — does
+            // a single atomic snapshot + dictionary + WAL-segment-rotation +
+            // MANIFEST commit (see `RingStore::commit_compaction`). This
+            // matters enormously for `--location --data`: the old path went
+            // through `extend()` → `insert()`, WAL-logging **and
+            // `fsync`-ing every single triple individually** (~4.2 ms/triple
+            // measured — see `benches/external/README.md`'s "Critical
+            // caveat" section), making a multi-million-triple bulk load take
+            // hours. `bulk_load()` is just as crash-safe (the MANIFEST swap
+            // is the single atomic commit point: a crash before it leaves
+            // the store exactly as empty as it started; a crash after
+            // leaves the fully-loaded snapshot committed — no partial
+            // states), so there is no reason to prefer the fsync-per-write
+            // path for an initial bulk load, persistent or not.
+            let count = store.bulk_load(quads).expect("bulk_load failed");
+            eprintln!(
+                "[nova_serve] Loaded + compacted {count} triples in {:.2}s.",
+                t0.elapsed().as_secs_f64()
+            );
         }
     } else if location.is_none() {
         panic!("either --data <dataset.nt> or --location <dir> is required");
@@ -189,9 +212,10 @@ async fn main() {
         );
 
         eprintln!(
-            "[nova_serve]   Dictionary (terms, 2x dup):      {:>10.2} MiB",
+            "[nova_serve]   Dictionary (terms, Arc-deduped): {:>10.2} MiB",
             mib(mb.dict_bytes)
         );
+
         eprintln!(
             "[nova_serve]   TOTAL:                           {:>10.2} MiB",
             mib(mb.total_bytes())
@@ -204,11 +228,11 @@ async fn main() {
         eprintln!("[nova_serve] ─────────────────────────────────────────────");
     }
 
-    // ── Per-ordering (SPO/SOP/PSO/POS/OPS/OSP) breakdown (Phase A.1) ────────
+    // ── Per-ordering (SPO/SOP/PSO/POS/OPS/OSP) breakdown ────────────────────
     {
         let bd = store.per_ordering_breakdown();
         let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
-        eprintln!("[nova_serve] ── Per-ordering breakdown (Phase A.1 diagnostic) ──");
+        eprintln!("[nova_serve] ── Per-ordering breakdown ──");
         eprintln!(
             "[nova_serve]   {:<6} {:>10} {:>10} {:>10} {:>12}",
             "Order", "T (MiB)", "L (MiB)", "Side (MiB)", "Vocab* (MiB)"

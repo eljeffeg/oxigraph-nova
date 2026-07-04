@@ -2,7 +2,7 @@
 
 **A Rust-native RDF 1.2 / SPARQL 1.2 triple store with a novel succinct index and worst-case optimal joins.**
 
-Oxigraph Nova reuses the community’s battle-tested parsing and serialization crates while implementing a fresh storage layer and query engine. The goal is a store that is simultaneously W3C-conformant, live-writable, and algorithmically competitive with the fastest static stores.
+Oxigraph Nova reuses the RDF ecosystem's battle-tested parsing and serialization crates while implementing a fresh storage layer and query engine from scratch. The goal is a store that is simultaneously W3C-conformant, live-writable, and algorithmically competitive with the fastest static stores — a combination existing options don't offer: forking Oxigraph means inheriting its sealed `Store` type, and forking OxiRS means inheriting a broken test suite and unaudited code.
 
 ---
 
@@ -21,7 +21,6 @@ Oxigraph Nova does **not** re-implement RDF parsing, SPARQL parsing, result seri
 | [`axum`](https://crates.io/crates/axum) | Tokio project | Async HTTP server for the SPARQL endpoint |
 | [`tantivy`](https://crates.io/crates/tantivy) | community | Full-text search engine (planned) |
 | [`sux`](https://crates.io/crates/sux) | Sebastiano Vigna | Rank9 + SelectAdapt bitvectors and `BitFieldVec` — the LOUDS trie substrate |
-| [`sucds`](https://crates.io/crates/sucds) | community | `CompactVector` for packed-integer label arrays |
 
 All `rdf-12` / `sparql-12` feature flags are enabled across the parsing stack from day one, giving full RDF-star / quoted-triple support throughout.
 
@@ -88,7 +87,7 @@ pub trait TrieIterator: Send {
 (graph_id as u128) << 120 | (subject_id as u128) << 80 | (pred_id as u128) << 40 | object_id
 ```
 
-8 + 40 + 40 + 40 = 128 bits exactly. Inserts and deletes land here in O(log n). When the delta crosses a threshold, a background thread rebuilds the Ring over the merged dataset and atomically swaps it in. Queries during the merge read both layers — no read downtime.
+8 + 40 + 40 + 40 = 128 bits exactly. Inserts and deletes land here in O(log n). When the delta crosses a threshold, the store rebuilds the Ring over the merged dataset and atomically swaps it in. Queries during the merge read both layers — no read downtime.
 
 **Term dictionary** — all internal computation runs over **40-bit integer IDs** (`TermId`), not cloned `Term` objects. The 40-bit ceiling (~1.1 trillion distinct terms) comfortably exceeds Wikidata at current scale (~200M distinct terms). Named graphs get a separate 8-bit `GraphId`. Several `GraphId` values are reserved for system use:
 
@@ -146,10 +145,10 @@ The ontology graph (`GraphId(1)`) is the input to the planned OWL 2 RL reasoner.
 | `oxigraph-nova-core` | RDF types (re-exports `oxrdf`), `QuadStore` trait, `TrieIterator` trait, `Dictionary` (40-bit `TermId`, 8-bit `GraphId`), error types |
 | `oxigraph-nova-query` | SPARQL 1.2 evaluator, `Dataset` trait, Leapfrog Triejoin (`lftj.rs`), `ExtensionRegistry` |
 | `oxigraph-nova-storage-memory` | In-memory backend — `Vec`-based linear scan; testing and development |
-| `oxigraph-nova-storage-ring` | CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + `BTreeMap<u128>` LSM delta; live-write storage engine |
-| `oxigraph-nova-server` | SPARQL 1.2 HTTP endpoint (`axum`), `/sparql` GET/POST, `/update` POST |
-| `oxigraph-nova-w3c-harness` | W3C SPARQL 1.1 conformance test runner — fetches and caches real W3C manifests (test-only; not published) |
-| `oxigraph-nova-bench` | Criterion benchmarks comparing Ring+LFTJ vs in-memory on a synthetic Wikidata slice (not published) |
+| `oxigraph-nova-storage-ring` | CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + `BTreeMap<u128>` LSM delta; live-write, persistent storage engine |
+| `oxigraph-nova-server` | SPARQL 1.2 HTTP endpoint (`axum`), SPARQL Query/Update, Graph Store Protocol |
+| `oxigraph-nova-w3c-harness` | W3C SPARQL conformance test runner — fetches and caches real W3C manifests (test-only; not published) |
+| `oxigraph-nova-bench` | Criterion benchmarks comparing Ring+LFTJ vs in-memory and vs. other RDF stores (not published) |
 
 ---
 
@@ -162,52 +161,31 @@ QLever (C++) is a high-performance RDF store optimized for bulk-loaded static da
 | Sequential predicate scan | Fast | Fast (Ring POS/PSO traversal — same orderings, near-optimal space) |
 | 2–3 way join, selective | Fast | Fast (dictionary integer IDs, no Term clone overhead) |
 | Cyclic joins | Merge-join based | LFTJ: worst-case optimal over Ring `TrieIterator`s |
-| Live writes | SPARQL UPDATE via offline diff/merge | O(log n) per write into `BTreeMap` delta; background Ring rebuild with no read downtime |
+| Live writes | SPARQL UPDATE via offline diff/merge | O(log n) per write into `BTreeMap` delta; Ring rebuild with no read downtime |
 | Full-text + SPARQL | Integrated | Tantivy binding injection (planned) |
-| Reasoning | None | Reasonable binding (planned) |
-| Memory footprint | 6 sorted compressed arrays | Single compact Ring (~20 bytes/triple at benchmark scale) |
+| Reasoning | None | OWL 2 RL reasoning via `reasonable` (planned) |
+| Memory footprint | Six sorted compressed arrays | Single compact Ring (tens of bytes/triple at benchmark scale) |
 
 ---
 
-## Current status
+## Conformance and compatibility
 
-- ✅ Workspace structure — 7 crates
-- ✅ `QuadStore` and `Dataset` trait definitions
-- ✅ `MemoryStore` / `InMemoryDataset` — in-memory backend
-- ✅ `StoreDataset` adapter bridging `QuadStore` → `Dataset`
-- ✅ `ExtensionRegistry` — `CustomFunction`, `CustomOperator`, `CustomAggregate` hooks
-- ✅ Full SPARQL 1.1 evaluator — BGP, Filter, Join, LeftJoin, Union, Distinct, Reduced, Slice, OrderBy, Group (with COUNT/SUM/AVG/MIN/MAX/GROUP_CONCAT), Extend (BIND), Minus, Values, Graph, subqueries; all built-in functions including hash (MD5/SHA*), string (CONCAT/SUBSTR/UCASE/LCASE/STRBEFORE/STRAFTER/REPLACE/STRDT/STRLANG), date-time (YEAR/MONTH/DAY/HOURS/MINUTES/SECONDS/TIMEZONE/TZ/NOW), constructors (COALESCE/IRI/URI/UUID/STRUUID); SELECT / ASK / CONSTRUCT
-- ✅ HTTP server (`oxigraph-nova-server`) — SPARQL endpoint wired to the evaluator via `axum`
-- ✅ W3C SPARQL 1.1 conformance harness (`tests/w3c/`) — **328/328 tests pass (100%)** against the live W3C manifests; 0 expected failures; 0 unexpected failures
+Oxigraph Nova targets full conformance with the W3C SPARQL 1.1 and (Working Draft) SPARQL 1.2 test suites, run against the live, up-to-date W3C test manifests rather than a fixed snapshot — see `tests/w3c/` to run the harness yourself. RDF 1.2 features (quoted triples, `TRIPLE()`, base-direction literals) are supported end-to-end since Nova enables the `rdf-12`/`sparql-12` feature flags across the whole parsing stack from day one.
 
-- ✅ `oxigraph-nova-core::Dictionary` — Term↔TermId (40-bit), GraphName↔GraphId (8-bit), packed `u128` quad key
-- ✅ `oxigraph-nova-storage-ring` — **CompactLTJ LOUDS tries**: six explicit height-3 tries (one per ordering) with O(1) `child`/`degree`/`access`/`leap` navigation; `sux 0.14` Rank9+SelectAdapt T bitvector; `sux::BitFieldVec` L label array (⌈log₂ U⌉ bits/label); `BTreeMap<u128>` LSM delta with tombstones; `RingStore` with `compact()`
-- ✅ **Leapfrog Triejoin evaluator** — `eval_bgp_lftj` wired into the evaluator fast path; adaptive Variable Elimination Order (VEO) via `veo_sort`; benchmarks at 42 ms for a 3-way cyclic join over 50,000 triples
-- ✅ **106 unit tests** passing — 7 core + 28 query + 12 server + 4 memory + 55 ring
-
-**Conformance ceiling:** All 328 SPARQL 1.1 tests pass (100%); 265/269 SPARQL 1.2 tests pass (98%)
-
----
-
-## Remaining RDF 1.2 test issues
-
-Oxigraph Nova reuses the Oxigraph project's own parsing/RDF crates (see the table at the top of this README), which means any gap in those crates shows up here too. `spargebra`, `oxrdf`, and the rest of the Oxigraph crates are published from the single `oxigraph/oxigraph` monorepo, so all of the below belong on the same tracker: https://github.com/oxigraph/oxigraph/issues.  Remaining issues are already fix in the repository and slated for release in v0.5.
+Because Nova reuses the Oxigraph project's own parsing crates (`spargebra`, `oxrdf`, etc. — see the table above), any gap in those crates shows up here too. Where this project has found and worked around genuine parser bugs or missing features in those upstream crates, the details are tracked in `CLAUDE.md` rather than here, since that's development-process detail rather than product description.
 
 ### Other RDF ecosystems evaluated
 
-**[`rdf-reader-jelly`](https://crates.io/crates/rdf-reader-jelly) 0.4.4 — not viable yet.** Evaluated as a reader for [Jelly](https://jelly-rdf.github.io), a binary/protobuf RDF format, as a possible additional bulk-load format. The published crate has no actual decoding implementation yet (its own README says "under heavy construction"), and its `oxrdf` interop feature currently fails to compile. Revisit once it ships a real decoder.
+Several other RDF-adjacent crates and projects were evaluated as potential building blocks:
 
-**Dataset canonicalization (URDNA2015/RDFC-1.0) — no drop-in Oxi-compatible option yet.** [`rdf-canon`](https://crates.io/crates/rdf-canon) 0.15.3 explicitly advertises itself as "compatible with Oxigraph and Oxrdf" and has a real, substantial implementation with a full W3C RDFC-1.0 conformance test suite, but its `Cargo.toml` currently pins the old `oxrdf = "0.2.4"` (pre-RDF-1.2, no `rdf-12` feature), so adopting it today would pull a second, conflicting `oxrdf` version into the dependency tree. Revisit once it bumps to `oxrdf` 0.3.x/`rdf-12`.
-
-**Lakehouse native graph engine with git-style workflows** [`omnigraph`](https://github.com/ModernRelay/omnigraph) interesting project that we might be able to learn from
-
-**OxiRS** [oxirs](https://github.com/cool-japan/oxirs) is an AI sloppy mess, but it has some really cool ideas and features that could be used.
+- **[`rdf-reader-jelly`](https://crates.io/crates/rdf-reader-jelly)** — a reader for [Jelly](https://jelly-rdf.github.io), a binary/protobuf RDF format, evaluated as a possible additional bulk-load format. Not yet viable — the published crate has no actual decoding implementation.
+- **[`rdf-canon`](https://crates.io/crates/rdf-canon)** — the closest available crate for RDF Dataset Canonicalization (URDNA2015/RDFC-1.0), evaluated for stable content-hashing of query results. Not yet adoptable — it pins an old, pre-RDF-1.2 version of `oxrdf`.
+- **[`omnigraph`](https://github.com/ModernRelay/omnigraph)** — a lakehouse-native graph engine with git-style workflows; an interesting adjacent project worth learning from.
+- **[`OxiRS`](https://github.com/cool-japan/oxirs)** — has some genuinely interesting ideas and features, though its own codebase and test suite aren't in a state this project could safely build on.
 
 ---
 
-
-### Planned: OWL 2 RL reasoning via `reasonable`
-
+## Planned: OWL 2 RL reasoning via `reasonable`
 
 The planned reasoning layer adds forward-chaining OWL 2 RL inference as an **opt-in `Dataset` decorator** — zero changes to the evaluator or storage layer:
 
@@ -223,7 +201,7 @@ impl<D: Dataset> Dataset for ReasoningDataset<D> { … }
 
 **Engine:** [`reasonable`](https://github.com/gtfierro/reasonable) — pure-Rust OWL 2 RL reasoner. OWL 2 RL covers `rdfs:subClassOf` transitivity, `owl:sameAs`, property chains, inverse/symmetric/transitive properties, domain/range, and more — the pragmatic decidable profile. Neither QLever nor Tentris reasons; this is a genuine differentiator.
 
-**Materialization policy:** the OWL 2 RL closure is recomputed during the LSM merge cycle. When the background thread rebuilds the Ring, it also runs `reasonable` over the ontology (`GraphId(1)`) + base facts and writes inferred triples into the inference graph (`GraphId(255)`). Between merges, the live delta is treated as un-inferred — sound but incomplete; full inference catches up at the next merge. The reasoner is **never on the per-write hot path** — CDC throughput is unaffected.
+**Materialization policy:** the OWL 2 RL closure is recomputed as part of the same merge cycle that rebuilds the Ring, running `reasonable` over the ontology (`GraphId(1)`) plus base facts and writing inferred triples into the inference graph (`GraphId(255)`). Between merges, the live delta is treated as un-inferred — sound but incomplete; full inference catches up at the next merge. The reasoner is **never on the per-write hot path** — write throughput is unaffected.
 
 **Workflow:**
 ```sparql

@@ -55,11 +55,12 @@ jobs:
         run: cargo test -p oxigraph-nova-w3c-harness w3c_sparql12_query -- --nocapture
         continue-on-error: true
 
-      # Crash-recovery integration test (CLAUDE.md item 1e): spawns a real
-      # `nova_serve` subprocess, kill -9's it mid-write-burst, restarts it
-      # against the same data directory, and asserts the reloaded store
-      # matches what the client actually got acknowledged. Needs the release
-      # binary built first so `CARGO_BIN_EXE_nova_serve` resolves to it.
+      # Crash-recovery integration test: spawns a real `nova_serve`
+      # subprocess, kill -9's it mid-write-burst, restarts it against the
+      # same data directory, and asserts the reloaded store matches what the
+      # client actually got acknowledged. Needs the release binary built
+      # first so `CARGO_BIN_EXE_nova_serve` resolves to it.
+
       - name: Crash-recovery test (kill -9 mid-write-burst)
         run: cargo test -p oxigraph-nova-server --test crash_recovery --release -- --nocapture
 

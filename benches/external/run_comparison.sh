@@ -23,15 +23,13 @@
 # matters: on macOS, `ps` RSS includes allocator-retained-but-freed memory
 # (large freed regions `libmalloc` keeps mapped for fast reuse rather than
 # `munmap`-ing back to the OS immediately) and can vary wildly (30-300+ MB)
-# run-to-run for the identical process/workload with zero code changes -- see
-# CLAUDE.md's "RSS investigation: the 'anomalous' 142 MiB reading, explained"
-# for the full writeup of this discovery. `vmmap -summary`'s "Physical
-# footprint" is the same figure Activity Monitor and the kernel's own memory
-# accounting report, and is stable/reliable across repeated runs of the same
-# workload. On non-macOS platforms (no `vmmap`), this script falls back to
-# `ps -o rss` automatically. Oxigraph runs in a Docker container, so its
-# memory is still measured via `docker stats` (the container boundary makes
-# `vmmap` inapplicable there).
+# run-to-run for the identical process/workload with zero code changes.
+# `vmmap -summary`'s "Physical footprint" is the same figure Activity Monitor
+# and the kernel's own memory accounting report, and is stable/reliable
+# across repeated runs of the same workload. On non-macOS platforms (no
+# `vmmap`), this script falls back to `ps -o rss` automatically. Oxigraph
+# runs in a Docker container, so its memory is still measured via
+# `docker stats` (the container boundary makes `vmmap` inapplicable there).
 #
 # Usage:
 #   ./run_comparison.sh [ENTITIES] [ITERS] [WARMUP]
@@ -86,10 +84,10 @@ print(int(val))
 # --- Measure a native process's real physical memory footprint in KB. ---
 # Prefers `vmmap -summary <pid>`'s "Physical footprint:" line (macOS only --
 # this is the accurate, allocator-retention-immune metric; see the header
-# comment above and CLAUDE.md for why plain `ps -o rss` is unreliable
-# run-to-run on macOS). Falls back to `ps -o rss` on any platform/failure
-# where `vmmap` isn't available (e.g. Linux CI), so the script still works
-# everywhere, just with the less precise metric in that case.
+# comment above for why plain `ps -o rss` is unreliable run-to-run on
+# macOS). Falls back to `ps -o rss` on any platform/failure where `vmmap`
+# isn't available (e.g. Linux CI), so the script still works everywhere,
+# just with the less precise metric in that case.
 measure_footprint_kb() {
   local pid="$1"
   if command -v vmmap >/dev/null 2>&1; then

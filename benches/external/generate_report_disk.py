@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Generate RESULTS.md from raw_results.csv produced by run_comparison.sh.
+"""Generate RESULTS_DISK.md from raw_results_disk.csv produced by
+run_comparison_disk.sh.
 
-Computes p50/p95/mean latency per (engine, query) and renders a Markdown
-comparison table, along with an explicit methodology/storage-model section
-so the memory-vs-disk asymmetry between engines is never left implicit.
+Same shape as generate_report.py (the in-memory comparison), but for the
+disk-backed/persistent configuration of each engine: Nova (`--location`,
+WAL-backed RingStore), Oxigraph (`--location`, RocksDB-backed), and QLever
+(memory-mapped disk index, unchanged — it has no other mode). Adds an
+on-disk-footprint table alongside the existing memory/CPU/latency tables.
 """
 import argparse
 import csv
@@ -36,11 +39,13 @@ def main():
     ap.add_argument("--nova-load-s", type=float, default=None)
     ap.add_argument("--qlever-load-s", type=float, default=None)
     ap.add_argument("--oxigraph-load-s", type=float, default=None)
+    ap.add_argument("--nova-disk-kb", type=float, default=None)
+    ap.add_argument("--oxigraph-disk-kb", type=float, default=None)
+    ap.add_argument("--qlever-disk-kb", type=float, default=None)
     ap.add_argument("--entities", type=int, required=True)
     ap.add_argument("--triples", type=int, required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-
 
     with open(args.queries) as f:
         query_defs = json.load(f)
@@ -54,13 +59,13 @@ def main():
 
     engines = ["nova", "oxigraph", "qlever"]
     engine_labels = {
-        "nova": "Nova (Ring+LFTJ)",
-        "oxigraph": "Oxigraph (in-memory)",
+        "nova": "Nova (--location, WAL-backed)",
+        "oxigraph": "Oxigraph (--location, RocksDB-backed)",
         "qlever": "QLever (mmap, warmed)",
     }
 
     lines = []
-    lines.append("# Comparative Benchmark: Nova vs Oxigraph vs QLever\n")
+    lines.append("# Comparative Benchmark (Disk-Backed): Nova vs Oxigraph vs QLever\n")
     lines.append(
         f"Dataset: {args.entities:,} synthetic BSBM-style entities "
         f"({args.triples:,} triples), identical N-Triples file loaded into all three engines.\n"
@@ -68,93 +73,103 @@ def main():
 
     lines.append("## Methodology & Storage Model\n")
     lines.append(
-        "All three engines were benchmarked over the SPARQL 1.1 HTTP Protocol "
-        "(`curl` to each engine's `/sparql` or query endpoint) using **byte-identical "
-        "SPARQL query text** against a **byte-identical dataset**. Each query was run "
-        "with a warm-up pass (discarded) before N timed iterations, so all reported "
-        "latencies reflect steady-state (not cold-cache) performance.\n"
+        "This is the **disk-backed/persistent-storage** sibling of "
+        "`RESULTS.md` (the pure in-memory comparison). All three engines "
+        "were benchmarked over the SPARQL 1.1 HTTP Protocol using "
+        "**byte-identical SPARQL query text** against a **byte-identical "
+        "dataset**. Each query was run with a warm-up pass (discarded) "
+        "before N timed iterations.\n"
     )
     lines.append(
         "**Storage model per engine** (this matters — see below):\n\n"
         "| Engine | Storage model | Notes |\n"
         "|---|---|---|\n"
-        "| **Nova** | Pure in-process heap memory | No disk persistence exists at all; "
-        "the whole dataset + index must fit in RAM. |\n"
-        "| **Oxigraph** | Pure in-memory (`serve` run **without** `--location`) | "
-        "Deliberately run in-memory (not its default RocksDB-backed mode) to match "
-        "Nova's memory model — this is an apples-to-apples memory comparison, not "
-        "Oxigraph's disk-persistent configuration. |\n"
-        "| **QLever** | Memory-mapped disk index (mmap) | QLever has **no pure "
-        "in-memory mode** — its index format is inherently a set of memory-mapped "
-        "files. After the warm-up pass, the OS page cache holds the working set "
-        "resident in RAM, so steady-state latency is effectively RAM-speed. This is "
-        "consistent with how QLever is used and benchmarked in practice. |\n"
+        "| **Nova** | `RingStore::open(dir)` — WAL-backed | Every "
+        "`insert()` is durably logged (fsync-per-write) to a "
+        "write-ahead log before being applied in memory; periodic "
+        "`compact()` merges the delta into an ε-serde snapshot on disk. |\n"
+        "| **Oxigraph** | `serve --location <dir>` — RocksDB-backed | "
+        "Oxigraph's own default/production persistent storage mode "
+        "(`oxrocksdb-sys`). |\n"
+        "| **QLever** | Memory-mapped disk index (mmap) | Unchanged from "
+        "the in-memory comparison — QLever has no other mode. A warm-up "
+        "pass ensures the OS page cache holds the working set resident "
+        "before timed measurements. |\n"
     )
     lines.append(
-        "**Memory usage** is reported as *physical footprint* for Nova/QLever "
-        "(macOS `vmmap -summary <pid>`'s `Physical footprint:` line — falls back "
-        "to `ps -o rss` on platforms without `vmmap`, e.g. Linux) and container "
-        "memory for Oxigraph (`docker stats`). `vmmap`'s physical footprint is "
-        "used instead of raw `ps -o rss` because on macOS, `ps` RSS includes "
-        "allocator-retained-but-freed memory (`libmalloc` keeps large freed "
-        "regions mapped for fast reuse rather than returning them to the OS "
-        "immediately) and was observed to vary by 10x+ (30-300+ MB) run-to-run "
-        "for the *identical* process and workload with zero code changes. "
-        "`vmmap`'s physical footprint is the same figure macOS's Activity Monitor "
-        "and the kernel's own memory accounting report, and is stable across "
-        "repeated runs. For QLever, this figure includes memory-mapped index "
-        "pages resident via the OS page cache — architecturally different from "
-        "Nova/Oxigraph's pure heap allocations, but it answers the same practical "
-        "question (\"how much RAM does this process hold to serve the "
-        "workload\"), so it is used as the common denominator across all three. "
-        "This asymmetry is called out explicitly here rather than left implicit.\n"
+        "**Memory usage** is reported as *physical footprint* for "
+        "Nova/QLever (macOS `vmmap -summary <pid>`'s `Physical "
+        "footprint:` line — falls back to `ps -o rss` on platforms "
+        "without `vmmap`) and container memory for Oxigraph (`docker "
+        "stats`). See `README.md` for the full rationale behind this "
+        "choice over raw `ps -o rss`.\n"
     )
 
     lines.append(
-        "**CPU usage** is sampled every ~0.3s throughout each engine's query phase "
-        "(`ps -o %cpu` for Nova/QLever; `docker stats --format '{{.CPUPerc}}'` for "
-        "Oxigraph) and averaged. Values are percent of one CPU core (e.g. 150% means "
-        "1.5 cores kept busy on average) — this is a coarse approximation, not a "
-        "precise profiler measurement, but useful for relative comparison.\n"
+        "**On-disk footprint** is measured via `du -sk` on each engine's "
+        "data directory after the query phase completes (includes WAL + "
+        "snapshot files for Nova, the full RocksDB directory for "
+        "Oxigraph, and all QLever index/permutation files).\n"
     )
-
-
+    lines.append(
+        "**CPU usage** is sampled every ~0.3s throughout each engine's "
+        "query phase and averaged. Values are percent of one CPU core.\n"
+    )
 
     lines.append("")
     lines.append("## Dataset Load Time\n")
     lines.append(
-        "Wall-clock time to load the identical N-Triples dataset and become ready "
-        "to serve queries (includes parsing + index construction for all engines; "
-        "for Nova this is parse + `compact()` into the Ring/LFTJ index, for QLever "
-        "this is the separate `qlever-index` build step, for Oxigraph this is the "
-        "HTTP bulk-load POST into the in-memory store).\n"
+        "Wall-clock time to load the identical N-Triples dataset and "
+        "become ready to serve queries. For Nova this includes WAL-logging "
+        "every triple (fsync-per-write) plus a `compact()` pass — "
+        "necessarily slower than the in-memory `bulk_load()` path measured "
+        "in `RESULTS.md`. For Oxigraph this is the HTTP bulk-load POST into "
+        "the RocksDB-backed store. For QLever this is the same "
+        "`qlever-index` build step as the in-memory comparison (QLever's "
+        "index is always disk-based).\n"
     )
     lines.append("| Engine | Load time |")
     lines.append("|---|---|")
     if args.nova_load_s is not None:
-        lines.append(f"| Nova (Ring+LFTJ) | {args.nova_load_s:.2f} s |")
+        lines.append(f"| Nova (--location) | {args.nova_load_s:.2f} s |")
     if args.oxigraph_load_s is not None:
-        lines.append(f"| Oxigraph (in-memory) | {args.oxigraph_load_s:.2f} s |")
+        lines.append(f"| Oxigraph (--location) | {args.oxigraph_load_s:.2f} s |")
     if args.qlever_load_s is not None:
         lines.append(f"| QLever (mmap, warmed) | {args.qlever_load_s:.2f} s |")
 
     lines.append("")
     lines.append("## Memory Usage (Physical Footprint)\n")
-    lines.append(
-        "Nova/QLever figures are macOS `vmmap -summary`'s \"Physical footprint\" "
-        "(stable, allocator-retention-immune — see Methodology above); falls back "
-        "to `ps -o rss` on non-macOS platforms.\n"
-    )
-
     lines.append("| Engine | Memory | Storage model |")
     lines.append("|---|---|---|")
-    lines.append(f"| Nova (Ring+LFTJ) | {args.nova_rss_kb / 1024:.1f} MiB | Pure heap |")
-    lines.append(f"| Oxigraph (in-memory) | {args.oxigraph_mem} | Pure heap (in-memory mode) |")
+    lines.append(
+        f"| Nova (--location) | {args.nova_rss_kb / 1024:.1f} MiB | "
+        "WAL-backed heap (recovered/compacted state resident) |"
+    )
+    lines.append(
+        f"| Oxigraph (--location) | {args.oxigraph_mem} | RocksDB-backed "
+        "(block cache + heap) |"
+    )
     lines.append(
         f"| QLever (mmap, warmed) | {args.qlever_rss_kb / 1024:.1f} MiB | "
         "Incl. memory-mapped index pages |"
     )
 
+    if args.nova_disk_kb is not None or args.oxigraph_disk_kb is not None or args.qlever_disk_kb is not None:
+        lines.append("")
+        lines.append("## On-Disk Footprint\n")
+        lines.append(
+            "`du -sk` on each engine's data directory after the query "
+            "phase (WAL + snapshot for Nova, full RocksDB dir for "
+            "Oxigraph, all index/permutation files for QLever).\n"
+        )
+        lines.append("| Engine | On-disk size |")
+        lines.append("|---|---|")
+        if args.nova_disk_kb is not None:
+            lines.append(f"| Nova (--location) | {args.nova_disk_kb / 1024:.1f} MiB |")
+        if args.oxigraph_disk_kb is not None:
+            lines.append(f"| Oxigraph (--location) | {args.oxigraph_disk_kb / 1024:.1f} MiB |")
+        if args.qlever_disk_kb is not None:
+            lines.append(f"| QLever (mmap, warmed) | {args.qlever_disk_kb / 1024:.1f} MiB |")
 
     if (
         args.nova_cpu_pct is not None
@@ -166,9 +181,9 @@ def main():
         lines.append("| Engine | Avg CPU % |")
         lines.append("|---|---|")
         if args.nova_cpu_pct is not None:
-            lines.append(f"| Nova (Ring+LFTJ) | {args.nova_cpu_pct:.1f}% |")
+            lines.append(f"| Nova (--location) | {args.nova_cpu_pct:.1f}% |")
         if args.oxigraph_cpu_pct is not None:
-            lines.append(f"| Oxigraph (in-memory) | {args.oxigraph_cpu_pct:.1f}% |")
+            lines.append(f"| Oxigraph (--location) | {args.oxigraph_cpu_pct:.1f}% |")
         if args.qlever_cpu_pct is not None:
             lines.append(f"| QLever (mmap, warmed) | {args.qlever_cpu_pct:.1f}% |")
 
@@ -236,8 +251,6 @@ def main():
         row("min (ms)", "min", lambda v: f"{v:.2f}")
         row("max (ms)", "max", lambda v: f"{v:.2f}")
         lines.append("")
-
-
 
     with open(args.out, "w") as f:
         f.write("\n".join(lines) + "\n")

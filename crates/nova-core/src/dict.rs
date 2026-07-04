@@ -104,14 +104,13 @@ pub struct Dictionary {
     // ── Term ↔ TermId ──────────────────────────────────────────────────────
     /// Reverse: `id_to_term[id.as_u64()]` → `Term`.
     ///
-    /// Stored as `Arc<Term>` (Phase A.4 — see `CLAUDE.md`'s "Memory footprint
-    /// investigation" section) so the same heap-allocated term content is
+    /// Stored as `Arc<Term>` so the same heap-allocated term content is
     /// shared with the `term_to_id` HashMap key below, instead of being
     /// duplicated. This halves the Dictionary's real memory footprint versus
     /// storing two independent owned `Term`s per interned value.
     id_to_term: Vec<Arc<Term>>,
     /// Forward: `Term` → `TermId`. The key `Arc<Term>` is the *same*
-    /// allocation as the corresponding `id_to_term` entry (Phase A.4).
+    /// allocation as the corresponding `id_to_term` entry.
     term_to_id: HashMap<Arc<Term>, TermId>,
 
     // ── GraphName ↔ GraphId ─────────────────────────────────────────────────
@@ -167,14 +166,13 @@ impl Dictionary {
     /// Real allocated byte size of this dictionary, for memory-breakdown
     /// diagnostics.
     ///
-    /// **Phase A.4** (see `CLAUDE.md`'s "Memory footprint investigation"
-    /// section): `id_to_term` and `term_to_id` now share the *same*
-    /// `Arc<Term>` heap allocation per interned term — `oxrdf` 0.3.3's `Term`
-    /// variants don't do this sharing natively (owned `String`s, no `Arc`),
-    /// so we wrap each interned `Term` in our own `Arc` once and clone the
-    /// `Arc` (cheap refcount bump) into both tables. This halves the prior
-    /// "pays for every term's string content twice" cost down to once per
-    /// term, plus a small fixed `Arc` control-block + pointer overhead.
+    /// `id_to_term` and `term_to_id` share the *same* `Arc<Term>` heap
+    /// allocation per interned term — `oxrdf` 0.3.3's `Term` variants don't
+    /// do this sharing natively (owned `String`s, no `Arc`), so each interned
+    /// `Term` is wrapped in our own `Arc` once and the `Arc` (cheap refcount
+    /// bump) is cloned into both tables. This avoids paying for every term's
+    /// string content twice, down to once per term plus a small fixed `Arc`
+    /// control-block + pointer overhead.
     ///
     /// This is a diagnostic estimate, not exact `malloc` accounting: it uses
     /// `String::len()` (not allocator capacity, which is usually equal or only
@@ -210,9 +208,9 @@ impl Dictionary {
         // `ArcInner<T>` prepends two refcounts (strong + weak) before `T`.
         const ARC_CTRL_OVERHEAD: usize = size_of::<usize>() * 2;
 
-        // Each interned term now has exactly ONE heap allocation, shared
-        // (via `Arc::clone`) between `id_to_term` and `term_to_id` — Phase
-        // A.4. Iterating `id_to_term` visits each unique term exactly once.
+        // Each interned term has exactly ONE heap allocation, shared
+        // (via `Arc::clone`) between `id_to_term` and `term_to_id`.
+        // Iterating `id_to_term` visits each unique term exactly once.
         let unique_term_bytes: usize = self
             .id_to_term
             .iter()
@@ -288,9 +286,9 @@ impl Dictionary {
         }
 
         // Regular terms: IRI, blank node, literal.
-        // Phase A.4: wrap in one `Arc` and clone the (cheap) refcounted
-        // pointer into both tables, instead of cloning the full `Term`
-        // (and its heap-allocated `String` content) twice.
+        // Wrap in one `Arc` and clone the (cheap) refcounted pointer into
+        // both tables, instead of cloning the full `Term` (and its
+        // heap-allocated `String` content) twice.
         let raw = self.id_to_term.len() as u64;
         let id = TermId::new(raw)?;
         let arc = Arc::new(term.clone());
@@ -311,6 +309,24 @@ impl Dictionary {
     ///
     /// Returns `None` only for IDs that were never assigned by this dictionary
     /// (should never happen in correct usage).
+    /// Look up the `Arc<Term>` for `id` without cloning the term's heap
+    /// content — a cheap refcount bump instead of a deep `String` clone.
+    ///
+    /// The read hot path (`quads_for_pattern` / `decode_stored_quad`) needs
+    /// to avoid `.clone()`-ing the `&Term` returned by [`Self::get_term`],
+    /// which would deep-copy the term's owned `String` content
+    /// (subject/object IRI, blank node id, or literal value+lang+datatype)
+    /// on *every matched row* — even when many rows share the exact same
+    /// interned term (e.g. a `rdf:type` object repeated across thousands of
+    /// matching subjects). Since `id_to_term` already stores `Arc<Term>`,
+    /// this `Arc`-cloning accessor lets hot-path callers share the same heap
+    /// allocation across all rows that reference it, turning an O(rows ×
+    /// term size) cost into O(rows × pointer size) for the transient result
+    /// buffer.
+    pub fn get_term_arc(&self, id: TermId) -> Option<Arc<Term>> {
+        self.id_to_term.get(id.as_u64() as usize).cloned()
+    }
+
     pub fn get_term(&self, id: TermId) -> Option<&Term> {
         self.id_to_term
             .get(id.as_u64() as usize)
@@ -361,7 +377,7 @@ impl Dictionary {
 
     /// The next available user `GraphId` (range `2..=254`). Exposed for
     /// on-disk `Dictionary` persistence (see `oxigraph_nova_storage_ring`'s
-    /// `dict_snapshot` module — item 1c in `CLAUDE.md`'s "What's Next").
+    /// `dict_snapshot` module).
     pub fn next_graph_id_raw(&self) -> u8 {
         self.next_graph_id
     }

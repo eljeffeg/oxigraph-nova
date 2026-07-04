@@ -1,4 +1,4 @@
-//! Crash-recovery integration test (`CLAUDE.md` item 1e).
+//! Crash-recovery integration test.
 //!
 //! Spawns a real `nova_serve` subprocess backed by a persistent
 //! (`--location`) `RingStore`, hammers it with a burst of `INSERT DATA`

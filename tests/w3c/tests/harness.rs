@@ -1356,8 +1356,7 @@ fn w3c_sparql11_query() {
 ///
 /// A handful of tests fail due to grammar limitations in the pinned
 /// `spargebra` 0.4.6 parser dependency rather than anything in this crate's
-/// evaluator or harness — see the "Remaining RDF 1.2 test issues" section of
-/// `CLAUDE.md` for the current count and details of each.
+/// evaluator or harness.
 #[test]
 fn w3c_sparql12_query() {
     eprintln!("\n[W3C] Loading SPARQL 1.2 (Working Draft) test manifest …");

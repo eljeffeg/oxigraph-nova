@@ -21,7 +21,7 @@
 //!    Ring, `Arc::swap`, clear delta — so compaction never blocks readers or
 //!    writers. This would replace the current inline `maybe_auto_compact`.
 //!
-//! ## Isolation semantics (CLAUDE.md item 1f)
+//! ## Isolation semantics
 //!
 //! Every **single** `QuadStore` call (`insert`, `remove`, `contains`,
 //! `quads_for_pattern`, ...) is atomic: it acquires `Mutex<RingStoreInner>`
@@ -73,13 +73,86 @@ use oxigraph_nova_storage_common::manifest::{self, Manifest};
 use oxigraph_nova_storage_common::wal::{self, WalRecord, WalWriter};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Default delta-size threshold (number of live entries) that triggers an
 /// automatic inline compaction for a persistent (`RingStore::open`) store.
 /// See `maybe_auto_compact`. In-memory (`RingStore::new`) stores never
 /// auto-compact (no `data_dir` to persist to).
 const DEFAULT_AUTO_COMPACT_THRESHOLD: usize = 1_000_000;
+
+/// Configurable WAL durability policy — the user-facing knob for trading a
+/// small durability window for much higher write throughput (see
+/// `wal.rs`'s "## Fsync policy" module docs).
+///
+/// - `Always` (default): every `insert`/`remove`/`extend` call's WAL record(s)
+///   are `fsync`ed before the call returns. Every acknowledged write is
+///   durable. This is the safest, simplest policy and matches the original
+///   (pre-optimization) behavior.
+/// - `Interval(d)`: WAL records are written but **not** fsynced by the
+///   writer thread; a background thread fsyncs the WAL file every `d`
+///   (group commit / "periodic fsync"). Writes return immediately after the
+///   in-memory apply, without waiting on any disk I/O at all. The cost: on
+///   a crash, any writes made since the last background flush are lost
+///   (not corrupted — `wal::replay`'s torn-tail handling covers this
+///   exactly the same way it covers any other incomplete write). This is
+///   the "group commit" pattern used by most production databases (e.g.
+///   RocksDB's default WAL mode, MongoDB's periodic journal commit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SyncPolicy {
+    #[default]
+    Always,
+    Interval(Duration),
+}
+
+/// Background flusher thread for `SyncPolicy::Interval`: periodically calls
+/// `fsync` (`File::sync_data`) on a cloned handle of the currently-active
+/// WAL file. Runs independently of the `Mutex<RingStoreInner>` — `fsync`
+/// from one thread while another thread concurrently `write`s to the same
+/// fd is safe (the kernel serializes them), so the flusher never needs to
+/// acquire the store's lock.
+///
+/// A new `Flusher` is spawned every time the active WAL file changes (WAL
+/// rotation during `commit_compaction`, or initial `RingStore::open`), and
+/// the previous one is stopped (via `stop`) and joined on `Drop`.
+struct Flusher {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Flusher {
+    fn spawn(file: std::fs::File, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Best-effort: an fsync error here (e.g. disk full) is not
+                // actionable from a background thread; the next foreground
+                // write/compaction will surface any persistent I/O failure.
+                let _ = file.sync_data();
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Flusher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
 
 // ── Inner state ───────────────────────────────────────────────────────────────
 
@@ -99,8 +172,7 @@ struct RingStoreInner {
     wal: Option<WalWriter>,
 
     /// Data directory root, present only for persistent stores opened via
-    /// [`RingStore::open`] (see `crate::manifest` — item 1c in `CLAUDE.md`'s
-    /// "What's Next"). `None` for `RingStore::new()`.
+    /// [`RingStore::open`] (see `crate::manifest`). `None` for `RingStore::new()`.
     data_dir: Option<PathBuf>,
     /// Generation number of the currently-installed snapshot
     /// (`nova.snapshot.<snapshot_gen>`), `0` if none has been committed yet.
@@ -117,6 +189,13 @@ struct RingStoreInner {
     /// `true` for persistent stores; `RingStore::set_auto_compact_enabled`
     /// lets callers (e.g. `nova_serve`) turn it off.
     auto_compact_enabled: bool,
+    /// Current WAL durability policy (see [`SyncPolicy`]). Defaults to
+    /// `Always`. Irrelevant for in-memory stores (`wal.is_none()`).
+    sync_policy: SyncPolicy,
+    /// Background flusher thread for `SyncPolicy::Interval`, `None` under
+    /// `Always` or for in-memory stores. Replaced whenever the active WAL
+    /// file changes.
+    flusher: Option<Flusher>,
 }
 
 impl RingStoreInner {
@@ -132,16 +211,62 @@ impl RingStoreInner {
             wal_seq: 1,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
             auto_compact_enabled: true,
+            sync_policy: SyncPolicy::Always,
+            flusher: None,
         }
     }
 
-    /// Append `record` to the WAL if this store is persistent; no-op otherwise.
+    /// Append `record` to the WAL if this store is persistent, respecting
+    /// `sync_policy`: `Always` fsyncs immediately (via `WalWriter::append`);
+    /// `Interval` writes without fsyncing (`append_no_sync`), relying on the
+    /// background `Flusher` to fsync periodically.
     fn wal_append(&mut self, record: &WalRecord) -> Result<(), Oxigraph> {
         if let Some(w) = &mut self.wal {
-            w.append(record)
-                .map_err(|e| Oxigraph::Storage(format!("WAL append failed: {e}")))?;
+            match self.sync_policy {
+                SyncPolicy::Always => w
+                    .append(record)
+                    .map_err(|e| Oxigraph::Storage(format!("WAL append failed: {e}")))?,
+                SyncPolicy::Interval(_) => w
+                    .append_no_sync(record)
+                    .map_err(|e| Oxigraph::Storage(format!("WAL append failed: {e}")))?,
+            }
         }
         Ok(())
+    }
+
+    /// Append a batch of records with a single `fsync` (or none, under
+    /// `Interval` policy) — used by `RingStore::extend` for multi-quad bulk
+    /// inserts / SPARQL `INSERT DATA` with many triples.
+    fn wal_append_batch<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a WalRecord>,
+    ) -> Result<(), Oxigraph> {
+        if let Some(w) = &mut self.wal {
+            match self.sync_policy {
+                SyncPolicy::Always => w
+                    .append_batch(records)
+                    .map_err(|e| Oxigraph::Storage(format!("WAL append_batch failed: {e}")))?,
+                SyncPolicy::Interval(_) => {
+                    for record in records {
+                        w.append_no_sync(record)
+                            .map_err(|e| Oxigraph::Storage(format!("WAL append failed: {e}")))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// (Re)spawn the background flusher thread for `SyncPolicy::Interval`
+    /// against the currently-active WAL file, dropping (stopping/joining)
+    /// any previous one. No-op for in-memory stores or `SyncPolicy::Always`.
+    fn respawn_flusher(&mut self) {
+        self.flusher = None; // drop stops+joins the old thread, if any
+        if let (SyncPolicy::Interval(interval), Some(w)) = (self.sync_policy, &self.wal)
+            && let Ok(file) = w.try_clone_file()
+        {
+            self.flusher = Some(Flusher::spawn(file, interval));
+        }
     }
 
     /// Apply an already-durable `InsertQuad`/`RemoveQuad`/`RegisterGraph`
@@ -268,7 +393,7 @@ impl RingStoreInner {
         Ok(())
     }
 
-    /// Crash-safe compaction commit (item 1c): serialize `new_graphs` to a
+    /// Crash-safe compaction commit: serialize `new_graphs` to a
     /// fresh snapshot generation, rotate the WAL to a fresh segment, commit
     /// both atomically via the MANIFEST, delete now-obsolete snapshot/WAL
     /// files, then install the round-tripped graphs.
@@ -334,6 +459,9 @@ impl RingStoreInner {
                 self.wal = Some(new_wal);
                 self.snapshot_gen = new_gen;
                 self.wal_seq = new_seq;
+                // The WAL file changed (rotated) — re-spawn the background
+                // flusher (if any) against the new file.
+                self.respawn_flusher();
             }
         }
         if clear_delta {
@@ -409,8 +537,7 @@ impl RingStore {
 
     /// Open (or create) a persistent `RingStore` rooted at `dir` (created if
     /// it doesn't exist), using the MANIFEST + generation-numbered
-    /// snapshot + segment-numbered WAL scheme (item 1c in `CLAUDE.md`'s
-    /// "What's Next").
+    /// snapshot + segment-numbered WAL scheme.
     ///
     /// ## Recovery procedure
     ///
@@ -421,8 +548,7 @@ impl RingStore {
     /// 3. Replay every `nova.wal.<seq>` segment with `seq >= wal_seq`, in
     ///    ascending order — **not** the entire WAL history, since everything
     ///    in earlier segments is already reflected in the loaded snapshot
-    ///    (this is the O(tail) startup cost item 1c introduces, replacing
-    ///    1b's O(total history) full replay).
+    ///    (this keeps startup cost O(tail) instead of O(total history)).
     /// 4. Open the highest such segment (or a fresh one at `wal_seq` if none
     ///    exist yet) for appending, and delete any now-provably-obsolete
     ///    snapshot/segment files (best-effort; see `manifest::cleanup_orphans`).
@@ -518,6 +644,31 @@ impl RingStore {
         })
     }
 
+    /// Set the WAL durability policy (see [`SyncPolicy`]). Default is
+    /// `Always`. Switching to `Interval(d)` spawns a background flusher
+    /// thread against the currently-active WAL file; switching back to
+    /// `Always` stops it. No-op for in-memory stores (no WAL to flush).
+    pub fn set_sync_policy(&self, policy: SyncPolicy) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.sync_policy = policy;
+            inner.respawn_flusher();
+        }
+    }
+
+    /// Explicitly fsync the active WAL file right now, regardless of
+    /// `SyncPolicy`. Useful before a clean shutdown under
+    /// `SyncPolicy::Interval` to guarantee all acknowledged writes are
+    /// durable. No-op for in-memory stores.
+    pub fn flush_wal(&self) -> Result<(), Oxigraph> {
+        if let Ok(inner) = self.inner.lock()
+            && let Some(w) = &inner.wal
+        {
+            w.sync()
+                .map_err(|e| Oxigraph::Storage(format!("WAL flush failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// The on-disk path of the WAL segment `open(dir)` would create/use for
     /// a **fresh** directory (segment `1`). Exposed for tests that need to
     /// interact with the WAL file directly (e.g. to simulate a torn write)
@@ -566,8 +717,7 @@ impl RingStore {
     }
 
     /// Bulk-load quads directly into the Ring, **bypassing the delta
-    /// `BTreeMap` entirely** (Phase A.3 — see `CLAUDE.md`'s "Memory
-    /// footprint investigation" section).
+    /// `BTreeMap` entirely**.
     ///
     /// Intended for initial dataset loads (e.g. `nova_serve`'s startup path)
     /// where every quad is known to be a fresh insert and there is no need to
@@ -652,8 +802,7 @@ impl RingStore {
     }
 
     /// Per-ordering (SPO/SOP/PSO/POS/OPS/OSP) memory breakdown, summed across
-    /// all graphs — the Phase A.1 diagnostic (see `CLAUDE.md`'s "Memory
-    /// footprint investigation" section).  Also returns the summed redundant
+    /// all graphs.  Also returns the summed redundant
     /// `spo: Vec<[u64;3]>` bytes and the summed deduped-vocab bytes (both
     /// summed across graphs, since dedup only applies within one graph's
     /// six tries).
@@ -696,7 +845,7 @@ impl RingStore {
     }
 }
 
-/// Per-ordering memory breakdown across all graphs (Phase A.1 diagnostic).
+/// Per-ordering memory breakdown across all graphs.
 ///
 /// See [`RingStore::per_ordering_breakdown`].
 #[derive(Clone, Debug)]
@@ -712,9 +861,8 @@ pub struct PerOrderingBreakdown {
     /// alone" but double/triple-counts shared allocations — see
     /// `vocab_deduped_total` for the real total.
     pub vocab_undeduped: [usize; 6],
-    /// Always `0` now that Phase A.2 removed the redundant
-    /// `spo: Vec<[u64;3]>` raw copy; retained for print-layout stability in
-    /// `nova_serve.rs`.
+    /// Always `0` — there is no redundant `spo: Vec<[u64;3]>` raw copy;
+    /// retained for print-layout stability in `nova_serve.rs`.
     pub spo_bytes_total: usize,
 
     /// Summed deduped vocab bytes across all graphs (3 unique allocations
@@ -728,8 +876,8 @@ pub struct PerOrderingBreakdown {
 #[derive(Copy, Clone, Debug)]
 pub struct MemoryBreakdown {
     /// Total bytes across all graphs' `GraphRing` indexes (six-LOUDS-trie
-    /// CompactLTJ structure, Arc-deduped vocab; Phase A.2 removed the
-    /// formerly-redundant `spo: Vec<[u64;3]>` raw copy).
+    /// CompactLTJ structure, Arc-deduped vocab; no redundant
+    /// `spo: Vec<[u64;3]>` raw copy is kept).
     pub ring_bytes: usize,
 
     /// Total bytes in the `Dictionary` (`id_to_term` + `term_to_id` + side
@@ -786,14 +934,16 @@ fn decode_stored_quad(
     o_id: TermId,
 ) -> Option<StoredQuad> {
     let graph_name = dict.get_graph(g_id)?.clone();
-    let s_term = dict.get_term(s_id)?;
+    // Fetch `Arc<Term>` (cheap refcount bump) instead of `.clone()`-ing the
+    // dereferenced `Term` (deep String copy) on every matched row.
+    let s_term = dict.get_term_arc(s_id)?;
     let p_term = dict.get_term(p_id)?;
-    let o_term = dict.get_term(o_id)?;
+    let o_term = dict.get_term_arc(o_id)?;
 
     // Subject may be NamedNode, BlankNode, or (RDF-star) Triple — all are valid.
     // Literals are never legal RDF subjects; return None so they are silently skipped.
-    let subject: Term = match s_term {
-        Term::NamedNode(_) | Term::BlankNode(_) | Term::Triple(_) => s_term.clone(),
+    match s_term.as_ref() {
+        Term::NamedNode(_) | Term::BlankNode(_) | Term::Triple(_) => {}
         Term::Literal(_) => return None,
     };
     let predicate: NamedNode = match p_term {
@@ -802,9 +952,9 @@ fn decode_stored_quad(
     };
 
     Some(StoredQuad {
-        subject,
+        subject: s_term,
         predicate,
-        object: o_term.clone(),
+        object: o_term,
         graph_name,
     })
 }
@@ -1148,15 +1298,44 @@ impl QuadStore for RingStore {
         Ok(())
     }
 
+    /// Bulk insert: acquires the lock **once** for the entire batch (not
+    /// once per quad), applies every quad in-memory, and — for a persistent
+    /// store — writes every resulting `WalRecord::InsertQuad` in a single
+    /// `append_batch` call (one `fsync` for the whole batch instead of one
+    /// per quad; see `wal.rs`'s "## Fsync policy" module docs). This is the
+    /// path taken by SPARQL `INSERT DATA` with multiple triples.
+    ///
+    /// Durability ordering: every quad about to be applied — whether or not
+    /// it turns out to already exist (`apply_insert` is idempotent, see its
+    /// doc comment) — is logged to the WAL *before* any of them are applied
+    /// to in-memory state, exactly mirroring the single-quad `insert()`'s
+    /// "log intent durably BEFORE applying" discipline, just batched.
     fn extend(&self, quads: impl IntoIterator<Item = Quad>) -> Result<usize, Oxigraph> {
-        // Bulk insert: intern all terms under one lock acquisition per quad.
-        // For very large bulk loads, callers should call `compact()` afterwards.
+        let quads: Vec<Quad> = quads.into_iter().collect();
+        if quads.is_empty() {
+            return Ok(0);
+        }
+
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+
+        // Log every quad's intent durably BEFORE applying any of them (one
+        // batched fsync for the whole set, instead of one per quad).
+        let records: Vec<WalRecord> = quads
+            .iter()
+            .map(|q| WalRecord::InsertQuad(q.clone()))
+            .collect();
+        inner.wal_append_batch(records.iter())?;
+
         let mut count = 0usize;
-        for quad in quads {
-            if self.insert(&quad)? {
+        for quad in &quads {
+            if inner.apply_insert(quad)? {
                 count += 1;
             }
         }
+        inner.maybe_auto_compact()?;
         Ok(count)
     }
 }
@@ -1567,7 +1746,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── Isolation semantics (CLAUDE.md item 1f) ─────────────────────────────
+    #[test]
+    fn extend_single_lock_and_batch_fsync_round_trips() {
+        let dir = temp_dir("extend_batch");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RingStore::open(&dir).unwrap();
+        let quads: Vec<Quad> = (0..50)
+            .map(|i| make_quad(&format!("http://ex/s{i}"), "http://ex/p", "v", dg()))
+            .collect();
+        let count = store.extend(quads.clone()).unwrap();
+        assert_eq!(count, 50);
+        assert_eq!(store.len().unwrap(), 50);
+
+        drop(store);
+        let store2 = RingStore::open(&dir).unwrap();
+        assert_eq!(store2.len().unwrap(), 50);
+        for q in &quads {
+            assert!(store2.contains(q).unwrap());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_policy_interval_writes_are_eventually_durable() {
+        let dir = temp_dir("interval_policy");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RingStore::open(&dir).unwrap();
+        store.set_sync_policy(SyncPolicy::Interval(Duration::from_millis(20)));
+
+        let q = make_quad("http://ex/s", "http://ex/p", "v", dg());
+        store.insert(&q).unwrap();
+
+        // Give the background flusher a chance to run at least once.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Explicit flush to be certain, then reopen and confirm durability.
+        store.flush_wal().unwrap();
+        drop(store);
+
+        let store2 = RingStore::open(&dir).unwrap();
+        assert!(store2.contains(&q).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Isolation semantics ──────────────────────────────────────────────────
     //
     // `RingStore` gives per-call atomicity for free (each `insert`/`remove`/
     // `quads_for_pattern` call takes the single `Mutex<RingStoreInner>` once
@@ -1579,9 +1805,8 @@ mod tests {
     // the same hypothetical multi-pattern query **is** visible to the second
     // call, even though — under a true "fixed snapshot for the whole
     // operation" guarantee (the semantics upstream Oxigraph documents) — it
-    // should not be. See the module doc comment above and `CLAUDE.md`'s
-    // item 1f for the full write-up of why this is an accepted, documented
-    // limitation rather than a bug.
+    // should not be. See the module doc comment above for the full write-up
+    // of why this is an accepted, documented limitation rather than a bug.
     #[test]
     fn multi_call_scan_does_not_get_a_whole_query_repeatable_read_snapshot() {
         let store = Arc::new(RingStore::new());
@@ -1627,8 +1852,7 @@ mod tests {
             1,
             "quad_b, inserted strictly between the two scans, is visible to the second \
              scan — proving RingStore does NOT provide a repeatable-read/fixed-snapshot \
-             guarantee across multiple store calls belonging to one logical query or Update \
-             (see CLAUDE.md item 1f)"
+             guarantee across multiple store calls belonging to one logical query or Update"
         );
     }
 
@@ -1662,6 +1886,57 @@ mod tests {
         assert_eq!(store.len().unwrap(), 1);
         assert!(store.contains(&q1).unwrap());
         assert!(!store.contains(&q2).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extend_torn_batch_tail_replays_none_of_the_batch() {
+        // A batch's records are each independently framed, so a torn write
+        // mid-batch behaves exactly like any other torn write: replay stops
+        // at the first bad frame. If the tear happens to land such that NO
+        // record in the batch is fully intact, none of the batch survives —
+        // this test picks a small batch and truncates enough bytes to tear
+        // through all of it, confirming no partial/corrupt state results.
+        let dir = temp_dir("extend_torn");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let q_before = make_quad("http://ex/before", "http://ex/p", "v", dg());
+        {
+            let store = RingStore::open(&dir).unwrap();
+            store.insert(&q_before).unwrap();
+        }
+
+        let before_len = std::fs::metadata(RingStore::wal_path(&dir)).unwrap().len();
+
+        {
+            let store = RingStore::open(&dir).unwrap();
+            let quads: Vec<Quad> = (0..10)
+                .map(|i| make_quad(&format!("http://ex/batch{i}"), "http://ex/p", "v", dg()))
+                .collect();
+            store.extend(quads).unwrap();
+        }
+
+        let full_len = std::fs::metadata(RingStore::wal_path(&dir)).unwrap().len();
+        assert!(full_len > before_len);
+
+        // Truncate everything the batch wrote, minus a few bytes, so the
+        // batch's tail is torn but the pre-existing record is untouched.
+        {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(RingStore::wal_path(&dir))
+                .unwrap();
+            file.set_len(before_len + 5).unwrap();
+        }
+
+        let store = RingStore::open(&dir).unwrap();
+        assert!(store.contains(&q_before).unwrap());
+        assert_eq!(
+            store.len().unwrap(),
+            1,
+            "torn batch tail must not partially apply — only the pre-existing record survives"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -94,8 +94,7 @@ impl CltjTrie {
     }
 
     /// Per-component (T/L/sidecar) memory breakdown of this trie's LOUDS
-    /// structure, for the Phase A.1 diagnostic (see `CLAUDE.md`'s "Memory
-    /// footprint investigation" section).  Excludes vocab — see
+    /// structure.  Excludes vocab — see
     /// [`CltjData::mem_breakdown_per_ordering`] for per-field vocab bytes.
     pub fn mem_breakdown(&self) -> LoudsMemBreakdown {
         self.louds.mem_breakdown()
@@ -126,8 +125,8 @@ impl CltjTrie {
     /// the top-level [`CltjSnapshot`], deduped across all six tries) and
     /// keeping only the ε-serde-serializable [`LoudsCore`].
     ///
-    /// Used by the persistent snapshot format (item 1b in `CLAUDE.md`'s
-    /// "What's Next").  Requires unique ownership of the trie (i.e. the
+    /// Used by the persistent snapshot format.  Requires unique ownership
+    /// of the trie (i.e. the
     /// enclosing `Arc<CltjTrie>` must have refcount 1) — true for a freshly
     /// built [`CltjData`] that has not yet been shared, per the "always
     /// mapped" design (see `RingStore::compact`).
@@ -288,8 +287,7 @@ impl CltjData {
         louds_total + vocab_total
     }
 
-    /// Per-ordering memory breakdown (Phase A.1 diagnostic — see `CLAUDE.md`'s
-    /// "Memory footprint investigation" section).
+    /// Per-ordering memory breakdown.
     ///
     /// Returns one `(SortOrder, LoudsMemBreakdown, vocab_bytes_undeduped)` tuple
     /// per of the six tries, in the fixed order SPO/SOP/PSO/POS/OPS/OSP.  The
@@ -336,8 +334,8 @@ impl CltjData {
     /// Consume this `CltjData`, producing the ε-serde-serializable
     /// [`CltjSnapshot`] (3 deduped vocab arrays + 6 [`LoudsCore`]s).
     ///
-    /// Used by the persistent snapshot format (item 1b in `CLAUDE.md`'s
-    /// "What's Next").  Requires that no other `Arc<CltjTrie>` clones exist
+    /// Used by the persistent snapshot format.  Requires that no other
+    /// `Arc<CltjTrie>` clones exist
     /// (true for a freshly built `CltjData` per the "always mapped" design —
     /// see `RingStore::compact`); panics otherwise via `expect`.
     ///
@@ -367,8 +365,7 @@ impl CltjData {
     }
 
     /// Reconstruct a `CltjData` from a [`CltjSnapshot`] loaded from disk (or
-    /// from an in-memory round-trip buffer; see item 1b's "always mapped"
-    /// design in `CLAUDE.md`).
+    /// from an in-memory round-trip buffer using the "always mapped" design).
     ///
     /// Rebuilds each `CltjTrie`'s sidecar via [`LoudsTrie::from_core`] and
     /// redistributes the three vocab arrays across the six tries per the
@@ -434,8 +431,8 @@ impl CltjData {
 /// excluded), one per [`SortOrder`] in the fixed order
 /// SPO/SOP/PSO/POS/OPS/OSP.
 ///
-/// This is the persistent on-disk representation for item 1b in
-/// `CLAUDE.md`'s "What's Next".  Loading redistributes the three vocab
+/// This is the persistent on-disk representation.  Loading redistributes
+/// the three vocab
 /// arrays across the six tries per the static ordering permutation in
 /// [`build_cltj_data`], and rebuilds each trie's sidecar via
 /// [`LoudsTrie::from_core`] — see [`CltjData::from_snapshot`].
@@ -913,7 +910,7 @@ mod tests {
         assert!(it1.at_end());
     }
 
-    /// End-to-end round-trip of the persistent snapshot format (item 1b):
+    /// End-to-end round-trip of the persistent snapshot format:
     /// build a `CltjData`, convert to `CltjSnapshot`, serialize via ε-serde
     /// into an in-memory buffer, deserialize back, reconstruct a `CltjData`
     /// via `from_snapshot`, and verify identical `TrieIterator` behaviour

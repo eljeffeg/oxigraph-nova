@@ -40,10 +40,12 @@ sparopt       = { version = "0.3",     features = ["sparql-12"] } # SPARQL algeb
 tantivy = "0.26"   # Full-text search engine; listed here for version coordination
 
 # ── Async runtime + HTTP ────────────────────────────────────────────────────
-tokio      = { version = "1.52",  features = ["full"] }
-axum       = { version = "0.8",   features = ["json"] }
-tower      = "0.5"
-tower-http = { version = "0.7",   features = ["cors", "trace"] }
+tokio        = { version = "1.52",  features = ["full"] }
+tokio-stream = { version = "0.1" }
+axum         = { version = "0.8",   features = ["json"] }
+tower        = "0.5"
+tower-http   = { version = "0.7",   features = ["cors", "trace"] }
+
 
 # ── Serialization ───────────────────────────────────────────────────────────
 serde      = { version = "1", features = ["derive"] }
@@ -61,6 +63,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2  = "0.10"
 sha1  = "0.10"
 md-5  = "0.10"
+
+# ── Compression (on-disk persistence: snapshot + dictionary files) ─────────
+zstd = "0.13"
+
 
 # ── Regex ───────────────────────────────────────────────────────────────────
 regex = "1"

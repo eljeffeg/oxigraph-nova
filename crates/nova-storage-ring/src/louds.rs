@@ -29,20 +29,18 @@
 //! L is stored as a `sux::bits::BitFieldVec<usize>` using ⌈log₂(U)⌉ bits per
 //! label, where U = alphabet size (max local ID + 1).  This provides bit-packed
 //! storage with direct index access, and — since sux 0.14's `BitFieldVec`
-//! derives `epserde::Epserde` — a zero-copy ε-serde + mmap persistence path
-//! (item 1b in `CLAUDE.md`'s "What's Next"). Typically 14–17 bits/label for
-//! real datasets.
+//! derives `epserde::Epserde` — a zero-copy ε-serde + mmap persistence path.
+//! Typically 14–17 bits/label for real datasets.
 //!
 //! ## T bitvector substrate
 //!
 //! The LOUDS `T` bitvector is **select1-dominant** — every `child()` and
 //! `degree()` call issues one or two `select1` operations.
 //!
-//! Backend: `sux 0.14` Rank9 + SelectAdapt (benchmarked winner, −10% vs the
-//! formerly-available `sucds::Rank9Sel` fallback — see Hard-Won Lesson #5 in
-//! `CLAUDE.md`; the fallback was removed as part of item 1b since a single
-//! sux-only T backend is a prerequisite for an unambiguous ε-serde/mmap
-//! snapshot format).
+//! Backend: `sux 0.14` Rank9 + SelectAdapt (benchmarked winner, −10% vs a
+//! `sucds::Rank9Sel` fallback that was removed once benchmarking confirmed
+//! sux was faster; a single T backend is also a prerequisite for an
+//! unambiguous ε-serde/mmap snapshot format).
 //!
 //! The `T` substrate is fully encapsulated in the `t_backend` module below.
 //! All paper navigation formulas and all unit tests are substrate-independent.
@@ -120,9 +118,9 @@ enum SidecarPayload {
 //   pub(super) fn select1(&self, k: usize) -> Option<usize>  // 0-indexed k-th 1
 //
 // sux Rank9+SelectAdapt is the sole T backend (the formerly-available
-// `sucds::Rank9Sel` `--no-default-features` fallback was removed as part of
-// item 1b in CLAUDE.md's "What's Next" — a single sux-only T backend is a
-// prerequisite for an unambiguous ε-serde/mmap snapshot format).
+// `sucds::Rank9Sel` `--no-default-features` fallback was removed — a single
+// sux-only T backend is a prerequisite for an unambiguous ε-serde/mmap
+// snapshot format).
 mod t_backend {
     //! T bitvector backend: `sux 0.14` Rank9 + SelectAdapt (Vigna).
     //!
@@ -166,13 +164,11 @@ mod t_backend {
     /// One backing store; no clone; both rank() and select() work on `rs`.
     type SuxRS = SelectAdapt<AddNumBits<Rank9<SuxBV>>>;
 
-    // Item 1b (wired up, permanently): `#[derive(epserde::Epserde)]` composes
-    // cleanly through sux's nested Deref chain
-    // (SelectAdapt<AddNumBits<Rank9<BitVec<Vec<u64>>>>>) with zero extra
-    // trait-bound or lifetime work — confirmed by the throwaway spike
-    // (2026-07-03) and now enabled for real: `TBitvec` is the T-bitvector
+    // `#[derive(epserde::Epserde)]` composes cleanly through sux's nested
+    // Deref chain (SelectAdapt<AddNumBits<Rank9<BitVec<Vec<u64>>>>>) with
+    // zero extra trait-bound or lifetime work. `TBitvec` is the T-bitvector
     // component of the ε-serde/mmap snapshot format (`LoudsCore`, see
-    // CLAUDE.md item 1b / `snapshot.rs`).
+    // `snapshot.rs`).
     #[derive(Epserde)]
     pub(super) struct TBitvec {
         rs: SuxRS,
@@ -279,8 +275,7 @@ const EF_THRESH_EFFECTIVE: usize = SIDECAR_THRESH;
 #[cfg(not(feature = "l-opt-ef"))]
 const EF_THRESH_EFFECTIVE: usize = EF_THRESH;
 
-/// Per-component memory breakdown of a single [`LoudsTrie`] (Phase A.1
-/// diagnostic — see `CLAUDE.md`'s "Memory footprint investigation" section).
+/// Per-component memory breakdown of a single [`LoudsTrie`].
 /// Does not include the shared vocab arrays, which live one level up in
 /// [`crate::cltj::CltjData`] (Arc-deduped across all six tries).
 #[derive(Copy, Clone, Debug, Default)]
@@ -310,7 +305,7 @@ impl LoudsMemBreakdown {
 /// `l` is a `sux::bits::BitFieldVec` (backend `Vec<usize>`) storing ⌈log₂(U)⌉
 /// bits per label using bit-packed storage with direct index access.  Since
 /// `BitFieldVec` derives `epserde::Epserde`, this is also the basis for the
-/// ε-serde mmap persistence path (item 1b in `CLAUDE.md`'s "What's Next").
+/// ε-serde mmap persistence path.
 /// `l_len` stores the logical length (= n_edges + 1 for the dummy) separately
 /// to avoid pulling in `value_traits::SliceByValue` as a direct dependency.
 ///
@@ -348,7 +343,7 @@ pub struct LoudsTrie {
 /// T+L-only core of a [`LoudsTrie`], excluding the sidecar.
 ///
 /// This is the ε-serde-serializable subset of `LoudsTrie` used by the
-/// persistent snapshot format (item 1b in `CLAUDE.md`'s "What's Next").  The
+/// persistent snapshot format.  The
 /// sidecar is a purely derived index (rebuilt in O(n) from `t`/`l` via
 /// [`LoudsTrie::build_sidecar`]), so excluding it from the snapshot keeps the
 /// on-disk format smaller without losing any information.
@@ -367,7 +362,7 @@ impl LoudsTrie {
     /// Consume this trie, discarding the sidecar (a derived index — see
     /// [`LoudsCore`]), and keep only the ε-serde-serializable T+L core.
     ///
-    /// Used by the persistent snapshot format (item 1b) to serialize a freshly
+    /// Used by the persistent snapshot format to serialize a freshly
     /// built trie without paying for sidecar storage on disk.
     pub(crate) fn into_core(self) -> LoudsCore {
         LoudsCore {
@@ -379,7 +374,7 @@ impl LoudsTrie {
 
     /// Reconstruct a full `LoudsTrie` — including a freshly rebuilt sidecar —
     /// from a [`LoudsCore`] loaded from disk (or from an in-memory round-trip
-    /// buffer; see item 1b's "always mapped" design in `CLAUDE.md`).
+    /// buffer).
     pub(crate) fn from_core(core: LoudsCore) -> Self {
         let sidecar = Self::build_sidecar(&core.t, &core.l, core.l_len);
         LoudsTrie {
@@ -557,8 +552,7 @@ impl LoudsTrie {
     }
 
     /// Per-component breakdown of this trie's memory (T bitvector / L label
-    /// array / sidecar), for the Phase A.1 diagnostic (see `CLAUDE.md`'s
-    /// "Memory footprint investigation" section). Does not include shared
+    /// array / sidecar). Does not include shared
     /// vocab — see `CltjData::mem_size_bytes` for the Arc-deduped vocab total.
     pub fn mem_breakdown(&self) -> LoudsMemBreakdown {
         let sidecar_bytes: usize = self
@@ -829,7 +823,7 @@ mod tests {
     use super::*;
 
     /// Construct the exact trie from Example 10 of the CompactLTJ paper
-    /// (as quoted in CLAUDE.md) and verify every formula from the paper.
+    /// and verify every formula from the paper.
     ///
     /// T = 00001 111101 1111000010001  (24 bits)
     /// L = 13456 777789 3251123451234  (24 entries, 1-indexed in paper)
@@ -856,7 +850,7 @@ mod tests {
         assert_eq!(t_bits.len(), l_labels.len(), "T and L must be same length");
         let trie = LoudsTrie::from_raw(&t_bits, &l_labels);
 
-        // ── degree and child checks from CLAUDE.md ────────────────────────────
+        // ── degree and child checks ───────────────────────────────────────────
 
         // degree(root=0) should be 5
         assert_eq!(trie.degree(0), 5, "root degree");

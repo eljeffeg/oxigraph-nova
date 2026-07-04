@@ -367,17 +367,19 @@ fn clear_one_graph<S: QuadStore>(store: &Arc<S>, g: &GraphName) -> Result<()> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("{e}"))?;
     for sq in stored {
-        let subject = match sq.subject {
-            Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
-            Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
+        let subject = match sq.subject.as_ref() {
+            Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n.clone()),
+            Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b.clone()),
             // Quoted-triple subject: not representable in a plain `Quad`
             // (write-path limitation of oxrdf 0.3), so it can't be removed
             // via `QuadStore::remove` — skip it.
             _ => continue,
         };
-        let quad = Quad::new(subject, sq.predicate, sq.object, sq.graph_name);
+        let object = Arc::unwrap_or_clone(sq.object);
+        let quad = Quad::new(subject, sq.predicate, object, sq.graph_name);
         store.remove(&quad).map_err(|e| anyhow!("{e}"))?;
     }
+
     Ok(())
 }
 

@@ -490,12 +490,16 @@ impl<S: QuadStore + 'static> Dataset for StoreDataset<S> {
                 Ok(sq) => graph_matches(&graph_sel, &sq.graph_name),
             })
             .map(|r| {
-                // StoredQuad.subject is already Term — no NamedOrBlankNode→Term
-                // conversion needed, so Term::Triple subjects flow through intact.
+                // StoredQuad.subject/object are Arc<Term>: the tight
+                // quads_for_pattern loop shares dictionary Arc
+                // allocations instead of deep-cloning every matched term. We
+                // unwrap/clone back to an owned `Term` exactly once here, at
+                // the StoredQuad → QuadMatch boundary, rather than doing the
+                // (much more numerous) deep clones inside that hot loop.
                 r.map(|sq| QuadMatch {
-                    subject: sq.subject,
+                    subject: Arc::unwrap_or_clone(sq.subject),
                     predicate: Term::NamedNode(sq.predicate),
-                    object: sq.object,
+                    object: Arc::unwrap_or_clone(sq.object),
                     graph_name: sq.graph_name,
                 })
                 .map_err(|e| anyhow::anyhow!("{e}"))

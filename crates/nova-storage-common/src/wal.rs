@@ -41,10 +41,30 @@
 //!
 //! ## Fsync policy
 //!
-//! [`WalWriter::append`] calls `File::sync_data()` after every write. This is
-//! the simplest correct policy (every acknowledged write is durable) at the
-//! cost of one fsync per operation; batching/group-commit is a future
-//! optimization.
+//! [`WalWriter::append`] calls `File::sync_data()` after every write — the
+//! simplest correct policy (every acknowledged write is durable) at the cost
+//! of one fsync per operation. Two group-commit alternatives are now also
+//! available for callers that want to trade a small window of durability for
+//! much higher write throughput:
+//!
+//! - [`WalWriter::append_batch`] writes an entire batch of records with a
+//!   **single** `fsync` at the end — used by `RingStore::extend` (and thus
+//!   any multi-quad bulk insert / SPARQL `INSERT DATA` with many triples) so
+//!   that every record in the batch is either fully durable or the whole
+//!   batch is torn identically to a single-record torn write (see [`replay`]
+//!   — the per-record framing means a batch's records are indistinguishable
+//!   from independently-appended ones at replay time).
+//! - [`WalWriter::append_no_sync`] writes without fsyncing at all, paired
+//!   with a caller-managed background thread that calls
+//!   [`WalWriter::sync`]/[`WalWriter::try_clone_file`] periodically (see
+//!   `oxigraph_nova_storage_ring::store::SyncPolicy::Interval`). This is the
+//!   "group commit" pattern used by most production databases (e.g.
+//!   RocksDB's default WAL mode, MongoDB's periodic journal commit): writes
+//!   return immediately, and a background flusher batches many writers'
+//!   fsyncs into one periodic syscall. The cost is a small durability
+//!   window — writes acknowledged since the last flush are lost on a crash
+//!   (not corrupted; `replay`'s torn-tail handling covers this exactly the
+//!   same way as any other incomplete/torn write).
 
 use oxigraph_nova_core::{BlankNode, GraphName, Literal, NamedNode, Oxigraph, Quad, Subject, Term};
 use std::fs::{File, OpenOptions};
@@ -341,18 +361,82 @@ impl WalWriter {
         Ok(Self { file })
     }
 
-    /// Append one record, framed with a length prefix and CRC32 checksum,
-    /// and `fsync` before returning (see module docs on fsync policy).
-    pub fn append(&mut self, record: &WalRecord) -> io::Result<()> {
+    /// Frame one record: `[u32 LE payload_len][payload][u32 LE crc32(payload)]`.
+    fn frame_record(record: &WalRecord) -> Vec<u8> {
         let payload = encode_record(record);
         let crc = crc32fast::hash(&payload);
         let mut framed = Vec::with_capacity(4 + payload.len() + 4);
         framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         framed.extend_from_slice(&payload);
         framed.extend_from_slice(&crc.to_le_bytes());
+        framed
+    }
+
+    /// Append one record, framed with a length prefix and CRC32 checksum,
+    /// and `fsync` before returning (see module docs on fsync policy).
+    pub fn append(&mut self, record: &WalRecord) -> io::Result<()> {
+        let framed = Self::frame_record(record);
         self.file.write_all(&framed)?;
         self.file.sync_data()?;
         Ok(())
+    }
+
+    /// Append every record in `records`, each independently framed exactly
+    /// as [`append`] would, but with a **single** `fsync` after the whole
+    /// batch is written — group commit. Either the entire batch is durable
+    /// after this returns `Ok`, or (on a crash before the fsync completes)
+    /// none of it is guaranteed durable; because each record keeps its own
+    /// length+CRC frame, a partially-flushed batch is torn identically to
+    /// any other torn write and is handled the same way by [`replay`] (stop
+    /// at the first bad frame, truncate to the last good boundary — no
+    /// record is ever left half-applied).
+    ///
+    /// Empty `records` is a no-op (no write, no fsync).
+    pub fn append_batch<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a WalRecord>,
+    ) -> io::Result<()> {
+        let mut buf = Vec::new();
+        for record in records {
+            buf.extend_from_slice(&Self::frame_record(record));
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(&buf)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Append one record like [`append`], but **without** fsyncing —
+    /// intended for use with `SyncPolicy::Interval`'s background flusher
+    /// (see module docs). The caller is responsible for ensuring
+    /// [`WalWriter::sync`] is called periodically (or before shutdown) so
+    /// writes eventually become durable; until then, a crash can lose
+    /// anything written via this method since the last `sync`.
+    pub fn append_no_sync(&mut self, record: &WalRecord) -> io::Result<()> {
+        let framed = Self::frame_record(record);
+        self.file.write_all(&framed)?;
+        Ok(())
+    }
+
+    /// Explicitly `fsync` (`sync_data`) the underlying file — used by a
+    /// background flusher thread under `SyncPolicy::Interval` to durably
+    /// commit everything written via [`append_no_sync`] since the last call.
+    pub fn sync(&self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+
+    /// Clone the underlying `File` handle (shares the same OS file
+    /// description/offset), so a background flusher thread can call
+    /// [`WalWriter::sync`]-equivalent (`File::sync_data`) concurrently with
+    /// the writer thread continuing to `write_all`/`append_no_sync` — Unix
+    /// `write`s to the same fd are safe to interleave with `fsync` from
+    /// another thread (the kernel serializes them), and this avoids needing
+    /// a lock shared between the writer and flusher for the common case
+    /// where the flusher only ever calls `sync_data`.
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 }
 
