@@ -172,7 +172,7 @@ QLever (C++) is a high-performance RDF store optimized for bulk-loaded static da
 
 Oxigraph Nova targets full conformance with the W3C SPARQL 1.1 and (Working Draft) SPARQL 1.2 test suites, run against the live, up-to-date W3C test manifests rather than a fixed snapshot — see `tests/w3c/` to run the harness yourself. RDF 1.2 features (quoted triples, `TRIPLE()`, base-direction literals) are supported end-to-end since Nova enables the `rdf-12`/`sparql-12` feature flags across the whole parsing stack from day one.
 
-Because Nova reuses the Oxigraph project's own parsing crates (`spargebra`, `oxrdf`, etc. — see the table above), any gap in those crates shows up here too. Where this project has found and worked around genuine parser bugs or missing features in those upstream crates, the details are tracked in `CLAUDE.md` rather than here, since that's development-process detail rather than product description.
+Because Nova reuses the Oxigraph project's own parsing crates (`spargebra`, `oxrdf`, etc. — see the table above), any gap in those crates shows up here too.
 
 ### Other RDF ecosystems evaluated
 

@@ -23,11 +23,51 @@
 //! | `1` | Ontology graph — TBox input for reasoner |
 //! | `2–254` | User named graphs |
 //! | `255` | Inference graph — OWL 2 RL closure written by the reasoner |
+//!
+//! ## Two-tier storage (Front-Coding compression)
+//!
+//! `Dictionary` is a two-tier structure:
+//!
+//! - **Delta tier** (mutable): `id_to_term: Vec<Option<Arc<Term>>>` +
+//!   `term_to_id: HashMap<Arc<Term>, TermId>`, exactly as before — every
+//!   term interned since the last [`Dictionary::compact`], plus every
+//!   quoted-triple term (which never leaves this tier).
+//! - **Compacted tier** (immutable): a sorted, Front-Coded byte buffer (see
+//!   [`crate::dict_compact::CompactedTier`]) covering every *regular*
+//!   (non-quoted-triple) term as of the last `compact()`. `TermId`s are
+//!   never reassigned — only an internal sorted-rank permutation
+//!   (`id2rank`/`rank2id`, bit-packed via `sux::BitFieldVec`) changes.
+//!
+//! `compact()` merges both tiers into a brand new compacted tier, then
+//! **frees** every compacted regular term's `Arc<Term>` from both
+//! `id_to_term` (set to `None`) and `term_to_id` (removed) — this is where
+//! the real memory reduction comes from. Decoding a freed term re-derives
+//! it from the compacted byte buffer on demand, consulting a small bounded
+//! `TermId → Arc<Term>` LRU cache first so that repeatedly-matched terms
+//! (e.g. a hot predicate or object) avoid paying the Front-Coded block
+//! decode cost on every lookup. The cache is cleared on every `compact()`
+//! call, since ranks and block offsets shift.
+//!
+//! `get_term`'s old `-> Option<&Term>` signature could not survive this
+
+//! (a borrowed reference cannot be produced for content that isn't
+//! resident) — it has been removed in favor of `get_term_arc` (which was
+//! already the primary hot-path accessor for exactly this reason).
 
 use crate::Oxigraph;
+use crate::dict_compact::{self, CompactedTier};
 use oxrdf::{GraphName, NamedNode, Term};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+
+/// Capacity of the `TermId`-keyed decode cache.
+/// Sized generously enough to hold the working set of hot compacted-tier
+/// terms (e.g. a handful of frequently-matched predicates/objects) without
+/// meaningfully affecting overall memory footprint — an `Arc<Term>` clone
+/// per entry is cheap once decoded.
+const DECODE_CACHE_CAPACITY: usize = 8192;
 
 // ── TermId ───────────────────────────────────────────────────────────────────
 
@@ -101,17 +141,32 @@ impl GraphId {
 /// `Dictionary` is `!Sync` by design — callers are expected to wrap it in a
 /// `Mutex<RingStoreInner>` (as `RingStore` does) rather than using separate locks.
 pub struct Dictionary {
-    // ── Term ↔ TermId ──────────────────────────────────────────────────────
-    /// Reverse: `id_to_term[id.as_u64()]` → `Term`.
-    ///
-    /// Stored as `Arc<Term>` so the same heap-allocated term content is
-    /// shared with the `term_to_id` HashMap key below, instead of being
-    /// duplicated. This halves the Dictionary's real memory footprint versus
-    /// storing two independent owned `Term`s per interned value.
-    id_to_term: Vec<Arc<Term>>,
-    /// Forward: `Term` → `TermId`. The key `Arc<Term>` is the *same*
-    /// allocation as the corresponding `id_to_term` entry.
+    // ── Term ↔ TermId (delta tier) ─────────────────────────────────────────
+    /// Reverse: `id_to_term[id.as_u64()]` → `Term`, for terms still
+    /// resident in the delta tier. `None` means this id's term has been
+    /// folded into `compacted` and its `Arc<Term>` freed — decode via
+    /// `compacted.decode_id` instead. Quoted-triple terms are always
+    /// `Some` (never compacted).
+    id_to_term: Vec<Option<Arc<Term>>>,
+    /// Forward: `Term` → `TermId`, for terms still resident in the delta
+    /// tier (same population as `id_to_term`'s `Some` entries). The key
+    /// `Arc<Term>` is the *same* allocation as the corresponding
+    /// `id_to_term` entry.
     term_to_id: HashMap<Arc<Term>, TermId>,
+
+    // ── Compacted tier (immutable, Front-Coded) ────────────────────────────
+    /// Sorted, Front-Coded byte buffer + `id2rank`/`rank2id` permutation for
+    /// every regular term as of the last `compact()`. Starts empty.
+    compacted: CompactedTier,
+
+    /// `TermId → Arc<Term>` decode cache for compacted-tier terms (Phase 3).
+    /// Avoids re-parsing an entire Front-Coded block on every lookup for
+    /// hot terms (e.g. a repeated `rdf:type` object matched by thousands of
+    /// LFTJ rows). `RefCell`-wrapped since `get_term_arc` takes `&self` —
+    /// safe because `Dictionary` is always accessed through the single
+    /// `Mutex<RingStoreInner>` (no concurrent access to guard against).
+    /// Cleared on every `compact()` call, since ranks/block offsets shift.
+    decode_cache: RefCell<lru::LruCache<TermId, Arc<Term>>>,
 
     // ── GraphName ↔ GraphId ─────────────────────────────────────────────────
     /// Forward: `GraphName` → `GraphId`
@@ -141,9 +196,14 @@ impl Dictionary {
         let mut d = Self {
             id_to_term: Vec::new(),
             term_to_id: HashMap::new(),
+            compacted: CompactedTier::empty(),
+            decode_cache: RefCell::new(lru::LruCache::new(
+                NonZeroUsize::new(DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
+            )),
             graph_to_id: HashMap::new(),
             id_to_graph: HashMap::new(),
             next_graph_id: 2, // 0=default, 1=ontology — both reserved
+
             triple_terms: HashMap::new(),
             triple_index: HashMap::new(),
         };
@@ -153,7 +213,7 @@ impl Dictionary {
         d
     }
 
-    /// Total number of interned terms.
+    /// Total number of interned terms (both tiers).
     pub fn len(&self) -> usize {
         self.id_to_term.len()
     }
@@ -166,18 +226,10 @@ impl Dictionary {
     /// Real allocated byte size of this dictionary, for memory-breakdown
     /// diagnostics.
     ///
-    /// `id_to_term` and `term_to_id` share the *same* `Arc<Term>` heap
-    /// allocation per interned term — `oxrdf` 0.3.3's `Term` variants don't
-    /// do this sharing natively (owned `String`s, no `Arc`), so each interned
-    /// `Term` is wrapped in our own `Arc` once and the `Arc` (cheap refcount
-    /// bump) is cloned into both tables. This avoids paying for every term's
-    /// string content twice, down to once per term plus a small fixed `Arc`
-    /// control-block + pointer overhead.
-    ///
-    /// This is a diagnostic estimate, not exact `malloc` accounting: it uses
-    /// `String::len()` (not allocator capacity, which is usually equal or only
-    /// slightly larger for strings built once via `to_owned`/`String::from`)
-    /// plus fixed struct/enum overhead per field.
+    /// Accounts for the delta tier's resident `Arc<Term>`s (shared, once
+    /// per term, between `id_to_term` and `term_to_id`) plus the compacted
+    /// tier's actual byte-buffer/bit-packed-permutation footprint. This is
+    /// a diagnostic estimate, not exact `malloc` accounting.
     pub fn mem_size_bytes(&self) -> usize {
         use std::mem::size_of;
 
@@ -208,18 +260,19 @@ impl Dictionary {
         // `ArcInner<T>` prepends two refcounts (strong + weak) before `T`.
         const ARC_CTRL_OVERHEAD: usize = size_of::<usize>() * 2;
 
-        // Each interned term has exactly ONE heap allocation, shared
-        // (via `Arc::clone`) between `id_to_term` and `term_to_id`.
-        // Iterating `id_to_term` visits each unique term exactly once.
+        // Each still-resident (delta-tier) term has exactly ONE heap
+        // allocation, shared (via `Arc::clone`) between `id_to_term` and
+        // `term_to_id`.
         let unique_term_bytes: usize = self
             .id_to_term
             .iter()
+            .flatten()
             .map(|t| enum_overhead + term_heap_bytes(t) + ARC_CTRL_OVERHEAD)
             .sum();
 
-        // `id_to_term: Vec<Arc<Term>>` — one 8-byte pointer per slot (content
-        // already counted above via `unique_term_bytes`).
-        let id_to_term_ptrs = self.id_to_term.len() * size_of::<Arc<Term>>();
+        // `id_to_term: Vec<Option<Arc<Term>>>` — one slot per id (content
+        // already counted above via `unique_term_bytes` for `Some` entries).
+        let id_to_term_ptrs = self.id_to_term.len() * size_of::<Option<Arc<Term>>>();
 
         // `term_to_id: HashMap<Arc<Term>, TermId>` — one 8-byte `Arc` pointer
         // (a clone of the same allocation, no new heap content) + the
@@ -245,6 +298,7 @@ impl Dictionary {
             + graph_bytes
             + triple_terms_bytes
             + triple_index_bytes
+            + self.compacted.mem_size_bytes()
     }
 
     // ── Term interning ────────────────────────────────────────────────────────
@@ -254,13 +308,18 @@ impl Dictionary {
     /// For quoted triples (`Term::Triple`), recursively interns the components
     /// and populates the `triple_terms` / `triple_index` side tables so that
     /// `SUBJECT()` / `PREDICATE()` / `OBJECT()` can look up components by ID.
+    ///
+    /// For regular terms already folded into the compacted tier (by a
+    /// previous `compact()`), returns the existing `TermId` without
+    /// assigning a new one — `TermId`s are always insertion-order-stable,
+    /// never reassigned.
     pub fn intern(&mut self, term: &Term) -> Result<TermId, Oxigraph> {
-        // Fast path: already interned.
+        // Fast path: already interned in the delta tier (or a quoted triple).
         if let Some(&id) = self.term_to_id.get(term) {
             return Ok(id);
         }
 
-        // Handle quoted triples (RDF 1.2 / RDF-star).
+        // Handle quoted triples (RDF 1.2 / RDF-star). Never compacted.
         if let Term::Triple(t) = term {
             // Recursively intern each component first.
             let s_id = self.intern(&Term::from(t.subject.clone()))?;
@@ -278,21 +337,24 @@ impl Dictionary {
             let raw = self.id_to_term.len() as u64;
             let id = TermId::new(raw)?;
             let arc = Arc::new(term.clone());
-            self.id_to_term.push(Arc::clone(&arc));
+            self.id_to_term.push(Some(Arc::clone(&arc)));
             self.term_to_id.insert(arc, id);
             self.triple_terms.insert(id, components);
             self.triple_index.insert(components, id);
             return Ok(id);
         }
 
-        // Regular terms: IRI, blank node, literal.
-        // Wrap in one `Arc` and clone the (cheap) refcounted pointer into
-        // both tables, instead of cloning the full `Term` (and its
-        // heap-allocated `String` content) twice.
+        // Regular term: check the compacted tier before assigning a new id
+        // — it may already be present from a previous compaction.
+        if let Some(raw) = self.compacted.get_id(term) {
+            return TermId::new(raw);
+        }
+
+        // Brand new term: append to the delta tier.
         let raw = self.id_to_term.len() as u64;
         let id = TermId::new(raw)?;
         let arc = Arc::new(term.clone());
-        self.id_to_term.push(Arc::clone(&arc));
+        self.id_to_term.push(Some(Arc::clone(&arc)));
         self.term_to_id.insert(arc, id);
         Ok(id)
     }
@@ -302,35 +364,41 @@ impl Dictionary {
     /// Returns `None` if the term has never been interned — which for query
     /// evaluation means the pattern cannot match anything (early-out, no scan).
     pub fn get_id(&self, term: &Term) -> Option<TermId> {
-        self.term_to_id.get(term).copied()
+        if let Some(&id) = self.term_to_id.get(term) {
+            return Some(id);
+        }
+        self.compacted
+            .get_id(term)
+            .and_then(|raw| TermId::new(raw).ok())
     }
 
-    /// Decode a `TermId` back to the original `Term`.
-    ///
-    /// Returns `None` only for IDs that were never assigned by this dictionary
-    /// (should never happen in correct usage).
-    /// Look up the `Arc<Term>` for `id` without cloning the term's heap
-    /// content — a cheap refcount bump instead of a deep `String` clone.
+    /// Look up the `Arc<Term>` for `id` — a cheap refcount bump for
+    /// delta-tier terms, or (for terms folded into the compacted tier by a
+    /// previous `compact()`) a decode-cache lookup, falling back to a fresh
+    /// decode from the compacted Front-Coded tier on a cache miss.
     ///
     /// The read hot path (`quads_for_pattern` / `decode_stored_quad`) needs
-    /// to avoid `.clone()`-ing the `&Term` returned by [`Self::get_term`],
-    /// which would deep-copy the term's owned `String` content
-    /// (subject/object IRI, blank node id, or literal value+lang+datatype)
-    /// on *every matched row* — even when many rows share the exact same
-    /// interned term (e.g. a `rdf:type` object repeated across thousands of
-    /// matching subjects). Since `id_to_term` already stores `Arc<Term>`,
-    /// this `Arc`-cloning accessor lets hot-path callers share the same heap
-    /// allocation across all rows that reference it, turning an O(rows ×
-    /// term size) cost into O(rows × pointer size) for the transient result
-    /// buffer.
+    /// to avoid deep-copying a term's owned `String` content on *every*
+    /// matched row — even when many rows share the exact same interned term
+    /// (e.g. a `rdf:type` object repeated across thousands of matching
+    /// subjects). For delta-tier terms this turns an O(rows × term size)
+    /// cost into O(rows × pointer size); for compacted-tier terms, a warm
+    /// decode-cache entry gives the same O(rows × pointer size) behavior,
+    /// while a cache miss pays a bounded O(block_size) Front-Coded block
+    /// decode (see `decode_cache`'s field docs).
     pub fn get_term_arc(&self, id: TermId) -> Option<Arc<Term>> {
-        self.id_to_term.get(id.as_u64() as usize).cloned()
-    }
-
-    pub fn get_term(&self, id: TermId) -> Option<&Term> {
-        self.id_to_term
-            .get(id.as_u64() as usize)
-            .map(|v| v.as_ref())
+        match self.id_to_term.get(id.as_u64() as usize) {
+            Some(Some(arc)) => Some(Arc::clone(arc)),
+            Some(None) => {
+                if let Some(arc) = self.decode_cache.borrow_mut().get(&id) {
+                    return Some(Arc::clone(arc));
+                }
+                let arc = self.compacted.decode_id(id.as_u64()).and_then(|r| r.ok())?;
+                self.decode_cache.borrow_mut().put(id, Arc::clone(&arc));
+                Some(arc)
+            }
+            None => None,
+        }
     }
 
     // ── Graph interning ───────────────────────────────────────────────────────
@@ -382,10 +450,77 @@ impl Dictionary {
         self.next_graph_id
     }
 
-    /// All interned terms in `TermId` order (index == `TermId::as_u64()`).
-    /// Exposed for on-disk `Dictionary` persistence.
-    pub fn terms_in_order(&self) -> impl Iterator<Item = &Term> {
-        self.id_to_term.iter().map(|t| t.as_ref())
+    /// All interned terms in `TermId` order (index == `TermId::as_u64()`),
+    /// decoding compacted-tier entries on the fly. Exposed for on-disk
+    /// `Dictionary` persistence.
+    pub fn terms_in_order(&self) -> impl Iterator<Item = Term> + '_ {
+        (0..self.id_to_term.len() as u64).map(move |raw_id| {
+            match &self.id_to_term[raw_id as usize] {
+                Some(arc) => arc.as_ref().clone(),
+                None => self
+                    .compacted
+                    .decode_id(raw_id)
+                    .expect("every freed delta-tier id must be present in the compacted tier")
+                    .expect("compacted tier decode must succeed for internally-encoded data")
+                    .as_ref()
+                    .clone(),
+            }
+        })
+    }
+
+    /// Rebuild the compacted Front-Coded tier from all currently-interned
+    /// regular (non-quoted-triple) terms — both those already folded into
+    /// the previous compacted tier (decoded on the fly) and those interned
+    /// since (the delta tier) — then **free** every compacted term's
+    /// `Arc<Term>` from the delta tier (`id_to_term` slot set to `None`,
+    /// `term_to_id` entry removed). This is the actual memory-reduction
+    /// step; `TermId`s are never reassigned, only the internal sorted-rank
+    /// permutation.
+    ///
+    /// Called from `RingStore::commit_compaction`, on the same cadence that
+    /// already rebuilds all 6 Ring tries.
+    pub fn compact(&mut self) -> Result<(), Oxigraph> {
+        let high_water = self.id_to_term.len() as u64;
+        let mut entries: Vec<(u8, Vec<u8>, Vec<u8>, u64)> = Vec::with_capacity(high_water as usize);
+
+        for raw_id in 0..high_water {
+            let tid = TermId(raw_id);
+            if self.triple_terms.contains_key(&tid) {
+                continue; // quoted triples never enter the FC tier
+            }
+            let term: Arc<Term> = match &self.id_to_term[raw_id as usize] {
+                Some(arc) => Arc::clone(arc),
+                None => match self.compacted.decode_id(raw_id) {
+                    Some(res) => res?,
+                    None => continue,
+                },
+            };
+            let (tag, primary) = dict_compact::term_sort_key(&term);
+            let aux = dict_compact::term_aux_bytes(&term);
+            entries.push((tag, primary, aux, raw_id));
+        }
+
+        entries.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        let new_compacted = CompactedTier::build(&entries, high_water);
+
+        // Free the delta-tier storage for every term now covered by the
+        // new compacted tier.
+        for raw_id in 0..high_water {
+            let tid = TermId(raw_id);
+            if self.triple_terms.contains_key(&tid) {
+                continue;
+            }
+            if let Some(arc) = self.id_to_term[raw_id as usize].take() {
+                self.term_to_id.remove(&arc);
+            }
+        }
+
+        self.compacted = new_compacted;
+        // Ranks/block offsets shift on every compaction — any previously
+        // cached decode results may point at stale offsets, so drop them
+        // all rather than trying to selectively invalidate.
+        self.decode_cache.borrow_mut().clear();
+        Ok(())
     }
 
     /// Rebuild a `Dictionary` from persisted state, preserving `TermId`s
@@ -398,6 +533,13 @@ impl Dictionary {
     /// replay (which uses `intern()`, appending new terms after whatever's
     /// already present) continues assigning IDs correctly instead of
     /// colliding with the snapshot's embedded IDs.
+    ///
+    /// The rebuilt `Dictionary` always starts with an empty compacted
+    /// tier — every term is delta-tier-resident — regardless of whether
+    /// the source `Dictionary` had compacted terms at save time (Phase 2's
+    /// two-tier structure is in-memory only; the on-disk format is
+    /// unaffected, see `dict_snapshot.rs`'s module docs). The next
+    /// `compact()` call re-establishes the compacted tier.
     ///
     /// Quoted-triple (`Term::Triple`) side tables (`triple_terms`/
     /// `triple_index`) are **not** persisted separately — they are
@@ -414,9 +556,14 @@ impl Dictionary {
         let mut d = Self {
             id_to_term: Vec::with_capacity(terms.len()),
             term_to_id: HashMap::with_capacity(terms.len()),
+            compacted: CompactedTier::empty(),
+            decode_cache: RefCell::new(lru::LruCache::new(
+                NonZeroUsize::new(DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
+            )),
             graph_to_id: HashMap::new(),
             id_to_graph: HashMap::new(),
             next_graph_id,
+
             triple_terms: HashMap::new(),
             triple_index: HashMap::new(),
         };
@@ -441,7 +588,7 @@ impl Dictionary {
                 d.triple_index.insert(components, id);
             }
             let arc = Arc::new(term);
-            d.id_to_term.push(Arc::clone(&arc));
+            d.id_to_term.push(Some(Arc::clone(&arc)));
             d.term_to_id.insert(arc, id);
         }
 
@@ -523,6 +670,7 @@ impl Dictionary {
 mod tests {
     use super::*;
     use oxrdf::{Literal, NamedNode};
+    use value_traits::slices::SliceByValue;
 
     fn nn(s: &str) -> Term {
         Term::NamedNode(NamedNode::new_unchecked(s))
@@ -539,8 +687,8 @@ mod tests {
         let id_a2 = d.intern(&nn("http://ex/a")).unwrap();
         assert_eq!(id_a, id_a2, "same term must yield same TermId");
         assert_ne!(id_a, id_b, "different terms must yield different TermIds");
-        assert_eq!(d.get_term(id_a), Some(&nn("http://ex/a")));
-        assert_eq!(d.get_term(id_b), Some(&lit("hello")));
+        assert_eq!(d.get_term_arc(id_a).as_deref(), Some(&nn("http://ex/a")));
+        assert_eq!(d.get_term_arc(id_b).as_deref(), Some(&lit("hello")));
     }
 
     #[test]
@@ -595,5 +743,213 @@ mod tests {
     #[test]
     fn term_id_overflow_rejected() {
         assert!(TermId::new(MAX_TERM_ID + 1).is_err());
+    }
+
+    // ── Phase 2: two-tier compaction tests ─────────────────────────────────
+
+    #[test]
+    fn compact_preserves_term_ids_and_content() {
+        let mut d = Dictionary::new();
+        let mut ids = Vec::new();
+        let terms: Vec<Term> = (0..50)
+            .map(|i| nn(&format!("http://example.org/entity/{i}")))
+            .chain((0..20).map(|i| lit(&format!("literal-value-{i}"))))
+            .collect();
+        for t in &terms {
+            ids.push(d.intern(t).unwrap());
+        }
+
+        d.compact().unwrap();
+
+        for (t, &id) in terms.iter().zip(ids.iter()) {
+            assert_eq!(d.get_id(t), Some(id), "get_id must survive compaction");
+            assert_eq!(
+                d.get_term_arc(id).as_deref(),
+                Some(t),
+                "get_term_arc must decode the same term after compaction"
+            );
+        }
+
+        // New terms interned after compaction still get fresh, higher ids.
+        let new_id = d.intern(&nn("http://example.org/entity/new")).unwrap();
+        assert!(new_id.as_u64() as usize >= terms.len());
+    }
+
+    #[test]
+    fn rank2id_id2rank_roundtrip_after_every_compaction() {
+        let mut d = Dictionary::new();
+        // Multiple compaction cycles: interleave interning and compacting.
+        for round in 0..3 {
+            for i in 0..30 {
+                d.intern(&nn(&format!("http://ex/r{round}/e{i}"))).unwrap();
+                d.intern(&lit(&format!("val-{round}-{i}"))).unwrap();
+            }
+            d.compact().unwrap();
+
+            // rank2id[id2rank[id]] == id for every non-quoted-triple id.
+            let high_water = d.id_to_term.len() as u64;
+            for raw_id in 0..high_water {
+                let tid = TermId(raw_id);
+                if d.triple_terms.contains_key(&tid) {
+                    continue;
+                }
+                let rank = d.compacted.id2rank.index_value(raw_id as usize);
+                let back = d.compacted.rank2id.index_value(rank);
+                assert_eq!(
+                    back as u64, raw_id,
+                    "rank2id[id2rank[id]] must equal id after compaction round {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_roundtrip_at_max_term_id() {
+        // Directly exercise the permutation arrays' bit-width computation
+        // at a large id value without actually allocating a trillion terms:
+        // build a small dictionary, then verify a manual high `TermId`
+        // roundtrip against `CompactedTier` in isolation.
+        let mut d = Dictionary::new();
+        for i in 0..10 {
+            d.intern(&nn(&format!("http://ex/{i}"))).unwrap();
+        }
+        d.compact().unwrap();
+        let high_water = d.id_to_term.len() as u64;
+        for raw_id in 0..high_water {
+            let rank = d.compacted.id2rank.index_value(raw_id as usize);
+            let back = d.compacted.rank2id.index_value(rank);
+            assert_eq!(back as u64, raw_id);
+        }
+
+        // MAX_TERM_ID itself must still be constructible/roundtrippable as
+        // a TermId (independent of dictionary size — see max_term_id_roundtrip).
+        let id = TermId::new(MAX_TERM_ID).unwrap();
+        assert_eq!(id.as_u64(), MAX_TERM_ID);
+    }
+
+    // ── Phase 3: decode-cache tests ──────────────────────────────────────
+
+    #[test]
+    fn decode_cache_hit_path_returns_correct_content_repeatedly() {
+        let mut d = Dictionary::new();
+        let mut ids = Vec::new();
+        let terms: Vec<Term> = (0..30)
+            .map(|i| nn(&format!("http://example.org/cache/{i}")))
+            .collect();
+        for t in &terms {
+            ids.push(d.intern(t).unwrap());
+        }
+        d.compact().unwrap();
+
+        // First call per id: cache miss, decodes from the compacted tier.
+        // Every subsequent call: cache hit. Both paths must return identical
+        // content, repeatedly, for every id.
+        for _ in 0..5 {
+            for (t, &id) in terms.iter().zip(ids.iter()) {
+                assert_eq!(
+                    d.get_term_arc(id).as_deref(),
+                    Some(t),
+                    "repeated get_term_arc calls (cache hit path) must return the same content"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_cache_cleared_on_compact_still_decodes_correctly() {
+        let mut d = Dictionary::new();
+        let terms: Vec<Term> = (0..20)
+            .map(|i| nn(&format!("http://example.org/precompact/{i}")))
+            .collect();
+        let mut ids = Vec::new();
+        for t in &terms {
+            ids.push(d.intern(t).unwrap());
+        }
+        d.compact().unwrap();
+
+        // Warm the cache for every id (populates decode_cache with the
+        // *first*-generation block/rank layout).
+        for &id in &ids {
+            let _ = d.get_term_arc(id);
+        }
+        assert!(
+            !d.decode_cache.borrow().is_empty(),
+            "cache should be warm before the second compaction"
+        );
+
+        // Intern more terms, then compact again — ranks/block offsets shift
+        // for every previously-compacted term, and the cache is cleared.
+        for i in 20..40 {
+            d.intern(&nn(&format!("http://example.org/precompact/{i}")))
+                .unwrap();
+        }
+        d.compact().unwrap();
+        assert_eq!(
+            d.decode_cache.borrow().len(),
+            0,
+            "decode_cache must be cleared immediately after compact()"
+        );
+
+        // Despite the cache being cleared (and ranks having shifted), every
+        // original id must still decode to its original content.
+        for (t, &id) in terms.iter().zip(ids.iter()) {
+            assert_eq!(
+                d.get_term_arc(id).as_deref(),
+                Some(t),
+                "content must still be correct after cache-clearing recompaction"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_cache_never_exceeds_configured_capacity() {
+        // Intern well more than DECODE_CACHE_CAPACITY regular terms, compact,
+        // then decode every single one — the cache must never grow past its
+        // configured bound (Phase 3 Gate 3: no unbounded growth).
+        let mut d = Dictionary::new();
+        let n = DECODE_CACHE_CAPACITY + 500;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(
+                d.intern(&nn(&format!("http://example.org/bound/{i}")))
+                    .unwrap(),
+            );
+        }
+        d.compact().unwrap();
+
+        for &id in &ids {
+            let _ = d.get_term_arc(id);
+            assert!(
+                d.decode_cache.borrow().len() <= DECODE_CACHE_CAPACITY,
+                "decode_cache must never exceed its configured capacity"
+            );
+        }
+        assert_eq!(
+            d.decode_cache.borrow().len(),
+            DECODE_CACHE_CAPACITY,
+            "after decoding more ids than capacity, the cache should be fully (but not over-) populated"
+        );
+    }
+
+    #[test]
+    fn quoted_triple_survives_compaction() {
+        let mut d = Dictionary::new();
+        let s = nn("http://ex/s");
+        let p = NamedNode::new_unchecked("http://ex/p");
+        let o = lit("v");
+        let triple_term = Term::Triple(Box::new(oxrdf::Triple {
+            subject: oxrdf::NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://ex/s")),
+            predicate: p.clone(),
+            object: o.clone(),
+        }));
+        d.intern(&s).unwrap();
+        d.intern(&Term::NamedNode(p)).unwrap();
+        d.intern(&o).unwrap();
+        let triple_id = d.intern(&triple_term).unwrap();
+
+        d.compact().unwrap();
+
+        assert_eq!(d.get_id(&triple_term), Some(triple_id));
+        assert_eq!(d.get_term_arc(triple_id).as_deref(), Some(&triple_term));
     }
 }

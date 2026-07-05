@@ -1,5 +1,7 @@
 pub mod dict;
+mod dict_compact;
 pub mod error;
+
 pub mod store;
 pub mod trie;
 

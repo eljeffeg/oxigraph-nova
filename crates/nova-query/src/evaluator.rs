@@ -1530,6 +1530,46 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         object: &TermPattern,
         active_graph: &GraphSelector,
     ) -> Result<Solutions> {
+        // Endpoint-aware Ring fast path: for `p+`/`p*` where at least one of
+        // subject/object is a bound constant, use bidirectional (both bound)
+        // or single-direction backward (target-only bound) BFS instead of
+        // materializing the whole transitive closure.
+        if let Some(result) = self.try_bound_path_ring(subject, path, object, active_graph) {
+            let pairs = result?;
+            let mut sols = Vec::new();
+            for (s_term, o_term) in pairs {
+                let mut sol = Solution::new();
+                let ok_s = match_term_pattern(subject, &s_term, &mut sol);
+                let ok_o = match_term_pattern(object, &o_term, &mut sol);
+                if ok_s && ok_o {
+                    sols.push(sol);
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            sols.retain(|sol| seen.insert(solution_key(sol)));
+            return Ok(sols);
+        }
+
+        // Product-automaton fast path for composed RPQs (sequence/alternative/
+        // negated-property-set/nested Kleene stars) — evaluates the whole
+        // expression in a single (node, state) BFS instead of materializing a
+        // full Vec<(Term, Term)> per operator via `path_pairs`.
+        if let Some(result) = self.try_rpq_product_automaton(subject, path, object, active_graph) {
+            let pairs = result?;
+            let mut sols = Vec::new();
+            for (s_term, o_term) in pairs {
+                let mut sol = Solution::new();
+                let ok_s = match_term_pattern(subject, &s_term, &mut sol);
+                let ok_o = match_term_pattern(object, &o_term, &mut sol);
+                if ok_s && ok_o {
+                    sols.push(sol);
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            sols.retain(|sol| seen.insert(solution_key(sol)));
+            return Ok(sols);
+        }
+
         let mut pairs = self.path_pairs(path, active_graph)?;
 
         // For ZeroOrMore (*) and ZeroOrOne (?), identity pairs (x, x) are always
@@ -1573,6 +1613,116 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         let mut seen = std::collections::HashSet::new();
         result.retain(|sol| seen.insert(solution_key(sol)));
         Ok(result)
+    }
+
+    /// Endpoint-aware Ring fast path for `p+`/`p*` where subject and/or
+    /// object is a bound constant term. Returns `None` if not applicable
+    /// (falls through to the generic `path_pairs` path).
+    fn try_bound_path_ring(
+        &self,
+        subject: &TermPattern,
+        path: &PPE,
+        object: &TermPattern,
+        ag: &GraphSelector,
+    ) -> Option<Result<Vec<(Term, Term)>>> {
+        let (pred, include_identity) = match path {
+            PPE::OneOrMore(inner) => match inner.as_ref() {
+                PPE::NamedNode(p) => (p, false),
+                _ => return None,
+            },
+            PPE::ZeroOrMore(inner) => match inner.as_ref() {
+                PPE::NamedNode(p) => (p, true),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if !self.dataset.supports_lftj() || self.dataset.lftj_has_delta() {
+            return None;
+        }
+        match ag {
+            GraphSelector::Default | GraphSelector::Named(_) => {}
+            _ => return None,
+        }
+
+        let subj_bound = match subject {
+            TermPattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
+            TermPattern::Literal(l) => Some(Term::Literal(l.clone())),
+            _ => None,
+        };
+        let obj_bound = match object {
+            TermPattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
+            TermPattern::Literal(l) => Some(Term::Literal(l.clone())),
+            _ => None,
+        };
+        // If neither endpoint is bound, there's nothing to specialize.
+        if subj_bound.is_none() && obj_bound.is_none() {
+            return None;
+        }
+
+        let p_id = self
+            .dataset
+            .lftj_intern_term(&Term::NamedNode(pred.clone()), ag)?;
+        let source_id = match &subj_bound {
+            Some(t) => Some(self.dataset.lftj_intern_term(t, ag)?),
+            None => None,
+        };
+        let target_id = match &obj_bound {
+            Some(t) => Some(self.dataset.lftj_intern_term(t, ag)?),
+            None => None,
+        };
+
+        crate::path::ring_bfs_transitive_bound(
+            self.dataset,
+            p_id,
+            source_id,
+            target_id,
+            include_identity,
+            ag,
+        )
+    }
+
+    /// Product-automaton fast path for composed property-path expressions
+    /// (`Sequence`, `Alternative`, `NegatedPropertySet`, nested Kleene stars,
+    /// `Reverse` over anything other than a bare `NamedNode`). Returns `None`
+    /// for the simple single-predicate shapes already handled by
+    /// `try_bound_path_ring` / `path_transitive_ring` (falls through to
+    /// `path_pairs` for those, and for any dataset that doesn't support LFTJ).
+    fn try_rpq_product_automaton(
+        &self,
+        subject: &TermPattern,
+        path: &PPE,
+        object: &TermPattern,
+        ag: &GraphSelector,
+    ) -> Option<Result<Vec<(Term, Term)>>> {
+        if !self.dataset.supports_lftj() || self.dataset.lftj_has_delta() {
+            return None;
+        }
+        match ag {
+            GraphSelector::Default | GraphSelector::Named(_) => {}
+            _ => return None,
+        }
+
+        let subj_bound = match subject {
+            TermPattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
+            TermPattern::Literal(l) => Some(Term::Literal(l.clone())),
+            _ => None,
+        };
+        let obj_bound = match object {
+            TermPattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
+            TermPattern::Literal(l) => Some(Term::Literal(l.clone())),
+            _ => None,
+        };
+
+        let source_id = match &subj_bound {
+            Some(t) => Some(self.dataset.lftj_intern_term(t, ag)?),
+            None => None,
+        };
+        let target_id = match &obj_bound {
+            Some(t) => Some(self.dataset.lftj_intern_term(t, ag)?),
+            None => None,
+        };
+
+        crate::path::ring_eval_rpq(self.dataset, path, source_id, target_id, ag)
     }
 
     /// Enumerate all (subject, object) pairs reachable via `path` in `ag`.

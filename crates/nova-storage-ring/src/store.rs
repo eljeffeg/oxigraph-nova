@@ -87,24 +87,39 @@ const DEFAULT_AUTO_COMPACT_THRESHOLD: usize = 1_000_000;
 /// small durability window for much higher write throughput (see
 /// `wal.rs`'s "## Fsync policy" module docs).
 ///
-/// - `Always` (default): every `insert`/`remove`/`extend` call's WAL record(s)
-///   are `fsync`ed before the call returns. Every acknowledged write is
-///   durable. This is the safest, simplest policy and matches the original
-///   (pre-optimization) behavior.
-/// - `Interval(d)`: WAL records are written but **not** fsynced by the
-///   writer thread; a background thread fsyncs the WAL file every `d`
-///   (group commit / "periodic fsync"). Writes return immediately after the
-///   in-memory apply, without waiting on any disk I/O at all. The cost: on
-///   a crash, any writes made since the last background flush are lost
-///   (not corrupted — `wal::replay`'s torn-tail handling covers this
-///   exactly the same way it covers any other incomplete write). This is
-///   the "group commit" pattern used by most production databases (e.g.
-///   RocksDB's default WAL mode, MongoDB's periodic journal commit).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// - `Always`: every `insert`/`remove`/`extend` call's WAL record(s) are
+///   `fsync`ed before the call returns. Every acknowledged write is
+///   durable, at the cost of an fsync's latency on every single write.
+/// - `Interval(d)` (default: 500ms — see `Default` impl below): WAL records
+///   are written but **not** fsynced by the writer thread; a background
+///   thread fsyncs the WAL file every `d` (group commit / "periodic
+///   fsync"). Writes return immediately after the in-memory apply, without
+///   waiting on any disk I/O at all — this is the much higher-throughput
+///   default for both in-process and `nova_serve` usage. The cost: on a
+///   crash, any writes made since the last background flush (at most `d`
+///   old) are lost (not corrupted — `wal::replay`'s torn-tail handling
+///   covers this exactly the same way it covers any other incomplete
+///   write). This is the "group commit" pattern used by most production
+///   databases (e.g. RocksDB's default WAL mode, MongoDB's periodic
+///   journal commit) — `Always` remains available as an explicit opt-in
+///   for callers that need zero durability window and can accept the
+///   latency cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncPolicy {
-    #[default]
     Always,
     Interval(Duration),
+}
+
+/// Default durability policy: `Interval(500ms)` — group-commit fsync every
+/// 500 milliseconds rather than on every single write. This is the
+/// optimized, recommended default for both library callers and
+/// `nova_serve`; see the module docs above for the trade-off. Use
+/// `RingStore::set_sync_policy(SyncPolicy::Always)` to opt into per-write
+/// fsync durability instead.
+impl Default for SyncPolicy {
+    fn default() -> Self {
+        SyncPolicy::Interval(Duration::from_millis(500))
+    }
 }
 
 /// Background flusher thread for `SyncPolicy::Interval`: periodically calls
@@ -185,13 +200,10 @@ struct RingStoreInner {
     /// `maybe_auto_compact`). Irrelevant for in-memory stores (`data_dir ==
     /// None` gates auto-compaction off regardless of this value).
     auto_compact_threshold: usize,
-    /// Whether automatic inline compaction is enabled at all. Defaults to
-    /// `true` for persistent stores; `RingStore::set_auto_compact_enabled`
-    /// lets callers (e.g. `nova_serve`) turn it off.
-    auto_compact_enabled: bool,
     /// Current WAL durability policy (see [`SyncPolicy`]). Defaults to
-    /// `Always`. Irrelevant for in-memory stores (`wal.is_none()`).
+    /// `Interval(500ms)`. Irrelevant for in-memory stores (`wal.is_none()`).
     sync_policy: SyncPolicy,
+
     /// Background flusher thread for `SyncPolicy::Interval`, `None` under
     /// `Always` or for in-memory stores. Replaced whenever the active WAL
     /// file changes.
@@ -210,8 +222,7 @@ impl RingStoreInner {
             snapshot_gen: 0,
             wal_seq: 1,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
-            auto_compact_enabled: true,
-            sync_policy: SyncPolicy::Always,
+            sync_policy: SyncPolicy::default(),
             flusher: None,
         }
     }
@@ -375,19 +386,21 @@ impl RingStoreInner {
         }
 
         let new_graphs = build_graphs_from_triples(per_graph);
+        // In-memory Front-Coding compaction of the Dictionary  — runs on the same
+        // cadence as the Ring trie rebuild above, regardless of persistence mode.
+        self.dict.compact()?;
         self.commit_compaction(new_graphs, true)
     }
 
-    /// If this is a persistent store, auto-compaction is enabled, and the
-    /// delta has crossed `auto_compact_threshold`, compact inline (see
-    /// module docs for the "stalls writers" trade-off this accepts). No-op
-    /// otherwise (including always for in-memory stores, since `data_dir ==
-    /// None`).
+    /// If this is a persistent store and the delta has crossed
+    /// `auto_compact_threshold`, compact inline (see module docs for the
+    /// "stalls writers" trade-off this accepts). No-op otherwise (including
+    /// always for in-memory stores, since `data_dir == None`). Auto-compaction
+    /// cannot be disabled for a persistent store — only its threshold is
+    /// configurable (see `RingStore::set_auto_compact_threshold`) — so that
+    /// memory-efficient defaults can't be accidentally left off.
     fn maybe_auto_compact(&mut self) -> Result<(), Oxigraph> {
-        if self.data_dir.is_some()
-            && self.auto_compact_enabled
-            && self.delta.len() >= self.auto_compact_threshold
-        {
+        if self.data_dir.is_some() && self.delta.len() >= self.auto_compact_threshold {
             self.compact_locked()?;
         }
         Ok(())
@@ -645,8 +658,8 @@ impl RingStore {
     }
 
     /// Set the WAL durability policy (see [`SyncPolicy`]). Default is
-    /// `Always`. Switching to `Interval(d)` spawns a background flusher
-    /// thread against the currently-active WAL file; switching back to
+    /// `Interval(500ms)`. Switching to `Interval(d)` spawns a background
+    /// flusher thread against the currently-active WAL file; switching to
     /// `Always` stops it. No-op for in-memory stores (no WAL to flush).
     pub fn set_sync_policy(&self, policy: SyncPolicy) {
         if let Ok(mut inner) = self.inner.lock() {
@@ -707,15 +720,6 @@ impl RingStore {
         }
     }
 
-    /// Enable/disable automatic inline compaction entirely (default:
-    /// enabled). Has no effect on in-memory (`RingStore::new()`) stores,
-    /// which never auto-compact regardless of this setting.
-    pub fn set_auto_compact_enabled(&self, enabled: bool) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.auto_compact_enabled = enabled;
-        }
-    }
-
     /// Bulk-load quads directly into the Ring, **bypassing the delta
     /// `BTreeMap` entirely**.
     ///
@@ -769,6 +773,15 @@ impl RingStore {
         }
 
         let new_graphs = build_graphs_from_triples(per_graph);
+        // Same as `compact_locked`: fold the newly-interned terms into the
+        // Front-Coded compacted tier before committing, so a bulk load ends
+        // up in the same memory-efficient state as an inline-compacted
+        // incrementally-built store. Without this call,
+        // `bulk_load()` — the path used by `nova_serve --data`, and thus by
+        // every external comparative benchmark — would leave the entire
+        // dictionary sitting in its uncompacted delta tier forever, since
+        // nothing else ever triggers compaction for a one-shot bulk load.
+        inner.dict.compact()?;
         inner.commit_compaction(new_graphs, false)?;
         Ok(count)
     }
@@ -777,6 +790,7 @@ impl RingStore {
     pub fn triple_count(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         let ring_total: usize = inner.graphs.values().map(|r| r.n).sum();
+
         let delta_inserts = inner.delta.insert_count();
         let delta_tombstones = inner.delta.tombstone_count();
         ring_total.saturating_sub(delta_tombstones) + delta_inserts
@@ -937,7 +951,7 @@ fn decode_stored_quad(
     // Fetch `Arc<Term>` (cheap refcount bump) instead of `.clone()`-ing the
     // dereferenced `Term` (deep String copy) on every matched row.
     let s_term = dict.get_term_arc(s_id)?;
-    let p_term = dict.get_term(p_id)?;
+    let p_term = dict.get_term_arc(p_id)?;
     let o_term = dict.get_term_arc(o_id)?;
 
     // Subject may be NamedNode, BlankNode, or (RDF-star) Triple — all are valid.
@@ -946,7 +960,7 @@ fn decode_stored_quad(
         Term::NamedNode(_) | Term::BlankNode(_) | Term::Triple(_) => {}
         Term::Literal(_) => return None,
     };
-    let predicate: NamedNode = match p_term {
+    let predicate: NamedNode = match p_term.as_ref() {
         Term::NamedNode(n) => n.clone(),
         _ => return None, // predicates must be IRIs
     };
@@ -983,7 +997,7 @@ impl QuadStore for RingStore {
     fn lftj_decode_term(&self, id: u64) -> Option<Term> {
         let inner = self.inner.lock().ok()?;
         let tid = oxigraph_nova_core::TermId::new(id).ok()?;
-        inner.dict.get_term(tid).cloned()
+        inner.dict.get_term_arc(tid).map(|arc| arc.as_ref().clone())
     }
 
     fn lftj_graph_id(&self, graph: &GraphName) -> Option<u8> {
@@ -1722,26 +1736,6 @@ mod tests {
         // been folded into it.
         assert!(manifest::snapshot_path(&dir, 1).exists());
         assert_eq!(store.len().unwrap(), 3);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn auto_compact_disabled_never_triggers() {
-        let dir = temp_dir("auto_compact_disabled");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let store = RingStore::open(&dir).unwrap();
-        store.set_auto_compact_threshold(1);
-        store.set_auto_compact_enabled(false);
-
-        let q = make_quad("http://ex/s", "http://ex/p", "v", dg());
-        store.insert(&q).unwrap();
-
-        // Even though the threshold (1) was crossed, auto-compaction is
-        // disabled, so no snapshot should have been written.
-        assert!(!manifest::snapshot_path(&dir, 1).exists());
-        assert_eq!(store.len().unwrap(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

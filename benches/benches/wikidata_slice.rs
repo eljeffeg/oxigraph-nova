@@ -497,6 +497,49 @@ fn bench_query_triangle(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Benchmark 8: Bound-endpoint property paths (bidirectional search) ───────
+//
+// Validates bidirectional search: for `p+`/`p*`
+// property paths where at least one endpoint is a bound constant, the Ring
+// evaluator should use endpoint-aware BFS (bidirectional meet-in-the-middle
+// when both ends are bound, backward BFS when only the target is bound)
+// instead of materializing the whole transitive closure.
+//
+// The synthetic `related` graph has branching factor 3 (each entity links to
+// i+1, i+2, i+3 mod N), so the number of nodes reachable within k hops grows
+// roughly as 3^k — meaning any two connected nodes are typically only a few
+// hops apart even though N is large. This is exactly the shape where
+// meet-in-the-middle search pays off: two BFS frontiers each covering k/2
+// hops (≈3^(k/2) nodes each) do dramatically less work than one frontier
+// covering the full k hops (≈3^k nodes), or a naive approach that must first
+// enumerate all N subjects of `related` before running BFS from each one.
+//
+// - `bound_both`: `ASK { wd:Q0 wdt:related+ wd:Q40 }` — both endpoints bound;
+//   Q40 is reachable from Q0 in a handful of hops (branching factor 3 means
+//   ~4 hops covers up to 3^4 = 81 nodes), exercising `bidirectional_reachable`.
+// - `bound_target`: `SELECT ?a WHERE { ?a wdt:related+ wd:Q40 }` — only the
+//   target is bound; exercises backward BFS (`ring_bfs_transitive_backward`)
+//   instead of enumerating all ~N subjects with predicate `related` first.
+
+fn bench_query_path_bound(c: &mut Criterion) {
+    let ring_quads = generate_quads(RING_QUERY_N);
+    let ring_ds = StoreDataset::new(build_ring_store(&ring_quads));
+
+    let ask_sparql = format!("{PREFIXES}ASK {{ wd:Q0 wdt:related+ wd:Q40 }}");
+    let target_sparql = format!("{PREFIXES}SELECT ?a WHERE {{ ?a wdt:related+ wd:Q40 }}");
+
+    let mut group = c.benchmark_group("query/path_bound");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("ring_bound_both", |b| {
+        b.iter(|| black_box(count_solutions(&ring_ds, &ask_sparql)))
+    });
+    group.bench_function("ring_bound_target_only", |b| {
+        b.iter(|| black_box(count_solutions(&ring_ds, &target_sparql)))
+    });
+    group.finish();
+}
+
 // ── Criterion registration ────────────────────────────────────────────────────
 
 criterion_group!(
@@ -507,6 +550,7 @@ criterion_group!(
     bench_query_2join,
     bench_query_star,
     bench_query_path,
+    bench_query_path_bound,
     bench_query_triangle,
 );
 criterion_main!(benches);

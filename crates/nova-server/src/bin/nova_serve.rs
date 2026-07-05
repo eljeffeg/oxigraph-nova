@@ -98,12 +98,12 @@ async fn main() {
                      that triggers automatic inline compaction for a persistent store.\n\
                      Default: 1,000,000. Has no effect without --location.\n\
                      \n\
-                     --sync-interval-ms <n>: switch WAL durability policy from the default\n\
-                     `Always` (fsync every write) to `Interval(n ms)` — a background thread\n\
-                     fsyncs the WAL every n milliseconds instead ('group commit'), trading a\n\
-                     bounded durability window (writes acknowledged since the last flush can\n\
-                     be lost on a crash) for much higher write throughput. Has no effect\n\
-                     without --location. See oxigraph_nova_storage_ring::SyncPolicy docs."
+                     --sync-interval-ms <n>: override the default WAL durability policy of\n\
+                     `Interval(500ms)` (fsync every 500ms, 'group commit') with a custom\n\
+                     interval in milliseconds instead, trading a bounded durability window\n\
+                     (writes acknowledged since the last flush can be lost on a crash) for\n\
+                     write throughput. Has no effect without --location. See\n\
+                     oxigraph_nova_storage_ring::SyncPolicy docs."
                 );
                 return;
             }
