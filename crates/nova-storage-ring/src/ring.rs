@@ -70,14 +70,20 @@ impl SortOrder {
 // ── RingData ──────────────────────────────────────────────────────────────────
 
 /// All immutable data for one graph's Ring index.
-struct RingData {
+///
+/// Generic over the vocab representation `V` (see [`CltjData`]/[`CltjTrie`]
+/// in `cltj.rs`) so that a future mmap'd/zero-copy snapshot load can populate
+/// `cltj`'s vocab with borrowed `&[u64]` slices, with no code duplication
+/// versus the owned `Vec<u64>` path — see CLAUDE.md item 14, Phase 3.
+struct RingData<V = Vec<u64>> {
     /// Six LOUDS tries (one per ordering) — O(1) navigation per step.
     /// `contains()`, `match_triples()`, and `spo_triples()` are all derived
     /// from these tries via O(1)-per-step LOUDS navigation. There is no
     /// redundant `spo: Vec<[u64;3]>` raw copy — that used to account for
     /// ~53% of Ring memory before it was removed.
-    cltj: CltjData,
+    cltj: CltjData<V>,
 }
+
 
 // ── LFTJ ordering selection ───────────────────────────────────────────────────
 
@@ -110,13 +116,20 @@ fn choose_array_for_lftj(bound_fields: &[usize], target_field: usize) -> SortOrd
 ///
 /// Immutable after construction.  `RingStore` wraps it in `Arc` so it can be
 /// swapped out atomically during an LSM merge without blocking readers.
-pub struct GraphRing {
+///
+/// Generic over the vocab representation `V` (defaulted to owned `Vec<u64>`)
+/// so that a future mmap'd/zero-copy snapshot load can produce a
+/// `GraphRing<&[u64]>`-style value with no code duplication — see CLAUDE.md
+/// item 14, Phase 3. All existing callers use the default `GraphRing`
+/// (`V = Vec<u64>`) and are unaffected by this generic parameter.
+pub struct GraphRing<V = Vec<u64>> {
     /// Number of distinct triples stored in this graph.
     pub n: usize,
-    data: Option<Arc<RingData>>,
+    data: Option<Arc<RingData<V>>>,
 }
 
-impl GraphRing {
+impl<V: AsRef<[u64]> + Send + Sync + 'static> GraphRing<V> {
+
     /// All triples in SPO order (for testing / serialisation).
     ///
     /// Derived by a full depth-3 traversal of the SPO LOUDS trie (O(n) over
@@ -355,6 +368,9 @@ impl GraphRing {
         it
     }
 
+}
+
+impl GraphRing {
     /// Consume this `GraphRing`, producing the ε-serde-serializable
     /// [`RingSnapshot`] (triple count + optional per-graph [`CltjSnapshot`]).
     ///
@@ -362,6 +378,9 @@ impl GraphRing {
     /// `Arc<RingData>` (true for a freshly built `GraphRing` that has not yet
     /// been shared, per the "always mapped" design — see `RingStore::compact`);
     /// panics via `expect` otherwise.
+    ///
+    /// Only defined for the owned `Vec<u64>` form (`V`'s default) — a fresh
+    /// build always starts from owned vocab, matching [`CltjData::into_snapshot`].
     pub(crate) fn into_snapshot(self) -> RingSnapshot {
         let cltj = self.data.map(|data| {
             Arc::try_unwrap(data)
@@ -383,6 +402,7 @@ impl GraphRing {
         GraphRing { n: snap.n, data }
     }
 }
+
 
 /// ε-serde-serializable snapshot of a [`GraphRing`]: triple count plus an
 /// optional [`CltjSnapshot`] (`None` for an empty graph, matching
