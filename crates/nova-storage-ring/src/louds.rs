@@ -944,7 +944,69 @@ where
     }
 }
 
+// ── LoudsNav ──────────────────────────────────────────────────────────────────
+
+/// Object-safety-free trait bundling every [`LoudsTrie<B, L, S>`] navigation
+/// method that [`crate::cltj::CltjTrie`] needs, collapsing the three separate
+/// `B`/`L`/`S` generic parameters (and their three separate trait bounds)
+/// behind a single parameter — mirroring the [`SidecarSub`] bundling pattern
+/// used one level down for the sidecar substrate.
+///
+/// Blanket-implemented for every `LoudsTrie<B, L, S>` instantiation whose
+/// `B`/`L`/`S` satisfy the same bounds as the generic navigation `impl` block
+/// above — this includes both the owned/default instantiation
+/// (`LoudsTrie<t_backend::SuxRS, BitFieldVec, SidecarCore>`, produced by
+/// `from_raw`/`from_core`) and a future borrowed/mmap'd instantiation whose
+/// `B`/`L`/`S` are ε-serde's `DeserType` forms (Phase 3.3 of the mmap'd
+/// ε-serde snapshot plan — CLAUDE.md item 14), with **zero code
+/// duplication**: `CltjTrie`/`CltjData`/`GraphRing` only need to be generic
+/// over one `Louds: LoudsNav` parameter instead of three.
+pub(crate) trait LoudsNav {
+    fn root_degree(&self) -> usize;
+    fn degree(&self, v: usize) -> usize;
+    fn leap(&self, lo: usize, hi: usize, c: u32) -> usize;
+    fn label_at(&self, pos: usize) -> u32;
+    fn child_from_label_pos(&self, label_pos: usize) -> usize;
+    fn mem_size_bytes(&self) -> usize;
+    fn mem_breakdown(&self) -> LoudsMemBreakdown;
+}
+
+impl<B, L, S> LoudsNav for LoudsTrie<B, L, S>
+where
+    B: Rank + SelectUnchecked + MemSize,
+    L: SliceByValue<Value = usize> + MemSize,
+    S: SidecarSub,
+{
+    #[inline]
+    fn root_degree(&self) -> usize {
+        LoudsTrie::root_degree(self)
+    }
+    #[inline]
+    fn degree(&self, v: usize) -> usize {
+        LoudsTrie::degree(self, v)
+    }
+    #[inline]
+    fn leap(&self, lo: usize, hi: usize, c: u32) -> usize {
+        LoudsTrie::leap(self, lo, hi, c)
+    }
+    #[inline]
+    fn label_at(&self, pos: usize) -> u32 {
+        LoudsTrie::label_at(self, pos)
+    }
+    #[inline]
+    fn child_from_label_pos(&self, label_pos: usize) -> usize {
+        LoudsTrie::child_from_label_pos(self, label_pos)
+    }
+    fn mem_size_bytes(&self) -> usize {
+        LoudsTrie::mem_size_bytes(self)
+    }
+    fn mem_breakdown(&self) -> LoudsMemBreakdown {
+        LoudsTrie::mem_breakdown(self)
+    }
+}
+
 // ── Construction helpers ──────────────────────────────────────────────────────
+
 
 /// Append `d − 1` `false` bits then one `true` bit to `t`.
 #[inline]

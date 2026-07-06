@@ -55,6 +55,7 @@
 //! (u64 term IDs) for each depth.
 
 use crate::louds::{LoudsCore, LoudsMemBreakdown, LoudsTrie, build_louds_from_sorted};
+
 use crate::ring::SortOrder;
 use epserde::Epserde;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
@@ -124,6 +125,8 @@ pub struct CltjTrie<V = Vec<u64>> {
 }
 
 impl CltjTrie {
+
+
     /// Consume this trie, discarding the vocab `Arc`s (vocab is hoisted to
     /// the top-level [`CltjSnapshot`], deduped across all six tries) and
     /// keeping only the ε-serde-serializable [`LoudsCore`].
