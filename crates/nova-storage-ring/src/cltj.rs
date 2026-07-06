@@ -65,25 +65,60 @@ use std::sync::Arc;
 /// A single LOUDS trie for one sort ordering, with vocabulary for global-ID
 /// translation.
 ///
-/// `vocab[d]` holds a sorted `Vec<u64>` of global term IDs for depth `d`.
-/// Direct `Vec` indexing keeps `key()` at O(1) with no bit-unpacking, and
-/// `seek()` can use `partition_point` which the compiler can SIMD-vectorise.
-pub struct CltjTrie {
+/// `vocab[d]` holds a sorted array of global term IDs for depth `d`. Generic
+/// over the vocab representation `V` (bounded by `AsRef<[u64]>`) so that a
+/// future mmap'd/zero-copy snapshot load can populate `vocab` with borrowed
+/// `&[u64]` slices directly, with **no code duplication** versus the owned
+/// `Vec<u64>` path — this mirrors the `LoudsTrie<B, L, S>` generic-substrate
+/// pattern established in Phase 2b (CLAUDE.md item 14).
+///
+/// Direct indexing keeps `key()` at O(1) with no bit-unpacking, and `seek()`
+/// can use `partition_point` which the compiler can SIMD-vectorise, for both
+/// the owned and borrowed representations.
+pub struct CltjTrie<V = Vec<u64>> {
     /// LOUDS bitvector + label array.
     louds: LoudsTrie,
     /// `vocab[d]` = sorted global IDs for depth `d` (0, 1, or 2).
     /// `vocab[d][local_id]` → global TermId as `u64`.
-    vocab: [Arc<Vec<u64>>; 3],
+    vocab: [Arc<V>; 3],
 }
 
 impl CltjTrie {
+    /// Consume this trie, discarding the vocab `Arc`s (vocab is hoisted to
+    /// the top-level [`CltjSnapshot`], deduped across all six tries) and
+    /// keeping only the ε-serde-serializable [`LoudsCore`].
+    ///
+    /// Used by the persistent snapshot format.  Requires unique ownership
+    /// of the trie (i.e. the
+    /// enclosing `Arc<CltjTrie>` must have refcount 1) — true for a freshly
+    /// built [`CltjData`] that has not yet been shared, per the "always
+    /// mapped" design (see `RingStore::compact`).
+    pub(crate) fn into_core(self) -> LoudsCore {
+        self.louds.into_core()
+    }
+}
+
+impl<V: AsRef<[u64]>> CltjTrie<V> {
+    /// Borrow depth `d`'s vocab array as a plain `&[u64]` slice, going
+    /// through `V`'s `AsRef<[u64]>` impl.  `Arc<V>` itself only implements
+    /// `AsRef<V>` (not a conditional `AsRef<[u64]>` passthrough), so we must
+    /// deref to `V` first before calling `AsRef<[u64]>::as_ref` — the
+    /// explicit `&[u64]` return type disambiguates the (potentially
+    /// multi-impl) `as_ref()` call.
+    #[inline]
+    pub(crate) fn vocab_slice(&self, d: usize) -> &[u64] {
+        (*self.vocab[d]).as_ref()
+    }
+
+
     /// Number of distinct values (vocabulary size) at depth `d` (0, 1, or 2).
     ///
     /// Used by [`CltjData::vocab_size_for_field`] to produce cardinality
     /// estimates for adaptive VEO in LFTJ without opening a TrieIterator.
     pub fn vocab_len(&self, d: usize) -> usize {
-        if d < 3 { self.vocab[d].len() } else { 0 }
+        if d < 3 { self.vocab_slice(d).len() } else { 0 }
     }
+
 
     /// Real allocated byte size of this trie's LOUDS structure (T + L +
     /// sidecar), **excluding** vocab (vocab is `Arc`-shared across multiple
@@ -104,16 +139,26 @@ impl CltjTrie {
     /// (i.e. counted once per trie, even if shared with other tries).  Used
     /// by [`CltjData::mem_breakdown_per_ordering`] to report a per-ordering
     /// "as if not shared" vocab figure alongside the deduped grand total.
+    ///
+    /// Counts only the raw `u64` payload (`len() * 8` bytes) plus one
+    /// `size_of::<V>()` header — accurate for the owned `Vec<u64>` case and a
+    /// reasonable approximation for a borrowed slice reference `V` (whose
+    /// backing bytes live in the mmap, not the heap, once Phase 3.3 wires in
+    /// real mmap loading).
     pub fn vocab_bytes_undeduped(&self) -> usize {
         self.vocab
             .iter()
-            .map(|v| std::mem::size_of::<Vec<u64>>() + v.len() * std::mem::size_of::<u64>())
+            .map(|v| {
+                std::mem::size_of::<V>()
+                    + AsRef::<[u64]>::as_ref(&**v).len() * std::mem::size_of::<u64>()
+            })
             .sum()
     }
 
+
     /// Pointer identities of this trie's three vocab `Arc` allocations, for
     /// dedup accounting at the `CltjData` level.
-    pub(crate) fn vocab_arc_ptrs(&self) -> [*const Vec<u64>; 3] {
+    pub(crate) fn vocab_arc_ptrs(&self) -> [*const V; 3] {
         [
             Arc::as_ptr(&self.vocab[0]),
             Arc::as_ptr(&self.vocab[1]),
@@ -121,23 +166,13 @@ impl CltjTrie {
         ]
     }
 
-    /// Consume this trie, discarding the vocab `Arc`s (vocab is hoisted to
-    /// the top-level [`CltjSnapshot`], deduped across all six tries) and
-    /// keeping only the ε-serde-serializable [`LoudsCore`].
-    ///
-    /// Used by the persistent snapshot format.  Requires unique ownership
-    /// of the trie (i.e. the
-    /// enclosing `Arc<CltjTrie>` must have refcount 1) — true for a freshly
-    /// built [`CltjData`] that has not yet been shared, per the "always
-    /// mapped" design (see `RingStore::compact`).
-    pub(crate) fn into_core(self) -> LoudsCore {
-        self.louds.into_core()
-    }
-
     /// Create a depth-0 `CltjTrieIter` positioned at the first root child.
     ///
     /// Returns [`EmptyTrieIter`] if the trie is empty.
-    pub fn iter_d0(self: &Arc<Self>) -> Box<dyn TrieIterator> {
+    pub fn iter_d0(self: &Arc<Self>) -> Box<dyn TrieIterator>
+    where
+        V: Send + Sync + 'static,
+    {
         let degree = self.louds.root_degree();
         if degree == 0 {
             return Box::new(EmptyTrieIter);
@@ -176,10 +211,11 @@ impl CltjTrie {
             if depth >= 3 || pos > hi {
                 return 0;
             }
-            let vocab = &self.vocab[depth];
+            let vocab = self.vocab_slice(depth);
             // seek: no-op if val <= current key, else exponential-search leap.
             let cur_local = self.louds.label_at(pos) as usize;
             if val > vocab[cur_local] {
+
                 let local_target = vocab.partition_point(|&v| v < val);
                 if local_target >= vocab.len() {
                     return 0;
@@ -210,14 +246,19 @@ impl CltjTrie {
     }
 }
 
+
 // ── CltjData ──────────────────────────────────────────────────────────────────
 
 /// Six LOUDS tries (one per ordering) for a single named graph.
-pub struct CltjData {
-    tries: [Arc<CltjTrie>; 6],
+///
+/// Generic over the vocab representation `V` (see [`CltjTrie`]) so that the
+/// borrowed (mmap'd) form can share this same implementation.
+pub struct CltjData<V = Vec<u64>> {
+    tries: [Arc<CltjTrie<V>>; 6],
 }
 
-impl CltjData {
+impl<V: AsRef<[u64]> + Send + Sync + 'static> CltjData<V> {
+
     /// Index into `tries` for a given ordering.
     #[inline]
     fn idx(ord: SortOrder) -> usize {
@@ -271,21 +312,27 @@ impl CltjData {
         // Sum each trie's LOUDS-only bytes (never shared — unique per trie).
         let louds_total: usize = self.tries.iter().map(|t| t.louds_mem_size_bytes()).sum();
 
-        // Dedup vocab Arcs by pointer identity, then sum each unique Vec<u64>'s
-        // real heap size once.
-        let mut seen: HashSet<*const Vec<u64>> = HashSet::new();
+        // Dedup vocab Arcs by pointer identity, then sum each unique vocab's
+        // real byte size once.
+        let mut seen: HashSet<*const V> = HashSet::new();
         let mut vocab_total = 0usize;
         for trie in &self.tries {
-            for (ptr, arc) in trie.vocab_arc_ptrs().into_iter().zip(trie.vocab.iter()) {
+            for (ptr, len) in trie
+                .vocab_arc_ptrs()
+                .into_iter()
+                .zip(trie.vocab.iter().map(|v| AsRef::<[u64]>::as_ref(&**v).len()))
+            {
+
                 if seen.insert(ptr) {
-                    vocab_total +=
-                        std::mem::size_of::<Vec<u64>>() + arc.len() * std::mem::size_of::<u64>();
+                    vocab_total += std::mem::size_of::<V>() + len * std::mem::size_of::<u64>();
                 }
             }
         }
 
         louds_total + vocab_total
     }
+
+
 
     /// Per-ordering memory breakdown.
     ///
@@ -314,23 +361,28 @@ impl CltjData {
         })
     }
 
-    /// Deduped total vocab bytes across all six tries' shared `Arc<Vec<u64>>`
+    /// Deduped total vocab bytes across all six tries' shared `Arc<V>`
     /// arrays (3 unique allocations, regardless of the 18 references).
     pub fn vocab_bytes_deduped(&self) -> usize {
         use std::collections::HashSet;
-        let mut seen: HashSet<*const Vec<u64>> = HashSet::new();
+        let mut seen: HashSet<*const V> = HashSet::new();
         let mut total = 0usize;
         for trie in &self.tries {
             for (ptr, arc) in trie.vocab_arc_ptrs().into_iter().zip(trie.vocab.iter()) {
                 if seen.insert(ptr) {
-                    total +=
-                        std::mem::size_of::<Vec<u64>>() + arc.len() * std::mem::size_of::<u64>();
+                    total += std::mem::size_of::<V>()
+                        + AsRef::<[u64]>::as_ref(&**arc).len() * std::mem::size_of::<u64>();
                 }
             }
+
         }
         total
     }
 
+
+}
+
+impl CltjData {
     /// Consume this `CltjData`, producing the ε-serde-serializable
     /// [`CltjSnapshot`] (3 deduped vocab arrays + 6 [`LoudsCore`]s).
     ///
@@ -343,6 +395,9 @@ impl CltjData {
     /// `vocab` is `[orig_s, orig_p, orig_o]` — see [`build_cltj_data`]) before
     /// any trie is consumed, since all six tries share the same three `Arc`
     /// allocations.
+    ///
+    /// Only defined for the owned `Vec<u64>` form (`V`'s default) — a fresh
+    /// build always starts from owned vocab.
     pub(crate) fn into_snapshot(self) -> CltjSnapshot {
         // Extract the three shared vocab arrays via the SPO trie (index 0)
         // before consuming any trie (all six share the same three Arcs).
@@ -373,6 +428,7 @@ impl CltjData {
     /// references, 3 unique `Arc` allocations — matching the runtime
     /// hot-path layout exactly).
     pub(crate) fn from_snapshot(snap: CltjSnapshot) -> CltjData {
+
         let orig_s = Arc::new(snap.vocab_s);
         let orig_p = Arc::new(snap.vocab_p);
         let orig_o = Arc::new(snap.vocab_o);
@@ -635,9 +691,9 @@ pub fn build_cltj_data(
 ///
 /// Navigation is O(1) per step (LOUDS rank/select), with O(log ℓ) seek via
 /// exponential search — replacing the WaveletMatrix Ring's O(log σ) per step.
-pub struct CltjTrieIter {
+pub struct CltjTrieIter<V = Vec<u64>> {
     /// The parent trie (shared between parent and child iterators).
-    trie: Arc<CltjTrie>,
+    trie: Arc<CltjTrie<V>>,
     /// Inclusive upper bound of the current node's children label-range in L.
     hi: usize,
     /// Current position within [lo, hi].  `pos > hi` means exhausted.
@@ -646,15 +702,16 @@ pub struct CltjTrieIter {
     depth: u8,
 }
 
-impl TrieIterator for CltjTrieIter {
+impl<V: AsRef<[u64]> + Send + Sync + 'static> TrieIterator for CltjTrieIter<V> {
     /// Return the global term ID at the current position.
     ///
     /// O(1): direct Vec index (local_id from LOUDS L, then vocab lookup).
     #[inline]
     fn key(&self) -> u64 {
         let local_id = self.trie.louds.label_at(self.pos) as usize;
-        self.trie.vocab[self.depth as usize][local_id]
+        self.trie.vocab_slice(self.depth as usize)[local_id]
     }
+
 
     /// Advance to the first position where `key() >= target`.
     ///
@@ -669,8 +726,9 @@ impl TrieIterator for CltjTrieIter {
             return;
         }
 
-        let vocab = &self.trie.vocab[self.depth as usize];
+        let vocab = self.trie.vocab_slice(self.depth as usize);
         // Binary search for first local_id where vocab[local_id] >= target.
+
         let local_target = vocab.partition_point(|&v| v < target);
         if local_target >= vocab.len() {
             // All vocab values are below target — exhaust the iterator.
@@ -711,6 +769,7 @@ impl TrieIterator for CltjTrieIter {
         self.pos > self.hi
     }
 }
+
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
