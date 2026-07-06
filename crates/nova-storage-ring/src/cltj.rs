@@ -54,7 +54,7 @@
 //! vocabulary arrays (`vocab[0]`, `vocab[1]`, `vocab[2]`) map local → global
 //! (u64 term IDs) for each depth.
 
-use crate::louds::{LoudsCore, LoudsMemBreakdown, LoudsTrie, build_louds_from_sorted};
+use crate::louds::{LoudsCore, LoudsMemBreakdown, LoudsNav, LoudsTrie, build_louds_from_sorted};
 
 use crate::ring::SortOrder;
 use epserde::Epserde;
@@ -116,9 +116,13 @@ impl AsRef<[u64]> for VocabRepr {
 /// Direct indexing keeps `key()` at O(1) with no bit-unpacking, and `seek()`
 /// can use `partition_point` which the compiler can SIMD-vectorise, for both
 /// the owned and borrowed representations.
-pub struct CltjTrie<V = Vec<u64>> {
-    /// LOUDS bitvector + label array.
-    louds: LoudsTrie,
+pub struct CltjTrie<Louds = LoudsTrie, V = Vec<u64>> {
+    /// LOUDS bitvector + label array.  Generic over the LOUDS navigation
+    /// substrate (bounded by [`LoudsNav`]) so a future mmap'd/zero-copy
+    /// snapshot load can populate this with a borrowed, ε-serde `DeserType`
+    /// LOUDS structure directly, with **no code duplication** versus the
+    /// owned `LoudsTrie` path (CLAUDE.md item 14, Phase 3.3).
+    louds: Louds,
     /// `vocab[d]` = sorted global IDs for depth `d` (0, 1, or 2).
     /// `vocab[d][local_id]` → global TermId as `u64`.
     vocab: [Arc<V>; 3],
@@ -136,12 +140,15 @@ impl CltjTrie {
     /// enclosing `Arc<CltjTrie>` must have refcount 1) — true for a freshly
     /// built [`CltjData`] that has not yet been shared, per the "always
     /// mapped" design (see `RingStore::compact`).
+    ///
+    /// Only defined for the owned `LoudsTrie` form (`Louds`'s default) — a
+    /// fresh build always starts from an owned trie.
     pub(crate) fn into_core(self) -> LoudsCore {
         self.louds.into_core()
     }
 }
 
-impl<V: AsRef<[u64]>> CltjTrie<V> {
+impl<Louds: LoudsNav, V: AsRef<[u64]>> CltjTrie<Louds, V> {
     /// Borrow depth `d`'s vocab array as a plain `&[u64]` slice, going
     /// through `V`'s `AsRef<[u64]>` impl.  `Arc<V>` itself only implements
     /// `AsRef<V>` (not a conditional `AsRef<[u64]>` passthrough), so we must
@@ -214,6 +221,7 @@ impl<V: AsRef<[u64]>> CltjTrie<V> {
     /// Returns [`EmptyTrieIter`] if the trie is empty.
     pub fn iter_d0(self: &Arc<Self>) -> Box<dyn TrieIterator>
     where
+        Louds: Send + Sync + 'static,
         V: Send + Sync + 'static,
     {
         let degree = self.louds.root_degree();
@@ -296,11 +304,13 @@ impl<V: AsRef<[u64]>> CltjTrie<V> {
 ///
 /// Generic over the vocab representation `V` (see [`CltjTrie`]) so that the
 /// borrowed (mmap'd) form can share this same implementation.
-pub struct CltjData<V = Vec<u64>> {
-    tries: [Arc<CltjTrie<V>>; 6],
+pub struct CltjData<Louds = LoudsTrie, V = Vec<u64>> {
+    tries: [Arc<CltjTrie<Louds, V>>; 6],
 }
 
-impl<V: AsRef<[u64]> + Send + Sync + 'static> CltjData<V> {
+impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 'static>
+    CltjData<Louds, V>
+{
 
     /// Index into `tries` for a given ordering.
     #[inline]
@@ -734,9 +744,9 @@ pub fn build_cltj_data(
 ///
 /// Navigation is O(1) per step (LOUDS rank/select), with O(log ℓ) seek via
 /// exponential search — replacing the WaveletMatrix Ring's O(log σ) per step.
-pub struct CltjTrieIter<V = Vec<u64>> {
+pub struct CltjTrieIter<Louds = LoudsTrie, V = Vec<u64>> {
     /// The parent trie (shared between parent and child iterators).
-    trie: Arc<CltjTrie<V>>,
+    trie: Arc<CltjTrie<Louds, V>>,
     /// Inclusive upper bound of the current node's children label-range in L.
     hi: usize,
     /// Current position within [lo, hi].  `pos > hi` means exhausted.
@@ -745,7 +755,10 @@ pub struct CltjTrieIter<V = Vec<u64>> {
     depth: u8,
 }
 
-impl<V: AsRef<[u64]> + Send + Sync + 'static> TrieIterator for CltjTrieIter<V> {
+impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 'static> TrieIterator
+    for CltjTrieIter<Louds, V>
+{
+
     /// Return the global term ID at the current position.
     ///
     /// O(1): direct Vec index (local_id from LOUDS L, then vocab lookup).

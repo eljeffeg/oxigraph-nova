@@ -33,7 +33,8 @@
 //! [`CltjTrieIter`] in `cltj.rs`.
 
 use crate::cltj::{CltjData, CltjSnapshot, build_cltj_data};
-use crate::louds::LoudsMemBreakdown;
+use crate::louds::{LoudsMemBreakdown, LoudsNav, LoudsTrie};
+
 use epserde::Epserde;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 use std::collections::HashMap;
@@ -75,14 +76,15 @@ impl SortOrder {
 /// in `cltj.rs`) so that a future mmap'd/zero-copy snapshot load can populate
 /// `cltj`'s vocab with borrowed `&[u64]` slices, with no code duplication
 /// versus the owned `Vec<u64>` path — see CLAUDE.md item 14, Phase 3.
-struct RingData<V = Vec<u64>> {
+struct RingData<Louds = LoudsTrie, V = Vec<u64>> {
     /// Six LOUDS tries (one per ordering) — O(1) navigation per step.
     /// `contains()`, `match_triples()`, and `spo_triples()` are all derived
     /// from these tries via O(1)-per-step LOUDS navigation. There is no
     /// redundant `spo: Vec<[u64;3]>` raw copy — that used to account for
     /// ~53% of Ring memory before it was removed.
-    cltj: CltjData<V>,
+    cltj: CltjData<Louds, V>,
 }
+
 
 
 // ── LFTJ ordering selection ───────────────────────────────────────────────────
@@ -122,13 +124,16 @@ fn choose_array_for_lftj(bound_fields: &[usize], target_field: usize) -> SortOrd
 /// `GraphRing<&[u64]>`-style value with no code duplication — see CLAUDE.md
 /// item 14, Phase 3. All existing callers use the default `GraphRing`
 /// (`V = Vec<u64>`) and are unaffected by this generic parameter.
-pub struct GraphRing<V = Vec<u64>> {
+pub struct GraphRing<Louds = LoudsTrie, V = Vec<u64>> {
     /// Number of distinct triples stored in this graph.
     pub n: usize,
-    data: Option<Arc<RingData<V>>>,
+    data: Option<Arc<RingData<Louds, V>>>,
 }
 
-impl<V: AsRef<[u64]> + Send + Sync + 'static> GraphRing<V> {
+impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 'static>
+    GraphRing<Louds, V>
+{
+
 
     /// All triples in SPO order (for testing / serialisation).
     ///
