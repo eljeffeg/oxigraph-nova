@@ -141,15 +141,22 @@ enum SidecarPayload {
 /// ε-serde-serializable — the sidecar no longer needs to be excluded from the
 /// snapshot or rebuilt on load.
 #[derive(Epserde, Default)]
-pub(crate) struct SidecarCore {
-    his: Vec<usize>,
-
-    los: Vec<usize>,
-    kind: Vec<u8>,
-    slice_start: Vec<usize>,
-    ef_idx: Vec<usize>,
-    slice_flat: Vec<u32>,
-    ef_dicts: Vec<EfDict<usize>>,
+pub(crate) struct SidecarCore<
+    His = Vec<usize>,
+    Los = Vec<usize>,
+    Kind = Vec<u8>,
+    SliceStart = Vec<usize>,
+    EfIdx = Vec<usize>,
+    SliceFlat = Vec<u32>,
+    EfDicts = Vec<EfDict<usize>>,
+> {
+    his: His,
+    los: Los,
+    kind: Kind,
+    slice_start: SliceStart,
+    ef_idx: EfIdx,
+    slice_flat: SliceFlat,
+    ef_dicts: EfDicts,
 }
 
 impl SidecarCore {
@@ -190,7 +197,7 @@ impl SidecarCore {
 // `sucds::Rank9Sel` `--no-default-features` fallback was removed — a single
 // sux-only T backend is a prerequisite for an unambiguous ε-serde/mmap
 // snapshot format).
-mod t_backend {
+pub(crate) mod t_backend {
     //! T bitvector backend: `sux 0.14` Rank9 + SelectAdapt (Vigna).
     //!
     //! sux is the authoritative Rust implementation by Sebastiano Vigna (the
@@ -231,20 +238,25 @@ mod t_backend {
     /// Single nested structure: select on top of rank9 on top of bitvec.
     /// Deref chain: SelectAdapt → AddNumBits → Rank9 → BitVec<Vec<u64>>.
     /// One backing store; no clone; both rank() and select() work on `rs`.
-    type SuxRS = SelectAdapt<AddNumBits<Rank9<SuxBV>>>;
+    pub(crate) type SuxRS = SelectAdapt<AddNumBits<Rank9<SuxBV>>>;
 
-    // `#[derive(epserde::Epserde)]` composes cleanly through sux's nested
-    // Deref chain (SelectAdapt<AddNumBits<Rank9<BitVec<Vec<u64>>>>>) with
-    // zero extra trait-bound or lifetime work. `TBitvec` is the T-bitvector
-    // component of the ε-serde/mmap snapshot format (`LoudsCore`, see
-    // `snapshot.rs`).
+    // `TBitvec` is generic over its backing rank/select structure `B`,
+    // defaulting to the owned `SuxRS`.  This "bare generic parameter with
+    // default" pattern is what epserde's `#[derive(Epserde)]` needs in order
+    // to treat the `rs` field as zero-copy-eligible: because `rs`'s declared
+    // type is the bare identifier `B` (a generic parameter of this struct),
+    // epserde recurses into `B`'s own `DeserType` when deserializing via
+    // `load_mmap`/`deserialize_eps`, producing a borrowed (zero-copy) form
+    // instead of re-allocating an owned copy.  All existing call sites are
+    // unaffected because `TBitvec == TBitvec<SuxRS>` by default.
     #[derive(Epserde)]
-    pub(super) struct TBitvec {
-        rs: SuxRS,
+    pub(crate) struct TBitvec<B = SuxRS> {
+        rs: B,
         num_ones: usize,
     }
 
-    impl TBitvec {
+    impl TBitvec<SuxRS> {
+        /// Construction only ever produces the owned form.
         pub(super) fn build(bits: impl Iterator<Item = bool>) -> Self {
             let bv: SuxBV = bits.collect();
 
@@ -254,11 +266,19 @@ mod t_backend {
             let rs: SuxRS = SelectAdapt::new(Rank9::new(bv).into());
             TBitvec { rs, num_ones }
         }
+    }
 
+    impl<B> TBitvec<B> {
         /// Count of 1-bits in `[0, k)`.
         /// Deref chain: SelectAdapt → AddNumBits → Rank9::rank().
+        ///
+        /// Generic over `B` so this works identically whether `B` is the
+        /// owned `SuxRS` or its mmap'd/borrowed `DeserType` form.
         #[inline(always)]
-        pub(super) fn rank1(&self, k: usize) -> usize {
+        pub(super) fn rank1(&self, k: usize) -> usize
+        where
+            B: Rank,
+        {
             self.rs.rank(k)
         }
 
@@ -269,7 +289,10 @@ mod t_backend {
         /// verified `k < num_ones`, the unchecked call is safe and eliminates the
         /// redundant `Option` wrap/unwrap in the LOUDS select-dominant hot path.
         #[inline(always)]
-        pub(super) fn select1(&self, k: usize) -> Option<usize> {
+        pub(super) fn select1(&self, k: usize) -> Option<usize>
+        where
+            B: SelectUnchecked,
+        {
             if k < self.num_ones {
                 // SAFETY: k < num_ones guarantees the k-th 1-bit exists.
                 // sux::SelectAdapt::select_unchecked is UB only when k >= num_ones.
@@ -283,7 +306,10 @@ mod t_backend {
         /// Rank9 counters + SelectAdapt inventory), for memory-breakdown
         /// diagnostics.  Uses `sux`'s derived `MemSize` (accounts for every
         /// heap allocation in the nested Deref chain).
-        pub(super) fn mem_size_bytes(&self) -> usize {
+        pub(super) fn mem_size_bytes(&self) -> usize
+        where
+            B: MemSize,
+        {
             self.rs.mem_size(SizeFlags::default())
         }
     }
@@ -415,11 +441,11 @@ pub struct LoudsTrie {
 /// derive `epserde::Epserde`, so this struct composes cleanly through
 /// `#[derive(Epserde)]` with zero extra trait-bound or lifetime work.
 #[derive(Epserde)]
-pub(crate) struct LoudsCore {
-    t: t_backend::TBitvec,
-    l: BitFieldVec,
+pub(crate) struct LoudsCore<T = t_backend::TBitvec, L = BitFieldVec, S = SidecarCore> {
+    t: T,
+    l: L,
     l_len: usize,
-    sidecar: SidecarCore,
+    sidecar: S,
 }
 
 impl LoudsTrie {
@@ -599,7 +625,7 @@ impl LoudsTrie {
         // so that `SidecarCore::find` can binary-search.
         entries.sort_unstable_by_key(|(hi, _, _)| *hi);
 
-        let mut core = SidecarCore::default();
+        let mut core: SidecarCore = SidecarCore::default();
         for (hi, lo, payload) in entries {
             core.his.push(hi);
             core.los.push(lo);
