@@ -443,10 +443,15 @@ impl CltjData {
 // is substituted in as the generic parameter's default.  This mirrors the
 // pattern used for `TBitvec`/`SidecarCore`/`LoudsCore` in `louds.rs`.
 #[derive(Epserde)]
-pub(crate) struct CltjSnapshot<Tries = [LoudsCore; 6]> {
-    vocab_s: Vec<u64>,
-    vocab_p: Vec<u64>,
-    vocab_o: Vec<u64>,
+pub(crate) struct CltjSnapshot<
+    VocabS = Vec<u64>,
+    VocabP = Vec<u64>,
+    VocabO = Vec<u64>,
+    Tries = [LoudsCore; 6],
+> {
+    vocab_s: VocabS,
+    vocab_p: VocabP,
+    vocab_o: VocabO,
     tries: Tries,
 }
 
