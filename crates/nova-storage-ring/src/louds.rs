@@ -521,6 +521,28 @@ pub(crate) struct LoudsCore<T = t_backend::TBitvec, L = BitFieldVec, S = Sidecar
     sidecar: S,
 }
 
+// ── Reconstruction from core (generic over substrate) ─────────────────────────
+//
+// Pure field-moves with no owned-specific logic, so this is generic over any
+// substrate `B`/`L`/`S` — this is what lets a future borrowed/mmap'd
+// `LoudsCore<DeserType<TBitvec<B>>, DeserType<L>, DeserType<S>>` reconstruct
+// directly into a navigable `LoudsTrie<B, L, S>` with **zero extra code**
+// versus the owned round-trip path (Phase 3.3c step 2a, CLAUDE.md item 14).
+impl<B, L, S> LoudsTrie<B, L, S> {
+    /// Reconstruct a full `LoudsTrie` from a [`LoudsCore`] loaded from disk
+    /// (or from an in-memory round-trip buffer, or a borrowed `load_mmap`'d
+    /// view). The sidecar travels with the core as-is — no rebuild required
+    /// (Phase 2).
+    pub(crate) fn from_core(core: LoudsCore<t_backend::TBitvec<B>, L, S>) -> Self {
+        LoudsTrie {
+            t: core.t,
+            l: core.l,
+            l_len: core.l_len,
+            sidecar: core.sidecar,
+        }
+    }
+}
+
 // ── Construction (owned-only) ─────────────────────────────────────────────────
 //
 // These methods only ever operate on the default, fully-owned instantiation
@@ -528,6 +550,7 @@ pub(crate) struct LoudsCore<T = t_backend::TBitvec, L = BitFieldVec, S = Sidecar
 // scratch, or converting to/from the ε-serde core, always produces/consumes
 // owned data.  Read-only navigation (below) is generic over any substrate.
 impl LoudsTrie {
+
     /// Consume this trie into its fully ε-serde-serializable [`LoudsCore`]
     /// (T + L + sidecar — no information is discarded or needs rebuilding).
     ///
@@ -542,20 +565,8 @@ impl LoudsTrie {
         }
     }
 
-    /// Reconstruct a full `LoudsTrie` from a [`LoudsCore`] loaded from disk
-    /// (or from an in-memory round-trip buffer). The sidecar travels with
-    /// the core as-is — no rebuild required (Phase 2).
-    pub(crate) fn from_core(core: LoudsCore) -> Self {
-        LoudsTrie {
-            t: core.t,
-            l: core.l,
-            l_len: core.l_len,
-            sidecar: core.sidecar,
-        }
-    }
-
-
     /// Build from T bits and L labels in paper format (no dummy entries).
+
     ///
     /// Prepends dummy `false` / `0` entries automatically.
     ///

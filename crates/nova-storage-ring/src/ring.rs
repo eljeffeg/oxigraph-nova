@@ -33,7 +33,7 @@
 //! [`CltjTrieIter`] in `cltj.rs`.
 
 use crate::cltj::{CltjData, CltjSnapshot, build_cltj_data};
-use crate::louds::{LoudsMemBreakdown, LoudsNav, LoudsTrie};
+use crate::louds::{LoudsCore, LoudsMemBreakdown, LoudsNav, LoudsTrie, t_backend};
 
 use epserde::Epserde;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
@@ -396,9 +396,24 @@ impl GraphRing {
         RingSnapshot { n: self.n, cltj }
     }
 
+}
+
+// ── Reconstruction from snapshot (generic over substrate) ─────────────────────
+//
+// Pure field-moves with no owned-specific logic, so this is generic over any
+// LOUDS substrate `B`/`L`/`S` and any vocab representation `V: AsRef<[u64]>`
+// — this is what lets a future borrowed/mmap'd
+// `RingSnapshot<CltjSnapshot<DeserType<Vec<u64>>, ..., [DeserType<LoudsCore>; 6]>>`
+// reconstruct directly into a navigable `GraphRing<LoudsTrie<B, L, S>, V>`
+// with **zero extra code** versus the owned round-trip path (Phase 3.3c step
+// 2a, CLAUDE.md item 14).
+impl<B, L, S, V: AsRef<[u64]>> GraphRing<LoudsTrie<B, L, S>, V> {
     /// Reconstruct a `GraphRing` from a [`RingSnapshot`] loaded from disk (or
-    /// from an in-memory round-trip buffer using the "always mapped" design).
-    pub(crate) fn from_snapshot(snap: RingSnapshot) -> GraphRing {
+    /// from an in-memory round-trip buffer, or a borrowed `load_mmap`'d
+    /// view).
+    pub(crate) fn from_snapshot(
+        snap: RingSnapshot<CltjSnapshot<V, V, V, [LoudsCore<t_backend::TBitvec<B>, L, S>; 6]>>,
+    ) -> GraphRing<LoudsTrie<B, L, S>, V> {
         let data = snap.cltj.map(|cltj_snap| {
             Arc::new(RingData {
                 cltj: CltjData::from_snapshot(cltj_snap),
@@ -407,6 +422,7 @@ impl GraphRing {
         GraphRing { n: snap.n, data }
     }
 }
+
 
 
 /// ε-serde-serializable snapshot of a [`GraphRing`]: triple count plus an

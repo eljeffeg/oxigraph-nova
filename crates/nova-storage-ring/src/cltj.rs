@@ -54,7 +54,9 @@
 //! vocabulary arrays (`vocab[0]`, `vocab[1]`, `vocab[2]`) map local → global
 //! (u64 term IDs) for each depth.
 
-use crate::louds::{LoudsCore, LoudsMemBreakdown, LoudsNav, LoudsTrie, build_louds_from_sorted};
+use crate::louds::{
+    LoudsCore, LoudsMemBreakdown, LoudsNav, LoudsTrie, build_louds_from_sorted, t_backend,
+};
 
 use crate::ring::SortOrder;
 use epserde::Epserde;
@@ -472,23 +474,37 @@ impl CltjData {
         }
     }
 
+}
+
+// ── Reconstruction from snapshot (generic over substrate) ─────────────────────
+//
+// Pure field-moves + a static vocab redistribution with no owned-specific
+// logic, so this is generic over any LOUDS substrate `B`/`L`/`S` and any
+// vocab representation `V: AsRef<[u64]>` — this is what lets a future
+// borrowed/mmap'd `CltjSnapshot<DeserType<Vec<u64>>, ..., [DeserType<LoudsCore>; 6]>`
+// reconstruct directly into a navigable `CltjData<LoudsTrie<B, L, S>, V>` with
+// **zero extra code** versus the owned round-trip path (Phase 3.3c step 2a,
+// CLAUDE.md item 14).
+impl<B, L, S, V: AsRef<[u64]>> CltjData<LoudsTrie<B, L, S>, V> {
     /// Reconstruct a `CltjData` from a [`CltjSnapshot`] loaded from disk (or
-    /// from an in-memory round-trip buffer using the "always mapped" design).
+    /// from an in-memory round-trip buffer, or a borrowed `load_mmap`'d
+    /// view).
     ///
     /// Rebuilds each `CltjTrie`'s sidecar via [`LoudsTrie::from_core`] and
     /// redistributes the three vocab arrays across the six tries per the
     /// static ordering permutation documented in [`build_cltj_data`] (18
     /// references, 3 unique `Arc` allocations — matching the runtime
     /// hot-path layout exactly).
-    pub(crate) fn from_snapshot(snap: CltjSnapshot) -> CltjData {
-
+    pub(crate) fn from_snapshot(
+        snap: CltjSnapshot<V, V, V, [LoudsCore<t_backend::TBitvec<B>, L, S>; 6]>,
+    ) -> CltjData<LoudsTrie<B, L, S>, V> {
         let orig_s = Arc::new(snap.vocab_s);
         let orig_p = Arc::new(snap.vocab_p);
         let orig_o = Arc::new(snap.vocab_o);
 
         // Static per-ordering vocab assignment — must exactly match
         // `build_cltj_data`'s vocab_primary/vocab_secondary arguments.
-        let vocabs: [[Arc<Vec<u64>>; 3]; 6] = [
+        let vocabs: [[Arc<V>; 3]; 6] = [
             [
                 Arc::clone(&orig_s),
                 Arc::clone(&orig_p),
@@ -522,7 +538,7 @@ impl CltjData {
         ];
 
         let mut cores = snap.tries.into_iter();
-        let tries: [Arc<CltjTrie>; 6] = vocabs.map(|vocab| {
+        let tries: [Arc<CltjTrie<LoudsTrie<B, L, S>, V>>; 6] = vocabs.map(|vocab| {
             let core = cores.next().expect("CltjSnapshot always has 6 tries");
             Arc::new(CltjTrie {
                 louds: LoudsTrie::from_core(core),
@@ -533,6 +549,7 @@ impl CltjData {
         CltjData { tries }
     }
 }
+
 
 /// ε-serde-serializable snapshot of a [`CltjData`]: three deduped vocab
 /// arrays (plain `Vec<u64>`, not `Arc`-wrapped — `Arc` is not directly
