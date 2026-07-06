@@ -921,6 +921,58 @@ mod tests {
         assert!(it1.at_end());
     }
 
+    /// Phase 3.1b probe: real `load_mmap` round-trip of a `CltjSnapshot` to a
+    /// temp file, confirming that epserde's zero-copy `DeserType` form
+    /// actually materializes (i.e. `load_mmap` succeeds and the resulting
+    /// `MemCase`'s `.uncase()` produces a navigable borrowed structure).
+    ///
+    /// This does NOT yet wire the borrowed form into `CltjTrie`/`CltjData` —
+    /// it is a standalone feasibility probe informing the Phase 3.1 design
+    /// (see CLAUDE.md item 14, Phase 3).
+    #[test]
+    fn cltj_snapshot_load_mmap_probe() {
+        use epserde::deser::{Deserialize, Flags};
+        use epserde::ser::Serialize;
+
+        let triples: &[[u64; 3]] = &[[1, 2, 3], [1, 2, 4], [1, 3, 5], [2, 2, 6]];
+        let original = make_cltj(triples);
+        let snap = original.into_snapshot();
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pid = std::process::id();
+        let path =
+            std::env::temp_dir().join(format!("nova_cltj_mmap_probe_{pid}_{n}.snap"));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut f = std::fs::File::create(&path).expect("create temp file");
+            unsafe {
+                snap.serialize(&mut f).expect("serialize CltjSnapshot");
+            }
+        }
+
+        // Zero-copy mmap load: `mem_case` owns the mmap'd backing memory;
+        // `.uncase()` yields a borrowed `DeserType<CltjSnapshot>` tied to
+        // `mem_case`'s lifetime.
+        let mem_case = unsafe {
+            <CltjSnapshot>::load_mmap(&path, Flags::empty()).expect("load_mmap CltjSnapshot")
+        };
+        let view: &epserde::deser::DeserType<CltjSnapshot> = mem_case.uncase();
+
+
+
+        // vocab_s/vocab_p/vocab_o should be borrowed `&[u64]` slices (zero-copy),
+        // not freshly-allocated owned `Vec<u64>` copies.
+        assert!(!view.vocab_s.is_empty());
+        assert!(!view.vocab_p.is_empty());
+        assert!(!view.vocab_o.is_empty());
+        // 6 tries, one per SortOrder.
+        assert_eq!(view.tries.len(), 6);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// End-to-end round-trip of the persistent snapshot format:
     /// build a `CltjData`, convert to `CltjSnapshot`, serialize via ε-serde
     /// into an in-memory buffer, deserialize back, reconstruct a `CltjData`
@@ -928,6 +980,7 @@ mod tests {
     /// across all six orderings compared to the original.
     #[test]
     fn cltj_snapshot_round_trip() {
+
         use epserde::deser::Deserialize;
         use epserde::ser::Serialize;
 
