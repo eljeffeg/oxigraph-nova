@@ -89,8 +89,8 @@
 //! zstd-3 alone already achieves ~25× on typical
 //! BSBM-style data, so this phase's primary value is validating the
 //! encode/sort/permute/decode round trip against real data ahead of the
-//! (much higher-risk) in-memory two-tier FC dictionary in Phase 2, not a
-//! large additional disk-size win.
+//! (much higher-risk) in-memory two-tier FC dictionary, not a large
+//! additional disk-size win.
 
 use crate::wal::{
     read_graph_name, read_object_term, read_string, read_tag, write_graph_name, write_object_term,

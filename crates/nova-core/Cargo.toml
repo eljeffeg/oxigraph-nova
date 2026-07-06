@@ -10,8 +10,9 @@ repository.workspace = true
 oxrdf        = { workspace = true }
 anyhow       = { workspace = true }
 thiserror    = { workspace = true }
-sux          = { version = "0.14", features = ["epserde", "mmap"] } # BitFieldVec-based id2rank/rank2id permutation arrays (Phase 2 PFC dictionary)
+sux          = { version = "0.14", features = ["epserde", "mmap"] } # BitFieldVec-based id2rank/rank2id permutation arrays (PFC dictionary)
 value-traits = "0.2.0"  # SliceByValue::index_value for safe BitFieldVec reads
-lru          = "0.12"   # TermId-keyed decode cache for compacted-tier terms (Phase 3 PFC dictionary)
+lru          = "0.12"   # TermId-keyed decode cache for compacted-tier terms (PFC dictionary)
+
 
 

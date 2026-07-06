@@ -16,9 +16,8 @@
 // Re-export so calling code can write `oxigraph_nova_query::Variable`.
 pub use oxrdf::Variable as SparqlVariable;
 use oxrdf::{BlankNode, Term, Variable};
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A single SPARQL solution mapping: a set of (variable → RDF term) bindings.
 ///
@@ -30,16 +29,27 @@ use std::rc::Rc;
 /// repeated calls to `BNODE(strExpr)` with the same string value *within the
 /// same solution* must return the *same* blank node, while different
 /// solutions (even with the same string value) must get *fresh*, distinct
-/// blank nodes. The cache is shared (via `Rc`) across clones that represent
-/// the *same* logical row being incrementally built up (e.g. BGP nested-loop
-/// extension, `Extend`/`Filter`/`Project` passthroughs), but a **fresh** empty
-/// cache is created whenever a genuinely new row is constructed via
-/// `Solution::new()`/`Solution::default()` (e.g. one result row from LFTJ, a
-/// `VALUES` row, or the start of BGP evaluation).
+/// blank nodes. The cache is shared (via `Arc<Mutex<_>>` — `Arc` rather than
+/// `Rc` so `Solution` is `Send` and can cross thread boundaries, e.g. into the
+/// HTTP server's background serialization thread; the lock is never
+/// contended since a solution row is only ever touched by one thread at a
+/// time) across clones that represent the *same* logical row being
+/// incrementally built up (e.g. BGP nested-loop extension,
+/// `Extend`/`Filter`/`Project` passthroughs).
+///
+/// The cache is wrapped in a [`OnceLock`] so the `Arc<Mutex<HashMap<_>>>`
+/// heap allocation is deferred until the first actual `BNODE(strExpr)` call
+/// via [`Self::bnode_for`] — even though a fresh row's `OnceLock` starts
+/// uninitialized, `bnode_for` can still lazily populate it through a shared
+/// `&self` reference. `BNODE(strExpr)` is rare in practice, and
+/// `Solution::new()` is called once per *result row* (e.g. 900K times for a
+/// large LFTJ join), so this avoids one heap allocation per row for the
+/// overwhelming majority of rows that never call `BNODE()`, at the cost of
+/// a branch on every `bnode_for` call to check initialization.
 #[derive(Debug, Clone, Default)]
 pub struct Solution {
     bindings: HashMap<Variable, Term>,
-    bnode_cache: Rc<RefCell<HashMap<String, BlankNode>>>,
+    bnode_cache: OnceLock<Arc<Mutex<HashMap<String, BlankNode>>>>,
 }
 
 impl PartialEq for Solution {
@@ -51,8 +61,9 @@ impl PartialEq for Solution {
 }
 
 impl Solution {
-    /// Create an empty solution (no variables bound), with a fresh (empty,
-    /// unshared) `BNODE()` cache — i.e. a genuinely *new* solution row.
+    /// Create an empty solution (no variables bound), with no `BNODE()`
+    /// cache allocated yet — i.e. a genuinely *new* solution row. The cache
+    /// is lazily created on first use by [`Self::bnode_for`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -88,15 +99,21 @@ impl Solution {
 
     /// Get or create the blank node associated with `key` (the string value
     /// of `BNODE(strExpr)`'s argument) *within this solution row*. Because
-    /// `bnode_cache` is an `Rc<RefCell<_>>`, clones produced while extending
-    /// or filtering the *same* row (e.g. `sol.clone()` inside BGP nested-loop
-    /// join, or `&mut sol` in `Extend`) share the same underlying cache, so
+    /// `bnode_cache` is an `Arc<Mutex<_>>` (behind a lazily-initialized
+    /// `OnceLock`), clones produced while extending or filtering the *same*
+    /// row (e.g. `sol.clone()` inside BGP nested-loop join, or `&mut sol` in
+    /// `Extend`) share the same underlying cache once initialized, so
     /// repeated `BNODE(?x)` calls with the same value within one row's
     /// evaluation return the same blank node. A genuinely fresh row created
-    /// via `Solution::new()` gets its own empty `Rc`, so different rows never
-    /// collide even if the argument value repeats.
+    /// via `Solution::new()` has no cache allocated yet — the first call
+    /// here lazily creates one, so different rows never collide even if the
+    /// argument value repeats, and rows that never call `BNODE()` never pay
+    /// for the allocation at all.
     pub fn bnode_for(&self, key: &str) -> BlankNode {
-        let mut cache = self.bnode_cache.borrow_mut();
+        let cache = self
+            .bnode_cache
+            .get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
+        let mut cache = cache.lock().unwrap();
         cache.entry(key.to_string()).or_default().clone()
     }
 
@@ -131,13 +148,13 @@ impl Solution {
     /// unbound in this solution remain absent (per SPARQL semantics — they
     /// must not appear as explicit `NULL`s at this layer).
     ///
-    /// The `BNODE()` cache is preserved (shared) across the projection since
-    /// this still represents the *same* solution row, just with a narrower
-    /// set of visible variables.
+    /// The `BNODE()` cache is preserved (shared, if already initialized)
+    /// across the projection since this still represents the *same*
+    /// solution row, just with a narrower set of visible variables.
     pub fn project<'a>(&self, vars: impl IntoIterator<Item = &'a Variable>) -> Solution {
         let mut projected = Solution {
             bindings: HashMap::new(),
-            bnode_cache: Rc::clone(&self.bnode_cache),
+            bnode_cache: self.bnode_cache.clone(),
         };
         for var in vars {
             if let Some(term) = self.bindings.get(var) {
@@ -268,11 +285,44 @@ mod tests {
     }
 
     #[test]
-    fn bnode_for_shared_across_clone() {
+    fn bnode_for_shared_across_clone_after_init() {
+        // Once a row's bnode cache has been lazily initialized by a first
+        // `bnode_for` call, clones taken *after* that point share the same
+        // underlying `Arc<Mutex<HashMap<_>>>` (the `OnceLock` itself is
+        // cloned as already-initialized, so `Clone` copies the `Arc`
+        // pointer, not its contents). This matches every real evaluator
+        // code path (`Filter`/`OrderBy`/`Extend`), which always calls
+        // `bnode_for` on the same solution reference throughout one row's
+        // evaluation rather than branching into independent clones first.
         let s = Solution::new();
+        let _ = s.bnode_for("BAZ"); // force lazy init
         let cloned = s.clone();
         let b1 = s.bnode_for("BAZ");
         let b2 = cloned.bnode_for("BAZ");
-        assert_eq!(b1, b2, "clones of the same row share the bnode cache (Rc)");
+        assert_eq!(
+            b1, b2,
+            "clones taken after cache init share the bnode cache (Arc<Mutex<_>>)"
+        );
+    }
+
+    #[test]
+    fn bnode_for_pre_init_clones_are_independent() {
+        // A clone taken *before* the first `bnode_for` call has no cache to
+        // share yet — the `OnceLock` is still uninitialized at clone time,
+        // so `Clone` copies that uninitialized state rather than an `Arc`
+        // pointer. Each side then lazily initializes its own independent
+        // cache on first use, so they must NOT share bnode assignments, even
+        // for the same key. This never happens on any real evaluator path
+        // (which always calls `bnode_for` on one solution reference
+        // throughout a row's evaluation before branching), but pinning the
+        // behavior here guards against silently changing this nuance.
+        let s = Solution::new();
+        let cloned = s.clone(); // taken before any bnode_for call
+        let b1 = s.bnode_for("BAZ");
+        let b2 = cloned.bnode_for("BAZ");
+        assert_ne!(
+            b1, b2,
+            "clones taken before cache init do not share a bnode cache"
+        );
     }
 }

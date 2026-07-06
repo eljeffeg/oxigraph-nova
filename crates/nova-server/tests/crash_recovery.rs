@@ -25,7 +25,14 @@ use std::time::{Duration, Instant};
 /// Total number of `INSERT DATA` requests the background thread attempts.
 /// Kept modest so the test runs quickly, but large enough that the kill
 /// reliably lands mid-burst rather than after the last request completes.
-const TOTAL_INSERTS: usize = 400;
+///
+/// Bumped from 400 → 4000 after a store-side performance optimization
+/// (removing a redundant sort/dedup + copy pass from `RingBuilder`
+/// construction) made bulk compaction/insert throughput fast enough that
+/// 400 inserts could complete well within the 60ms window below, making
+/// the test spuriously fail its "kill actually landed mid-burst" sanity
+/// check rather than exercising real crash-recovery behavior.
+const TOTAL_INSERTS: usize = 4000;
 
 fn nova_serve_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nova_serve")

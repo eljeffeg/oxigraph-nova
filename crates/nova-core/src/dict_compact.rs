@@ -44,7 +44,7 @@ use value_traits::slices::SliceByValue;
 /// Entries per Front-Coding block.
 ///
 /// **tuning result:** swept `8` vs `16` against
-/// the `wikidata_slice` benchmark suite (with the Phase 3 decode cache in
+/// the `wikidata_slice` benchmark suite (with the decode cache in
 /// place). `8` won on every measured axis:
 ///
 /// | Benchmark | `BLOCK_SIZE = 16` | `BLOCK_SIZE = 8` |
@@ -115,9 +115,8 @@ fn bit_width_for(max_val: u64) -> usize {
 
 // ── Term ↔ (tag, primary, aux) ──────────────────────────────────────────────
 //
-// Mirrors `oxigraph-nova-storage-common`'s `dict_snapshot.rs` on-disk codec
-// (Phase 1's blueprint), minus tag 6 (quoted triples), which never reaches
-// this tier.
+// Mirrors `oxigraph-nova-storage-common`'s `dict_snapshot.rs` on-disk codec,
+// minus tag 6 (quoted triples), which never reaches this tier.
 
 pub(crate) fn term_sort_key(term: &Term) -> (u8, Vec<u8>) {
     match term {
@@ -399,6 +398,39 @@ impl CompactedTier {
         let decoded = self.decode_block(block);
         let (tag, primary, aux) = decoded.get(offset)?.clone();
         Some(term_from_parts(tag, primary, &aux).map(Arc::new))
+    }
+
+    /// Decode **every** entry of the block containing `id`, returning
+    /// `(orig_id, decoded_term)` pairs for all of them (not just the one
+    /// originally requested).
+    ///
+    /// `decode_block` already pays the full O(block_size) cost to decode a
+    /// block on any single lookup within it (Front-Coding requires decoding
+    /// from the block's first entry to reconstruct any later entry's LCP
+    /// chain) — but the original `decode_id` discarded every entry except
+    /// the one requested, meaning a sequential scan touching many distinct
+    /// terms (e.g. `scan`'s 500K-row `?s wdt:P31 ?o`) paid this O(block_size)
+    /// cost on *every* row instead of amortizing it across the whole block.
+    /// Callers (`Dictionary::get_term_arc`) should insert every returned
+    /// entry into the decode cache, turning each miss into up to
+    /// `block_size` future hits instead of just one.
+    pub(crate) fn decode_block_for_id(
+        &self,
+        id: u64,
+    ) -> Option<Vec<(u64, Result<Arc<Term>, Oxigraph>)>> {
+        if id >= self.high_water || self.encoded_count == 0 {
+            return None;
+        }
+        let rank = self.id2rank.index_value(id as usize);
+        let block = rank / self.block_size;
+        let block_start_rank = block * self.block_size;
+        let decoded = self.decode_block(block);
+        let mut out = Vec::with_capacity(decoded.len());
+        for (i, (tag, primary, aux)) in decoded.into_iter().enumerate() {
+            let orig_id = self.rank2id.index_value(block_start_rank + i) as u64;
+            out.push((orig_id, term_from_parts(tag, primary, &aux).map(Arc::new)));
+        }
+        Some(out)
     }
 
     /// Real allocated byte size — buffer + block index + bit-packed

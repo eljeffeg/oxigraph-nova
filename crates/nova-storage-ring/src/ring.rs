@@ -452,6 +452,16 @@ impl RingBuilder {
         }
     }
 
+    /// Build directly from an existing `Vec<[u64; 3]>` — takes ownership
+    /// without copying, avoiding the allocate/push/reallocate churn of
+    /// repeated `add()` calls when the caller already has the triples in a
+    /// single contiguous buffer (e.g. `build_graphs_from_triples`'s
+    /// already-collected per-graph `Vec`).  The Vec need not be pre-sorted
+    /// or deduped — `build()` still performs both.
+    pub(crate) fn from_vec(triples: Vec<[u64; 3]>) -> Self {
+        Self { triples }
+    }
+
     pub fn add(&mut self, s: u64, p: u64, o: u64) {
         self.triples.push([s, p, o]);
     }
@@ -465,6 +475,7 @@ impl RingBuilder {
         triples.sort_unstable();
         triples.dedup();
         let n = triples.len();
+
         if n == 0 {
             return GraphRing { n: 0, data: None };
         }

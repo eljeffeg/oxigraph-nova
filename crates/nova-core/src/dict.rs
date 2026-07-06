@@ -63,11 +63,23 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// Capacity of the `TermId`-keyed decode cache.
-/// Sized generously enough to hold the working set of hot compacted-tier
-/// terms (e.g. a handful of frequently-matched predicates/objects) without
-/// meaningfully affecting overall memory footprint — an `Arc<Term>` clone
-/// per entry is cheap once decoded.
-const DECODE_CACHE_CAPACITY: usize = 8192;
+///
+/// Measured via `profile_eval --count-allocs` on a 500K-entity/12.5M-triple
+/// dataset by sweeping this constant (8192 → 100,000 → 500,000) and
+/// comparing per-query allocation counts: queries whose distinct-term
+/// working set fits within the cache (`2join`, `feature_lookup`,
+/// `star_with_features`) saw allocation counts drop by 40-80% and
+/// wall-clock time improve correspondingly once capacity reached 100,000 —
+/// decode-cache misses (a Front-Coded block decode + LRU evict/insert pair)
+/// are a real, avoidable cost for those query shapes. Queries that touch
+/// most of the dictionary (`scan`, `path_2hop`, `triangle`) see no
+/// improvement even at 500,000, since no realistically-bounded cache can
+/// cover a working set that large without approaching the full uncompacted
+/// dictionary size — defeating the memory-reduction purpose of compaction
+/// in the first place. 100,000 balances fully capturing the smaller
+/// working-set queries' wins against keeping the cache's own footprint
+/// small relative to the compacted tier it exists to avoid re-decoding.
+const DECODE_CACHE_CAPACITY: usize = 100_000;
 
 // ── TermId ───────────────────────────────────────────────────────────────────
 
@@ -159,8 +171,9 @@ pub struct Dictionary {
     /// every regular term as of the last `compact()`. Starts empty.
     compacted: CompactedTier,
 
-    /// `TermId → Arc<Term>` decode cache for compacted-tier terms (Phase 3).
+    /// `TermId → Arc<Term>` decode cache for compacted-tier terms.
     /// Avoids re-parsing an entire Front-Coded block on every lookup for
+
     /// hot terms (e.g. a repeated `rdf:type` object matched by thousands of
     /// LFTJ rows). `RefCell`-wrapped since `get_term_arc` takes `&self` —
     /// safe because `Dictionary` is always accessed through the single
@@ -393,9 +406,28 @@ impl Dictionary {
                 if let Some(arc) = self.decode_cache.borrow_mut().get(&id) {
                     return Some(Arc::clone(arc));
                 }
-                let arc = self.compacted.decode_id(id.as_u64()).and_then(|r| r.ok())?;
-                self.decode_cache.borrow_mut().put(id, Arc::clone(&arc));
-                Some(arc)
+                // Cache miss: Front-Coding forces decoding the *entire*
+                // containing block to reconstruct any single entry's LCP
+                // chain, so populate the decode cache with every entry in
+                // that block (not just the one requested) — this amortizes
+                // the O(block_size) decode cost across up to `BLOCK_SIZE`
+                // future lookups instead of paying it on every single one.
+                // Critical for high-cardinality sequential scans that touch
+                // many distinct compacted-tier terms (e.g. `?s wdt:P31 ?o`
+                // over hundreds of thousands of subjects).
+                let block = self.compacted.decode_block_for_id(id.as_u64())?;
+                let mut wanted: Option<Arc<Term>> = None;
+                let mut cache = self.decode_cache.borrow_mut();
+                for (orig_id, result) in block {
+                    if let Ok(arc) = result {
+                        let tid = TermId(orig_id);
+                        if tid == id {
+                            wanted = Some(Arc::clone(&arc));
+                        }
+                        cache.put(tid, arc);
+                    }
+                }
+                wanted
             }
             None => None,
         }
@@ -536,8 +568,9 @@ impl Dictionary {
     ///
     /// The rebuilt `Dictionary` always starts with an empty compacted
     /// tier — every term is delta-tier-resident — regardless of whether
-    /// the source `Dictionary` had compacted terms at save time (Phase 2's
+    /// the source `Dictionary` had compacted terms at save time (the
     /// two-tier structure is in-memory only; the on-disk format is
+    ///
     /// unaffected, see `dict_snapshot.rs`'s module docs). The next
     /// `compact()` call re-establishes the compacted tier.
     ///
@@ -745,7 +778,7 @@ mod tests {
         assert!(TermId::new(MAX_TERM_ID + 1).is_err());
     }
 
-    // ── Phase 2: two-tier compaction tests ─────────────────────────────────
+    // ── Two-tier compaction tests ────────────────────────────────────────
 
     #[test]
     fn compact_preserves_term_ids_and_content() {
@@ -827,7 +860,7 @@ mod tests {
         assert_eq!(id.as_u64(), MAX_TERM_ID);
     }
 
-    // ── Phase 3: decode-cache tests ──────────────────────────────────────
+    // ── Decode-cache tests ───────────────────────────────────────────────
 
     #[test]
     fn decode_cache_hit_path_returns_correct_content_repeatedly() {
@@ -905,7 +938,8 @@ mod tests {
     fn decode_cache_never_exceeds_configured_capacity() {
         // Intern well more than DECODE_CACHE_CAPACITY regular terms, compact,
         // then decode every single one — the cache must never grow past its
-        // configured bound (Phase 3 Gate 3: no unbounded growth).
+        // configured bound (no unbounded growth).
+
         let mut d = Dictionary::new();
         let n = DECODE_CACHE_CAPACITY + 500;
         let mut ids = Vec::with_capacity(n);

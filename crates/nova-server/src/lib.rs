@@ -742,25 +742,18 @@ impl std::io::Write for ChannelWriter {
 /// bounded channel as they're produced, so the full serialized output is
 /// never buffered in memory all at once (matches QLever's chunked-transfer
 /// design and avoids doubling peak memory for large result sets).
+///
+/// `Solution`'s `BNODE()` cache is `Arc<Mutex<_>>` (not `Rc<RefCell<_>>`),
+/// so the whole `Solutions` vector is `Send` and can be moved into the
+/// background thread as-is — each row is serialized straight from its own
+/// borrowed `(&Variable, &Term)` pairs, with zero per-row allocation or
+/// term cloning (mirrors Oxigraph's own `QuerySolution`-by-reference
+/// handoff to `sparesults`, which never materializes an intermediate
+/// owned copy of the result set before serializing).
 fn serialize_solutions(variables: &[Variable], solutions: Solutions, accept: &str) -> Response {
     let format = results_format_for_accept(accept);
     let content_type = results_content_type(format);
     let variables = variables.to_vec();
-
-    // `Solution` embeds an `Rc<RefCell<_>>` (its per-row `BNODE()` cache),
-    // so it isn't `Send` and can't be moved into a background thread as-is.
-    // Extract each row's bound (Variable, Term) pairs — plain owned data,
-    // no `Rc` — into a `Send`-safe intermediate before spawning; this is a
-    // shallow re-shape (the `Term`s themselves are moved, not deep-cloned).
-    let rows: Vec<Vec<(Variable, Term)>> = solutions
-        .into_iter()
-        .map(|sol| {
-            variables
-                .iter()
-                .filter_map(|v| sol.get(v).map(|t| (v.clone(), t.clone())))
-                .collect()
-        })
-        .collect();
 
     // Bounded channel: a handful of ~1 MiB chunks in flight is enough to
     // decouple producer/consumer speed without unbounded buffering.
@@ -771,9 +764,13 @@ fn serialize_solutions(variables: &[Variable], solutions: Solutions, accept: &st
         let result: std::io::Result<()> = (|| {
             let mut ser = QueryResultsSerializer::from_format(format)
                 .serialize_solutions_to_writer(writer, variables.clone())?;
-            for row in &rows {
+            for sol in &solutions {
                 // Emit only bound variables; unbound are absent (SPARQL JSON § 3.2.1).
-                ser.serialize(row.iter().map(|(v, t)| (v.as_ref(), t.as_ref())))?;
+                ser.serialize(
+                    variables
+                        .iter()
+                        .filter_map(|v| sol.get(v).map(|t| (v.as_ref(), t.as_ref()))),
+                )?;
             }
             let mut writer = ser.finish()?;
             writer.flush()?;

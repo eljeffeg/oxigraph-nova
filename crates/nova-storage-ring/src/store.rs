@@ -480,6 +480,7 @@ impl RingStoreInner {
         if clear_delta {
             self.delta.clear();
         }
+
         Ok(())
     }
 }
@@ -491,16 +492,18 @@ fn build_graphs_from_triples(
 ) -> HashMap<GraphId, Arc<GraphRing>> {
     let mut new_graphs: HashMap<GraphId, Arc<GraphRing>> = HashMap::new();
     for (g_id, triples) in per_graph {
-        let mut t = triples;
-        t.sort_unstable();
-        t.dedup();
-        if !t.is_empty() {
-            let mut builder = RingBuilder::new();
-            for [s, p, o] in t {
-                builder.add(s, p, o);
-            }
-            new_graphs.insert(g_id, Arc::new(builder.build()));
+        if triples.is_empty() {
+            continue;
         }
+        // Hand the already-collected Vec straight to the builder — `build()`
+        // performs its own sort_unstable+dedup, so there is no need to
+        // sort/dedup here first (that used to cause a redundant second
+        // sort/dedup pass) nor to copy element-by-element via `add()` (which
+        // used to force a second Vec to grow via repeated reallocation from
+        // empty capacity). This removes one full-size transient Vec
+        // allocation per graph per compaction/bulk-load.
+        let builder = RingBuilder::from_vec(triples);
+        new_graphs.insert(g_id, Arc::new(builder.build()));
     }
     new_graphs
 }
