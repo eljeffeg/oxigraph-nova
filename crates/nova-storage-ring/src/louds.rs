@@ -94,20 +94,89 @@ use sux::traits::Succ;
 // value-traits 0.2.0 is the same version sux 0.14 depends on (pinned for trait compatibility).
 use value_traits::slices::SliceByValue; // not re-exported by sux::prelude — must be imported explicitly
 
-/// Sidecar payload — adaptive runtime enum (Step 12).
-///
-/// Nodes with `degree >= SIDECAR_THRESH` and `degree < EF_THRESH_EFFECTIVE` use
-/// `Slice` (contiguous `Box<[u32]>`, SIMD `partition_point`, O(log d)).
-/// Nodes with `degree >= EF_THRESH_EFFECTIVE` use `Ef` (Elias-Fano, O(1) `succ()`).
-///
-/// The `l-opt-ef` feature overrides `EF_THRESH_EFFECTIVE` to `SIDECAR_THRESH`,
-/// forcing all sidecar nodes to use EF — useful for A/B benchmarking.
+/// Intermediate, construction-time-only sidecar payload for a single
+/// high-degree node, produced during `build_sidecar`'s BFS walk before
+/// being flattened into the ε-serde-serializable [`SidecarCore`]
+/// representation. This type is never itself serialized (only
+/// `SidecarCore`'s parallel vectors are).
 enum SidecarPayload {
     /// SIMD-friendly contiguous label array: `partition_point` O(log d).
     Slice(Box<[u32]>),
     /// Elias-Fano indexed dictionary: `succ()` O(1).
     Ef(EfDict<usize>),
 }
+
+/// ε-serde-serializable sidecar (Phase 2 of the mmap'd ε-serde snapshot plan —
+/// see CLAUDE.md item 14).
+///
+/// Previously the sidecar was an owned `HashMap<usize, (usize, SidecarPayload)>`
+/// keyed by `hi` with an enum payload — neither `HashMap` nor enums with
+/// heap-allocated variants are directly ε-serde-serializable, so the sidecar
+/// used to be excluded from the persistent snapshot format entirely and
+/// rebuilt from scratch (an O(n) walk) every time a trie was loaded from disk
+/// or round-tripped in memory.
+///
+/// This representation instead stores **sorted parallel vectors** keyed by
+/// `hi` (ascending) with **binary-search** lookup (`his.binary_search`)
+/// replacing the hash lookup, and both payload kinds (SIMD slice / Elias-Fano)
+/// flattened into shared backing arrays instead of a payload enum:
+///
+/// - `his`/`los`: sorted-by-`his` parallel arrays of (node_hi, node_lo) for
+///   every high-degree node (`degree >= SIDECAR_THRESH`).
+/// - `kind`: 0 = `Slice` payload, 1 = `Ef` payload, one per entry.
+/// - `slice_start`: for `Slice` entries, the starting offset into
+///   `slice_flat` (labels are `slice_flat[start .. start + (hi - lo + 1)]`).
+///   Unused (0) for `Ef` entries.
+/// - `slice_flat`: concatenated label arrays for every `Slice` entry, in
+///   entry order.
+/// - `ef_idx`: for `Ef` entries, the index into `ef_dicts`. Unused (0) for
+///   `Slice` entries.
+/// - `ef_dicts`: one `EfDict<usize>` per `Ef` entry, in entry order. `EfDict`
+///   is already `epserde::Epserde`-derivable (from `sux`), and epserde
+///   supports `Vec<T>` generically for any `T: Epserde`, so this composes
+///   through `#[derive(Epserde)]` with zero extra work.
+///
+/// Every field here is a plain `Vec` of a primitive or an `Epserde` type, so
+/// `SidecarCore` (and therefore all of [`LoudsCore`]) is now **fully**
+/// ε-serde-serializable — the sidecar no longer needs to be excluded from the
+/// snapshot or rebuilt on load.
+#[derive(Epserde, Default)]
+pub(crate) struct SidecarCore {
+    his: Vec<usize>,
+
+    los: Vec<usize>,
+    kind: Vec<u8>,
+    slice_start: Vec<usize>,
+    ef_idx: Vec<usize>,
+    slice_flat: Vec<u32>,
+    ef_dicts: Vec<EfDict<usize>>,
+}
+
+impl SidecarCore {
+    /// Binary-search `his` (sorted ascending) for an exact match, returning
+    /// the shared entry index on success.
+    #[inline]
+    fn find(&self, hi: usize) -> Option<usize> {
+        self.his.binary_search(&hi).ok()
+    }
+
+    /// Approximate heap byte size of this sidecar's backing vectors, for
+    /// memory-breakdown diagnostics.
+    fn mem_size_bytes(&self) -> usize {
+        std::mem::size_of_val(&self.his[..])
+            + std::mem::size_of_val(&self.los[..])
+            + std::mem::size_of_val(&self.kind[..])
+            + std::mem::size_of_val(&self.slice_start[..])
+            + std::mem::size_of_val(&self.ef_idx[..])
+            + std::mem::size_of_val(&self.slice_flat[..])
+            + self
+                .ef_dicts
+                .iter()
+                .map(|ef| ef.mem_size(SizeFlags::default()))
+                .sum::<usize>()
+    }
+}
+
 
 // ── T bitvector backend ───────────────────────────────────────────────────────
 //
@@ -327,63 +396,59 @@ pub struct LoudsTrie {
     /// importing `value_traits::SliceByValue` just for `.len()`.
     l_len: usize,
     /// L-opt B sidecar: for high-degree nodes (degree >= SIDECAR_THRESH),
-    /// stores (node_lo, payload).  Key = `hi` (inclusive upper bound of the
-    /// node's label range in L).
+    /// stores (node_lo, payload) keyed by `hi` (inclusive upper bound of the
+    /// node's label range in L), as sorted parallel vectors with binary
+    /// search — see [`SidecarCore`].
     ///
     /// `hi` is the only context available inside `leap(lo, hi, c)` without
     /// changing the public signature.  `node_lo` is stored alongside to avoid
     /// recomputing it from `hi` and `degree`.
-    ///
-    /// Payload type is `SidecarPayload`:
-    /// - Default: `Box<[u32]>` — SIMD `partition_point` (O(log d)).
-    /// - `--features l-opt-ef`: `EfDict<usize>` — O(1) `succ()`.
-    sidecar: std::collections::HashMap<usize, (usize, SidecarPayload)>,
+    sidecar: SidecarCore,
 }
 
-/// T+L-only core of a [`LoudsTrie`], excluding the sidecar.
+/// Fully ε-serde-serializable core of a [`LoudsTrie`] — T, L, **and** the
+/// sidecar (Phase 2 of the mmap'd ε-serde snapshot plan; see
+/// [`SidecarCore`]'s docs for why the sidecar is now included here rather
+/// than excluded-and-rebuilt-on-load as it was pre-Phase-2).
 ///
-/// This is the ε-serde-serializable subset of `LoudsTrie` used by the
-/// persistent snapshot format.  The
-/// sidecar is a purely derived index (rebuilt in O(n) from `t`/`l` via
-/// [`LoudsTrie::build_sidecar`]), so excluding it from the snapshot keeps the
-/// on-disk format smaller without losing any information.
-///
-/// Both `t_backend::TBitvec` and `sux::bits::BitFieldVec` derive
-/// `epserde::Epserde`, so this struct composes cleanly through
+/// `t_backend::TBitvec`, `sux::bits::BitFieldVec`, and [`SidecarCore`] all
+/// derive `epserde::Epserde`, so this struct composes cleanly through
 /// `#[derive(Epserde)]` with zero extra trait-bound or lifetime work.
 #[derive(Epserde)]
 pub(crate) struct LoudsCore {
     t: t_backend::TBitvec,
     l: BitFieldVec,
     l_len: usize,
+    sidecar: SidecarCore,
 }
 
 impl LoudsTrie {
-    /// Consume this trie, discarding the sidecar (a derived index — see
-    /// [`LoudsCore`]), and keep only the ε-serde-serializable T+L core.
+    /// Consume this trie into its fully ε-serde-serializable [`LoudsCore`]
+    /// (T + L + sidecar — no information is discarded or needs rebuilding).
     ///
-    /// Used by the persistent snapshot format to serialize a freshly
-    /// built trie without paying for sidecar storage on disk.
+    /// Used by the persistent snapshot format to serialize a freshly built
+    /// trie.
     pub(crate) fn into_core(self) -> LoudsCore {
         LoudsCore {
             t: self.t,
             l: self.l,
             l_len: self.l_len,
+            sidecar: self.sidecar,
         }
     }
 
-    /// Reconstruct a full `LoudsTrie` — including a freshly rebuilt sidecar —
-    /// from a [`LoudsCore`] loaded from disk (or from an in-memory round-trip
-    /// buffer).
+    /// Reconstruct a full `LoudsTrie` from a [`LoudsCore`] loaded from disk
+    /// (or from an in-memory round-trip buffer). The sidecar travels with
+    /// the core as-is — no rebuild required (Phase 2).
     pub(crate) fn from_core(core: LoudsCore) -> Self {
-        let sidecar = Self::build_sidecar(&core.t, &core.l, core.l_len);
         LoudsTrie {
             t: core.t,
             l: core.l,
             l_len: core.l_len,
-            sidecar,
+            sidecar: core.sidecar,
         }
     }
+
 
     /// Build from T bits and L labels in paper format (no dummy entries).
     ///
@@ -443,15 +508,17 @@ impl LoudsTrie {
     ///
     /// Separate function to avoid a partial-move issue (called after `t`, `l`,
     /// and `l_len` are computed but before they are moved into `Self`).
-    fn build_sidecar(
-        t: &t_backend::TBitvec,
-        l: &BitFieldVec,
-        l_len: usize,
-    ) -> std::collections::HashMap<usize, (usize, SidecarPayload)> {
-        let mut map = std::collections::HashMap::new();
+    ///
+    /// Builds an intermediate `Vec<(hi, lo, SidecarPayload)>` during the BFS
+    /// walk (order is BFS, not sorted by `hi`), then sorts by `hi` and
+    /// flattens into the ε-serde-serializable [`SidecarCore`] representation
+    /// (Phase 2 of the mmap'd ε-serde snapshot plan).
+    fn build_sidecar(t: &t_backend::TBitvec, l: &BitFieldVec, l_len: usize) -> SidecarCore {
+        let mut entries: Vec<(usize, usize, SidecarPayload)> = Vec::new();
         if l_len <= 1 {
-            return map; // empty trie
+            return SidecarCore::default(); // empty trie
         }
+
 
         // Enumerate nodes by walking the T bitvector BFS-style.
         // A node at T-position v has degree = selectnext1(v+1) - v.
@@ -524,11 +591,36 @@ impl LoudsTrie {
                     SidecarPayload::Slice(labels)
                 };
 
-                map.insert(node_hi, (node_lo, payload));
+                entries.push((node_hi, node_lo, payload));
             }
         }
-        map
+
+        // Sort by `hi` ascending (BFS order is level-order, not `hi`-sorted)
+        // so that `SidecarCore::find` can binary-search.
+        entries.sort_unstable_by_key(|(hi, _, _)| *hi);
+
+        let mut core = SidecarCore::default();
+        for (hi, lo, payload) in entries {
+            core.his.push(hi);
+            core.los.push(lo);
+            match payload {
+                SidecarPayload::Slice(labels) => {
+                    core.kind.push(0);
+                    core.slice_start.push(core.slice_flat.len());
+                    core.ef_idx.push(0);
+                    core.slice_flat.extend_from_slice(&labels);
+                }
+                SidecarPayload::Ef(ef) => {
+                    core.kind.push(1);
+                    core.slice_start.push(0);
+                    core.ef_idx.push(core.ef_dicts.len());
+                    core.ef_dicts.push(ef);
+                }
+            }
+        }
+        core
     }
+
 
     /// Number of trie edges (|T| = |L|, excluding the dummy at index 0).
     #[inline]
@@ -555,23 +647,13 @@ impl LoudsTrie {
     /// array / sidecar). Does not include shared
     /// vocab — see `CltjData::mem_size_bytes` for the Arc-deduped vocab total.
     pub fn mem_breakdown(&self) -> LoudsMemBreakdown {
-        let sidecar_bytes: usize = self
-            .sidecar
-            .values()
-            .map(|(_, payload)| {
-                std::mem::size_of::<usize>() * 2 // (key, node_lo) overhead approx
-                    + match payload {
-                        SidecarPayload::Slice(b) => std::mem::size_of_val(&**b),
-                        SidecarPayload::Ef(ef) => ef.mem_size(SizeFlags::default()),
-                    }
-            })
-            .sum();
         LoudsMemBreakdown {
             t_bytes: self.t.mem_size_bytes(),
             l_bytes: self.l.mem_size(SizeFlags::default()),
-            sidecar_bytes,
+            sidecar_bytes: self.sidecar.mem_size_bytes(),
         }
     }
+
 
     /// Position of the first 1-bit at T-index ≥ `k`.
     ///
@@ -642,42 +724,44 @@ impl LoudsTrie {
         // ── L-opt B: sidecar dispatch for high-degree nodes ───────────────────
         //
         // Keyed by `hi` — populated at construction for degree >= SIDECAR_THRESH.
-        // Default: Box<[u32]> + partition_point (SIMD, O(log d)).
-        // --features l-opt-ef: EfDict + succ() (O(1)).
-        if let Some((node_lo, payload)) = self.sidecar.get(&hi) {
-            let offset = lo.saturating_sub(*node_lo);
+        // Binary search via `SidecarCore::find`, then dispatch on `kind`:
+        // 0 = Slice + partition_point (SIMD, O(log d)); 1 = EfDict + succ() (O(1)).
+        if let Some(idx) = self.sidecar.find(hi) {
+            let node_lo = self.sidecar.los[idx];
+            let offset = lo.saturating_sub(node_lo);
 
-            return match payload {
-                SidecarPayload::Slice(labels) => {
-                    // SIMD-friendly `partition_point` on contiguous u32 sidecar.
-                    // Slice from `offset` to search only the [lo, hi] sub-range.
-                    let slice = &labels[offset..];
-                    if slice.is_empty() {
-                        return hi + 1;
-                    }
-                    let rel = slice.partition_point(|&v| v < c);
-                    if rel >= slice.len() { hi + 1 } else { lo + rel }
+            return if self.sidecar.kind[idx] == 0 {
+                // SIMD-friendly `partition_point` on contiguous u32 sidecar.
+                let start = self.sidecar.slice_start[idx];
+                let end = start + (hi - node_lo + 1);
+                let labels = &self.sidecar.slice_flat[start..end];
+                let slice = &labels[offset..];
+                if slice.is_empty() {
+                    return hi + 1;
                 }
-                SidecarPayload::Ef(ef) => {
-                    // Elias-Fano O(1) succ: find first value >= c in the full
-                    // label range, then clamp to [offset, end].
-                    //
-                    // rank < offset: labels[offset] >= labels[rank] >= c (sorted) → lo.
-                    // rank >= offset: exact position node_lo + rank (>= lo).
-                    // None: no value >= c in entire node range → hi + 1.
-                    match ef.succ(c as usize) {
-                        None => hi + 1,
-                        Some((rank, _)) => {
-                            if rank < offset {
-                                lo
-                            } else {
-                                *node_lo + rank
-                            }
+                let rel = slice.partition_point(|&v| v < c);
+                if rel >= slice.len() { hi + 1 } else { lo + rel }
+            } else {
+                // Elias-Fano O(1) succ: find first value >= c in the full
+                // label range, then clamp to [offset, end].
+                //
+                // rank < offset: labels[offset] >= labels[rank] >= c (sorted) → lo.
+                // rank >= offset: exact position node_lo + rank (>= lo).
+                // None: no value >= c in entire node range → hi + 1.
+                let ef = &self.sidecar.ef_dicts[self.sidecar.ef_idx[idx]];
+                match ef.succ(c as usize) {
+                    None => hi + 1,
+                    Some((rank, _)) => {
+                        if rank < offset {
+                            lo
+                        } else {
+                            node_lo + rank
                         }
                     }
                 }
             };
         }
+
 
         // ── Scalar path for low-degree nodes (degree < SIDECAR_THRESH) ────────
         //
@@ -1017,9 +1101,10 @@ mod tests {
 
         // The sidecar must be present for this hi.
         assert!(
-            trie.sidecar.contains_key(&hi),
+            trie.sidecar.find(hi).is_some(),
             "sidecar must contain entry for hi={hi} (degree=20 >= SIDECAR_THRESH={SIDECAR_THRESH})"
         );
+
 
         // Every possible target — compare against manually expected position.
         for target in 0u32..20 {

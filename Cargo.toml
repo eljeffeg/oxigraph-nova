@@ -34,10 +34,6 @@ spargebra     = { version = "0.4.6",  features = ["sparql-12"] }
 
 sparesults    = { version = "0.3.3",  features = ["sparql-12"] }  # .srx / .srj / .tsv result I/O
 oxsdatatypes  = { version = "0.2" }    # Correct XSD typed-value semantics; route evaluator comparison through this
-sparopt       = { version = "0.3",     features = ["sparql-12"] } # SPARQL algebra normalizer/optimizer
-
-# ── Full-text search ────────────────────────────────────────────────────────
-tantivy = "0.26"   # Full-text search engine; listed here for version coordination
 
 # ── Async runtime + HTTP ────────────────────────────────────────────────────
 tokio        = { version = "1.52",  features = ["full"] }

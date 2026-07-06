@@ -35,3 +35,4 @@ tests/w3c/data/
 /profile*.json*
 profile.json.gz
 *.pyc
+*.csv

@@ -32,10 +32,12 @@
 //!   freshly-built `Arc<GraphRing>` map with the result of serializing it
 //!   and immediately deserializing it back — so the servable representation
 //!   is always literally "what ε-serde deserialized", matching what will
-//!   later be loaded from disk (`deserialize_full`) or eventually
-//!   mmap'd (`deserialize_eps`/`mmap`). Since ε-serde's on-disk byte format
-//!   is identical for both loading strategies, mmap loading can be added
-//!   later with **zero** file-format migration.  This round-trip happens in
+//!   later be loaded from disk. Since ε-serde's on-disk byte format
+//!   is identical for both loading strategies (`deserialize_full`'s heap copy
+//!   or `load_mmap`'s zero-copy mapping), the loading strategy can be
+//!   changed later with **zero** file-format migration — this is exactly
+//!   what Phase 3 of the mmap'd ε-serde snapshot plan (CLAUDE.md item 14)
+//!   does. This round-trip happens in
 //!   `compact()`/`bulk_load()`, never on the query hot path
 //!   (`quads_for_pattern`/`join_scan`), so it cannot affect query latency.
 //!
@@ -44,6 +46,22 @@
 //!   the snapshot file (for persistent stores) and doing the in-memory
 //!   round-trip (for all stores) are both side effects layered on top with
 //!   no behavioural change to `RingStore`'s query or write semantics.
+//!
+//! ## Phase 1 of the mmap'd ε-serde snapshot plan (CLAUDE.md item 14)
+//!
+//! This file's `nova.snapshot.<gen>` on-disk format is **uncompressed**
+//! (no zstd) — a deliberate, documented reversal of the earlier zstd-on-
+//! snapshot optimisation. This reintroduces an on-disk size regression
+//! (roughly 2.3 MiB -> 43-45 MiB on the disk benchmark dataset), but it is
+//! a prerequisite for Phase 3 ("map after compact"): mmap-based zero-copy
+//! loading is only possible against a file whose bytes are byte-identical
+//! to the in-memory ε-serde layout, which zstd compression would break.
+//! Still roughly 9x smaller than Oxigraph's 416.5 MiB RocksDB directory on
+//! the same dataset. The dictionary file (`nova.dict.<gen>`, see
+//! `dict_snapshot.rs`) is unaffected by this — it keeps its zstd
+//! compression until Phase 4. In-memory mode (`path: None`) is also
+//! unaffected, since `round_trip_and_maybe_save`'s file-writing branch is
+//! skipped entirely when `path` is `None`.
 
 use crate::ring::{GraphRing, RingSnapshot};
 use epserde::Epserde;
@@ -108,20 +126,15 @@ impl StoreSnapshot {
                 .map_err(|e| Oxigraph::Storage(format!("snapshot serialize failed: {e}")))?;
         }
 
-        // Compress the on-disk copy with zstd (level 3) — the in-memory
-        // round-trip below always uses the uncompressed `buf` directly, so
-        // this has zero effect on servable-representation semantics (see
-        // module docs' "Always mapped" section); it only shrinks what
-        // actually hits disk.
+        // Phase 1 (see module docs above): write the raw ε-serde bytes
+        // directly, with NO zstd compression.
         if let Some(path) = path {
-            let compressed = zstd::encode_all(&buf[..], 3)
-                .map_err(|e| Oxigraph::Storage(format!("snapshot compress failed: {e}")))?;
             let tmp_path = {
                 let mut s = path.as_os_str().to_os_string();
                 s.push(".tmp");
                 std::path::PathBuf::from(s)
             };
-            std::fs::write(&tmp_path, &compressed)
+            std::fs::write(&tmp_path, &buf)
                 .map_err(|e| Oxigraph::Storage(format!("snapshot write failed: {e}")))?;
             std::fs::rename(&tmp_path, path)
                 .map_err(|e| Oxigraph::Storage(format!("snapshot rename failed: {e}")))?;
@@ -145,14 +158,13 @@ impl StoreSnapshot {
         if !path.exists() {
             return Ok(HashMap::new());
         }
-        // The file on disk is zstd-compressed (see `round_trip_and_maybe_save`);
-        // decompress into an in-memory buffer first, then deserialize via
-        // ε-serde's `deserialize_full` (not `load_full`, which mmaps the file
-        // directly — not applicable once the on-disk bytes are compressed).
-        let compressed = std::fs::read(path)
+        // The file on disk is raw, uncompressed ε-serde bytes (see Phase 1
+        // module docs above) — read it directly and deserialize via
+        // `deserialize_full`. (A future Phase 3 change will replace this with
+        // `load_mmap` for true zero-copy loading; the on-disk byte format is
+        // already compatible with that today.)
+        let buf = std::fs::read(path)
             .map_err(|e| Oxigraph::Storage(format!("snapshot read failed: {e}")))?;
-        let buf = zstd::decode_all(&compressed[..])
-            .map_err(|e| Oxigraph::Storage(format!("snapshot decompress failed: {e}")))?;
         let mut cursor = std::io::Cursor::new(&buf[..]);
         let snap = unsafe {
             StoreSnapshot::deserialize_full(&mut cursor)
