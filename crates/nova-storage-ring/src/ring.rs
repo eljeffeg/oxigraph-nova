@@ -415,11 +415,19 @@ impl GraphRing {
 ///
 /// This is the persistent on-disk representation.  See [`GraphRing::into_snapshot`] and
 /// [`GraphRing::from_snapshot`].
+///
+/// Generic over `Cltj` (default [`CltjSnapshot`]) so that a future mmap'd
+/// load can substitute ε-serde's borrowed `DeserType<CltjSnapshot>` form here
+/// with **zero extra code** — this mirrors the "bare generic parameter with
+/// a default" pattern used throughout `louds.rs`/`cltj.rs` (Phase 3.3c probe,
+/// CLAUDE.md item 14).
 #[derive(Epserde)]
-pub(crate) struct RingSnapshot {
-    n: usize,
-    cltj: Option<CltjSnapshot>,
+pub(crate) struct RingSnapshot<Cltj = CltjSnapshot> {
+    pub(crate) n: usize,
+    pub(crate) cltj: Option<Cltj>,
 }
+
+
 
 // ── Trie suffix enumeration helper ────────────────────────────────────────────
 

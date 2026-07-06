@@ -74,11 +74,18 @@ use std::sync::Arc;
 
 /// Whole-store ε-serde-serializable snapshot: one [`RingSnapshot`] per graph,
 /// keyed by the parallel `graph_ids` vector (index-aligned with `rings`).
+///
+/// Generic over `Rings` (default `Vec<RingSnapshot>`) so that a future
+/// mmap'd load can substitute ε-serde's borrowed `DeserType<Vec<RingSnapshot>>`
+/// form here with **zero extra code** — mirrors the "bare generic parameter
+/// with a default" pattern used for `CltjSnapshot`'s `Tries = [LoudsCore; 6]`
+/// (Phase 3.3c probe, CLAUDE.md item 14).
 #[derive(Epserde)]
-pub(crate) struct StoreSnapshot {
+pub(crate) struct StoreSnapshot<Rings = Vec<RingSnapshot>> {
     graph_ids: Vec<u8>,
-    rings: Vec<RingSnapshot>,
+    rings: Rings,
 }
+
 
 impl StoreSnapshot {
     /// Build a snapshot from a per-graph `Arc<GraphRing>` map, consuming each
@@ -255,4 +262,74 @@ mod tests {
         let loaded = StoreSnapshot::load_from_file(&path).unwrap();
         assert!(loaded.is_empty());
     }
+
+    /// Phase 3.3c step 1 (probe): real `load_mmap` round-trip of a whole
+    /// [`StoreSnapshot`] (not just a single [`crate::cltj::CltjSnapshot`] as
+    /// `cltj_snapshot_load_mmap_probe` in `cltj.rs` already proved) to a temp
+    /// file, confirming that the generic-with-defaults threading added to
+    /// [`StoreSnapshot`]/[`RingSnapshot`] this session actually produces a
+    /// navigable, zero-copy `DeserType` view all the way down through
+    /// `StoreSnapshot -> RingSnapshot -> CltjSnapshot`, with vocab slices and
+    /// tries still directly inspectable/borrowed at the innermost layer.
+    ///
+    /// This is deliberately scoped to *inspecting* the borrowed view (not yet
+    /// constructing a navigable `GraphRing<BorrowedLouds, VocabRepr>` from
+    /// it) — that reconstruction is genuinely new code (an `Option A`/`Option
+    /// D` concern for Step 2/3 of the mmap'd ε-serde snapshot plan, CLAUDE.md
+    /// item 14), whereas this probe's job is only to de-risk the type-level
+    /// plumbing added in this step.
+    #[test]
+    fn store_snapshot_load_mmap_probe() {
+        use epserde::deser::Flags;
+
+        let mut graphs: HashMap<GraphId, Arc<GraphRing>> = HashMap::new();
+        graphs.insert(
+            GRAPH_DEFAULT,
+            Arc::new(build_ring(&[[1, 2, 3], [1, 2, 4], [5, 6, 7]])),
+        );
+        graphs.insert(GraphId(2), Arc::new(build_ring(&[[10, 20, 30]])));
+
+        let snap = StoreSnapshot::from_graphs(graphs);
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("nova_store_mmap_probe_{pid}_{n}.snap"));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut f = std::fs::File::create(&path).expect("create temp file");
+            unsafe {
+                snap.serialize(&mut f).expect("serialize StoreSnapshot");
+            }
+        }
+
+        // Zero-copy mmap load: `mem_case` owns the mmap'd backing memory;
+        // `.uncase()` yields a borrowed `DeserType<StoreSnapshot>` tied to
+        // `mem_case`'s lifetime.
+        let mem_case = unsafe {
+            <StoreSnapshot>::load_mmap(&path, Flags::empty()).expect("load_mmap StoreSnapshot")
+        };
+        let view: &epserde::deser::DeserType<StoreSnapshot> = mem_case.uncase();
+
+        assert_eq!(view.graph_ids.len(), 2);
+        assert_eq!(view.rings.len(), 2);
+
+        // Every non-empty graph's `RingSnapshot.cltj` should still expose a
+        // navigable-looking `CltjSnapshot` view (borrowed vocab slices, 6
+        // tries) even through this extra `StoreSnapshot`/`RingSnapshot`
+        // wrapping — proving the generic threading survives the additional
+        // nesting introduced this step.
+        for ring in view.rings.iter() {
+            if let Some(cltj) = ring.cltj.as_ref() {
+                assert!(!cltj.vocab_s.is_empty());
+                assert!(!cltj.vocab_p.is_empty());
+                assert!(!cltj.vocab_o.is_empty());
+                assert_eq!(cltj.tries.len(), 6);
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
+

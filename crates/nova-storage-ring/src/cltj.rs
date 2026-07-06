@@ -558,11 +558,12 @@ pub(crate) struct CltjSnapshot<
     VocabO = Vec<u64>,
     Tries = [LoudsCore; 6],
 > {
-    vocab_s: VocabS,
-    vocab_p: VocabP,
-    vocab_o: VocabO,
-    tries: Tries,
+    pub(crate) vocab_s: VocabS,
+    pub(crate) vocab_p: VocabP,
+    pub(crate) vocab_o: VocabO,
+    pub(crate) tries: Tries,
 }
+
 
 // ── Pair builder ──────────────────────────────────────────────────────────────
 
