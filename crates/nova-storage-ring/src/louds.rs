@@ -159,28 +159,101 @@ pub(crate) struct SidecarCore<
     ef_dicts: EfDicts,
 }
 
+/// Substrate-generic read-only view over any [`SidecarCore`] instantiation
+/// (owned `Vec<_>` fields, as produced by [`LoudsTrie::build_sidecar`], OR the
+/// borrowed/mmap'd `DeserType` fields produced by ε-serde's `load_mmap`).
+///
+/// This collapses `SidecarCore`'s 7 individual generic parameters behind a
+/// single trait bound, so that a generic `LoudsTrie<T, L, S>` only needs one
+/// `S: SidecarSub` bound instead of threading all 7 parameters through.
+///
+/// Blanket-implemented for every `SidecarCore<His, Los, ...>` whose fields
+/// are `AsRef<[_]>` over the expected element types — satisfied by both
+/// `Vec<T>` (owned) and epserde's borrowed-slice `DeserType` forms.
+pub(crate) trait SidecarSub {
+    fn find(&self, hi: usize) -> Option<usize>;
+    fn lo(&self, idx: usize) -> usize;
+    fn kind(&self, idx: usize) -> u8;
+    fn slice_start(&self, idx: usize) -> usize;
+    fn ef_idx(&self, idx: usize) -> usize;
+    fn slice_flat_range(&self, start: usize, end: usize) -> &[u32];
+    fn ef_dict(&self, idx: usize) -> &EfDict<usize>;
+    fn mem_size_bytes(&self) -> usize;
+}
+
+impl<His, Los, Kind, SliceStart, EfIdx, SliceFlat, EfDicts> SidecarSub
+    for SidecarCore<His, Los, Kind, SliceStart, EfIdx, SliceFlat, EfDicts>
+where
+    His: AsRef<[usize]>,
+    Los: AsRef<[usize]>,
+    Kind: AsRef<[u8]>,
+    SliceStart: AsRef<[usize]>,
+    EfIdx: AsRef<[usize]>,
+    SliceFlat: AsRef<[u32]>,
+    EfDicts: AsRef<[EfDict<usize>]>,
+{
+    #[inline]
+    fn find(&self, hi: usize) -> Option<usize> {
+        self.his.as_ref().binary_search(&hi).ok()
+    }
+
+    #[inline]
+    fn lo(&self, idx: usize) -> usize {
+        self.los.as_ref()[idx]
+    }
+
+    #[inline]
+    fn kind(&self, idx: usize) -> u8 {
+        self.kind.as_ref()[idx]
+    }
+
+    #[inline]
+    fn slice_start(&self, idx: usize) -> usize {
+        self.slice_start.as_ref()[idx]
+    }
+
+    #[inline]
+    fn ef_idx(&self, idx: usize) -> usize {
+        self.ef_idx.as_ref()[idx]
+    }
+
+    #[inline]
+    fn slice_flat_range(&self, start: usize, end: usize) -> &[u32] {
+        &self.slice_flat.as_ref()[start..end]
+    }
+
+    #[inline]
+    fn ef_dict(&self, idx: usize) -> &EfDict<usize> {
+        &self.ef_dicts.as_ref()[idx]
+    }
+
+    fn mem_size_bytes(&self) -> usize {
+        let his = self.his.as_ref();
+        let los = self.los.as_ref();
+        let kind = self.kind.as_ref();
+        let slice_start = self.slice_start.as_ref();
+        let ef_idx = self.ef_idx.as_ref();
+        let slice_flat = self.slice_flat.as_ref();
+        let ef_dicts = self.ef_dicts.as_ref();
+        std::mem::size_of_val(his)
+            + std::mem::size_of_val(los)
+            + std::mem::size_of_val(kind)
+            + std::mem::size_of_val(slice_start)
+            + std::mem::size_of_val(ef_idx)
+            + std::mem::size_of_val(slice_flat)
+            + ef_dicts
+                .iter()
+                .map(|ef| ef.mem_size(SizeFlags::default()))
+                .sum::<usize>()
+    }
+}
+
 impl SidecarCore {
     /// Binary-search `his` (sorted ascending) for an exact match, returning
     /// the shared entry index on success.
     #[inline]
     fn find(&self, hi: usize) -> Option<usize> {
         self.his.binary_search(&hi).ok()
-    }
-
-    /// Approximate heap byte size of this sidecar's backing vectors, for
-    /// memory-breakdown diagnostics.
-    fn mem_size_bytes(&self) -> usize {
-        std::mem::size_of_val(&self.his[..])
-            + std::mem::size_of_val(&self.los[..])
-            + std::mem::size_of_val(&self.kind[..])
-            + std::mem::size_of_val(&self.slice_start[..])
-            + std::mem::size_of_val(&self.ef_idx[..])
-            + std::mem::size_of_val(&self.slice_flat[..])
-            + self
-                .ef_dicts
-                .iter()
-                .map(|ef| ef.mem_size(SizeFlags::default()))
-                .sum::<usize>()
     }
 }
 
@@ -412,12 +485,12 @@ impl LoudsMemBreakdown {
 /// `sidecar` maps `hi` → (node_lo, sorted_labels) for nodes with
 /// `degree >= SIDECAR_THRESH`.  `leap()` uses this to run `partition_point` on
 /// a contiguous `&[u32]` instead of scalar `index_value` bit-extracts.
-pub struct LoudsTrie {
+pub(crate) struct LoudsTrie<B = t_backend::SuxRS, L = BitFieldVec, S = SidecarCore> {
     /// LOUDS bitvector with dummy `false` at index 0.
     /// Supports O(1) `rank1` and `select1` via the active `t_backend`.
-    t: t_backend::TBitvec,
+    t: t_backend::TBitvec<B>,
     /// Label array with dummy `0` at index 0, bit-packed at ⌈log₂(U)⌉ bits/entry.
-    l: BitFieldVec,
+    l: L,
     /// Logical length of `l` (= n_edges + 1).  Stored explicitly to avoid
     /// importing `value_traits::SliceByValue` just for `.len()`.
     l_len: usize,
@@ -429,7 +502,7 @@ pub struct LoudsTrie {
     /// `hi` is the only context available inside `leap(lo, hi, c)` without
     /// changing the public signature.  `node_lo` is stored alongside to avoid
     /// recomputing it from `hi` and `degree`.
-    sidecar: SidecarCore,
+    sidecar: S,
 }
 
 /// Fully ε-serde-serializable core of a [`LoudsTrie`] — T, L, **and** the
@@ -448,6 +521,12 @@ pub(crate) struct LoudsCore<T = t_backend::TBitvec, L = BitFieldVec, S = Sidecar
     sidecar: S,
 }
 
+// ── Construction (owned-only) ─────────────────────────────────────────────────
+//
+// These methods only ever operate on the default, fully-owned instantiation
+// (`B = SuxRS`, `L = BitFieldVec`, `S = SidecarCore`) — building a trie from
+// scratch, or converting to/from the ε-serde core, always produces/consumes
+// owned data.  Read-only navigation (below) is generic over any substrate.
 impl LoudsTrie {
     /// Consume this trie into its fully ε-serde-serializable [`LoudsCore`]
     /// (T + L + sidecar — no information is discarded or needs rebuilding).
@@ -646,8 +725,22 @@ impl LoudsTrie {
         }
         core
     }
+}
 
-
+// ── Read-only navigation (generic over substrate) ─────────────────────────────
+//
+// Generic over `B` (T bitvector's inner rank/select backend), `L` (label
+// array substrate), and `S` (sidecar substrate) so that these methods work
+// identically whether the trie's fields are owned (`Vec`-backed, as built by
+// `from_raw`) or borrowed/mmap'd (as produced by ε-serde's `load_mmap` on a
+// `LoudsCore` — see `from_core`, which itself is owned-only, but whose result
+// can subsequently be treated generically here).
+impl<B, L, S> LoudsTrie<B, L, S>
+where
+    B: Rank + SelectUnchecked + MemSize,
+    L: SliceByValue<Value = usize> + MemSize,
+    S: SidecarSub,
+{
     /// Number of trie edges (|T| = |L|, excluding the dummy at index 0).
     #[inline]
     pub fn n_edges(&self) -> usize {
@@ -750,17 +843,17 @@ impl LoudsTrie {
         // ── L-opt B: sidecar dispatch for high-degree nodes ───────────────────
         //
         // Keyed by `hi` — populated at construction for degree >= SIDECAR_THRESH.
-        // Binary search via `SidecarCore::find`, then dispatch on `kind`:
+        // Binary search via `SidecarSub::find`, then dispatch on `kind`:
         // 0 = Slice + partition_point (SIMD, O(log d)); 1 = EfDict + succ() (O(1)).
         if let Some(idx) = self.sidecar.find(hi) {
-            let node_lo = self.sidecar.los[idx];
+            let node_lo = self.sidecar.lo(idx);
             let offset = lo.saturating_sub(node_lo);
 
-            return if self.sidecar.kind[idx] == 0 {
+            return if self.sidecar.kind(idx) == 0 {
                 // SIMD-friendly `partition_point` on contiguous u32 sidecar.
-                let start = self.sidecar.slice_start[idx];
+                let start = self.sidecar.slice_start(idx);
                 let end = start + (hi - node_lo + 1);
-                let labels = &self.sidecar.slice_flat[start..end];
+                let labels = self.sidecar.slice_flat_range(start, end);
                 let slice = &labels[offset..];
                 if slice.is_empty() {
                     return hi + 1;
@@ -774,7 +867,7 @@ impl LoudsTrie {
                 // rank < offset: labels[offset] >= labels[rank] >= c (sorted) → lo.
                 // rank >= offset: exact position node_lo + rank (>= lo).
                 // None: no value >= c in entire node range → hi + 1.
-                let ef = &self.sidecar.ef_dicts[self.sidecar.ef_idx[idx]];
+                let ef = self.sidecar.ef_dict(self.sidecar.ef_idx(idx));
                 match ef.succ(c as usize) {
                     None => hi + 1,
                     Some((rank, _)) => {
@@ -869,7 +962,7 @@ fn emit_node(d: usize, t: &mut Vec<bool>) {
 /// already removed.
 ///
 /// Returns `None` for an empty input slice.
-pub fn build_louds_from_sorted(sorted: &[[u32; 3]]) -> Option<LoudsTrie> {
+pub(crate) fn build_louds_from_sorted(sorted: &[[u32; 3]]) -> Option<LoudsTrie> {
     if sorted.is_empty() {
         return None;
     }
