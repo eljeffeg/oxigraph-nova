@@ -1,6 +1,6 @@
 # Comparative Benchmark: Nova vs Oxigraph vs QLever
 
-Dataset: 50,000 synthetic BSBM-style entities (1,250,000 triples), identical N-Triples file loaded into all three engines.
+Dataset: 500,000 synthetic BSBM-style entities (12,500,000 triples), identical N-Triples file loaded into all three engines.
 
 ## Methodology & Storage Model
 
@@ -25,9 +25,9 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 
 | Engine | Load time |
 |---|---|
-| Nova (Ring+LFTJ) | 2.10 s |
-| Oxigraph (in-memory) | 2.16 s |
-| QLever (mmap, warmed) | 3.10 s |
+| Nova (Ring+LFTJ) | 15.42 s |
+| Oxigraph (in-memory) | 21.25 s |
+| QLever (mmap, warmed) | 30.83 s |
 
 ## Memory Usage (Physical Footprint)
 
@@ -35,17 +35,17 @@ Nova/QLever figures are macOS `vmmap -summary`'s "Physical footprint" (stable, a
 
 | Engine | Memory | Storage model |
 |---|---|---|
-| Nova (Ring+LFTJ) | 294.6 MiB | Pure heap |
-| Oxigraph (in-memory) | 338.2MiB | Pure heap (in-memory mode) |
-| QLever (mmap, warmed) | 86.9 MiB | Incl. memory-mapped index pages |
+| Nova (Ring+LFTJ) | 1331.2 MiB | Pure heap |
+| Oxigraph (in-memory) | 3.303GiB | Pure heap (in-memory mode) |
+| QLever (mmap, warmed) | 487.0 MiB | Incl. memory-mapped index pages |
 
 ## CPU Usage (average % of one core during query phase)
 
 | Engine | Avg CPU % |
 |---|---|
-| Nova (Ring+LFTJ) | 15.6% |
-| Oxigraph (in-memory) | 23.2% |
-| QLever (mmap, warmed) | 28.2% |
+| Nova (Ring+LFTJ) | 25.9% |
+| Oxigraph (in-memory) | 25.3% |
+| QLever (mmap, warmed) | 44.0% |
 
 ## Latency Results (milliseconds, HTTP round-trip via curl)
 
@@ -55,43 +55,43 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 54.70 | 49.01 | 96.09 |
-| p95 (ms) | 56.79 | 50.28 | 98.44 |
+| p50 (ms) | 727.10 | 506.27 | 938.31 |
+| p95 (ms) | 746.61 | 512.43 | 950.86 |
 
 ### 2join
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 2.11 | 5.71 | 2.90 |
-| p95 (ms) | 2.28 | 10.24 | 3.07 |
+| p50 (ms) | 15.85 | 25.70 | 20.91 |
+| p95 (ms) | 17.49 | 26.25 | 21.95 |
 
 ### feature_lookup
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 0.85 | 4.25 | 1.21 |
-| p95 (ms) | 1.00 | 5.98 | 1.39 |
+| p50 (ms) | 4.44 | 6.57 | 5.61 |
+| p95 (ms) | 4.95 | 7.75 | 6.20 |
 
 ### star_with_features
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 15.50 | 17.95 | 40.51 |
-| p95 (ms) | 15.86 | 18.35 | 43.20 |
+| p50 (ms) | 152.72 | 163.59 | 379.13 |
+| p95 (ms) | 160.02 | 172.74 | 386.87 |
 
 ### path_2hop
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 589.25 | 537.95 | 1299.98 |
-| p95 (ms) | 609.43 | 551.52 | 1341.53 |
+| p50 (ms) | 6080.55 | 5273.18 | 12837.04 |
+| p95 (ms) | 6573.39 | 5757.78 | 13100.27 |
 
 ### triangle
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 355.48 | 353.68 | 438.48 |
-| p95 (ms) | 365.83 | 368.89 | 460.82 |
+| p50 (ms) | 3498.72 | 3736.23 | 4317.01 |
+| p95 (ms) | 3571.75 | 4289.18 | 4540.31 |
 
 ## Raw per-query summary (mean, stddev, n)
 
@@ -102,58 +102,58 @@ One sub-section per query, with each engine as a column and each statistic (n, m
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 55.02 | 49.09 | 96.38 |
-| stddev (ms) | 0.87 | 0.93 | 1.62 |
-| min (ms) | 53.98 | 47.12 | 94.18 |
-| max (ms) | 57.33 | 50.36 | 101.19 |
+| mean (ms) | 727.66 | 511.67 | 940.81 |
+| stddev (ms) | 10.53 | 38.28 | 8.55 |
+| min (ms) | 706.73 | 490.97 | 928.72 |
+| max (ms) | 751.33 | 712.55 | 976.02 |
 
 ### 2join
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 2.12 | 6.08 | 2.90 |
-| stddev (ms) | 0.09 | 2.52 | 0.11 |
-| min (ms) | 1.97 | 3.33 | 2.75 |
-| max (ms) | 2.39 | 10.93 | 3.10 |
+| mean (ms) | 16.20 | 25.73 | 20.96 |
+| stddev (ms) | 1.45 | 0.37 | 0.59 |
+| min (ms) | 15.08 | 25.02 | 20.29 |
+| max (ms) | 23.32 | 26.75 | 22.93 |
 
 ### feature_lookup
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 0.85 | 4.04 | 1.21 |
-| stddev (ms) | 0.08 | 1.28 | 0.10 |
-| min (ms) | 0.73 | 1.67 | 1.00 |
-| max (ms) | 1.07 | 6.61 | 1.43 |
+| mean (ms) | 4.49 | 6.67 | 5.73 |
+| stddev (ms) | 0.26 | 0.65 | 0.26 |
+| min (ms) | 4.16 | 5.67 | 5.43 |
+| max (ms) | 5.16 | 9.12 | 6.26 |
 
 ### star_with_features
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 15.50 | 17.77 | 40.76 |
-| stddev (ms) | 0.26 | 0.58 | 1.28 |
-| min (ms) | 15.06 | 16.05 | 38.84 |
-| max (ms) | 15.96 | 18.57 | 44.01 |
+| mean (ms) | 153.60 | 164.91 | 379.21 |
+| stddev (ms) | 3.59 | 6.35 | 3.48 |
+| min (ms) | 148.81 | 157.28 | 374.86 |
+| max (ms) | 164.30 | 190.45 | 387.96 |
 
 ### path_2hop
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 590.12 | 538.10 | 1303.90 |
-| stddev (ms) | 11.14 | 8.00 | 21.05 |
-| min (ms) | 574.30 | 523.31 | 1273.13 |
-| max (ms) | 611.29 | 555.30 | 1360.78 |
+| mean (ms) | 6131.34 | 5325.03 | 12859.80 |
+| stddev (ms) | 199.23 | 172.98 | 134.37 |
+| min (ms) | 5910.20 | 5177.22 | 12666.21 |
+| max (ms) | 6650.64 | 5904.66 | 13190.00 |
 
 ### triangle
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 356.33 | 355.66 | 444.26 |
-| stddev (ms) | 4.84 | 7.60 | 23.11 |
-| min (ms) | 350.48 | 348.06 | 429.89 |
-| max (ms) | 366.45 | 382.43 | 558.56 |
+| mean (ms) | 3508.65 | 3813.34 | 4363.71 |
+| stddev (ms) | 38.04 | 237.93 | 167.71 |
+| min (ms) | 3444.12 | 3658.02 | 4240.42 |
+| max (ms) | 3598.21 | 4736.79 | 5179.93 |
 

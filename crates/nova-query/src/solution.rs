@@ -19,18 +19,7 @@
 //! layout rather than a per-row `HashMap<Variable, Term>` — mirroring
 //! Oxigraph's own `QuerySolution` design (`Arc<[Variable]>` header shared
 //! once per query, plus a `Vec<Option<Term>>` of per-row values indexed by
-//! position). This was motivated by a counting-allocator measurement (see
-//! `CLAUDE.md`'s "What's Next" item 1b) showing that the old
-//! `HashMap<Variable, Term>` representation forced one heap allocation
-//! *and* one `Variable` (`String`-backed) clone per bound variable per
-//! emitted row — for a large LFTJ join (e.g. `path_2hop`'s ~4.5M rows ×
-//! 3 variables) this is millions of avoidable allocations. With the
-//! positional layout, a hot path that already knows its fixed variable set
-//! up front (LFTJ's `join_vars`, established once per query — see
-//! `lftj.rs`'s `eval_bgp_lftj`) builds the `Arc<[Variable]>` header exactly
-//! once and shares it (via a cheap `Arc::clone` refcount bump, not a deep
-//! copy) across every one of that query's result rows, paying only for a
-//! `Vec<Option<Term>>` allocation per row instead.
+//! position).
 //!
 //! Paths that don't know their variable set in advance (`BIND`/`EXTEND`,
 //! aggregation, and the nested-loop fallback evaluator) still work
@@ -39,10 +28,7 @@
 //! the header triggers a copy-on-write header extension (clone the small
 //! `Variable` slice, push the new one, rebuild the `Arc`). This is more
 //! expensive than the old `HashMap`'s O(1) insert for that one case, but
-//! those code paths process far fewer rows than the LFTJ hot path, so the
-//! net effect is a clear win. All existing external behavior (equality,
-//! iteration order treated as irrelevant, projection, merge semantics) is
-//! unchanged.
+//! those code paths process far fewer rows than the LFTJ hot path.
 // Re-export so calling code can write `oxigraph_nova_query::Variable`.
 pub use oxrdf::Variable as SparqlVariable;
 use oxrdf::{BlankNode, Term, Variable};
