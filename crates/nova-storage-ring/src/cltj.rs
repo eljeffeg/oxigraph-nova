@@ -60,7 +60,47 @@ use epserde::Epserde;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 use std::sync::Arc;
 
+// ── VocabRepr ─────────────────────────────────────────────────────────────────
+
+/// Vocab representation for [`CltjTrie`]/[`CltjData`]: either owned
+/// (heap-allocated, as produced by a fresh build or a heap-copy
+/// `deserialize_full` round-trip) or **borrowed** from a `load_mmap`'d
+/// snapshot file (Phase 3.3 of the mmap'd ε-serde snapshot plan — CLAUDE.md
+/// item 14).
+///
+/// `Mapped`'s `&'static [u64]` is not truly `'static` data — it is a
+/// lifetime-extended borrow into the backing memory owned by an
+/// `Arc<epserde::deser::MemCase<StoreSnapshot>>` that the store keeps alive
+/// for as long as any `Mapped` vocab derived from it is reachable (the
+/// standard self-referential mmap pattern: the borrow is sound as long as
+/// the owning `MemCase`'s mapped memory outlives every `VocabRepr::Mapped`
+/// constructed from it, which the store's ownership structure guarantees).
+///
+/// This is the substrate that lets [`CltjTrie<V>`]/[`CltjData<V>`] (generic
+/// since Phase 3.2a) hold zero-copy vocab slices with **no code
+/// duplication** versus the owned path — every navigation method already
+/// works generically over any `V: AsRef<[u64]>`.
+pub(crate) enum VocabRepr {
+    /// Heap-allocated owned vocab (fresh build, or in-memory round-trip).
+    Owned(Vec<u64>),
+    /// Borrowed vocab slice, zero-copy from a `load_mmap`'d snapshot file.
+    /// See the type-level doc comment above for the lifetime-extension
+    /// safety argument.
+    Mapped(&'static [u64]),
+}
+
+impl AsRef<[u64]> for VocabRepr {
+    #[inline]
+    fn as_ref(&self) -> &[u64] {
+        match self {
+            VocabRepr::Owned(v) => v.as_slice(),
+            VocabRepr::Mapped(s) => s,
+        }
+    }
+}
+
 // ── CltjTrie ──────────────────────────────────────────────────────────────────
+
 
 /// A single LOUDS trie for one sort ordering, with vocabulary for global-ID
 /// translation.
@@ -1112,11 +1152,45 @@ mod tests {
         }
     }
 
+    /// `VocabRepr::Owned` behaves exactly like a plain `Vec<u64>` through
+    /// `AsRef<[u64]>`.
+    #[test]
+    fn vocab_repr_owned_as_ref() {
+        let v = VocabRepr::Owned(vec![1, 2, 3]);
+        assert_eq!(v.as_ref(), &[1u64, 2, 3]);
+    }
+
+    /// `VocabRepr::Mapped` (the zero-copy/mmap'd variant) returns the same
+    /// slice contents via `AsRef<[u64]>` as the owned variant — proving the
+    /// two variants are interchangeable for every navigation method that is
+    /// generic over `V: AsRef<[u64]>` (all of `CltjTrie`/`CltjData`'s
+    /// read-only methods). Uses `Box::leak` to simulate the lifetime
+    /// extension that will, in Phase 3.3's full wiring, come from an
+    /// `Arc<epserde::deser::MemCase<StoreSnapshot>>` kept alive by the store.
+    #[test]
+    fn vocab_repr_mapped_as_ref() {
+        let boxed: Box<[u64]> = vec![10u64, 20, 30].into_boxed_slice();
+        let leaked: &'static [u64] = Box::leak(boxed);
+        let v = VocabRepr::Mapped(leaked);
+        assert_eq!(v.as_ref(), &[10u64, 20, 30]);
+    }
+
+    /// `VocabRepr` must be `Send + Sync + 'static` since it plugs directly
+    /// into `CltjTrie<V>`/`CltjData<V>`'s generic bound
+    /// (`V: AsRef<[u64]> + Send + Sync + 'static`) used throughout
+    /// `iter_d0`/`TrieIterator` — this is a compile-time-only assertion.
+    #[test]
+    fn vocab_repr_is_send_sync_static() {
+        fn assert_bounds<T: AsRef<[u64]> + Send + Sync + 'static>() {}
+        assert_bounds::<VocabRepr>();
+    }
+
     /// Cross-check: SPO and SOP each enumerate the same number of leaf triples.
     ///
     /// Uses only the public `TrieIterator` API (no internal field access).
     #[test]
     fn cltj_spo_sop_triple_count_matches() {
+
         let triples = &[[1u64, 2, 3], [1, 3, 4], [2, 2, 5], [2, 4, 3]];
         let cltj = make_cltj(triples);
 
