@@ -436,12 +436,18 @@ impl CltjData {
 /// arrays across the six tries per the static ordering permutation in
 /// [`build_cltj_data`], and rebuilds each trie's sidecar via
 /// [`LoudsTrie::from_core`] — see [`CltjData::from_snapshot`].
+// `tries` uses the "whole array as bare generic parameter" pattern: epserde's
+// zero-copy eligibility check only recognizes a field as zero-copy when its
+// declared type is a bare generic parameter of the struct, and arrays are not
+// themselves recognized as zero-copy-eligible unless the *entire array type*
+// is substituted in as the generic parameter's default.  This mirrors the
+// pattern used for `TBitvec`/`SidecarCore`/`LoudsCore` in `louds.rs`.
 #[derive(Epserde)]
-pub(crate) struct CltjSnapshot {
+pub(crate) struct CltjSnapshot<Tries = [LoudsCore; 6]> {
     vocab_s: Vec<u64>,
     vocab_p: Vec<u64>,
     vocab_o: Vec<u64>,
-    tries: [LoudsCore; 6],
+    tries: Tries,
 }
 
 // ── Pair builder ──────────────────────────────────────────────────────────────
