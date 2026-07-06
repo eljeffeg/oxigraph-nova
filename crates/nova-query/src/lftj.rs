@@ -72,6 +72,7 @@ use crate::dataset::{Dataset, GraphSelector};
 use crate::solution::{Solution, Solutions};
 use oxigraph_nova_core::{GraphName, Variable};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
+use std::sync::Arc;
 
 // ── Field specification ────────────────────────────────────────────────────────
 
@@ -380,23 +381,30 @@ fn leapfrog_sync(scans: &mut [Box<dyn oxigraph_nova_core::TrieIterator>]) -> Opt
 fn lftj_step<D: Dataset>(
     dataset: &D,
     specs: &[PatternSpec],
-    join_vars: &[Variable],
+    join_vars: &Arc<[Variable]>,
     graph: &GraphSelector,
     unbound: &[usize],
     bindings: &mut Vec<Option<u64>>,
     results: &mut Solutions,
 ) {
     // Base case: all variables bound → emit a solution.
+    //
+    // Builds the row via `Solution::positional`, sharing `join_vars`'s
+    // `Arc<[Variable]>` header (built once per query in `eval_bgp_lftj`)
+    // across every emitted row instead of cloning each bound `Variable`
+    // individually — see `solution.rs`'s module docs for the full
+    // allocation-reduction rationale (measured via `profile_eval
+    // --count-allocs`).
     if unbound.is_empty() {
-        let mut sol = Solution::new();
-        for (var_idx, binding) in bindings.iter().enumerate() {
-            if let Some(&id) = binding.as_ref()
-                && let Some(term) = dataset.lftj_decode_term(id)
-            {
-                sol.insert(join_vars[var_idx].clone(), term);
-            }
-        }
-        results.push(sol);
+        let values: Vec<Option<oxigraph_nova_core::Term>> = bindings
+            .iter()
+            .map(|binding| {
+                binding
+                    .as_ref()
+                    .and_then(|&id| dataset.lftj_decode_term(id))
+            })
+            .collect();
+        results.push(Solution::positional(Arc::clone(join_vars), values));
         return;
     }
 
@@ -523,7 +531,11 @@ pub fn eval_bgp_lftj<D: Dataset>(
     }
 
     // ── Collect join variables (assigns stable var_idx indices) ───────────────
-    let join_vars = collect_join_vars(patterns);
+    //
+    // Wrapped in an `Arc<[Variable]>` immediately: this is the query-wide
+    // header shared (via cheap `Arc::clone`) across every emitted row's
+    // `Solution::positional(...)` — see `solution.rs`'s module docs.
+    let join_vars: Arc<[Variable]> = Arc::from(collect_join_vars(patterns));
 
     // ── Classify all patterns ──────────────────────────────────────────────────
     let mut specs: Vec<PatternSpec> = Vec::with_capacity(patterns.len());

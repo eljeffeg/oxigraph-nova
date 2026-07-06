@@ -47,13 +47,6 @@ use value_traits::slices::SliceByValue;
 /// the `wikidata_slice` benchmark suite (with the decode cache in
 /// place). `8` won on every measured axis:
 ///
-/// | Benchmark | `BLOCK_SIZE = 16` | `BLOCK_SIZE = 8` |
-/// |---|---|---|
-/// | `query/triangle/ring` | 62.27 ms | **54.37 ms** (-12.7%) |
-/// | `compact_build_index/ring/1000` | 1.637 ms | **1.627 ms** (noise) |
-/// | `compact_build_index/ring/10000` | 17.81 ms | **17.40 ms** (-2.3%) |
-/// | `compact_build_index/ring/50000` | 94.13 ms | **94.52 ms** (noise) |
-///
 /// Smaller blocks mean less to decode per cache-miss (`decode_block` scans
 /// at most `BLOCK_SIZE` entries), which dominates `query/triangle/ring`'s
 /// remaining cost after the decode cache absorbs most repeat lookups —
