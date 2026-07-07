@@ -141,7 +141,7 @@ wait_ready() {
 }
 
 # --- Nova: persistent WAL-backed RingStore via --location ---
-# NOTE: Nova's --location --data load path now calls RingStore::bulk_load(),
+# NOTE: Nova's --location --file load path now calls RingStore::bulk_load(),
 # which bypasses the WAL entirely and commits via a single atomic snapshot +
 # MANIFEST swap (see benches/external/README.md's "Resolved" section) — this
 # is now fast (~1.3s for 1.25M triples, measured). The generous readiness
@@ -149,7 +149,7 @@ wait_ready() {
 # the load is expected to be slow anymore.
 
 NOVA_LOAD_START=$(date +%s.%N)
-"$ROOT/target/release/nova_serve" --location "$NOVA_LOCATION" --data "$DATA" \
+"$ROOT/target/release/nova_serve" --location "$NOVA_LOCATION" --file "$DATA" \
   --bind "127.0.0.1:$NOVA_PORT" > /tmp/nova_serve_disk_bench.log 2>&1 &
 NOVA_PID=$!
 wait_ready "http://127.0.0.1:$NOVA_PORT/sparql" 3600

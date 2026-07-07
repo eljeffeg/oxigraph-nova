@@ -26,8 +26,8 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 | Engine | Load time |
 |---|---|
 | Nova (Ring+LFTJ) | 2.10 s |
-| Oxigraph (in-memory) | 2.16 s |
-| QLever (mmap, warmed) | 3.10 s |
+| Oxigraph (in-memory) | 2.36 s |
+| QLever (mmap, warmed) | 3.14 s |
 
 ## Memory Usage (Physical Footprint)
 
@@ -35,17 +35,17 @@ Nova/QLever figures are macOS `vmmap -summary`'s "Physical footprint" (stable, a
 
 | Engine | Memory | Storage model |
 |---|---|---|
-| Nova (Ring+LFTJ) | 294.6 MiB | Pure heap |
+| Nova (Ring+LFTJ) | 199.8 MiB | Pure heap |
 | Oxigraph (in-memory) | 338.2MiB | Pure heap (in-memory mode) |
-| QLever (mmap, warmed) | 86.9 MiB | Incl. memory-mapped index pages |
+| QLever (mmap, warmed) | 87.6 MiB | Incl. memory-mapped index pages |
 
 ## CPU Usage (average % of one core during query phase)
 
 | Engine | Avg CPU % |
 |---|---|
-| Nova (Ring+LFTJ) | 15.6% |
-| Oxigraph (in-memory) | 23.2% |
-| QLever (mmap, warmed) | 28.2% |
+| Nova (Ring+LFTJ) | 12.6% |
+| Oxigraph (in-memory) | 23.8% |
+| QLever (mmap, warmed) | 29.1% |
 
 ## Latency Results (milliseconds, HTTP round-trip via curl)
 
@@ -55,43 +55,43 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 54.70 | 49.01 | 96.09 |
-| p95 (ms) | 56.79 | 50.28 | 98.44 |
+| p50 (ms) | 44.00 | 48.61 | 94.88 |
+| p95 (ms) | 45.18 | 59.86 | 96.72 |
 
 ### 2join
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 2.11 | 5.71 | 2.90 |
-| p95 (ms) | 2.28 | 10.24 | 3.07 |
+| p50 (ms) | 1.72 | 7.12 | 2.87 |
+| p95 (ms) | 1.96 | 9.94 | 3.09 |
 
 ### feature_lookup
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 0.85 | 4.25 | 1.21 |
-| p95 (ms) | 1.00 | 5.98 | 1.39 |
+| p50 (ms) | 0.73 | 3.14 | 1.34 |
+| p95 (ms) | 0.87 | 5.55 | 1.40 |
 
 ### star_with_features
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 15.50 | 17.95 | 40.51 |
-| p95 (ms) | 15.86 | 18.35 | 43.20 |
+| p50 (ms) | 13.44 | 17.53 | 39.17 |
+| p95 (ms) | 14.15 | 17.96 | 40.12 |
 
 ### path_2hop
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 589.25 | 537.95 | 1299.98 |
-| p95 (ms) | 609.43 | 551.52 | 1341.53 |
+| p50 (ms) | 497.68 | 529.50 | 1318.26 |
+| p95 (ms) | 503.36 | 539.72 | 1363.25 |
 
 ### triangle
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 355.48 | 353.68 | 438.48 |
-| p95 (ms) | 365.83 | 368.89 | 460.82 |
+| p50 (ms) | 284.64 | 355.80 | 440.03 |
+| p95 (ms) | 300.86 | 384.27 | 454.41 |
 
 ## Raw per-query summary (mean, stddev, n)
 
@@ -102,58 +102,58 @@ One sub-section per query, with each engine as a column and each statistic (n, m
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 55.02 | 49.09 | 96.38 |
-| stddev (ms) | 0.87 | 0.93 | 1.62 |
-| min (ms) | 53.98 | 47.12 | 94.18 |
-| max (ms) | 57.33 | 50.36 | 101.19 |
+| mean (ms) | 44.01 | 50.30 | 95.10 |
+| stddev (ms) | 0.78 | 4.73 | 0.83 |
+| min (ms) | 42.98 | 45.46 | 94.02 |
+| max (ms) | 45.44 | 67.58 | 96.94 |
 
 ### 2join
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 2.12 | 6.08 | 2.90 |
-| stddev (ms) | 0.09 | 2.52 | 0.11 |
-| min (ms) | 1.97 | 3.33 | 2.75 |
-| max (ms) | 2.39 | 10.93 | 3.10 |
+| mean (ms) | 1.75 | 6.24 | 2.89 |
+| stddev (ms) | 0.11 | 2.50 | 0.12 |
+| min (ms) | 1.60 | 2.79 | 2.67 |
+| max (ms) | 1.96 | 10.05 | 3.19 |
 
 ### feature_lookup
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 0.85 | 4.04 | 1.21 |
-| stddev (ms) | 0.08 | 1.28 | 0.10 |
-| min (ms) | 0.73 | 1.67 | 1.00 |
-| max (ms) | 1.07 | 6.61 | 1.43 |
+| mean (ms) | 0.72 | 3.29 | 1.33 |
+| stddev (ms) | 0.10 | 1.37 | 0.08 |
+| min (ms) | 0.57 | 1.51 | 1.20 |
+| max (ms) | 0.90 | 7.50 | 1.59 |
 
 ### star_with_features
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 15.50 | 17.77 | 40.76 |
-| stddev (ms) | 0.26 | 0.58 | 1.28 |
-| min (ms) | 15.06 | 16.05 | 38.84 |
-| max (ms) | 15.96 | 18.57 | 44.01 |
+| mean (ms) | 13.52 | 17.46 | 39.45 |
+| stddev (ms) | 0.40 | 0.42 | 1.27 |
+| min (ms) | 12.97 | 16.03 | 38.57 |
+| max (ms) | 14.99 | 18.04 | 45.81 |
 
 ### path_2hop
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 590.12 | 538.10 | 1303.90 |
-| stddev (ms) | 11.14 | 8.00 | 21.05 |
-| min (ms) | 574.30 | 523.31 | 1273.13 |
-| max (ms) | 611.29 | 555.30 | 1360.78 |
+| mean (ms) | 498.57 | 529.57 | 1317.67 |
+| stddev (ms) | 2.70 | 6.98 | 22.96 |
+| min (ms) | 495.00 | 516.79 | 1288.64 |
+| max (ms) | 503.92 | 540.62 | 1385.54 |
 
 ### triangle
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 356.33 | 355.66 | 444.26 |
-| stddev (ms) | 4.84 | 7.60 | 23.11 |
-| min (ms) | 350.48 | 348.06 | 429.89 |
-| max (ms) | 366.45 | 382.43 | 558.56 |
+| mean (ms) | 288.27 | 360.22 | 440.66 |
+| stddev (ms) | 7.49 | 10.89 | 7.78 |
+| min (ms) | 278.43 | 350.19 | 426.80 |
+| max (ms) | 302.15 | 387.53 | 459.00 |
 

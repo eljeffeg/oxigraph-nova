@@ -5,7 +5,14 @@
 //!   GET  `/sparql?query=<encoded>`                              — query via URL param
 //!   POST `/sparql`  Content-Type: application/sparql-query      — query in body
 //!   POST `/sparql`  Content-Type: application/x-www-form-urlencoded; `query=` field
-//!   POST `/sparql/update`                                       — SPARQL 1.1 Update
+//!   POST `/update`                                               — SPARQL 1.1 Update
+//!
+//! `/query` is routed to the same handler as `/sparql` (both GET and POST) —
+//! an alias matching upstream Oxigraph's endpoint naming (`oxigraph serve`
+//! exposes `POST /query` and `POST /update`), so a client written against
+//! Oxigraph's endpoint conventions works against Nova unmodified. Unlike
+//! Oxigraph's `/sparql`, which accepts *either* a query or an update, Nova's
+//! `/sparql`/`/query` are query-only; use `/update` for updates.
 //!
 //! Also implements the SPARQL 1.1 Graph Store HTTP Protocol (W3C Rec):
 //!
@@ -50,7 +57,7 @@
 //! target graph.
 //!
 //! # Usage
-
+//!
 //! ```no_run
 //! use oxigraph_nova_server::Server;
 //! use oxigraph_nova_storage_memory::MemoryStore;
@@ -166,7 +173,12 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
         let state = AppState { store: self.store };
         Router::new()
             .route("/sparql", get(sparql_get::<S>).post(sparql_post::<S>))
-            .route("/sparql/update", post(sparql_update::<S>))
+            // `/query` is an alias matching upstream Oxigraph's endpoint
+            // naming (`oxigraph serve` exposes `POST /query`), so clients
+            // written against Oxigraph's conventions work against Nova
+            // unmodified.
+            .route("/query", get(sparql_get::<S>).post(sparql_post::<S>))
+            .route("/update", post(sparql_update::<S>))
             .route(
                 "/store",
                 get(store_get::<S>)
@@ -248,7 +260,7 @@ async fn sparql_post<S: QuadStore + 'static>(
     execute_sparql_query(&state.store, &query_str, accept_header(&headers))
 }
 
-/// `POST /sparql/update` — SPARQL 1.1 Update.
+/// `POST /update` — SPARQL 1.1 Update.
 ///
 /// Accepted content-types (SPARQL 1.1 Protocol § 2.2):
 ///   - `application/sparql-update`         — body is the update text
@@ -1315,7 +1327,7 @@ mod tests {
         assert_eq!(percent_decode("plain"), "plain");
     }
 
-    // ── POST /sparql/update ───────────────────────────────────────────────────
+    // ── POST /update ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_update_insert_data() {
@@ -1325,7 +1337,7 @@ mod tests {
         let sparql = r#"INSERT DATA { <http://ex/carol> <http://ex/name> "Carol" }"#;
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from(sparql))
             .unwrap();
@@ -1352,7 +1364,7 @@ mod tests {
         let sparql = r#"DELETE DATA { <http://ex/alice> <http://ex/name> "Alice" }"#;
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from(sparql))
             .unwrap();
@@ -1379,7 +1391,7 @@ mod tests {
         let sparql = r#"DELETE WHERE { ?s <http://ex/name> ?n }"#;
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from(sparql))
             .unwrap();
@@ -1400,7 +1412,7 @@ mod tests {
                          WHERE { ?s <http://ex/age> ?a }"#;
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from(sparql))
             .unwrap();
@@ -1430,7 +1442,7 @@ mod tests {
         let sparql = "CLEAR DEFAULT";
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from(sparql))
             .unwrap();
@@ -1448,7 +1460,7 @@ mod tests {
         let sparql = "CREATE GRAPH <http://ex/g1>";
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from(sparql))
             .unwrap();
@@ -1470,7 +1482,7 @@ mod tests {
         let sparql2 = "DROP GRAPH <http://ex/g1>";
         let req2 = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from(sparql2))
             .unwrap();
@@ -1487,7 +1499,7 @@ mod tests {
         let form = "update=INSERT+DATA+%7B+%3Chttp%3A%2F%2Fex%2Fd%3E+%3Chttp%3A%2F%2Fex%2Fp%3E+%22v%22+%7D";
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/x-www-form-urlencoded")
             .body(Body::from(form))
             .unwrap();
@@ -1511,7 +1523,7 @@ mod tests {
         let router = make_router();
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::empty())
             .unwrap();
@@ -1525,7 +1537,7 @@ mod tests {
         let router = make_router();
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from("NOT AN UPDATE"))
             .unwrap();
@@ -1539,7 +1551,7 @@ mod tests {
         let router = make_router();
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/json")
             .body(Body::from("{}"))
             .unwrap();
@@ -1554,7 +1566,7 @@ mod tests {
         let sparql = "DROP GRAPH <http://ex/nonexistent>";
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from(sparql))
             .unwrap();
@@ -1569,7 +1581,7 @@ mod tests {
         let sparql = "DROP SILENT GRAPH <http://ex/nonexistent>";
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/sparql/update")
+            .uri("/update")
             .header("content-type", "application/sparql-update")
             .body(Body::from(sparql))
             .unwrap();

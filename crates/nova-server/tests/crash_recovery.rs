@@ -80,7 +80,7 @@ fn insert_update_body(i: usize) -> String {
 }
 
 fn send_insert(port: u16, i: usize) -> bool {
-    let url = format!("http://127.0.0.1:{port}/sparql/update");
+    let url = format!("http://127.0.0.1:{port}/update");
     ureq::post(&url)
         .header("Content-Type", "application/sparql-update")
         .send(insert_update_body(i))

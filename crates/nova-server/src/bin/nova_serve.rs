@@ -9,7 +9,7 @@
 //! ```bash
 //! # In-memory only (no persistence, matches Oxigraph's `serve` without `--location`):
 //! cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
-//!     --data /tmp/oxigraph-nova-bench/dataset.nt --bind 0.0.0.0:3030
+//!     --file /tmp/oxigraph-nova-bench/dataset.nt --bind 0.0.0.0:3030
 //!
 //! # Persistent (WAL-backed) store: writes survive restarts.
 //! cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
@@ -17,11 +17,16 @@
 //!
 //! # Persistent store, bulk-loaded from a dataset on first run only (if the
 //! # WAL directory is empty/fresh; on subsequent runs the existing WAL is
-//! # replayed instead and --data is ignored):
+//! # replayed instead and --file is ignored):
 //! cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
 //!     --location /tmp/oxigraph-nova-bench/data \
-//!     --data /tmp/oxigraph-nova-bench/dataset.nt --bind 0.0.0.0:3030
+//!     --file /tmp/oxigraph-nova-bench/dataset.nt --bind 0.0.0.0:3030
 //! ```
+//!
+//! `--location`/`-l`, `--bind`/`-b`, and `--file`/`-f` are named identically
+//! to upstream Oxigraph's own `oxigraph serve --location <path> --bind <addr>`
+//! and `oxigraph load --file <file>` flags, so a script or muscle memory
+//! built around either binary carries over unchanged.
 //!
 //! Storage model note: without `--location`, `RingStore` is always fully
 //! in-process heap memory — there is no disk persistence at all, so the
@@ -67,7 +72,7 @@ use std::time::{Duration, Instant};
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let mut data: Option<PathBuf> = None;
+    let mut file: Option<PathBuf> = None;
     let mut location: Option<PathBuf> = None;
     let mut bind: String = "0.0.0.0:3030".to_string();
     let mut compact_threshold: Option<usize> = None;
@@ -77,9 +82,9 @@ async fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--data" | "-d" => {
+            "--file" | "-f" => {
                 i += 1;
-                data = Some(PathBuf::from(&args[i]));
+                file = Some(PathBuf::from(&args[i]));
             }
             "--location" | "-l" => {
                 i += 1;
@@ -105,14 +110,22 @@ async fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: nova_serve [--data <dataset.nt>] [--location <dir>] [--bind 0.0.0.0:3030] \
+                    "Usage: nova_serve [--file <dataset.nt>] [--location <dir>] [--bind 0.0.0.0:3030] \
                      [--compact-threshold <n>] [--sync-interval-ms <n>]\n\
                      \n\
-                     Without --location: purely in-memory RingStore, --data is required.\n\
+                     --file <file> (matching `oxigraph load --file`): bulk-load an\n\
+                     N-Triples dataset. Short form: -f.\n\
+                     --location <dir> (matching `oxigraph serve --location`): persistent\n\
+                     WAL-backed RingStore rooted at <dir>. Short form: -l.\n\
+                     --bind <addr> (matching `oxigraph serve --bind`), default 0.0.0.0:3030.\n\
+                     Short form: -b.\n\
+                     \n\
+                     Without --location: purely in-memory RingStore, --file is required.\n\
                      With --location <dir>: persistent WAL-backed RingStore rooted at <dir>.\n\
-                     If <dir> already has a WAL, it is replayed and --data is ignored.\n\
-                     If <dir> is empty/fresh and --data is given, the dataset is bulk-loaded\n\
-                     and then persisted (each triple logged to the WAL) for future restarts.\n\
+                     If <dir> already has a WAL, it is replayed and --file is ignored.\n\
+                     If <dir> is empty/fresh and --file is given, the dataset is\n\
+                     bulk-loaded and then persisted (each triple logged to the WAL) for\n\
+                     future restarts.\n\
                      \n\
                      --compact-threshold <n>: delta-size threshold (number of live entries)\n\
                      that triggers automatic inline compaction for a persistent store.\n\
@@ -162,21 +175,21 @@ async fn main() {
         None => RingStore::new(),
     };
 
-    // Bulk-load from --data only if the store came up empty (a fresh
+    // Bulk-load from --file only if the store came up empty (a fresh
     // in-memory store, or a fresh/empty --location directory with no prior
     // WAL history). If a persistent store already has data recovered from
-    // its WAL, --data is ignored — the WAL is the source of truth.
-    if let Some(data) = &data {
+    // its WAL, --file is ignored — the WAL is the source of truth.
+    if let Some(file) = &file {
         if store.triple_count() > 0 {
             eprintln!(
-                "[nova_serve] Store already has {} triples (from --location); ignoring --data.",
+                "[nova_serve] Store already has {} triples (from --location); ignoring --file.",
                 store.triple_count()
             );
         } else {
-            eprintln!("[nova_serve] Loading {} ...", data.display());
+            eprintln!("[nova_serve] Loading {} ...", file.display());
             let t0 = Instant::now();
-            let file = File::open(data).expect("failed to open dataset file");
-            let reader = BufReader::new(file);
+            let f = File::open(file).expect("failed to open dataset file");
+            let reader = BufReader::new(f);
 
             let mut parsed: usize = 0;
             let quads = NTriplesParser::new().for_reader(reader).map(|result| {
@@ -198,7 +211,7 @@ async fn main() {
             // via `commit_compaction`, which — for a persistent store — does
             // a single atomic snapshot + dictionary + WAL-segment-rotation +
             // MANIFEST commit (see `RingStore::commit_compaction`). This
-            // matters enormously for `--location --data`: the old path went
+            // matters enormously for `--location --file`: the old path went
             // through `extend()` → `insert()`, WAL-logging **and
             // `fsync`-ing every single triple individually** (~4.2 ms/triple
             // measured — see `benches/external/README.md`'s "Critical
@@ -216,7 +229,7 @@ async fn main() {
             );
         }
     } else if location.is_none() {
-        panic!("either --data <dataset.nt> or --location <dir> is required");
+        panic!("either --file <dataset.nt> or --location <dir> is required");
     }
 
     eprintln!("[nova_serve] Ring triple_count={}", store.triple_count());

@@ -794,7 +794,7 @@ impl RingStore {
         // Front-Coded compacted tier before committing, so a bulk load ends
         // up in the same memory-efficient state as an inline-compacted
         // incrementally-built store. Without this call,
-        // `bulk_load()` — the path used by `nova_serve --data`, and thus by
+        // `bulk_load()` — the path used by `nova_serve --file`, and thus by
         // every external comparative benchmark — would leave the entire
         // dictionary sitting in its uncompacted delta tier forever, since
         // nothing else ever triggers compaction for a one-shot bulk load.

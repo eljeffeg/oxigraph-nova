@@ -38,8 +38,7 @@ This distinction matters: on macOS, `ps` RSS includes allocator-retained-but
 -freed memory (`libmalloc` keeps large freed regions mapped for fast reuse
 rather than immediately `munmap`-ing them back to the OS) and was observed
 to vary 10x+ (30-300+ MB) run-to-run for the *identical* process/workload
-with zero code changes — see `CLAUDE.md`'s "RSS investigation: the
-'anomalous' 142 MiB reading, explained" section for the full writeup.
+with zero code changes.
 `vmmap`'s physical footprint is the same figure macOS's Activity Monitor
 and the kernel's own memory accounting report, and is stable/reproducible
 run-to-run, unlike `ps` RSS. On non-macOS platforms (no `vmmap` available),
@@ -110,48 +109,6 @@ durability matters. Results are written to
 Each engine is now running in its own natural persistent configuration, so
 this variant is arguably the fairer real-world comparison of the two — but
 see the critical caveat below before drawing conclusions from load time.
-
-### ✅ Resolved: Nova's `--location --data` bulk-load path (formerly fsync-per-write)
-
-**Update:** the fsync-per-write bulk-load bottleneck described below has
-been fixed. `nova_serve --location <dir> --data <dataset.nt>` now calls
-`RingStore::bulk_load()`, which bypasses the WAL entirely for the initial
-load — it builds the Ring index directly in memory and commits it via a
-single atomic snapshot + MANIFEST swap (see `RingStore::commit_compaction`).
-There is no per-triple (or even per-batch) `fsync` on this path at all; the
-only disk I/O is one sequential snapshot write plus one small MANIFEST
-write, both at the end.
-
-Measured on this machine: **1,250,000 triples loaded (parsed, interned,
-indexed, and durably committed to disk) in 1.31s** — compare to the
-previous ~210.97s for just 50,000 triples (a >4,000x improvement in
-triples/second, and no longer scaling linearly with fsync count at all).
-At this rate, a 12.5M-triple load is expected to take on the order of
-seconds, not the ~14.6 hours the old fsync-per-write path would have taken.
-
-Ongoing writes after the initial load (`INSERT DATA`/`extend()` with
-multiple triples, and single-quad `insert()`) still go through the WAL for
-durability, but:
-- Multi-triple `extend()` calls (e.g. SPARQL `INSERT DATA` with several
-  triples) now acquire the store's lock **once** for the whole batch and
-  issue a **single `fsync`** for all of that batch's WAL records (see
-  `WalWriter::append_batch` in `crates/nova-storage-common/src/wal.rs`),
-  instead of one `fsync` per triple.
-- A configurable `SyncPolicy` (see `oxigraph_nova_storage_ring::SyncPolicy`,
-  and `nova_serve --sync-interval-ms <n>`) lets a deployment trade the
-  default `Always` (fsync every write, zero data loss on crash) for
-  `Interval(n)` — a background thread fsyncs the WAL every `n`
-  milliseconds ("group commit"), removing fsync latency from the write path
-  entirely at the cost of a bounded durability window (writes acknowledged
-  since the last flush can be lost on a crash, though never corrupted —
-  `wal::replay`'s existing torn-tail handling covers this exactly the same
-  way it covers any other incomplete write).
-
-Because the disk-backed report may still use a different dataset scale than
-the in-memory report (depending on when each was last regenerated), the two
-reports are not necessarily directly comparable in absolute latency terms —
-only the relative engine-to-engine comparisons *within* each report are
-guaranteed meaningful.
 
 
 ### Running (disk-backed)

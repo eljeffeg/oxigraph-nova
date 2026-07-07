@@ -145,7 +145,7 @@ wait_ready() {
 
 # --- Nova: pure in-memory RingStore (load time = parse + compact into Ring index) ---
 NOVA_LOAD_START=$(date +%s.%N)
-"$ROOT/target/release/nova_serve" --data "$DATA" --bind "127.0.0.1:$NOVA_PORT" > /tmp/nova_serve_bench.log 2>&1 &
+"$ROOT/target/release/nova_serve" --file "$DATA" --bind "127.0.0.1:$NOVA_PORT" > /tmp/nova_serve_bench.log 2>&1 &
 NOVA_PID=$!
 wait_ready "http://127.0.0.1:$NOVA_PORT/sparql"
 NOVA_LOAD_END=$(date +%s.%N)

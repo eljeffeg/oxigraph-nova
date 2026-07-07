@@ -41,6 +41,7 @@ Oxigraph Nova does **not** re-implement RDF parsing, SPARQL parsing, result seri
 | [`sux`](https://crates.io/crates/sux) | Sebastiano Vigna | Rank9 + SelectAdapt bitvectors and `BitFieldVec` — the LOUDS trie substrate |
 | [`epserde`](https://crates.io/crates/epserde) | Sebastiano Vigna | ε-copy serialization — mmap'd, near-zero-copy load of the Ring and dictionary snapshots |
 | [`tantivy`](https://crates.io/crates/tantivy) | community | Full-text search engine (planned — not yet a workspace dependency) |
+| [`reasonable`](https://github.com/gtfierro/reasonable) | Gabe Fierro | OWL 2 RL Reasoner (planned — not yet a workspace dependency) |
 
 
 All `rdf-12` / `sparql-12` feature flags are enabled across the parsing stack from day one, giving full RDF-star / quoted-triple support throughout.
@@ -285,22 +286,95 @@ cargo run -p oxigraph-nova-bench --example memory_report --release  # memory foo
 
 ---
 
+## Running the server
+
+`nova_serve` is a standalone SPARQL 1.1 HTTP server binary, built on the same
+`RingStore` (Ring + LFTJ) used throughout this crate. Its flags are
+deliberately named to match upstream Oxigraph's own CLI where the concepts
+overlap, so a script or muscle memory built around `oxigraph serve`/
+`oxigraph load` mostly carries over unchanged:
+
+| Flag                    | Alias(es) | Meaning                                                                 |
+|-------------------------|-----------|--------------------------------------------------------------------------|
+| `--file <file>`         | `-f`      | Bulk-load an N-Triples dataset (matches `oxigraph load --file`) |
+| `--location <dir>`      | `-l`      | Persistent, WAL-backed store rooted at `<dir>` (matches `oxigraph serve --location`) |
+| `--bind <addr>`         | `-b`      | Listen address, default `0.0.0.0:3030` (matches `oxigraph serve --bind`) |
+| `--compact-threshold <n>` |          | Delta-size threshold that triggers automatic inline compaction (persistent stores only) |
+| `--sync-interval-ms <n>` |          | Override the default 500ms WAL fsync/group-commit interval (persistent stores only) |
+
+```sh
+# In-memory only (no persistence) — bulk-loads a dataset and serves it:
+cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
+    --file dataset.nt --bind 0.0.0.0:3030
+
+# Persistent (WAL-backed) store — writes survive restarts:
+cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
+    --location ./data --bind 0.0.0.0:3030
+
+# Persistent store, bulk-loaded from a dataset on first run only (an
+# existing WAL at --location is replayed on subsequent runs and --file
+# is then ignored):
+cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
+    --location ./data --file dataset.nt --bind 0.0.0.0:3030
+```
+
+Once running, the server exposes the SPARQL 1.1 Protocol and the SPARQL 1.1
+Graph Store HTTP Protocol, both content-negotiated via `Accept`/`Content-Type`
+exactly as Oxigraph's own server does:
+
+```sh
+# SPARQL query (also available at /query, matching Oxigraph's endpoint naming)
+curl -X POST http://localhost:3030/sparql \
+    -H 'Content-Type: application/sparql-query' \
+    -H 'Accept: application/sparql-results+json' \
+    --data 'SELECT * WHERE { ?s ?p ?o } LIMIT 10'
+
+# SPARQL update (matching Oxigraph's endpoint naming)
+curl -X POST http://localhost:3030/update \
+    -H 'Content-Type: application/sparql-update' \
+    --data 'INSERT DATA { <http://ex/s> <http://ex/p> "v" }'
+
+# Graph Store Protocol — read/replace/merge/clear a graph (identical to Oxigraph's /store)
+curl http://localhost:3030/store?default
+curl -X PUT http://localhost:3030/store?graph=http://ex/g1 \
+    -H 'Content-Type: text/turtle' --data-binary @graph.ttl
+```
+
+See `nova_serve --help` for the full flag reference, and
+`crates/nova-server/src/lib.rs`'s module doc comment for the complete list of
+supported RDF/SPARQL-results serialization formats.
+
+---
+
 ## Design papers
+
 
 The compact storage and join algorithms are described in published research. Listed in reading order:
 
-1. **CompactLTJ** — "CompactLTJ: Space and Time Efficient Leapfrog Triejoin on Graph Databases" (VLDB Journal 2025), Arroyuelo, Navarro, Gómez-Brandón et al. The compact trie storage engine implemented here.
-2. **Leapfrog Triejoin** — "Leapfrog Triejoin: A Simple, Worst-Case Optimal Join Algorithm" (ICDT 2014), Veldhuizen. The join evaluator.
-3. **The Ring** — "Worst-Case Optimal Graph Joins in Almost No Space" (SIGMOD 2021 / ACM TODS 2024), Hogan et al. The BWT-based succinct index that motivated the architecture; CompactLTJ builds on the same orderings with faster O(1) navigation.
-4. **Wavelet Trees** — "Wavelet Trees for All" (ALENEX 2012), Claude & Navarro. Foundational rank/select primitives.
+1. **CompactLTJ** — "[CompactLTJ: Space and Time Efficient Leapfrog Triejoin on Graph Databases](https://dl.acm.org/doi/10.1145/3661304.3661898)" (VLDB Journal 2025), Arroyuelo, Navarro, Gómez-Brandón et al. The compact trie storage engine implemented here.
+2. **Leapfrog Triejoin** — "[Leapfrog Triejoin: A Simple, Worst-Case Optimal Join Algorithm](https://arxiv.org/abs/1210.0481)" (ICDT 2014), Veldhuizen. The join evaluator.
+3. **The Ring** — "[Worst-Case Optimal Graph Joins in Almost No Space](https://dl.acm.org/doi/10.1145/3448016.3457256)" (SIGMOD 2021 / ACM TODS 2024), Hogan et al. The BWT-based succinct index that motivated the architecture; CompactLTJ builds on the same orderings with faster O(1) navigation.
+4. **Wavelet Trees** — "[Wavelet Trees for All](https://www.sciencedirect.com/science/article/pii/S1570866713000610)" (ALENEX 2012), Claude & Navarro. Foundational rank/select primitives.
 
 Context / prior art (read, not implemented):
 
-5. **Tentris / Hypertrie** — "Tentris — A Tensor-Based Triple Store" (ISWC 2020). Prior WCOJ state of the art; higher memory, C++ only.
-6. **HoneyComb** — "HoneyComb: A Parallel Worst-Case Optimal Join" (ACM PODS 2025). Future parallelism strategy if LFTJ becomes CPU-bound at Wikidata scale.
+5. **Tentris / Hypertrie** — "[Tentris — A Tensor-Based Triple Store](https://dl.acm.org/doi/10.1007/978-3-030-62419-4_4)" (ISWC 2020). Prior WCOJ state of the art; higher memory, C++ only.
+6. **HoneyComb** — "[HoneyComb: A Parallel Worst-Case Optimal Join](https://dl.acm.org/doi/10.1145/3725307)" (ACM PODS 2025). Future parallelism strategy if LFTJ becomes CPU-bound at Wikidata scale.
 
 ---
 
 ## License
 
 MIT
+
+## Oxigraph Sponsors
+
+* [Zazuko](https://zazuko.com/), a knowledge graph consulting company.
+* [RelationLabs](https://relationlabs.ai/) that is building [Relation-Graph](https://github.com/relationlabs/Relation-Graph), a SPARQL database module for the [Substrate blockchain platform](https://substrate.io/) based on Oxigraph.
+* [Field 33](https://field33.com) that was building [an ontology management platform](https://plow.pm/).
+* [Magnus Bakken](https://github.com/magbak) who is building [Data Treehouse](https://www.data-treehouse.com/), a time-series + RDF datalake platform, and [chrontext](https://github.com/magbak/chrontext), a SPARQL query endpoint on top of joint RDF and time series databases.
+* [DeciSym.AI](https://www.decisym.ai/) a cybersecurity consulting company providing RDF-based software.
+* [ACE IoT Solutions](https://aceiotsolutions.com/), a building IOT platform.
+* [Albin Larsson](https://byabbe.se/) who is building [GovDirectory](https://www.govdirectory.org/), a directory of public agencies based on Wikidata.
+
+And [others](https://github.com/sponsors/Tpt). Many thanks to them!

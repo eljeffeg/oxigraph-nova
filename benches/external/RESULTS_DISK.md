@@ -27,17 +27,17 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 
 | Engine | Load time |
 |---|---|
-| Nova (--location) | 2.07 s |
-| Oxigraph (--location) | 10.31 s |
-| QLever (mmap, warmed) | 3.24 s |
+| Nova (--location) | 2.09 s |
+| Oxigraph (--location) | 10.00 s |
+| QLever (mmap, warmed) | 3.28 s |
 
 ## Memory Usage (Physical Footprint)
 
 | Engine | Memory | Storage model |
 |---|---|---|
-| Nova (--location) | 191.6 MiB | WAL-backed heap (recovered/compacted state resident) |
-| Oxigraph (--location) | 598.3MiB | RocksDB-backed (block cache + heap) |
-| QLever (mmap, warmed) | 88.6 MiB | Incl. memory-mapped index pages |
+| Nova (--location) | 216.4 MiB | WAL-backed heap (recovered/compacted state resident) |
+| Oxigraph (--location) | 599.4MiB | RocksDB-backed (block cache + heap) |
+| QLever (mmap, warmed) | 95.8 MiB | Incl. memory-mapped index pages |
 
 ## On-Disk Footprint
 
@@ -53,9 +53,9 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 
 | Engine | Avg CPU % |
 |---|---|
-| Nova (--location) | 6.0% |
-| Oxigraph (--location) | 57.2% |
-| QLever (mmap, warmed) | 17.4% |
+| Nova (--location) | 5.9% |
+| Oxigraph (--location) | 56.6% |
+| QLever (mmap, warmed) | 16.8% |
 
 ## Latency Results (milliseconds, HTTP round-trip via curl)
 
@@ -65,43 +65,43 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 42.17 | 171.86 | 95.66 |
-| p95 (ms) | 43.77 | 206.23 | 99.75 |
+| p50 (ms) | 42.38 | 173.89 | 92.97 |
+| p95 (ms) | 44.02 | 212.95 | 94.55 |
 
 ### 2join
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 1.59 | 8.80 | 3.02 |
-| p95 (ms) | 1.74 | 12.98 | 3.23 |
+| p50 (ms) | 1.66 | 8.75 | 2.84 |
+| p95 (ms) | 1.91 | 11.84 | 3.12 |
 
 ### feature_lookup
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 0.83 | 8.03 | 1.22 |
-| p95 (ms) | 2.17 | 10.52 | 1.57 |
+| p50 (ms) | 0.73 | 6.60 | 1.19 |
+| p95 (ms) | 0.98 | 8.61 | 1.30 |
 
 ### star_with_features
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 13.66 | 46.80 | 38.86 |
-| p95 (ms) | 14.89 | 58.28 | 40.25 |
+| p50 (ms) | 13.18 | 43.32 | 37.78 |
+| p95 (ms) | 13.89 | 48.77 | 38.56 |
 
 ### path_2hop
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 487.12 | 2064.41 | 1289.58 |
-| p95 (ms) | 494.92 | 2195.63 | 1359.17 |
+| p50 (ms) | 488.87 | 1936.69 | 1263.60 |
+| p95 (ms) | 506.25 | 2045.92 | 1296.20 |
 
 ### triangle
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 270.17 | 1794.76 | 436.93 |
-| p95 (ms) | 274.28 | 2068.49 | 455.46 |
+| p50 (ms) | 270.94 | 1726.99 | 421.84 |
+| p95 (ms) | 277.91 | 1775.59 | 425.55 |
 
 ## Raw per-query summary (mean, stddev, n)
 
@@ -112,58 +112,58 @@ One sub-section per query, with each engine as a column and each statistic (n, m
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 42.41 | 178.30 | 96.02 |
-| stddev (ms) | 0.67 | 22.29 | 2.03 |
-| min (ms) | 41.57 | 158.55 | 93.44 |
-| max (ms) | 44.23 | 275.90 | 102.39 |
+| mean (ms) | 42.38 | 179.77 | 93.11 |
+| stddev (ms) | 0.78 | 16.41 | 0.71 |
+| min (ms) | 40.96 | 163.08 | 92.06 |
+| max (ms) | 44.39 | 222.01 | 94.86 |
 
 ### 2join
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 1.60 | 9.28 | 3.01 |
-| stddev (ms) | 0.09 | 1.75 | 0.15 |
-| min (ms) | 1.49 | 7.07 | 2.75 |
-| max (ms) | 1.96 | 13.67 | 3.26 |
+| mean (ms) | 1.69 | 9.05 | 2.86 |
+| stddev (ms) | 0.13 | 1.32 | 0.12 |
+| min (ms) | 1.48 | 6.29 | 2.69 |
+| max (ms) | 1.98 | 12.05 | 3.21 |
 
 ### feature_lookup
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 0.95 | 7.67 | 1.36 |
-| stddev (ms) | 0.61 | 2.25 | 0.62 |
-| min (ms) | 0.58 | 3.53 | 1.03 |
-| max (ms) | 3.30 | 12.26 | 4.56 |
+| mean (ms) | 0.75 | 6.12 | 1.19 |
+| stddev (ms) | 0.12 | 1.91 | 0.07 |
+| min (ms) | 0.53 | 2.58 | 1.06 |
+| max (ms) | 1.10 | 9.04 | 1.34 |
 
 ### star_with_features
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 13.77 | 48.10 | 39.02 |
-| stddev (ms) | 0.61 | 7.16 | 0.77 |
-| min (ms) | 12.90 | 42.34 | 37.77 |
-| max (ms) | 15.38 | 79.82 | 41.49 |
+| mean (ms) | 13.26 | 43.76 | 37.85 |
+| stddev (ms) | 0.40 | 2.23 | 0.40 |
+| min (ms) | 12.65 | 41.45 | 37.26 |
+| max (ms) | 14.07 | 50.94 | 39.13 |
 
 ### path_2hop
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 487.90 | 2062.50 | 1303.27 |
-| stddev (ms) | 3.37 | 93.06 | 34.88 |
-| min (ms) | 482.56 | 1925.22 | 1268.59 |
-| max (ms) | 497.08 | 2371.49 | 1435.10 |
+| mean (ms) | 490.50 | 1947.84 | 1267.19 |
+| stddev (ms) | 6.84 | 44.74 | 13.45 |
+| min (ms) | 484.02 | 1889.19 | 1249.95 |
+| max (ms) | 513.79 | 2063.11 | 1308.55 |
 
 ### triangle
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 30 | 30 | 30 |
-| mean (ms) | 270.49 | 1850.27 | 442.20 |
-| stddev (ms) | 2.86 | 120.34 | 24.00 |
-| min (ms) | 265.26 | 1715.87 | 429.57 |
-| max (ms) | 281.07 | 2230.02 | 564.96 |
+| mean (ms) | 271.60 | 1723.71 | 426.10 |
+| stddev (ms) | 3.35 | 40.94 | 22.68 |
+| min (ms) | 267.45 | 1648.74 | 418.67 |
+| max (ms) | 282.25 | 1853.14 | 545.78 |
 
