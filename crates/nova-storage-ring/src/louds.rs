@@ -140,7 +140,13 @@ enum SidecarPayload {
 /// `SidecarCore` (and therefore all of [`LoudsCore`]) is now **fully**
 /// ε-serde-serializable — the sidecar no longer needs to be excluded from the
 /// snapshot or rebuilt on load.
-#[derive(Epserde, Default)]
+// `Clone` is derived (with per-field-type bounds auto-added by the derive
+// macro) so that a *borrowed* `SidecarCore<&[usize], ..., &[EfDict<usize>]>`
+// view (produced by `load_mmap`, whose fields are all cheap-to-copy slice
+// references) can be cloned out of a shared `&DeserType<...>` reference into
+// an owned-by-value instance — see `GraphRing::from_mapped` (Phase 3.3c step
+// 2b, CLAUDE.md item 14).
+#[derive(Epserde, Default, Clone)]
 pub(crate) struct SidecarCore<
     His = Vec<usize>,
     Los = Vec<usize>,
@@ -150,6 +156,7 @@ pub(crate) struct SidecarCore<
     SliceFlat = Vec<u32>,
     EfDicts = Vec<EfDict<usize>>,
 > {
+
     his: His,
     los: Los,
     kind: Kind,
@@ -170,6 +177,21 @@ pub(crate) struct SidecarCore<
 /// Blanket-implemented for every `SidecarCore<His, Los, ...>` whose fields
 /// are `AsRef<[_]>` over the expected element types — satisfied by both
 /// `Vec<T>` (owned) and epserde's borrowed-slice `DeserType` forms.
+pub(crate) trait EfDictsSub {
+    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)>;
+    fn ef_mem_size(&self) -> usize;
+}
+
+impl EfDictsSub for Vec<EfDict<usize>> {
+    #[inline]
+    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)> {
+        self[idx].succ(target)
+    }
+    fn ef_mem_size(&self) -> usize {
+        self.iter().map(|ef| ef.mem_size(SizeFlags::default())).sum()
+    }
+}
+
 pub(crate) trait SidecarSub {
     fn find(&self, hi: usize) -> Option<usize>;
     fn lo(&self, idx: usize) -> usize;
@@ -177,7 +199,7 @@ pub(crate) trait SidecarSub {
     fn slice_start(&self, idx: usize) -> usize;
     fn ef_idx(&self, idx: usize) -> usize;
     fn slice_flat_range(&self, start: usize, end: usize) -> &[u32];
-    fn ef_dict(&self, idx: usize) -> &EfDict<usize>;
+    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)>;
     fn mem_size_bytes(&self) -> usize;
 }
 
@@ -190,7 +212,7 @@ where
     SliceStart: AsRef<[usize]>,
     EfIdx: AsRef<[usize]>,
     SliceFlat: AsRef<[u32]>,
-    EfDicts: AsRef<[EfDict<usize>]>,
+    EfDicts: EfDictsSub,
 {
     #[inline]
     fn find(&self, hi: usize) -> Option<usize> {
@@ -223,8 +245,8 @@ where
     }
 
     #[inline]
-    fn ef_dict(&self, idx: usize) -> &EfDict<usize> {
-        &self.ef_dicts.as_ref()[idx]
+    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)> {
+        self.ef_dicts.ef_succ(idx, target)
     }
 
     fn mem_size_bytes(&self) -> usize {
@@ -234,17 +256,13 @@ where
         let slice_start = self.slice_start.as_ref();
         let ef_idx = self.ef_idx.as_ref();
         let slice_flat = self.slice_flat.as_ref();
-        let ef_dicts = self.ef_dicts.as_ref();
         std::mem::size_of_val(his)
             + std::mem::size_of_val(los)
             + std::mem::size_of_val(kind)
             + std::mem::size_of_val(slice_start)
             + std::mem::size_of_val(ef_idx)
             + std::mem::size_of_val(slice_flat)
-            + ef_dicts
-                .iter()
-                .map(|ef| ef.mem_size(SizeFlags::default()))
-                .sum::<usize>()
+            + self.ef_dicts.ef_mem_size()
     }
 }
 
@@ -322,11 +340,20 @@ pub(crate) mod t_backend {
     // `load_mmap`/`deserialize_eps`, producing a borrowed (zero-copy) form
     // instead of re-allocating an owned copy.  All existing call sites are
     // unaffected because `TBitvec == TBitvec<SuxRS>` by default.
-    #[derive(Epserde)]
+    // `Clone` is derived (bounded generically on `B: Clone` by the derive
+    // macro) so that a *borrowed* `TBitvec<BorrowedT>` view produced by
+    // `load_mmap` can be cheaply copied out of a `&DeserType<...>` reference
+    // (copying only the slice pointer/length/`num_ones` fields — no deep data
+    // copy) into an owned-by-value `TBitvec<BorrowedT>` that can then be fed
+    // into the existing (owned-only-signature) `from_core`/`from_snapshot`
+    // reconstruction chain. See `GraphRing::from_mapped` (Phase 3.3c step 2b,
+    // CLAUDE.md item 14).
+    #[derive(Epserde, Clone)]
     pub(crate) struct TBitvec<B = SuxRS> {
         rs: B,
         num_ones: usize,
     }
+
 
     impl TBitvec<SuxRS> {
         /// Construction only ever produces the owned form.
@@ -513,8 +540,15 @@ pub(crate) struct LoudsTrie<B = t_backend::SuxRS, L = BitFieldVec, S = SidecarCo
 /// `t_backend::TBitvec`, `sux::bits::BitFieldVec`, and [`SidecarCore`] all
 /// derive `epserde::Epserde`, so this struct composes cleanly through
 /// `#[derive(Epserde)]` with zero extra trait-bound or lifetime work.
-#[derive(Epserde)]
+///
+/// `Clone` is derived so that a *borrowed* `LoudsCore<TBitvec<BorrowedT>,
+/// BorrowedL, BorrowedS>` view produced by `load_mmap` can be cheaply cloned
+/// out of a shared `&DeserType<...>` reference (all fields are borrowed
+/// slices, so this only copies pointer/length data) — see
+/// `GraphRing::from_mapped` (Phase 3.3c step 2b, CLAUDE.md item 14).
+#[derive(Epserde, Clone)]
 pub(crate) struct LoudsCore<T = t_backend::TBitvec, L = BitFieldVec, S = SidecarCore> {
+
     t: T,
     l: L,
     l_len: usize,
@@ -878,8 +912,7 @@ where
                 // rank < offset: labels[offset] >= labels[rank] >= c (sorted) → lo.
                 // rank >= offset: exact position node_lo + rank (>= lo).
                 // None: no value >= c in entire node range → hi + 1.
-                let ef = self.sidecar.ef_dict(self.sidecar.ef_idx(idx));
-                match ef.succ(c as usize) {
+                match self.sidecar.ef_succ(self.sidecar.ef_idx(idx), c as usize) {
                     None => hi + 1,
                     Some((rank, _)) => {
                         if rank < offset {
@@ -1092,6 +1125,90 @@ pub(crate) fn build_louds_from_sorted(sorted: &[[u32; 3]]) -> Option<LoudsTrie> 
     Some(LoudsTrie::from_raw(&t_bits, &l_labels))
 }
 
+// ── Borrowed substrate (Phase 3.3c step 2b) ───────────────────────────────────
+//
+// Concrete types that ε-serde's `DeserType<LoudsCore>`/`DeserType<TBitvec>`/
+// `DeserType<BitFieldVec>`/`DeserType<SidecarCore>` resolve to when loaded via
+// `load_mmap`. Determined empirically by compiling a deliberately-wrong probe
+// (`let _: () = view.t;` etc.) against a real `load_mmap`'d value and reading
+// off the type-mismatch error's "found" type (Phase 3.3c step 2b, CLAUDE.md
+// item 14). These are exactly the `B`/`L`/`S` substrate parameters that
+// instantiate a **borrowed/zero-copy** `LoudsTrie<B, L, S>` — matched against
+// the `LoudsNav` blanket impl's bounds (`Rank + SelectUnchecked + MemSize` for
+// `B`; `SliceByValue<Value = usize> + MemSize` for `L`; `SidecarSub` for `S`),
+// all of which sux/this crate's blanket impls satisfy automatically for these
+// borrowed forms — **zero extra code** versus the owned path.
+//
+// The `'static` lifetime here is a lie in the general case (the actual data
+// borrows from a `MemCase`'s mapped memory) — soundness is established by the
+// caller keeping the backing `Arc<epserde::deser::MemCase<StoreSnapshot>>`
+// alive for as long as any `BorrowedLouds` value derived from it is
+// reachable, exactly mirroring `VocabRepr::Mapped(&'static [u64])`'s
+// documented safety argument in `cltj.rs`.
+pub(crate) type BorrowedT = SelectAdapt<
+    AddNumBits<Rank9<BitVec<&'static [u64]>, &'static [BlockCounters]>>,
+    &'static [usize],
+>;
+pub(crate) type BorrowedL = BitFieldVec<&'static [usize]>;
+// `ef_dicts`'s `DeserType` is NOT a borrowed slice `&[EfDict<usize>]` —
+// `EfDict<usize>` (= `EliasFano<usize, SelectZeroAdaptConst<..., Box<[usize]>,
+// 12, 3>, BitFieldVec<Box<[usize]>>>`) is a "deep" (non-zero-copy) type
+// because its own fields are not all bare generic parameters, so epserde
+// recurses into it: the *outer* `Vec<EfDict<usize>>` deserializes as an
+// owned `Vec<DeserType<EfDict<usize>>>`, while each *element*'s own
+// `Box<[usize]>` fields deserialize to borrowed `&[usize]` slices. This is
+// exactly `EliasFano<usize, SelectZeroAdaptConst<BitVec<&[usize]>,
+// &[usize], 12, 3>, BitFieldVec<&[usize]>>` — confirmed empirically via
+// `std::any::type_name_of_val` on a real `load_mmap`'d value (Phase 3.3c
+// step 2b, CLAUDE.md item 14). No transmute is needed for this field: an
+// owned `Vec` of partially-borrowed elements clones cheaply (no deep data
+// copy — see `Clone` derived on `SidecarCore`/`LoudsCore`) and assigns
+// directly.
+pub(crate) type BorrowedEfDict = EliasFano<
+    usize,
+    SelectZeroAdaptConst<BitVec<&'static [usize]>, &'static [usize], 12, 3>,
+    BitFieldVec<&'static [usize]>,
+>;
+
+// `BorrowedEfDict` is a distinct concrete type from `EfDict<usize>`, so it
+// needs its own `EfDictsSub` impl (the blanket `impl EfDictsSub for
+// Vec<EfDict<usize>>` above does not cover it). `succ()` is available on
+// `BorrowedEfDict` via the same `sux::traits::Succ` blanket impl that covers
+// `EfDict<usize>` (both are `EliasFano<usize, H, L>` for
+// `H: AsRef<[usize]> + SelectZeroUnchecked`, `L: SliceByValue<Value = usize>`
+// -- satisfied by both the owned `Box<[usize]>` and borrowed `&[usize]`
+// backing stores), so this impl is a byte-for-byte mirror of the owned one.
+impl EfDictsSub for Vec<BorrowedEfDict> {
+    #[inline]
+    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)> {
+        self[idx].succ(target)
+    }
+    fn ef_mem_size(&self) -> usize {
+        self.iter()
+            .map(|ef| ef.mem_size(SizeFlags::default()))
+            .sum()
+    }
+}
+
+pub(crate) type BorrowedS = SidecarCore<
+    &'static [usize],
+    &'static [usize],
+    &'static [u8],
+    &'static [usize],
+    &'static [usize],
+    &'static [u32],
+    Vec<BorrowedEfDict>,
+>;
+
+
+/// Borrowed/mmap'd instantiation of [`LoudsTrie`] — zero-copy, all fields
+/// borrowed slices tied to a `MemCase`'s mapped memory (see [`BorrowedT`]/
+/// [`BorrowedL`]/[`BorrowedS`]'s doc comments for the lifetime-safety
+/// argument). Satisfies [`LoudsNav`] via the same blanket impl the owned form
+/// uses — no extra trait implementation required.
+pub(crate) type BorrowedLouds = LoudsTrie<BorrowedT, BorrowedL, BorrowedS>;
+
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1099,6 +1216,7 @@ mod tests {
     use super::*;
 
     /// Construct the exact trie from Example 10 of the CompactLTJ paper
+
     /// and verify every formula from the paper.
     ///
     /// T = 00001 111101 1111000010001  (24 bits)

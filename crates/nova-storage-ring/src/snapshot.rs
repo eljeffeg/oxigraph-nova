@@ -82,8 +82,8 @@ use std::sync::Arc;
 /// (Phase 3.3c probe, CLAUDE.md item 14).
 #[derive(Epserde)]
 pub(crate) struct StoreSnapshot<Rings = Vec<RingSnapshot>> {
-    graph_ids: Vec<u8>,
-    rings: Rings,
+    pub(crate) graph_ids: Vec<u8>,
+    pub(crate) rings: Rings,
 }
 
 
@@ -91,7 +91,11 @@ impl StoreSnapshot {
     /// Build a snapshot from a per-graph `Arc<GraphRing>` map, consuming each
     /// `Arc` (requires unique ownership — true for a freshly-built `graphs`
     /// map that has not yet been installed into `RingStoreInner`/shared).
-    fn from_graphs(graphs: HashMap<GraphId, Arc<GraphRing>>) -> Self {
+    ///
+    /// `pub(crate)` (rather than private) so that `ring.rs`'s
+    /// `MappedGraphRing` tests can drive the exact same snapshot-construction
+    /// path used in production instead of hand-rolling a parallel struct.
+    pub(crate) fn from_graphs(graphs: HashMap<GraphId, Arc<GraphRing>>) -> Self {
         let mut graph_ids = Vec::with_capacity(graphs.len());
         let mut rings = Vec::with_capacity(graphs.len());
         for (g_id, ring) in graphs {
@@ -319,9 +323,14 @@ mod tests {
         // navigable-looking `CltjSnapshot` view (borrowed vocab slices, 6
         // tries) even through this extra `StoreSnapshot`/`RingSnapshot`
         // wrapping — proving the generic threading survives the additional
-        // nesting introduced this step.
+        // nesting introduced this step. `cltj` is a bare `CltjSnapshot` (not
+        // `Option`-wrapped — see `RingSnapshot`'s doc comment); `n == 0` is
+        // the empty-graph sentinel, so only check vocab non-emptiness for
+        // non-empty graphs (an empty graph's `cltj` is the valid-but-empty
+        // placeholder from `CltjSnapshot::empty()`).
         for ring in view.rings.iter() {
-            if let Some(cltj) = ring.cltj.as_ref() {
+            if ring.n > 0 {
+                let cltj = &ring.cltj;
                 assert!(!cltj.vocab_s.is_empty());
                 assert!(!cltj.vocab_p.is_empty());
                 assert!(!cltj.vocab_o.is_empty());

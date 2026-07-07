@@ -476,6 +476,30 @@ impl CltjData {
 
 }
 
+impl CltjSnapshot {
+    /// A structurally valid, empty snapshot: three empty vocab `Vec<u64>`s
+    /// plus six empty [`LoudsCore`]s (via `LoudsTrie::from_raw(&[], &[])`).
+    ///
+    /// Used as the empty-graph sentinel in [`RingSnapshot`] (see its doc
+    /// comment) — replaces the previous `Option<CltjSnapshot> = None`
+    /// representation, which broke ε-serde's zero-copy `load_mmap` chain
+    /// (an `Option<T>` field always deserializes as a fully-owned copy, even
+    /// under `load_mmap` — see CLAUDE.md item 14, Phase 3.3c step 2b
+    /// investigation notes). `n == 0` on the enclosing `RingSnapshot` is the
+    /// sentinel that lets `GraphRing::from_snapshot`/`from_mapped` skip
+    /// reconstructing a `RingData` at all, so this empty `CltjSnapshot` is
+    /// never actually read back — its only job is to be a valid, cheap
+    /// (few-hundred-byte) placeholder in the on-disk/in-memory byte layout.
+    pub(crate) fn empty() -> Self {
+        CltjSnapshot {
+            vocab_s: Vec::new(),
+            vocab_p: Vec::new(),
+            vocab_o: Vec::new(),
+            tries: std::array::from_fn(|_| LoudsTrie::from_raw(&[], &[]).into_core()),
+        }
+    }
+}
+
 // ── Reconstruction from snapshot (generic over substrate) ─────────────────────
 //
 // Pure field-moves + a static vocab redistribution with no owned-specific
@@ -1105,6 +1129,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
 
     /// End-to-end round-trip of the persistent snapshot format:
     /// build a `CltjData`, convert to `CltjSnapshot`, serialize via ε-serde
