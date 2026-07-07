@@ -63,14 +63,15 @@
 //! unaffected, since `round_trip_and_maybe_save`'s file-writing branch is
 //! skipped entirely when `path` is `None`.
 
-use crate::ring::{GraphRing, RingSnapshot};
+use crate::ring::{GraphRing, GraphRingHandle, MappedGraphRing, RingSnapshot};
 use epserde::Epserde;
-use epserde::deser::Deserialize;
+use epserde::deser::{Deserialize, Flags};
 use epserde::ser::Serialize;
 use oxigraph_nova_core::{GraphId, Oxigraph};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
 
 /// Whole-store ε-serde-serializable snapshot: one [`RingSnapshot`] per graph,
 /// keyed by the parallel `graph_ids` vector (index-aligned with `rings`).
@@ -163,6 +164,11 @@ impl StoreSnapshot {
     /// per-graph `Arc<GraphRing>` map. Returns an empty map if `path`
     /// doesn't exist (fresh store, or a persistent store that has never
     /// been compacted).
+    ///
+    /// Retained (alongside `load_mmap_from_file` below, which is what
+    /// `RingStore::open`/`commit_compaction` actually use now) as a
+    /// full-heap-copy alternative and for its existing regression test
+    /// coverage.
     pub(crate) fn load_from_file(
         path: &Path,
     ) -> Result<HashMap<GraphId, Arc<GraphRing>>, Oxigraph> {
@@ -171,9 +177,7 @@ impl StoreSnapshot {
         }
         // The file on disk is raw, uncompressed ε-serde bytes (see Phase 1
         // module docs above) — read it directly and deserialize via
-        // `deserialize_full`. (A future Phase 3 change will replace this with
-        // `load_mmap` for true zero-copy loading; the on-disk byte format is
-        // already compatible with that today.)
+        // `deserialize_full`.
         let buf = std::fs::read(path)
             .map_err(|e| Oxigraph::Storage(format!("snapshot read failed: {e}")))?;
         let mut cursor = std::io::Cursor::new(&buf[..]);
@@ -183,7 +187,67 @@ impl StoreSnapshot {
         };
         Ok(snap.into_graphs())
     }
+
+    /// Load a `StoreSnapshot` from `path` via zero-copy `load_mmap` (rather
+    /// than `deserialize_full`'s full heap copy) and wrap each graph in a
+    /// [`GraphRingHandle::Mapped`]. Returns an empty map if `path` doesn't
+    /// exist (fresh store, or a persistent store that has never been
+    /// compacted).
+    ///
+    /// Used by `RingStore::open()` (so a reopened persistent store's rings
+    /// are zero-copy mapped from the moment they're loaded, not just after
+    /// the next `compact()`) and by [`Self::write_and_load_mmap`] (right
+    /// after writing a fresh snapshot generation during `commit_compaction`).
+    pub(crate) fn load_mmap_from_file(
+        path: &Path,
+    ) -> Result<HashMap<GraphId, GraphRingHandle>, Oxigraph> {
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        let mem = Arc::new(unsafe {
+            StoreSnapshot::load_mmap(path, Flags::empty())
+                .map_err(|e| Oxigraph::Storage(format!("snapshot load_mmap failed: {e}")))?
+        });
+        let graph_ids: Vec<u8> = mem.uncase().graph_ids.iter().copied().collect();
+        let mut out = HashMap::with_capacity(graph_ids.len());
+        for (i, g) in graph_ids.into_iter().enumerate() {
+            let mapped = MappedGraphRing::new(Arc::clone(&mem), i);
+            out.insert(GraphId(g), GraphRingHandle::Mapped(Arc::new(mapped)));
+        }
+        Ok(out)
+    }
+
+    /// Consume `graphs`, serializing it once, atomically writing the bytes
+    /// to `path` (write to a `.tmp` sibling, then rename), then `load_mmap`
+    /// the just-written file back in — so the servable representation is a
+    /// genuine zero-copy view of exactly the bytes on disk, never a
+    /// redundant owned heap copy. Used by `commit_compaction`'s
+    /// persistent-store branch (see this module's doc comment, "Phase 3").
+    pub(crate) fn write_and_load_mmap(
+        graphs: HashMap<GraphId, Arc<GraphRing>>,
+        path: &Path,
+    ) -> Result<HashMap<GraphId, GraphRingHandle>, Oxigraph> {
+        let snap = Self::from_graphs(graphs);
+        let mut buf: Vec<u8> = Vec::new();
+        unsafe {
+            snap.serialize(&mut buf)
+                .map_err(|e| Oxigraph::Storage(format!("snapshot serialize failed: {e}")))?;
+        }
+
+        let tmp_path = {
+            let mut s = path.as_os_str().to_os_string();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+        std::fs::write(&tmp_path, &buf)
+            .map_err(|e| Oxigraph::Storage(format!("snapshot write failed: {e}")))?;
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| Oxigraph::Storage(format!("snapshot rename failed: {e}")))?;
+
+        Self::load_mmap_from_file(path)
+    }
 }
+
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

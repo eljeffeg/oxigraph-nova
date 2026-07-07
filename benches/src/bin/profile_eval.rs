@@ -132,7 +132,7 @@ fn run_query<D: Dataset>(ds: &D, name: &str, sparql: &str, iters: usize, count_a
     // counts so we can report a mean alongside the wall-clock numbers.
     let mut alloc_counts = Vec::with_capacity(iters);
     let mut alloc_byte_totals = Vec::with_capacity(iters);
-    for _ in 0..iters {
+    for i in 0..iters {
         let ev = Evaluator::new(ds);
         let before = count_allocs.then(alloc_stats_snapshot);
         let t0 = Instant::now();
@@ -143,8 +143,15 @@ fn run_query<D: Dataset>(ds: &D, name: &str, sparql: &str, iters: usize, count_a
             let delta = after - before;
             alloc_counts.push(delta.allocs);
             alloc_byte_totals.push(delta.alloc_bytes);
+            eprintln!(
+                "  [{name}] iter={i} alloc_bytes={} dealloc_bytes={} leaked_delta={}",
+                delta.alloc_bytes,
+                delta.dealloc_bytes,
+                delta.alloc_bytes as i64 - delta.dealloc_bytes as i64
+            );
         }
         n_results = match result {
+
             QueryResult::Solutions(s) => s.len(),
             QueryResult::Boolean(b) => b as usize,
             QueryResult::Triples(t) => t.len(),
@@ -227,6 +234,51 @@ fn main() {
         println!("\n=== Pure in-process evaluation (no HTTP, no JSON serialization) ===\n");
     }
 
+    // `--rss-loop <query_name> <n>`: repeatedly evaluate a single named query
+    // `n` times, printing this process's own RSS (via `ps -o rss=`, matching
+    // the same metric external benchmark scripts poll via `vmmap -summary`)
+    // after every iteration. Used to distinguish a genuine Rust-level leak
+    // (RSS growing without bound even though the counting allocator shows
+    // every iteration alloc/dealloc-ing an identical number of bytes) from
+    // ordinary libsystem_malloc page retention (RSS grows but the counting
+    // allocator already proves nothing is actually leaked at the Rust level).
+    if let Some(pos) = args.iter().position(|a| a == "--rss-loop") {
+        let query_name = args.get(pos + 1).expect("--rss-loop needs <query_name>");
+        let n: usize = args
+            .get(pos + 2)
+            .expect("--rss-loop needs <n>")
+            .parse()
+            .expect("n must be a number");
+        let qd = queries
+            .iter()
+            .find(|q| &q.name == query_name)
+            .unwrap_or_else(|| panic!("no such query: {query_name}"));
+        let q = SparqlParser::new().parse_query(&qd.sparql).unwrap();
+        let pid = std::process::id();
+        println!("[rss-loop] pid={pid} query={query_name} n={n}");
+        for i in 0..n {
+            let ev = Evaluator::new(&ds);
+            let result = ev.evaluate(&q).unwrap();
+            let rows = match result {
+                QueryResult::Solutions(s) => s.len(),
+                QueryResult::Boolean(b) => b as usize,
+                QueryResult::Triples(t) => t.len(),
+            };
+            let _ = rows;
+
+            let rss_kb = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            println!("[rss-loop] iter={i} rows={rows} rss_mb={:.1}", rss_kb as f64 / 1024.0);
+
+        }
+        return;
+    }
+
     for qd in &queries {
         // Fewer iterations for expensive queries to keep total runtime reasonable.
         let iters = match qd.name.as_str() {
@@ -236,3 +288,4 @@ fn main() {
         run_query(&ds, &qd.name, &qd.sparql, iters, count_allocs);
     }
 }
+

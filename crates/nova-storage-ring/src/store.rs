@@ -62,8 +62,9 @@
 
 use crate::delta::Delta;
 use crate::louds::LoudsMemBreakdown;
-use crate::ring::{GraphRing, RingBuilder, SortOrder};
+use crate::ring::{GraphRing, GraphRingHandle, RingBuilder, SortOrder};
 use crate::snapshot::StoreSnapshot;
+
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, NamedNode, Oxigraph, Quad,
     QuadStore, StoredQuad, Subject, Term, TermId,
@@ -174,8 +175,11 @@ impl Drop for Flusher {
 struct RingStoreInner {
     /// Bidirectional Term ↔ TermId / GraphName ↔ GraphId mapping.
     dict: Dictionary,
-    /// Per-graph Ring indexes (built by `compact()`).
-    graphs: HashMap<GraphId, Arc<GraphRing>>,
+    /// Per-graph Ring indexes (built by `compact()`), each either the owned
+    /// in-memory form or a zero-copy `load_mmap`'d form — see
+    /// [`GraphRingHandle`].
+    graphs: HashMap<GraphId, GraphRingHandle>,
+
     /// Live write buffer (inserts and tombstones since last compaction).
     delta: Delta,
     /// Named-graph IDs that have been explicitly registered (tracks empty graphs).
@@ -427,17 +431,27 @@ impl RingStoreInner {
     ) -> Result<(), Oxigraph> {
         match self.data_dir.clone() {
             None => {
-                self.graphs = StoreSnapshot::round_trip_and_maybe_save(new_graphs, None)?;
+                // In-memory store: no disk to map from, so keep the owned
+                // ε-serde round-trip (see `snapshot.rs` module docs,
+                // "Always mapped") and wrap each graph as `Owned`.
+                let round_tripped = StoreSnapshot::round_trip_and_maybe_save(new_graphs, None)?;
+                self.graphs = round_tripped
+                    .into_iter()
+                    .map(|(g, ring)| (g, GraphRingHandle::Owned(ring)))
+                    .collect();
             }
             Some(dir) => {
                 let new_gen = self.snapshot_gen + 1;
                 let new_seq = self.wal_seq + 1;
 
-                // 1. Serialize the new snapshot generation in full before
-                //    anything references it.
+                // 1. Serialize the new snapshot generation to disk, then
+                //    `load_mmap` it back in — the servable representation
+                //    becomes a genuine zero-copy view of exactly the bytes
+                //    just written (see `snapshot.rs`'s `write_and_load_mmap`
+                //    doc comment / this module's "Phase 3" reference).
                 let snap_path = manifest::snapshot_path(&dir, new_gen);
-                let graphs =
-                    StoreSnapshot::round_trip_and_maybe_save(new_graphs, Some(&snap_path))?;
+                let graphs = StoreSnapshot::write_and_load_mmap(new_graphs, &snap_path)?;
+
 
                 // 1b. Persist the Dictionary alongside this snapshot
                 //     generation (see `dict_snapshot.rs` module docs for why
@@ -584,7 +598,7 @@ impl RingStore {
         let mut inner = RingStoreInner::new();
         if m.snapshot_gen > 0 {
             let snap_path = manifest::snapshot_path(dir, m.snapshot_gen);
-            inner.graphs = StoreSnapshot::load_from_file(&snap_path)?;
+            inner.graphs = StoreSnapshot::load_mmap_from_file(&snap_path)?;
 
             // Reconstruct the Dictionary's exact TermId/GraphId assignments
             // from this snapshot generation BEFORE replaying the WAL tail,
@@ -792,7 +806,7 @@ impl RingStore {
     /// Number of triples stored across all graphs (approximation during merge).
     pub fn triple_count(&self) -> usize {
         let inner = self.inner.lock().unwrap();
-        let ring_total: usize = inner.graphs.values().map(|r| r.n).sum();
+        let ring_total: usize = inner.graphs.values().map(|r| r.n()).sum();
 
         let delta_inserts = inner.delta.insert_count();
         let delta_tombstones = inner.delta.tombstone_count();
@@ -810,7 +824,7 @@ impl RingStore {
         let inner = self.inner.lock().unwrap();
         let ring_bytes: usize = inner.graphs.values().map(|r| r.mem_size_bytes()).sum();
         let dict_bytes = inner.dict.mem_size_bytes();
-        let triple_count: usize = inner.graphs.values().map(|r| r.n).sum();
+        let triple_count: usize = inner.graphs.values().map(|r| r.n()).sum();
         MemoryBreakdown {
             ring_bytes,
             dict_bytes,
@@ -1222,7 +1236,7 @@ impl QuadStore for RingStore {
             .inner
             .lock()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
-        let ring_total: usize = inner.graphs.values().map(|r| r.n).sum();
+        let ring_total: usize = inner.graphs.values().map(|r| r.n()).sum();
         let delta_inserts = inner.delta.insert_count();
         let delta_tombstones = inner.delta.tombstone_count();
         Ok(ring_total.saturating_sub(delta_tombstones) + delta_inserts)

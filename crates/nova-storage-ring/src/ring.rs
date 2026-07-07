@@ -605,10 +605,113 @@ impl MappedGraphRing {
     }
 }
 
+/// A per-graph Ring handle that is either the owned in-memory form (built
+/// directly by `RingBuilder`/`build_graphs_from_triples`, or round-tripped
+/// through ε-serde for an in-memory store) or a zero-copy `load_mmap`'d form
+/// (installed by `commit_compaction`/`RingStore::open` for a persistent
+/// store, once its snapshot generation has been written to disk).
+///
+/// Both variants expose the same read-only method surface — `GraphRing<Louds,
+/// V>`'s inherent methods are already generic over the LOUDS substrate/vocab
+/// representation (see the `impl<Louds: LoudsNav + ..., V: AsRef<[u64]> +
+/// ...>` block above), so every method here is a one-line match delegating
+/// to whichever concrete `GraphRing` instantiation is present — no trait
+/// object or dynamic dispatch overhead beyond the match itself.
+pub(crate) enum GraphRingHandle {
+    Owned(Arc<GraphRing>),
+    Mapped(Arc<MappedGraphRing>),
+}
+
+impl GraphRingHandle {
+    /// Number of distinct triples stored in this graph.
+    pub(crate) fn n(&self) -> usize {
+        match self {
+            GraphRingHandle::Owned(r) => r.n,
+            GraphRingHandle::Mapped(m) => m.ring().n,
+        }
+    }
+
+    pub(crate) fn contains(&self, s: u64, p: u64, o: u64) -> bool {
+        match self {
+            GraphRingHandle::Owned(r) => r.contains(s, p, o),
+            GraphRingHandle::Mapped(m) => m.ring().contains(s, p, o),
+        }
+    }
+
+    pub(crate) fn spo_triples(&self) -> Vec<[u64; 3]> {
+        match self {
+            GraphRingHandle::Owned(r) => r.spo_triples(),
+            GraphRingHandle::Mapped(m) => m.ring().spo_triples(),
+        }
+    }
+
+    pub(crate) fn match_triples(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+    ) -> Vec<[u64; 3]> {
+        match self {
+            GraphRingHandle::Owned(r) => r.match_triples(s, p, o),
+            GraphRingHandle::Mapped(m) => m.ring().match_triples(s, p, o),
+        }
+    }
+
+    pub(crate) fn mem_size_bytes(&self) -> usize {
+        match self {
+            GraphRingHandle::Owned(r) => r.mem_size_bytes(),
+            GraphRingHandle::Mapped(m) => m.ring().mem_size_bytes(),
+        }
+    }
+
+    pub(crate) fn mem_breakdown_per_ordering(
+        &self,
+    ) -> Option<[(SortOrder, LoudsMemBreakdown, usize); 6]> {
+        match self {
+            GraphRingHandle::Owned(r) => r.mem_breakdown_per_ordering(),
+            GraphRingHandle::Mapped(m) => m.ring().mem_breakdown_per_ordering(),
+        }
+    }
+
+    pub(crate) fn spo_and_vocab_bytes(&self) -> (usize, usize) {
+        match self {
+            GraphRingHandle::Owned(r) => r.spo_and_vocab_bytes(),
+            GraphRingHandle::Mapped(m) => m.ring().spo_and_vocab_bytes(),
+        }
+    }
+
+    pub(crate) fn estimate_count(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+    ) -> u64 {
+        match self {
+            GraphRingHandle::Owned(r) => r.estimate_count(s, p, o, target_field),
+            GraphRingHandle::Mapped(m) => m.ring().estimate_count(s, p, o, target_field),
+        }
+    }
+
+    pub(crate) fn join_scan(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+    ) -> Box<dyn TrieIterator> {
+        match self {
+            GraphRingHandle::Owned(r) => r.join_scan(s, p, o, target_field),
+            GraphRingHandle::Mapped(m) => m.ring().join_scan(s, p, o, target_field),
+        }
+    }
+}
+
 /// ε-serde-serializable snapshot of a [`GraphRing`]: triple count plus a
 /// [`CltjSnapshot`] (a structurally valid but empty snapshot — see
 /// [`CltjSnapshot::empty`] — for an empty graph, i.e. `n == 0`).
 ///
+
 /// This is the persistent on-disk representation.  See [`GraphRing::into_snapshot`] and
 /// [`GraphRing::from_snapshot`].
 ///

@@ -32,12 +32,32 @@
 //! being applied in memory — see `oxigraph_nova_storage_ring::wal` and
 //! `RingStore::open` for details of the overall persistent-storage design.
 
+use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, Quad};
 use oxigraph_nova_server::Server;
 use oxigraph_nova_storage_ring::{RingStore, SyncPolicy};
 use oxttl::NTriplesParser;
 use std::env;
 use std::fs::File;
+
+// Large SELECT result sets (hundreds of thousands of rows) allocate and free
+// many large (multi-KiB–multi-MiB) buffers in quick succession while
+// serializing a response. macOS's system allocator (`libmalloc`) keeps freed
+// large-block VM regions mapped rather than eagerly returning them to the OS,
+// so a process's physical footprint (RSS) climbs monotonically across
+// repeated large-result-set queries and never comes back down under normal
+// operation — this looks exactly like a memory leak when watched via
+// `vmmap`/`ps`, but a byte-exact allocation/deallocation counting harness
+// (`benches/src/bin/profile_eval.rs --count-allocs`) proves every single
+// byte allocated during evaluation is deallocated again before the next
+// query starts: nothing is actually leaked at the Rust level. Swapping in
+// `mimalloc`, which is much more aggressive about giving large freed regions
+// back to the OS, eliminates the growth entirely (RSS plateaus rather than
+// climbing without bound across dozens of repeated large-result queries —
+// verified via `benches/src/bin/profile_eval_mimalloc.rs`).
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
