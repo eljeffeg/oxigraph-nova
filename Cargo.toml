@@ -31,8 +31,10 @@ oxrdfxml      = { version = "0.2",    features = ["rdf-12"] } # RDF/XML parser �
 oxjsonld      = { version = "0.2.5",  features = ["rdf-12"] } # JSON-LD parser/serializer — pins oxrdf =0.3.3, composes directly
 
 spargebra     = { version = "0.4.6",  features = ["sparql-12"] }
+sparopt       = { version = "0.3.6",  features = ["sparql-12"] }  # SPARQL algebra optimizer (filter pushdown, join reordering)
 
 sparesults    = { version = "0.3.3",  features = ["sparql-12"] }  # .srx / .srj / .tsv result I/O
+
 oxsdatatypes  = { version = "0.2" }    # Correct XSD typed-value semantics; route evaluator comparison through this
 
 # ── Async runtime + HTTP ────────────────────────────────────────────────────

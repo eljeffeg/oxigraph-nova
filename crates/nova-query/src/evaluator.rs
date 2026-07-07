@@ -73,11 +73,35 @@ fn dataset_clause_selector(dataset: Option<&spargebra::algebra::QueryDataset>) -
     }
 }
 
-// TODO: wire sparopt::Optimizer::optimize_graph_pattern() into
-// evaluate() before eval_pattern() to enable filter-pushdown and join
-// reordering.  Import: use sparopt::{Optimizer, algebra::GraphPattern as OptGP};
-// The optimizer's join variable ordering will be most valuable once CLTJ*
-// adaptive VEO is fully integrated.
+// ── sparopt algebra optimization (filter pushdown, join reordering) ──────────
+//
+// sparopt operates on its own algebra (`sparopt::algebra::GraphPattern` /
+// `Expression`), distinct from `spargebra`'s.  Both directions of conversion
+// are public (`From<&spargebra::algebra::GraphPattern> for sparopt::algebra::GraphPattern`
+// and the reverse), so we round-trip: convert in, optimize, convert back to
+// `spargebra::algebra::GraphPattern`.  This lets the entire existing evaluator
+// (expression evaluation, XSD numeric tower, aggregates, property paths) stay
+// untouched — it only ever sees `spargebra` types, just a rewritten tree with
+// filters pushed down and joins reordered.
+//
+// The reverse conversion necessarily drops sparopt's `JoinAlgorithm` /
+// `LeftJoinAlgorithm` / `MinusAlgorithm` hints (spargebra has no field for
+// them) — Nova doesn't consume those anyway, since join execution and the
+// CLTJ*/WCOJ variable ordering are driven by `lftj.rs`'s own adaptive VEO,
+// not by sparopt's static join order.
+#[cfg(feature = "sparopt")]
+fn optimize_pattern(pattern: &GP) -> GP {
+    use sparopt::Optimizer;
+    use sparopt::algebra::GraphPattern as OptGP;
+    let opt = Optimizer::optimize_graph_pattern(OptGP::from(pattern));
+    GP::from(&opt)
+}
+
+#[cfg(not(feature = "sparopt"))]
+fn optimize_pattern(pattern: &GP) -> GP {
+    pattern.clone()
+}
+
 
 // ── XSD numeric tower ─────────────────────────────────────────────────────────
 
@@ -210,19 +234,23 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         match query {
             Query::Select { pattern, .. } => {
                 let active_graph = dataset_clause_selector(query.dataset());
-                let solutions = self.eval_pattern(pattern, &active_graph)?;
+                let pattern = optimize_pattern(pattern);
+                let solutions = self.eval_pattern(&pattern, &active_graph)?;
                 Ok(QueryResult::Solutions(solutions))
             }
             Query::Ask { pattern, .. } => {
                 let active_graph = dataset_clause_selector(query.dataset());
-                let solutions = self.eval_pattern(pattern, &active_graph)?;
+                let pattern = optimize_pattern(pattern);
+                let solutions = self.eval_pattern(&pattern, &active_graph)?;
                 Ok(QueryResult::Boolean(!solutions.is_empty()))
             }
             Query::Construct {
                 template, pattern, ..
             } => {
                 let active_graph = dataset_clause_selector(query.dataset());
-                let solutions = self.eval_pattern(pattern, &active_graph)?;
+                let pattern = optimize_pattern(pattern);
+                let solutions = self.eval_pattern(&pattern, &active_graph)?;
+
 
                 let mut triples = Vec::new();
                 for sol in &solutions {

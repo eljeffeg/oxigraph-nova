@@ -10,6 +10,7 @@ repository.workspace = true
 oxigraph-nova-core = { path = "../nova-core" }
 oxrdf         = { workspace = true }
 spargebra     = { workspace = true }
+sparopt       = { workspace = true, optional = true }  # algebra optimizer: filter pushdown, join reordering
 oxsdatatypes  = { workspace = true }   # Correct XSD value semantics for comparison / arithmetic
 anyhow        = { workspace = true }
 sha2          = { workspace = true }   # SHA-256/384/512 hash functions
@@ -19,6 +20,11 @@ regex         = { workspace = true }   # SPARQL REGEX() / REPLACE() built-ins
 uuid          = { workspace = true }   # SPARQL UUID() / STRUUID() built-ins
 rand          = { workspace = true }   # SPARQL RAND() built-in
 
+[features]
+default = ["sparopt"]
+sparopt = ["dep:sparopt"]
+
 [dev-dependencies]
 oxigraph-nova-storage-memory = { path = "../nova-storage-memory" }
 pretty_assertions = { workspace = true }
+
