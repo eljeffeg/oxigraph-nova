@@ -1,0 +1,46 @@
+services:
+  nova-serve:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oxigraph-nova:latest
+    container_name: oxigraph-nova
+    ports:
+      - "3030:3030"
+    environment:
+      RUST_LOG: info
+    # Persistent, WAL-backed store rooted at /data (survives restarts).
+    # Drop a dataset file into ./data (e.g. ./data/dataset.nt) and add
+    # `--file /data/dataset.nt` below to bulk-load it on first run only —
+    # subsequent restarts replay the WAL already written to the volume and
+    # ignore --file.
+    command: ["--location", "/data", "--bind", "0.0.0.0:3030"]
+    volumes:
+      - nova-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -X POST http://localhost:3030/sparql -H 'Content-Type: application/sparql-query' --data 'ASK { ?s ?p ?o }' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # YASGUI — browser-based SPARQL query editor/results viewer, served as a
+  # static single-page app (see yasgui/index.html) and pre-pointed at the
+  # nova-serve endpoint above. nova-serve's CORS-permissive response headers
+  # let this page (a different origin/port) query it directly via fetch.
+  #
+  # Open http://localhost:8091 once `docker compose up` is running.
+  yasgui:
+    image: nginx:alpine
+    container_name: oxigraph-nova-yasgui
+    ports:
+      - "8091:80"
+    volumes:
+      - ./yasgui:/usr/share/nginx/html:ro
+    depends_on:
+      - nova-serve
+    restart: unless-stopped
+
+volumes:
+  nova-data:

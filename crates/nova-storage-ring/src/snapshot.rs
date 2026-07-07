@@ -53,10 +53,10 @@
 //! zstd compression would break; the on-disk size (roughly 43-45 MiB on the
 //! disk benchmark dataset) is still roughly 9x smaller than Oxigraph's
 //! 416.5 MiB RocksDB directory on the same dataset. The dictionary file
-//! (`nova.dict.<gen>`, see `dict_snapshot.rs`) is a separate file and keeps
-//! its own zstd compression. In-memory mode (`path: None`) is also
-//! unaffected, since `round_trip_and_maybe_save`'s file-writing branch is
-//! skipped entirely when `path` is `None`.
+//! (`nova.dict.<gen>`, see `dict_snapshot.rs`) is a separate file and is
+//! likewise uncompressed, for the same mmap-residency reason. In-memory mode
+//! (`path: None`) is also unaffected, since `round_trip_and_maybe_save`'s
+//! file-writing branch is skipped entirely when `path` is `None`.
 
 use crate::ring::{GraphRing, GraphRingHandle, MappedGraphRing, RingSnapshot};
 use epserde::Epserde;

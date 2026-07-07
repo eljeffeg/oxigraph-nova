@@ -219,15 +219,6 @@ Oxigraph Nova targets full conformance with the W3C SPARQL 1.1 and (Working Draf
 
 Because Nova reuses the Oxigraph project's own parsing crates (`spargebra`, `oxrdf`, etc. — see the table above), any gap in those crates shows up here too.
 
-### Other RDF ecosystems evaluated
-
-Several other RDF-adjacent crates and projects were evaluated as potential building blocks:
-
-- **[`rdf-reader-jelly`](https://crates.io/crates/rdf-reader-jelly)** — a reader for [Jelly](https://jelly-rdf.github.io), a binary/protobuf RDF format, evaluated as a possible additional bulk-load format. Not yet viable — the published crate has no actual decoding implementation.
-- **[`rdf-canon`](https://crates.io/crates/rdf-canon)** — the closest available crate for RDF Dataset Canonicalization (URDNA2015/RDFC-1.0), evaluated for stable content-hashing of query results. Not yet adoptable — it pins an old, pre-RDF-1.2 version of `oxrdf`.
-- **[`omnigraph`](https://github.com/ModernRelay/omnigraph)** — a lakehouse-native graph engine with git-style workflows; an interesting adjacent project worth learning from.
-- **[`OxiRS`](https://github.com/cool-japan/oxirs)** — has some genuinely interesting ideas and features, though its own codebase and test suite aren't in a state this project could safely build on.
-
 ---
 
 ## Planned: OWL 2 RL reasoning via `reasonable`

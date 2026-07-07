@@ -98,6 +98,8 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use oxigraph_nova_core::QuadStore;
+use tower_http::cors::CorsLayer;
+
 use oxigraph_nova_query::{
     Evaluator, QueryResult, Solutions, StoreDataset, clear_graph, execute_update,
 };
@@ -186,6 +188,10 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
                     .post(store_post::<S>)
                     .delete(store_delete::<S>),
             )
+            // Permissive CORS so browser-based SPARQL clients (e.g. YASGUI,
+            // or any web app served from a different origin/port) can query
+            // this endpoint directly via `fetch`/XHR without a proxy.
+            .layer(CorsLayer::permissive())
             .with_state(state)
     }
 

@@ -60,9 +60,6 @@ sha2  = "0.10"
 sha1  = "0.10"
 md-5  = "0.10"
 
-# ── Compression (on-disk persistence: snapshot + dictionary files) ─────────
-zstd = "0.13"
-
 
 # ── Regex ───────────────────────────────────────────────────────────────────
 regex = "1"

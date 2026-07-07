@@ -1,0 +1,16 @@
+target
+debug
+.git
+.gitignore
+.DS_Store
+*.swp
+CLAUDE.md
+tests/w3c/data
+data
+research
+louds-rs
+profile*.json*
+profile.json.gz
+*.pyc
+*.csv
+benches/external
