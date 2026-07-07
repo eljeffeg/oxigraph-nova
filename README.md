@@ -284,6 +284,22 @@ cargo bench -p oxigraph-nova-bench -- query/triangle # cyclic join only
 cargo run -p oxigraph-nova-bench --example memory_report --release  # memory footprint table
 ```
 
+These are internal Criterion benchmarks (`benches/bsbm_large.rs`, `benches/wikidata_slice.rs`) that compare Nova's own `RingStore` against its in-memory baseline. For a comparison against external, independently-developed engines, see the next section.
+
+### External comparative benchmarks (Nova vs Oxigraph vs QLever)
+
+[`benches/external/`](./benches/external/README.md) contains a harness that benchmarks Nova against
+[Oxigraph](https://github.com/oxigraph/oxigraph) and [QLever](https://github.com/ad-freiburg/qlever) over
+identical synthetic BSBM-style datasets and identical SPARQL queries, run through the standard SPARQL 1.1 HTTP Protocol:
+
+| Report | Dataset | Storage mode |
+|---|---|---|
+| [`RESULTS.md`](./benches/external/RESULTS.md) | 50,000 entities (1.25M triples) | In-memory (all engines) |
+| [`RESULTS_500K.md`](./benches/external/RESULTS_500K.md) | 500,000 entities (12.5M triples) | In-memory (all engines) |
+| [`RESULTS_DISK.md`](./benches/external/RESULTS_DISK.md) | 50,000 entities (1.25M triples) | Persistent/disk-backed (each engine's native mode) |
+
+See [`benches/external/README.md`](./benches/external/README.md) for the full methodology, storage-model fairness notes, and instructions to run the harness yourself.
+
 ---
 
 ## Running the server
