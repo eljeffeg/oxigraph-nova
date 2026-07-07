@@ -141,36 +141,36 @@ The ontology graph (`GraphId(1)`) is the input to the planned OWL 2 RL reasoner.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                   oxigraph-nova-server                        │
-│             SPARQL 1.2 HTTP endpoint (axum)                   │
-│             /sparql GET/POST · /update POST                   │
+│                   oxigraph-nova-server                       │
+│             SPARQL 1.2 HTTP endpoint (axum)                  │
+│             /sparql GET/POST · /update POST                  │
 └───────────────────────────┬──────────────────────────────────┘
                             │
 ┌───────────────────────────▼──────────────────────────────────┐
-│                   oxigraph-nova-query                         │
-│    spargebra (parse) → sparopt (normalize) → evaluator        │
-│    Dataset trait · Leapfrog Triejoin · ExtensionRegistry      │
+│                   oxigraph-nova-query                        │
+│    spargebra (parse) → sparopt (normalize) → evaluator       │
+│    Dataset trait · Leapfrog Triejoin · ExtensionRegistry     │
 └───────────────────────────┬──────────────────────────────────┘
                             │  QuadStore / Dataset traits
            ┌────────────────┴────────────────┐
            │                                 │
-┌──────────▼──────────────┐   ┌─────────────▼──────────────────┐
+┌──────────▼──────────────┐   ┌──────────────▼──────────────────┐
 │ oxigraph-nova-storage-  │   │  oxigraph-nova-storage-ring     │
 │        memory           │   │  CompactLTJ LOUDS tries         │
 │  Vec + linear scan      │   │  + BTreeMap<u128> LSM delta     │
 │  testing / dev          │   │  + Leapfrog Triejoin            │
 │  (no persistence)       │   │  + WAL/MANIFEST persistence     │
-└─────────────────────────┘   └─────────────┬──────────────────┘
+└─────────────────────────┘   └──────────────┬──────────────────┘
            │                                 │
-           │                   ┌─────────────▼──────────────────┐
+           │                   ┌─────────────▼───────────────────┐
            │                   │ oxigraph-nova-storage-common    │
            │                   │ WAL + MANIFEST + mmap'd ε-serde │
            │                   │ dictionary/snapshot persistence │
            │                   │ (backend-agnostic, reusable)    │
-           │                   └─────────────┬──────────────────┘
+           │                   └─────────────┬───────────────────┘
            └─────────────────┬───────────────┘
                              │
-┌────────────────────────────▼─────────────────────────────────┐
+┌────────────────────────────▼──────────────────────────────────┐
 │                      oxigraph-nova-core                       │
 │    re-exports oxrdf types · QuadStore / TrieIterator traits   │
 │    Dictionary (TermId / GraphId) · error types                │
