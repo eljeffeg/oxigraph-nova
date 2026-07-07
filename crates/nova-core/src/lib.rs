@@ -8,6 +8,7 @@ pub mod trie;
 pub use dict::{
     Dictionary, GRAPH_DEFAULT, GRAPH_INFERENCE, GRAPH_ONTOLOGY, GraphId, MAX_TERM_ID, TermId,
 };
+pub use dict_compact::DictSnapshot;
 pub use error::Oxigraph;
 // Re-export the Oxigraph RDF type system directly — no custom wrappers.
 // These are battle-tested, W3C-correct, and used by oxttl/spargebra already.

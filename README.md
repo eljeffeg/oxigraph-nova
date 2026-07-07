@@ -2,7 +2,26 @@
 
 **A Rust-native RDF 1.2 / SPARQL 1.2 triple store with a novel succinct index and worst-case optimal joins.**
 
-Oxigraph Nova reuses the RDF ecosystem's battle-tested parsing and serialization crates while implementing a fresh storage layer and query engine from scratch. The goal is a store that is simultaneously W3C-conformant, live-writable, and algorithmically competitive with the fastest static stores — a combination existing options don't offer: forking Oxigraph means inheriting its sealed `Store` type, and forking OxiRS means inheriting a broken test suite and unaudited code.
+Oxigraph Nova was built as a sibling to the [Oxigraph](https://github.com/oxigraph/oxigraph) project, sharing deep roots in the Rust RDF ecosystem but pursue **complementary goals**.
+
+**Oxigraph** has established itself as a production-grade, standards-compliant graph database. Its focus is on delivering a safe, correct, maintainable, and practically fast SPARQL implementation built on the mature RocksDB storage engine. It prioritizes broad ecosystem support (excellent Python and JavaScript bindings, CLI, multiple serialization formats), long-term stability, and reliable behavior for real-world workloads. The foundational crates it maintains (`oxrdf`, `oxttl`, `spargebra`, `sparesults`, `sparopt`, `oxsdatatypes`, etc.) have become trusted infrastructure across the Rust RDF community.
+
+**Oxigraph Nova** has a different charter: to aggressively explore the *algorithmic and standards frontier*. It targets full native support for RDF 1.2 (quoted triples, `TRIPLE()`, base direction, etc.) and SPARQL 1.2 from day one, while implementing advanced techniques from recent database research — most notably CompactLTJ (succinct LOUDS tries) combined with Leapfrog Triejoin for worst-case optimal joins. The goal is a store that is simultaneously W3C-conformant, live-writable, and competitive with the fastest static analytical engines on complex queries — a combination that is difficult to achieve when extending a codebase optimized for different constraints.
+
+Because Nova reuses Oxigraph’s battle-tested parsing, serialization, and algebra crates unchanged, it inherits years of correctness investment and full ecosystem compatibility “for free.” All innovation is isolated behind clean seams (`QuadStore` and `Dataset` traits) in the storage layer and query evaluator. This design makes Nova a natural experimental platform whose successful techniques can later inform or be upstreamed into Oxigraph without compromising the latter’s stability guarantees.
+
+In short:
+
+| Dimension              | Oxigraph                                      | Oxigraph Nova                                      |
+|------------------------|-----------------------------------------------|----------------------------------------------------|
+| **Primary Goal**       | Production excellence, stability, compliance  | Algorithmic innovation + latest standards          |
+| **Storage Engine**     | RocksDB (mature, battle-tested)               | CompactLTJ Ring + LSM delta (research-oriented)    |
+| **Join Evaluation**    | Traditional (actively being optimized)        | Leapfrog Triejoin (worst-case optimal)             |
+| **RDF / SPARQL Level** | Full RDF 1.1 + preliminary 1.2                | Full RDF 1.2 / SPARQL 1.2            |
+| **Stability Profile**  | High — ready for production use               | Experimental / bleeding-edge                       |
+| **Ideal For**          | General deployments, broad adoption           | Research, high-performance analytics, standards work |
+
+I envision both projects coexisting comfortably as alternative storage backends behind a common `QuadStore` abstraction. Oxigraph continues to deliver the reliable, widely-supported option the community needs today. Nova serves as the laboratory where we can push performance boundaries, validate emerging standards, and prototype what a next-generation high-performance RDF engine could look like.
 
 ---
 
@@ -19,8 +38,10 @@ Oxigraph Nova does **not** re-implement RDF parsing, SPARQL parsing, result seri
 | [`oxsdatatypes`](https://crates.io/crates/oxsdatatypes) | Oxigraph project | Correct XSD typed-value semantics (decimal/double/dateTime/duration) |
 | [`sparopt`](https://crates.io/crates/sparopt) | Oxigraph project | SPARQL algebra normalizer — filter pushdown, join reordering |
 | [`axum`](https://crates.io/crates/axum) | Tokio project | Async HTTP server for the SPARQL endpoint |
-| [`tantivy`](https://crates.io/crates/tantivy) | community | Full-text search engine (planned) |
 | [`sux`](https://crates.io/crates/sux) | Sebastiano Vigna | Rank9 + SelectAdapt bitvectors and `BitFieldVec` — the LOUDS trie substrate |
+| [`epserde`](https://crates.io/crates/epserde) | Sebastiano Vigna | ε-copy serialization — mmap'd, near-zero-copy load of the Ring and dictionary snapshots |
+| [`tantivy`](https://crates.io/crates/tantivy) | community | Full-text search engine (planned — not yet a workspace dependency) |
+
 
 All `rdf-12` / `sparql-12` feature flags are enabled across the parsing stack from day one, giving full RDF-star / quoted-triple support throughout.
 
@@ -31,16 +52,21 @@ All `rdf-12` / `sparql-12` feature flags are enabled across the parsing stack fr
 ### Storage is a trait, not a type
 
 ```rust
+// Simplified for illustration — the real trait (crates/nova-core/src/store.rs)
+// also carries a family of default `lftj_*` / `supports_*` methods that let a
+// backend opt into Leapfrog Triejoin acceleration and cardinality estimation;
+// backends that don't implement them (e.g. the in-memory store) simply fall
+// back to the default nested-loop-friendly behavior.
 pub trait QuadStore: Send + Sync {
     fn insert(&self, quad: &Quad) -> Result<bool, Oxigraph>;
     fn remove(&self, quad: &Quad) -> Result<bool, Oxigraph>;
     fn quads_for_pattern(
         &self,
-        subject:    Option<&Subject>,
+        subject:    Option<&Term>,
         predicate:  Option<&NamedNode>,
         object:     Option<&Term>,
         graph_name: Option<&GraphName>,
-    ) -> Result<Box<dyn Iterator<Item = Result<Quad, Oxigraph>> + '_>, Oxigraph>;
+    ) -> Result<Box<dyn Iterator<Item = Result<StoredQuad, Oxigraph>> + '_>, Oxigraph>;
     fn len(&self) -> Result<usize, Oxigraph>;
     fn contains(&self, quad: &Quad) -> Result<bool, Oxigraph>;
 }
@@ -53,6 +79,10 @@ Any backend — in-memory, compact trie + delta, sled, RocksDB — implements th
 A `StoreDataset` adapter bridges any `QuadStore` into the evaluator. The evaluator only sees the `Dataset` abstraction:
 
 ```rust
+// Simplified for illustration — the real trait (crates/nova-query/src/dataset.rs)
+// operates over a richer QuadPattern/GraphSelector pair (so it can express
+// GRAPH ?g, FROM/FROM NAMED, and graph unions precisely) and mirrors
+// QuadStore's optional lftj_*/supports_* capability methods.
 pub trait Dataset: Send + Sync {
     fn find_quads<'a>(&'a self, pattern: &QuadPattern) -> Result<QuadIter<'a>>;
     fn contains_quad(&self, s: &Term, p: &Term, o: &Term, g: &GraphName) -> Result<bool>;
@@ -61,6 +91,7 @@ pub trait Dataset: Send + Sync {
 ```
 
 These two traits are the architectural seam that makes the compact storage engine possible without touching the evaluator.
+
 
 ### The Ring index: CompactLTJ LOUDS tries + Leapfrog Triejoin
 
@@ -109,13 +140,13 @@ The ontology graph (`GraphId(1)`) is the input to the planned OWL 2 RL reasoner.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                     oxigraph-nova-server                      │
-│          SPARQL 1.2 HTTP endpoint (axum)                      │
-│          /sparql GET/POST · /update POST                      │
+│                   oxigraph-nova-server                        │
+│             SPARQL 1.2 HTTP endpoint (axum)                   │
+│             /sparql GET/POST · /update POST                   │
 └───────────────────────────┬──────────────────────────────────┘
                             │
 ┌───────────────────────────▼──────────────────────────────────┐
-│                     oxigraph-nova-query                       │
+│                   oxigraph-nova-query                         │
 │    spargebra (parse) → sparopt (normalize) → evaluator        │
 │    Dataset trait · Leapfrog Triejoin · ExtensionRegistry      │
 └───────────────────────────┬──────────────────────────────────┘
@@ -127,8 +158,15 @@ The ontology graph (`GraphId(1)`) is the input to the planned OWL 2 RL reasoner.
 │        memory           │   │  CompactLTJ LOUDS tries         │
 │  Vec + linear scan      │   │  + BTreeMap<u128> LSM delta     │
 │  testing / dev          │   │  + Leapfrog Triejoin            │
-└─────────────────────────┘   └────────────────────────────────┘
+│  (no persistence)       │   │  + WAL/MANIFEST persistence     │
+└─────────────────────────┘   └─────────────┬──────────────────┘
            │                                 │
+           │                   ┌─────────────▼──────────────────┐
+           │                   │ oxigraph-nova-storage-common    │
+           │                   │ WAL + MANIFEST + mmap'd ε-serde │
+           │                   │ dictionary/snapshot persistence │
+           │                   │ (backend-agnostic, reusable)    │
+           │                   └─────────────┬──────────────────┘
            └─────────────────┬───────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────┐
@@ -145,10 +183,12 @@ The ontology graph (`GraphId(1)`) is the input to the planned OWL 2 RL reasoner.
 | `oxigraph-nova-core` | RDF types (re-exports `oxrdf`), `QuadStore` trait, `TrieIterator` trait, `Dictionary` (40-bit `TermId`, 8-bit `GraphId`), error types |
 | `oxigraph-nova-query` | SPARQL 1.2 evaluator, `Dataset` trait, Leapfrog Triejoin (`lftj.rs`), `ExtensionRegistry` |
 | `oxigraph-nova-storage-memory` | In-memory backend — `Vec`-based linear scan; testing and development |
-| `oxigraph-nova-storage-ring` | CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + `BTreeMap<u128>` LSM delta; live-write, persistent storage engine |
+| `oxigraph-nova-storage-common` | Backend-agnostic WAL + MANIFEST + dictionary-persistence machinery, reusable by any `QuadStore` that wants crash-safe durability |
+| `oxigraph-nova-storage-ring` | CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + `BTreeMap<u128>` LSM delta + Leapfrog Triejoin; live-write, WAL-backed persistent storage engine with mmap'd ε-serde snapshot loading |
 | `oxigraph-nova-server` | SPARQL 1.2 HTTP endpoint (`axum`), SPARQL Query/Update, Graph Store Protocol |
 | `oxigraph-nova-w3c-harness` | W3C SPARQL conformance test runner — fetches and caches real W3C manifests (test-only; not published) |
 | `oxigraph-nova-bench` | Criterion benchmarks comparing Ring+LFTJ vs in-memory and vs. other RDF stores (not published) |
+
 
 ---
 
@@ -165,6 +205,10 @@ QLever (C++) is a high-performance RDF store optimized for bulk-loaded static da
 | Full-text + SPARQL | Integrated | Tantivy binding injection (planned) |
 | Reasoning | None | OWL 2 RL reasoning via `reasonable` (planned) |
 | Memory footprint | Six sorted compressed arrays | Single compact Ring (tens of bytes/triple at benchmark scale) |
+| Persistence | On-disk from the start | Optional: in-memory by default, or a crash-safe WAL + MANIFEST + mmap'd ε-serde snapshot store (`--location <dir>`) with near-zero-copy load of both the Ring index and the term dictionary |
+
+Nova runs in two modes. The default is a purely in-process, heap-resident store (matches Oxigraph's own no-`--location` in-memory mode, for apples-to-apples comparisons). Passing `--location <dir>` to `nova_serve` switches to a persistent, crash-recoverable mode: every write is first logged to a write-ahead log, snapshots (Ring + dictionary) are mmap'd back in on restart instead of being fully re-parsed, and a MANIFEST file provides the single atomic commit point tying a snapshot generation to a WAL segment.
+
 
 ---
 
@@ -222,7 +266,8 @@ cargo build
 cargo test
 ```
 
-Requires Rust 1.85+. All dependencies are on `crates.io`; no vendored C++ or patched crates.
+Requires the Rust **nightly** toolchain (pinned via `rust-toolchain.toml`; `rustup` picks it up automatically). All dependencies are on `crates.io`; no vendored C++ or patched crates.
+
 
 To run the full W3C conformance suite (fetches test files on first run, caches locally):
 

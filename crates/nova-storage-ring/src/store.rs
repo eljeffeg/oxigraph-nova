@@ -453,9 +453,12 @@ impl RingStoreInner {
 
                 // 1b. Persist the Dictionary alongside this snapshot
                 //     generation (see `dict_snapshot.rs` module docs for why
-                //     this is required under tail-only WAL replay).
+                //     this is required under tail-only WAL replay). Like the
+                //     Ring snapshot above, the servable dictionary becomes a
+                //     genuine zero-copy `load_mmap`'d view of exactly the
+                //     bytes just written.
                 let dict_path = manifest::dict_path(&dir, new_gen);
-                dict_snapshot::save(&self.dict, &dict_path)?;
+                self.dict = dict_snapshot::write_and_load_mmap(&self.dict, &dict_path)?;
 
                 // 2. Rotate the WAL: new writes land in a fresh empty segment.
 
@@ -600,9 +603,10 @@ impl RingStore {
             // from this snapshot generation BEFORE replaying the WAL tail,
             // so replay's intern() calls only ever append new terms after
             // the snapshot's high-water-mark (see `dict_snapshot.rs` module
-            // docs for why this is required).
+            // docs for why this is required). The compacted tier comes back
+            // as a genuine zero-copy `load_mmap`'d view of the on-disk file.
             let dict_path = manifest::dict_path(dir, m.snapshot_gen);
-            inner.dict = dict_snapshot::load(&dict_path)?;
+            inner.dict = dict_snapshot::load_mmap_from_file(&dict_path)?;
         }
 
         // Discover every WAL segment at or after the MANIFEST's recorded

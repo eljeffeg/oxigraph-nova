@@ -1,19 +1,21 @@
-//! In-memory compacted (immutable) Front-Coded tier for `Dictionary`
+//! Compacted (immutable) Front-Coded tier for `Dictionary`, plus its
+//! persistent, mmap-able on-disk representation.
 //!
 //! ## Design
 //!
 //! Every regular (non-quoted-triple) term present at the moment
-//! [`Dictionary::compact`] runs is sorted by `(tag, primary string)` and
-//! Front-Coded (LCP + suffix) into a single byte buffer, partitioned into
-//! fixed-size blocks (`BLOCK_SIZE` entries each). Each block resets its LCP
-//! chain (first entry of a block always stores its full primary string as
-//! "suffix" with `lcp = 0`), so a block can be decoded independently
-//! without first decoding every earlier block — this bounds decode cost to
-//! O(block_size) instead of O(n).
+//! [`crate::dict::Dictionary::compact`] runs is sorted by `(tag, primary
+//! string)` and Front-Coded (LCP + suffix) into a single byte buffer,
+//! partitioned into fixed-size blocks (`BLOCK_SIZE` entries each). Each block
+//! resets its LCP chain (first entry of a block always stores its full
+//! primary string as "suffix" with `lcp = 0`), so a block can be decoded
+//! independently without first decoding every earlier block — this bounds
+//! decode cost to O(block_size) instead of O(n).
 //!
 //! Two bit-packed permutation arrays (`sux::BitFieldVec`, exactly the
-//! pattern already used for the LOUDS L-array — see `louds.rs`) bridge
-//! insertion-order-stable `TermId`s to sorted ranks within this tier:
+//! pattern already used for the LOUDS L-array — see `louds.rs` in
+//! `nova-storage-ring`) bridge insertion-order-stable `TermId`s to sorted
+//! ranks within this tier:
 //!
 //! - `rank2id[rank]` → original `TermId` (dense, one entry per encoded term).
 //! - `id2rank[id]` → rank (dense over `0..high_water`; **gaps** at
@@ -34,8 +36,32 @@
 //! `orig_id` (the `TermId`) traveling alongside each entry never changes —
 //! only where it sits in the sorted rank space changes, and that
 //! indirection is fully absorbed by `id2rank`/`rank2id`.
+//!
+//! ## Substrate-generic storage (mmap residency)
+//!
+//! [`CompactedTier`] is generic over every variable-length field's backing
+//! storage (`Buf`, `BlockStarts`, `BlockTags`, `KeyFlat`, `KeyOffsets`,
+//! `Rank2Id`, `Id2Rank`), each defaulting to an owned, heap-allocated type
+//! (`Vec<u8>`/`Vec<u32>`/`BitFieldVec`). This "bare generic parameter with a
+//! default" pattern — every field's declared type is literally the bare
+//! generic parameter, never wrapped — is exactly what lets `epserde`'s
+//! `load_mmap` substitute a borrowed, zero-copy `DeserType` field (e.g.
+//! `&[u8]` in place of `Vec<u8>`) with **no additional code**, mirroring the
+//! pattern used throughout `nova-storage-ring`'s `louds.rs`/`cltj.rs`/
+//! `snapshot.rs`.
+//!
+//! The block-keyed binary search previously used a `Vec<(u8, Vec<u8>)>`
+//! (`block_first_keys`) — not directly ε-serde-friendly, since epserde does
+//! not support tuples or `Vec<Vec<u8>>` directly. This is flattened into
+//! three parallel arrays instead, mirroring `SidecarCore`'s
+//! "flatten variable-length payloads into parallel `Vec` + offset arrays"
+//! pattern: `block_tags` (one tag per block), `key_flat` (concatenated
+//! first-key primary-string bytes for every block), and `key_offsets` (the
+//! starting offset of each block's key within `key_flat`; a block's key ends
+//! at the next block's offset, or at `key_flat`'s end for the last block).
 
 use crate::Oxigraph;
+use epserde::Epserde;
 use oxrdf::{BaseDirection, BlankNode, Literal, NamedNode, Term};
 use std::sync::Arc;
 use sux::prelude::*;
@@ -108,8 +134,8 @@ fn bit_width_for(max_val: u64) -> usize {
 
 // ── Term ↔ (tag, primary, aux) ──────────────────────────────────────────────
 //
-// Mirrors `oxigraph-nova-storage-common`'s `dict_snapshot.rs` on-disk codec,
-// minus tag 6 (quoted triples), which never reaches this tier.
+// Mirrors `oxigraph-nova-storage-common`'s (legacy) `dict_snapshot.rs`
+// on-disk codec, minus tag 6 (quoted triples), which never reaches this tier.
 
 pub(crate) fn term_sort_key(term: &Term) -> (u8, Vec<u8>) {
     match term {
@@ -213,24 +239,53 @@ pub(crate) fn term_from_parts(tag: u8, primary: Vec<u8>, aux: &[u8]) -> Result<T
 /// One sorted, Front-Coded, immutable generation of the compacted dictionary
 /// tier, plus the `id2rank`/`rank2id` permutation bridging it to
 /// insertion-order-stable `TermId`s.
-pub(crate) struct CompactedTier {
-    block_size: usize,
+///
+/// Generic over every variable-length field's backing storage — see the
+/// module docs above. All existing callers use the default, fully-owned
+/// instantiation (plain `CompactedTier`); a `load_mmap`'d instantiation
+/// (see [`BorrowedCompactedTier`]) substitutes borrowed slices with zero
+/// code duplication.
+#[derive(Epserde, Clone)]
+pub struct CompactedTier<
+    Buf = Vec<u8>,
+    BlockStarts = Vec<u32>,
+    BlockTags = Vec<u8>,
+    KeyFlat = Vec<u8>,
+    KeyOffsets = Vec<u32>,
+    Rank2Id = BitFieldVec,
+    Id2Rank = BitFieldVec,
+> {
+    pub(crate) block_size: usize,
     /// Number of `TermId` slots this tier's `id2rank` covers (`0..high_water`).
     /// Includes gaps at quoted-triple ids (never populated/read).
-    high_water: u64,
+    pub(crate) high_water: u64,
     /// Number of actual encoded (non-triple) entries — the `rank` domain.
-    encoded_count: u64,
+    pub(crate) encoded_count: u64,
     /// Front-Coded byte buffer, block-partitioned (see module docs).
-    buf: Vec<u8>,
+    pub(crate) buf: Buf,
     /// Byte offset into `buf` where each block starts.
-    block_starts: Vec<u32>,
-    /// `(tag, primary)` sort key of each block's first entry — for binary
-    /// search in [`Self::get_id`].
-    block_first_keys: Vec<(u8, Vec<u8>)>,
+    pub(crate) block_starts: BlockStarts,
+    /// Tag (see `term_sort_key`) of each block's first entry — parallel to
+    /// `key_offsets`, for binary search in [`Self::get_id`].
+    pub(crate) block_tags: BlockTags,
+    /// Concatenated first-key primary-string bytes for every block, in
+    /// block order.
+    pub(crate) key_flat: KeyFlat,
+    /// Starting offset of each block's key within `key_flat`; a block's key
+    /// ends at the next block's offset (or at `key_flat`'s end for the last
+    /// block).
+    pub(crate) key_offsets: KeyOffsets,
     /// `rank2id[rank]` → original `TermId` (dense, len == `encoded_count`).
-    pub(crate) rank2id: BitFieldVec,
+    pub(crate) rank2id: Rank2Id,
     /// `id2rank[id]` → rank (dense over `0..high_water`, gaps at triple ids).
-    pub(crate) id2rank: BitFieldVec,
+    pub(crate) id2rank: Id2Rank,
+    /// Bit width `rank2id` was built with — stored explicitly (rather than
+    /// relying on a generic `BitFieldVec<B>::bit_width()` call) so
+    /// [`Self::mem_size_bytes`] works identically for every substrate
+    /// instantiation without an extra trait bound.
+    pub(crate) rank2id_bit_width: usize,
+    /// Bit width `id2rank` was built with — see `rank2id_bit_width`.
+    pub(crate) id2rank_bit_width: usize,
 }
 
 impl CompactedTier {
@@ -242,9 +297,13 @@ impl CompactedTier {
             encoded_count: 0,
             buf: Vec::new(),
             block_starts: Vec::new(),
-            block_first_keys: Vec::new(),
+            block_tags: Vec::new(),
+            key_flat: Vec::new(),
+            key_offsets: Vec::new(),
             rank2id: BitFieldVec::new(1, 0),
             id2rank: BitFieldVec::new(1, 0),
+            rank2id_bit_width: 1,
+            id2rank_bit_width: 1,
         }
     }
 
@@ -261,14 +320,18 @@ impl CompactedTier {
 
         let mut buf = Vec::new();
         let mut block_starts = Vec::new();
-        let mut block_first_keys = Vec::new();
+        let mut block_tags = Vec::new();
+        let mut key_flat = Vec::new();
+        let mut key_offsets = Vec::new();
         let mut rank2id_vals: Vec<u64> = Vec::with_capacity(entries.len());
 
         for (i, (tag, primary, aux, orig_id)) in entries.iter().enumerate() {
             let in_block_pos = i % block_size;
             if in_block_pos == 0 {
                 block_starts.push(buf.len() as u32);
-                block_first_keys.push((*tag, primary.clone()));
+                block_tags.push(*tag);
+                key_offsets.push(key_flat.len() as u32);
+                key_flat.extend_from_slice(primary);
             }
             let prev_primary: &[u8] = if in_block_pos == 0 {
                 &[]
@@ -309,43 +372,95 @@ impl CompactedTier {
             encoded_count,
             buf,
             block_starts,
-            block_first_keys,
+            block_tags,
+            key_flat,
+            key_offsets,
             rank2id,
             id2rank,
+            rank2id_bit_width: rank2id_bits,
+            id2rank_bit_width: id2rank_bits,
         }
     }
 
+    /// Deep-clone this owned tier — used by [`crate::dict::Dictionary::to_snapshot`]
+    /// to build a persistable snapshot without mutating (or taking
+    /// ownership of) the live `Dictionary`. Cheaper than the byte-buffer
+    /// this replaces had to pay at every save anyway (the legacy on-disk
+    /// codec re-decoded, re-sorted, and re-encoded every term from scratch
+    /// on each `save()` call).
+    pub(crate) fn clone_owned(&self) -> Self {
+        Self {
+            block_size: self.block_size,
+            high_water: self.high_water,
+            encoded_count: self.encoded_count,
+            buf: self.buf.clone(),
+            block_starts: self.block_starts.clone(),
+            block_tags: self.block_tags.clone(),
+            key_flat: self.key_flat.clone(),
+            key_offsets: self.key_offsets.clone(),
+            rank2id: self.rank2id.clone(),
+            id2rank: self.id2rank.clone(),
+            rank2id_bit_width: self.rank2id_bit_width,
+            id2rank_bit_width: self.id2rank_bit_width,
+        }
+    }
+}
+
+impl<Buf, BlockStarts, BlockTags, KeyFlat, KeyOffsets, Rank2Id, Id2Rank>
+    CompactedTier<Buf, BlockStarts, BlockTags, KeyFlat, KeyOffsets, Rank2Id, Id2Rank>
+where
+    Buf: AsRef<[u8]>,
+    BlockStarts: AsRef<[u32]>,
+    BlockTags: AsRef<[u8]>,
+    KeyFlat: AsRef<[u8]>,
+    KeyOffsets: AsRef<[u32]>,
+    Rank2Id: SliceByValue<Value = usize>,
+    Id2Rank: SliceByValue<Value = usize>,
+{
     fn num_blocks(&self) -> usize {
-        self.block_starts.len()
+        self.block_starts.as_ref().len()
     }
 
     /// Decode every entry of block `block_idx` in order:
     /// `(tag, primary, aux)` triples.
     fn decode_block(&self, block_idx: usize) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
-        let start = self.block_starts[block_idx] as usize;
-        let end = self
-            .block_starts
+        let buf = self.buf.as_ref();
+        let block_starts = self.block_starts.as_ref();
+        let start = block_starts[block_idx] as usize;
+        let end = block_starts
             .get(block_idx + 1)
             .map(|&x| x as usize)
-            .unwrap_or(self.buf.len());
+            .unwrap_or(buf.len());
         let mut pos = start;
         let mut prev_primary: Vec<u8> = Vec::new();
         let mut out = Vec::new();
         while pos < end {
-            let lcp = read_varint(&self.buf, &mut pos) as usize;
-            let suffix_len = read_varint(&self.buf, &mut pos) as usize;
+            let lcp = read_varint(buf, &mut pos) as usize;
+            let suffix_len = read_varint(buf, &mut pos) as usize;
             let mut primary = prev_primary[..lcp].to_vec();
-            primary.extend_from_slice(&self.buf[pos..pos + suffix_len]);
+            primary.extend_from_slice(&buf[pos..pos + suffix_len]);
             pos += suffix_len;
-            let tag = self.buf[pos];
+            let tag = buf[pos];
             pos += 1;
-            let aux_len = read_varint(&self.buf, &mut pos) as usize;
-            let aux = self.buf[pos..pos + aux_len].to_vec();
+            let aux_len = read_varint(buf, &mut pos) as usize;
+            let aux = buf[pos..pos + aux_len].to_vec();
             pos += aux_len;
             prev_primary = primary.clone();
             out.push((tag, primary, aux));
         }
         out
+    }
+
+    /// The bytes of block `block_idx`'s first-entry key (in `key_flat`).
+    fn block_key_bytes(&self, block_idx: usize) -> &[u8] {
+        let key_flat = self.key_flat.as_ref();
+        let key_offsets = self.key_offsets.as_ref();
+        let start = key_offsets[block_idx] as usize;
+        let end = key_offsets
+            .get(block_idx + 1)
+            .map(|&x| x as usize)
+            .unwrap_or(key_flat.len());
+        &key_flat[start..end]
     }
 
     /// Binary-search (over block first-keys) + linear block scan for
@@ -358,11 +473,32 @@ impl CompactedTier {
         let aux = term_aux_bytes(term);
         let target = (tag, primary);
 
-        let mut blk = self.block_first_keys.partition_point(|k| *k <= target);
-        blk = blk.saturating_sub(1);
+        let num_blocks = self.num_blocks();
+        let block_tags = self.block_tags.as_ref();
+
+        // Equivalent to the pre-refactor
+        // `block_first_keys.partition_point(|k| *k <= target)` over a
+        // `Vec<(u8, Vec<u8>)>`, but reading the parallel
+        // `block_tags`/`key_flat`/`key_offsets` arrays instead of a single
+        // tuple-Vec (which epserde cannot serialize directly).
+        let mut lo = 0usize;
+        let mut hi = num_blocks;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let mid_tag = block_tags[mid];
+            let mid_key = self.block_key_bytes(mid);
+            let is_le =
+                mid_tag < target.0 || (mid_tag == target.0 && mid_key <= target.1.as_slice());
+            if is_le {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let blk = lo.saturating_sub(1);
 
         let mut rank = blk * self.block_size;
-        for b in blk..self.num_blocks() {
+        for b in blk..num_blocks {
             let decoded = self.decode_block(b);
             for (t, p, a) in decoded {
                 let key = (t, p);
@@ -427,24 +563,275 @@ impl CompactedTier {
     }
 
     /// Real allocated byte size — buffer + block index + bit-packed
-    /// permutation arrays.
+    /// permutation arrays. Uses the explicitly-stored `encoded_count`/
+    /// `high_water`/`*_bit_width` fields (rather than a generic
+    /// `BitFieldVec<B>` API call) so this works identically for the owned
+    /// and borrowed/mmap'd substrate instantiations.
     pub(crate) fn mem_size_bytes(&self) -> usize {
-        use std::mem::size_of;
-        let buf_bytes = self.buf.len();
-        let block_starts_bytes = self.block_starts.len() * size_of::<u32>();
-        let block_first_keys_bytes: usize = self
-            .block_first_keys
-            .iter()
-            .map(|(_, p)| size_of::<u8>() + size_of::<Vec<u8>>() + p.len())
-            .sum();
-        // BitFieldVec stores `len * bit_width` bits, rounded up to words.
-        let rank2id_bytes = self.rank2id.len().div_ceil(8) * self.rank2id.bit_width() / 8 + 8;
-        let id2rank_bytes = self.id2rank.len().div_ceil(8) * self.id2rank.bit_width() / 8 + 8;
-        buf_bytes + block_starts_bytes + block_first_keys_bytes + rank2id_bytes + id2rank_bytes
+        let buf_bytes = self.buf.as_ref().len();
+        let block_starts_bytes = std::mem::size_of_val(self.block_starts.as_ref());
+        let block_tags_bytes = self.block_tags.as_ref().len();
+        let key_flat_bytes = self.key_flat.as_ref().len();
+        let key_offsets_bytes = std::mem::size_of_val(self.key_offsets.as_ref());
+
+        let rank2id_bytes =
+            (self.encoded_count as usize).div_ceil(8) * self.rank2id_bit_width / 8 + 8;
+        let id2rank_bytes = (self.high_water as usize).div_ceil(8) * self.id2rank_bit_width / 8 + 8;
+        buf_bytes
+            + block_starts_bytes
+            + block_tags_bytes
+            + key_flat_bytes
+            + key_offsets_bytes
+            + rank2id_bytes
+            + id2rank_bytes
     }
 
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.encoded_count == 0
+    }
+}
+
+// ── Borrowed substrate ─────────────────────────────────────────────────────
+//
+// Concrete types that ε-serde's `DeserType<CompactedTier>` resolves to when
+// loaded via `load_mmap` — determined empirically (mirroring the approach
+// documented in `nova-storage-ring`'s `louds.rs`), by compiling this crate
+// against a real `load_mmap`'d value and reading off the "found" type from
+// any resulting mismatch. The `'static` lifetime here is a documented lie —
+// soundness is established structurally by [`MappedCompactedTier`], which
+// keeps the backing `Arc<epserde::deser::MemCase<DictSnapshot>>` alive for as
+// long as any borrowed field derived from it is reachable.
+pub(crate) type BorrowedBuf = &'static [u8];
+pub(crate) type BorrowedBlockStarts = &'static [u32];
+pub(crate) type BorrowedBlockTags = &'static [u8];
+pub(crate) type BorrowedKeyFlat = &'static [u8];
+pub(crate) type BorrowedKeyOffsets = &'static [u32];
+pub(crate) type BorrowedRank2Id = BitFieldVec<&'static [usize]>;
+pub(crate) type BorrowedId2Rank = BitFieldVec<&'static [usize]>;
+
+/// Borrowed/mmap'd instantiation of [`CompactedTier`] — zero-copy, all
+/// variable-length fields borrowed slices tied to a `MemCase`'s mapped
+/// memory. Satisfies the generic navigation `impl` block above via the same
+/// `AsRef<[_]>`/`SliceByValue` bounds the owned form uses — no extra trait
+/// implementation required.
+pub(crate) type BorrowedCompactedTier = CompactedTier<
+    BorrowedBuf,
+    BorrowedBlockStarts,
+    BorrowedBlockTags,
+    BorrowedKeyFlat,
+    BorrowedKeyOffsets,
+    BorrowedRank2Id,
+    BorrowedId2Rank,
+>;
+
+// ── DictSnapshot ─────────────────────────────────────────────────────────────
+
+/// ε-serde-serializable snapshot of a whole [`crate::dict::Dictionary`]:
+/// the compacted Front-Coded tier (see [`CompactedTier`]) plus every
+/// quoted-triple term (never covered by the compacted tier — see module
+/// docs) and the graph table.
+///
+/// This is the persistent on-disk representation — see
+/// `oxigraph_nova_storage_common::dict_snapshot`'s `write_and_load_mmap`/
+/// `load_mmap_from_file`, and [`crate::dict::Dictionary::to_snapshot`]/
+/// [`crate::dict::Dictionary::from_mapped`].
+///
+/// Quoted-triple terms are persisted as just their three component
+/// `TermId`s (`triple_ids`/`triple_s`/`triple_p`/`triple_o`, parallel
+/// arrays in ascending-id order) rather than any encoded `Term` bytes —
+/// intern() always recursively interns a quoted triple's components
+/// *before* the triple itself, so every component is guaranteed to already
+/// be reconstructible (either from the compacted tier, or from an
+/// earlier-processed nested quoted triple) by the time
+/// [`crate::dict::Dictionary::from_mapped`] processes it.
+///
+/// The graph table is similarly flattened: `graph_ids` (one `GraphId` per
+/// entry) plus `graph_kinds` (0=NamedNode, 1=BlankNode, 2=DefaultGraph) and
+/// a `graph_str_flat`/`graph_str_offsets` pair (concatenated IRI/blank-node
+/// identifier bytes, empty for `DefaultGraph`) — the same
+/// flatten-into-parallel-arrays pattern used for the compacted tier's block
+/// keys, since epserde has no direct `HashMap`/tuple/`GraphName` support.
+///
+/// Generic over `Compacted` (default [`CompactedTier`]) so that a
+/// `load_mmap`'d view substitutes the borrowed [`BorrowedCompactedTier`]
+/// form here with **zero extra code** — mirrors the "bare generic parameter
+/// with a default" pattern used throughout `nova-storage-ring`.
+#[derive(Epserde)]
+pub struct DictSnapshot<Compacted = CompactedTier> {
+    pub(crate) next_graph_id: u8,
+    pub(crate) compacted: Compacted,
+    pub(crate) triple_ids: Vec<u64>,
+    pub(crate) triple_s: Vec<u64>,
+    pub(crate) triple_p: Vec<u64>,
+    pub(crate) triple_o: Vec<u64>,
+    pub(crate) graph_ids: Vec<u8>,
+    pub(crate) graph_kinds: Vec<u8>,
+    pub(crate) graph_str_flat: Vec<u8>,
+    pub(crate) graph_str_offsets: Vec<u32>,
+}
+
+// ── CompactedTierHandle ──────────────────────────────────────────────────────
+
+/// A compacted-tier handle that is either the owned in-memory form (built
+/// directly by [`CompactedTier::build`]) or a zero-copy `load_mmap`'d form
+/// (installed after `Dictionary::from_mapped` reconstructs a persistent
+/// store's dictionary from disk).
+///
+/// Mirrors `oxigraph_nova_storage_ring::ring::GraphRingHandle` exactly: both
+/// variants expose the same read-only method surface (`CompactedTier<...>`'s
+/// inherent methods are already generic over the backing substrate — see the
+/// `impl<Buf, ...>` block above), so every method here is a one-line match
+/// delegating to whichever concrete instantiation is present.
+pub(crate) enum CompactedTierHandle {
+    Owned(Box<CompactedTier>),
+    Mapped(Arc<MappedCompactedTier>),
+}
+
+impl CompactedTierHandle {
+    pub(crate) fn get_id(&self, term: &Term) -> Option<u64> {
+        match self {
+            CompactedTierHandle::Owned(t) => t.get_id(term),
+            CompactedTierHandle::Mapped(m) => m.tier().get_id(term),
+        }
+    }
+
+    pub(crate) fn decode_id(&self, id: u64) -> Option<Result<Arc<Term>, Oxigraph>> {
+        match self {
+            CompactedTierHandle::Owned(t) => t.decode_id(id),
+            CompactedTierHandle::Mapped(m) => m.tier().decode_id(id),
+        }
+    }
+
+    pub(crate) fn decode_block_for_id(
+        &self,
+        id: u64,
+    ) -> Option<Vec<(u64, Result<Arc<Term>, Oxigraph>)>> {
+        match self {
+            CompactedTierHandle::Owned(t) => t.decode_block_for_id(id),
+            CompactedTierHandle::Mapped(m) => m.tier().decode_block_for_id(id),
+        }
+    }
+
+    pub(crate) fn mem_size_bytes(&self) -> usize {
+        match self {
+            CompactedTierHandle::Owned(t) => t.mem_size_bytes(),
+            CompactedTierHandle::Mapped(m) => m.tier().mem_size_bytes(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            CompactedTierHandle::Owned(t) => t.is_empty(),
+            CompactedTierHandle::Mapped(m) => m.tier().is_empty(),
+        }
+    }
+
+    /// Test-only accessor for directly inspecting the owned tier's
+    /// permutation arrays (see `dict.rs`'s `#[cfg(test)]` module). Panics if
+    /// this handle is `Mapped` (never the case in these tests, since they
+    /// never go through `Dictionary::from_mapped`).
+    #[cfg(test)]
+    pub(crate) fn expect_owned(&self) -> &CompactedTier {
+        match self {
+            CompactedTierHandle::Owned(t) => t,
+            CompactedTierHandle::Mapped(_) => panic!("expected an Owned compacted tier"),
+        }
+    }
+}
+
+/// Owns the mmap'd backing memory for a dictionary's zero-copy
+/// `CompactedTier` and exposes it only through a private field + accessor,
+/// so the `MemCase`-outlives-tier invariant is enforced **structurally**
+/// rather than by caller convention.
+///
+/// Mirrors `oxigraph_nova_storage_ring::ring::MappedGraphRing` exactly — see
+/// its doc comment for the full safety rationale (self-referential mmap
+/// pattern, `'static` lifetime lies erased via `unsafe` transmutes, and why
+/// a private field + single accessor is what makes the invariant structural
+/// instead of documentation-only).
+///
+/// SAFETY (binding contract for [`MappedCompactedTier::new`], the sole place
+/// that constructs a [`BorrowedCompactedTier`]):
+/// 1. The only unsafe operations in this reconstruction path are lifetime
+///    extensions (`transmute`/`transmute_copy`) on borrowed slices/
+///    `BitFieldVec`s that already point into `mem`'s mapped memory — no
+///    unsafe type-punning transmute is used.
+/// 2. Soundness depends entirely on this struct owning/cloning the
+///    `Arc<epserde::deser::MemCase<DictSnapshot>>` that backs the mmap'd
+///    memory `tier`'s borrowed fields point into, and never releasing that
+///    `Arc` before `tier` itself is dropped.
+/// 3. The `tier` field **must remain private** — if made `pub`/`pub(crate)`,
+///    a caller could move it out of `self`, decoupling its borrowed
+///    lifetime from `_mem`'s.
+pub(crate) struct MappedCompactedTier {
+    /// Kept alive for as long as `tier`'s borrowed fields are reachable —
+    /// see the SAFETY contract above. Never accessed directly.
+    _mem: Arc<epserde::deser::MemCase<DictSnapshot>>,
+    /// Private — see SAFETY contract point 3 above.
+    tier: BorrowedCompactedTier,
+}
+
+impl MappedCompactedTier {
+    /// Construct a `MappedCompactedTier` from a `load_mmap`'d
+    /// [`DictSnapshot`].
+    ///
+    /// `mem` must be the same `Arc` (or a clone of it) that the caller keeps
+    /// alive for the lifetime of the whole store's mmap'd generation — see
+    /// this struct's SAFETY contract above.
+    pub(crate) fn new(mem: Arc<epserde::deser::MemCase<DictSnapshot>>) -> Self {
+        let view = mem.uncase();
+        let c = &view.compacted;
+
+        // SAFETY: see the type-level doc comment above — every borrowed
+        // field here points into the same `MemCase` mapped memory that the
+        // caller is required to keep alive for as long as this
+        // `MappedCompactedTier` is reachable. `buf`/`block_starts`/
+        // `block_tags`/`key_flat`/`key_offsets` are genuinely borrowed
+        // slices (`Copy`), so the transmutes below are lifetime-only
+        // extensions, not type-punning casts. `rank2id`/`id2rank` are
+        // `BitFieldVec<&[usize]>` values (pointer + length + bit-width
+        // metadata, no owned heap allocation) — `transmute_copy` performs a
+        // cheap bitwise copy of that value out of the `&view.compacted`
+        // borrow, exactly mirroring `GraphRing::from_mapped`'s `tries`
+        // field handling in `nova-storage-ring`'s `ring.rs`.
+        let buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(c.buf) };
+        let block_starts: &'static [u32] =
+            unsafe { std::mem::transmute::<&[u32], &'static [u32]>(c.block_starts) };
+        let block_tags: &'static [u8] =
+            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(c.block_tags) };
+        let key_flat: &'static [u8] =
+            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(c.key_flat) };
+        let key_offsets: &'static [u32] =
+            unsafe { std::mem::transmute::<&[u32], &'static [u32]>(c.key_offsets) };
+        let rank2id: BitFieldVec<&'static [usize]> =
+            unsafe { std::mem::transmute_copy(&c.rank2id) };
+        let id2rank: BitFieldVec<&'static [usize]> =
+            unsafe { std::mem::transmute_copy(&c.id2rank) };
+
+        let tier = CompactedTier {
+            block_size: c.block_size,
+            high_water: c.high_water,
+            encoded_count: c.encoded_count,
+            buf,
+            block_starts,
+            block_tags,
+            key_flat,
+            key_offsets,
+            rank2id,
+            id2rank,
+            rank2id_bit_width: c.rank2id_bit_width,
+            id2rank_bit_width: c.id2rank_bit_width,
+        };
+
+        MappedCompactedTier { _mem: mem, tier }
+    }
+
+    /// Borrow the navigable, zero-copy tier. This is the *only* way to
+    /// reach `tier` from outside this module — see SAFETY contract point 3
+    /// on the struct doc comment above.
+    pub(crate) fn tier(&self) -> &BorrowedCompactedTier {
+        &self.tier
     }
 }

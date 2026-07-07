@@ -28,15 +28,20 @@
 //!
 //! `Dictionary` is a two-tier structure:
 //!
-//! - **Delta tier** (mutable): `id_to_term: Vec<Option<Arc<Term>>>` +
-//!   `term_to_id: HashMap<Arc<Term>, TermId>`, exactly as before — every
-//!   term interned since the last [`Dictionary::compact`], plus every
-//!   quoted-triple term (which never leaves this tier).
+//! - **Delta tier** (mutable, always heap-resident): `id_to_term:
+//!   Vec<Option<Arc<Term>>>` + `term_to_id: HashMap<Arc<Term>, TermId>` —
+//!   every term interned since the last [`Dictionary::compact`], plus every
+//!   quoted-triple term (which never leaves this tier — see below).
 //! - **Compacted tier** (immutable): a sorted, Front-Coded byte buffer (see
 //!   [`crate::dict_compact::CompactedTier`]) covering every *regular*
 //!   (non-quoted-triple) term as of the last `compact()`. `TermId`s are
 //!   never reassigned — only an internal sorted-rank permutation
-//!   (`id2rank`/`rank2id`, bit-packed via `sux::BitFieldVec`) changes.
+//!   (`id2rank`/`rank2id`, bit-packed via `sux::BitFieldVec`) changes. This
+//!   tier is held behind a [`crate::dict_compact::CompactedTierHandle`],
+//!   which is either a freshly-built owned buffer, or a zero-copy
+//!   `load_mmap`'d view straight off the `nova.dict.<gen>` file (see
+//!   [`Dictionary::from_mapped`]) — both forms expose the identical
+//!   read-only method surface.
 //!
 //! `compact()` merges both tiers into a brand new compacted tier, then
 //! **frees** every compacted regular term's `Arc<Term>` from both
@@ -46,17 +51,21 @@
 //! `TermId → Arc<Term>` LRU cache first so that repeatedly-matched terms
 //! (e.g. a hot predicate or object) avoid paying the Front-Coded block
 //! decode cost on every lookup. The cache is cleared on every `compact()`
-//! call, since ranks and block offsets shift.
+//! call, since ranks and block offsets shift. The decode cache — like the
+//! delta tier — always stays heap-resident: both are small and bounded by
+//! design, so there is no benefit to mapping them.
 //!
 //! `get_term`'s old `-> Option<&Term>` signature could not survive this
-
 //! (a borrowed reference cannot be produced for content that isn't
 //! resident) — it has been removed in favor of `get_term_arc` (which was
 //! already the primary hot-path accessor for exactly this reason).
 
 use crate::Oxigraph;
-use crate::dict_compact::{self, CompactedTier};
-use oxrdf::{GraphName, NamedNode, Term};
+use crate::dict_compact::{
+    self, CompactedTier, CompactedTierHandle, DictSnapshot, MappedCompactedTier,
+};
+use epserde::deser::MemCase;
+use oxrdf::{BlankNode, GraphName, NamedNode, Term};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -168,12 +177,13 @@ pub struct Dictionary {
 
     // ── Compacted tier (immutable, Front-Coded) ────────────────────────────
     /// Sorted, Front-Coded byte buffer + `id2rank`/`rank2id` permutation for
-    /// every regular term as of the last `compact()`. Starts empty.
-    compacted: CompactedTier,
+    /// every regular term as of the last `compact()` — either an owned,
+    /// freshly-built buffer, or a zero-copy `load_mmap`'d view (see
+    /// [`Dictionary::from_mapped`]). Starts as an empty owned tier.
+    compacted: CompactedTierHandle,
 
     /// `TermId → Arc<Term>` decode cache for compacted-tier terms.
     /// Avoids re-parsing an entire Front-Coded block on every lookup for
-
     /// hot terms (e.g. a repeated `rdf:type` object matched by thousands of
     /// LFTJ rows). `RefCell`-wrapped since `get_term_arc` takes `&self` —
     /// safe because `Dictionary` is always accessed through the single
@@ -209,7 +219,7 @@ impl Dictionary {
         let mut d = Self {
             id_to_term: Vec::new(),
             term_to_id: HashMap::new(),
-            compacted: CompactedTier::empty(),
+            compacted: CompactedTierHandle::Owned(Box::new(CompactedTier::empty())),
             decode_cache: RefCell::new(lru::LruCache::new(
                 NonZeroUsize::new(DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
             )),
@@ -475,16 +485,13 @@ impl Dictionary {
         self.id_to_graph.iter().map(|(&raw, g)| (GraphId(raw), g))
     }
 
-    /// The next available user `GraphId` (range `2..=254`). Exposed for
-    /// on-disk `Dictionary` persistence (see `oxigraph_nova_storage_ring`'s
-    /// `dict_snapshot` module).
+    /// The next available user `GraphId` (range `2..=254`).
     pub fn next_graph_id_raw(&self) -> u8 {
         self.next_graph_id
     }
 
     /// All interned terms in `TermId` order (index == `TermId::as_u64()`),
-    /// decoding compacted-tier entries on the fly. Exposed for on-disk
-    /// `Dictionary` persistence.
+    /// decoding compacted-tier entries on the fly.
     pub fn terms_in_order(&self) -> impl Iterator<Item = Term> + '_ {
         (0..self.id_to_term.len() as u64).map(move |raw_id| {
             match &self.id_to_term[raw_id as usize] {
@@ -547,7 +554,8 @@ impl Dictionary {
             }
         }
 
-        self.compacted = new_compacted;
+        self.compacted = CompactedTierHandle::Owned(Box::new(new_compacted));
+
         // Ranks/block offsets shift on every compaction — any previously
         // cached decode results may point at stale offsets, so drop them
         // all rather than trying to selectively invalidate.
@@ -559,19 +567,14 @@ impl Dictionary {
     /// exactly (by insertion order in `terms`) and `GraphId`s exactly (via
     /// `graphs`).
     ///
-    /// Used by [`crate::store`]-adjacent persistence code (in
-    /// `oxigraph_nova_storage_ring`) to reconstruct the exact `Dictionary`
-    /// that was in effect when a snapshot was written, so that further WAL
-    /// replay (which uses `intern()`, appending new terms after whatever's
-    /// already present) continues assigning IDs correctly instead of
-    /// colliding with the snapshot's embedded IDs.
+    /// Legacy full-heap-copy reconstruction path (predates
+    /// [`Dictionary::from_mapped`]'s direct compacted-tier mmap
+    /// reconstruction). Retained for any caller that has a plain `Vec<Term>`
+    /// in hand rather than a `DictSnapshot`.
     ///
     /// The rebuilt `Dictionary` always starts with an empty compacted
     /// tier — every term is delta-tier-resident — regardless of whether
-    /// the source `Dictionary` had compacted terms at save time (the
-    /// two-tier structure is in-memory only; the on-disk format is
-    ///
-    /// unaffected, see `dict_snapshot.rs`'s module docs). The next
+    /// the source `Dictionary` had compacted terms at save time. The next
     /// `compact()` call re-establishes the compacted tier.
     ///
     /// Quoted-triple (`Term::Triple`) side tables (`triple_terms`/
@@ -589,7 +592,7 @@ impl Dictionary {
         let mut d = Self {
             id_to_term: Vec::with_capacity(terms.len()),
             term_to_id: HashMap::with_capacity(terms.len()),
-            compacted: CompactedTier::empty(),
+            compacted: CompactedTierHandle::Owned(Box::new(CompactedTier::empty())),
             decode_cache: RefCell::new(lru::LruCache::new(
                 NonZeroUsize::new(DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
             )),
@@ -638,6 +641,246 @@ impl Dictionary {
         d.id_to_graph.entry(0).or_insert(GraphName::DefaultGraph);
 
         Ok(d)
+    }
+
+    // ── mmap-based persistence (Phase 4: dictionary residency) ─────────────
+
+    /// Build an ε-serde-serializable [`DictSnapshot`] of this dictionary's
+    /// current state.
+    ///
+    /// Requires that `self.compacted` currently holds a freshly-built
+    /// **owned** tier (true immediately after [`Self::compact`] — the exact
+    /// call sequence `RingStore::commit_compaction` always uses: `dict.compact()`
+    /// then persist); panics otherwise, mirroring the "Arc is shared"
+    /// panics used by the analogous `into_snapshot` methods in
+    /// `oxigraph_nova_storage_ring`.
+    ///
+    /// Quoted-triple terms (never covered by the compacted tier) are
+    /// persisted as just their three component `TermId`s, sorted ascending
+    /// by the triple's own `TermId` — sufficient for
+    /// [`Self::from_mapped`] to reconstruct every quoted triple's full
+    /// `Term::Triple` value, since a triple's component ids are always
+    /// smaller than its own id (`intern` always interns components first).
+    pub fn to_snapshot(&self) -> DictSnapshot {
+        let compacted = match &self.compacted {
+            CompactedTierHandle::Owned(t) => t.clone_owned(),
+            CompactedTierHandle::Mapped(_) => panic!(
+                "Dictionary::to_snapshot: compacted tier is Mapped, not Owned — \
+                 caller must call Dictionary::compact() immediately before persisting"
+            ),
+        };
+
+        let mut triples: Vec<(u64, [u64; 3])> = self
+            .triple_terms
+            .iter()
+            .map(|(&id, &components)| {
+                (
+                    id.as_u64(),
+                    [
+                        components[0].as_u64(),
+                        components[1].as_u64(),
+                        components[2].as_u64(),
+                    ],
+                )
+            })
+            .collect();
+        triples.sort_unstable_by_key(|&(id, _)| id);
+
+        let mut triple_ids = Vec::with_capacity(triples.len());
+        let mut triple_s = Vec::with_capacity(triples.len());
+        let mut triple_p = Vec::with_capacity(triples.len());
+        let mut triple_o = Vec::with_capacity(triples.len());
+        for (id, [s, p, o]) in triples {
+            triple_ids.push(id);
+            triple_s.push(s);
+            triple_p.push(p);
+            triple_o.push(o);
+        }
+
+        let mut graph_ids = Vec::new();
+        let mut graph_kinds = Vec::new();
+        let mut graph_str_flat: Vec<u8> = Vec::new();
+        let mut graph_str_offsets = Vec::new();
+        for (gid, gname) in self.all_graphs() {
+            graph_ids.push(gid.as_u8());
+            graph_str_offsets.push(graph_str_flat.len() as u32);
+            match gname {
+                GraphName::DefaultGraph => graph_kinds.push(2u8),
+                GraphName::NamedNode(n) => {
+                    graph_kinds.push(0u8);
+                    graph_str_flat.extend_from_slice(n.as_str().as_bytes());
+                }
+                GraphName::BlankNode(b) => {
+                    graph_kinds.push(1u8);
+                    graph_str_flat.extend_from_slice(b.as_str().as_bytes());
+                }
+            }
+        }
+
+        DictSnapshot {
+            next_graph_id: self.next_graph_id,
+            compacted,
+            triple_ids,
+            triple_s,
+            triple_p,
+            triple_o,
+            graph_ids,
+            graph_kinds,
+            graph_str_flat,
+            graph_str_offsets,
+        }
+    }
+
+    /// Reconstruct a `Dictionary` directly from a `load_mmap`'d
+    /// [`DictSnapshot`] — the compacted Front-Coded tier stays a genuine
+    /// zero-copy view of the mmap'd `nova.dict.<gen>` file (via
+    /// [`MappedCompactedTier`]); only the small delta-tier-equivalent state
+    /// (quoted triples + the graph table) is copied into owned, heap-
+    /// resident structures, exactly mirroring the design already used for
+    /// the Ring index's `GraphRingHandle`/`MappedGraphRing`.
+    ///
+    /// `TermId`s are preserved exactly (the compacted tier's own
+    /// `id2rank`/`rank2id` arrays already encode the original insertion
+    /// order), so WAL-tail replay's `intern()` calls continue appending new
+    /// terms strictly after this snapshot's high-water-mark, same as the
+    /// legacy [`Self::rebuild`] path guaranteed.
+    pub fn from_mapped(mem: Arc<MemCase<DictSnapshot>>) -> Result<Self, Oxigraph> {
+        let view = mem.uncase();
+        let next_graph_id = view.next_graph_id;
+        let high_water = view.compacted.high_water;
+
+        // Small, bounded parallel arrays — copied into owned `Vec`s (cheap:
+        // one entry per quoted triple / per graph, never per regular term).
+        let triple_ids: Vec<u64> = view.triple_ids.to_vec();
+        let triple_s: Vec<u64> = view.triple_s.to_vec();
+        let triple_p: Vec<u64> = view.triple_p.to_vec();
+        let triple_o: Vec<u64> = view.triple_o.to_vec();
+        let graph_ids: Vec<u8> = view.graph_ids.to_vec();
+        let graph_kinds: Vec<u8> = view.graph_kinds.to_vec();
+        let graph_str_flat: Vec<u8> = view.graph_str_flat.to_vec();
+        let graph_str_offsets: Vec<u32> = view.graph_str_offsets.to_vec();
+
+        let compacted =
+            CompactedTierHandle::Mapped(Arc::new(MappedCompactedTier::new(Arc::clone(&mem))));
+
+        let mut id_to_term: Vec<Option<Arc<Term>>> = vec![None; high_water as usize];
+        let mut term_to_id: HashMap<Arc<Term>, TermId> = HashMap::new();
+        let mut triple_terms: HashMap<TermId, [TermId; 3]> = HashMap::new();
+        let mut triple_index: HashMap<[TermId; 3], TermId> = HashMap::new();
+
+        // Reconstruct every quoted triple in ascending-id order. Each
+        // triple's component ids are guaranteed to already be decodable at
+        // this point — either directly from the compacted tier (regular
+        // terms), or from an earlier iteration of this very loop (nested
+        // quoted triples) — since `intern()` always interns a triple's
+        // components before the triple itself, so component ids are always
+        // strictly smaller than the enclosing triple's id.
+        for i in 0..triple_ids.len() {
+            let tid_raw = triple_ids[i];
+            let s_raw = triple_s[i];
+            let p_raw = triple_p[i];
+            let o_raw = triple_o[i];
+
+            let decode_component =
+                |raw_id: u64, id_to_term: &[Option<Arc<Term>>]| -> Result<Arc<Term>, Oxigraph> {
+                    if let Some(Some(arc)) = id_to_term.get(raw_id as usize) {
+                        return Ok(Arc::clone(arc));
+                    }
+                    compacted.decode_id(raw_id).ok_or_else(|| {
+                        Oxigraph::Storage(format!(
+                            "dict snapshot: quoted-triple component id {raw_id} \
+                             not found in compacted tier or prior reconstruction"
+                        ))
+                    })?
+                };
+
+            let s_term = decode_component(s_raw, &id_to_term)?;
+            let p_term = decode_component(p_raw, &id_to_term)?;
+            let o_term = decode_component(o_raw, &id_to_term)?;
+
+            let subject = match s_term.as_ref() {
+                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n.clone()),
+                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b.clone()),
+                other => {
+                    return Err(Oxigraph::Storage(format!(
+                        "dict snapshot: quoted-triple subject decoded to non-subject term {other:?}"
+                    )));
+                }
+            };
+            let predicate = match p_term.as_ref() {
+                Term::NamedNode(n) => n.clone(),
+                other => {
+                    return Err(Oxigraph::Storage(format!(
+                        "dict snapshot: quoted-triple predicate decoded to non-IRI term {other:?}"
+                    )));
+                }
+            };
+            let object = o_term.as_ref().clone();
+
+            let triple_term = Term::Triple(Box::new(oxrdf::Triple {
+                subject,
+                predicate,
+                object,
+            }));
+
+            let tid = TermId::new(tid_raw)?;
+            let s_id = TermId::new(s_raw)?;
+            let p_id = TermId::new(p_raw)?;
+            let o_id = TermId::new(o_raw)?;
+            let components = [s_id, p_id, o_id];
+
+            let arc = Arc::new(triple_term);
+            id_to_term[tid_raw as usize] = Some(Arc::clone(&arc));
+            term_to_id.insert(arc, tid);
+            triple_terms.insert(tid, components);
+            triple_index.insert(components, tid);
+        }
+
+        let mut graph_to_id: HashMap<GraphName, GraphId> = HashMap::new();
+        let mut id_to_graph: HashMap<u8, GraphName> = HashMap::new();
+        for i in 0..graph_ids.len() {
+            let gid = graph_ids[i];
+            let kind = graph_kinds[i];
+            let start = graph_str_offsets[i] as usize;
+            let end = graph_str_offsets
+                .get(i + 1)
+                .map(|&x| x as usize)
+                .unwrap_or(graph_str_flat.len());
+            let s = std::str::from_utf8(&graph_str_flat[start..end])
+                .map_err(|e| Oxigraph::Storage(format!("dict snapshot: invalid utf8: {e}")))?
+                .to_string();
+            let gname = match kind {
+                0 => GraphName::NamedNode(NamedNode::new_unchecked(s)),
+                1 => GraphName::BlankNode(BlankNode::new_unchecked(s)),
+                2 => GraphName::DefaultGraph,
+                other => {
+                    return Err(Oxigraph::Storage(format!(
+                        "dict snapshot: unknown graph kind {other}"
+                    )));
+                }
+            };
+            graph_to_id.insert(gname.clone(), GraphId(gid));
+            id_to_graph.insert(gid, gname);
+        }
+        // Defensive: ensure the default graph is always present.
+        graph_to_id
+            .entry(GraphName::DefaultGraph)
+            .or_insert(GRAPH_DEFAULT);
+        id_to_graph.entry(0).or_insert(GraphName::DefaultGraph);
+
+        Ok(Self {
+            id_to_term,
+            term_to_id,
+            compacted,
+            decode_cache: RefCell::new(lru::LruCache::new(
+                NonZeroUsize::new(DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
+            )),
+            graph_to_id,
+            id_to_graph,
+            next_graph_id,
+            triple_terms,
+            triple_index,
+        })
     }
 
     // ── u128 quad key packing ─────────────────────────────────────────────────
@@ -821,13 +1064,14 @@ mod tests {
 
             // rank2id[id2rank[id]] == id for every non-quoted-triple id.
             let high_water = d.id_to_term.len() as u64;
+            let owned = d.compacted.expect_owned();
             for raw_id in 0..high_water {
                 let tid = TermId(raw_id);
                 if d.triple_terms.contains_key(&tid) {
                     continue;
                 }
-                let rank = d.compacted.id2rank.index_value(raw_id as usize);
-                let back = d.compacted.rank2id.index_value(rank);
+                let rank = owned.id2rank.index_value(raw_id as usize);
+                let back = owned.rank2id.index_value(rank);
                 assert_eq!(
                     back as u64, raw_id,
                     "rank2id[id2rank[id]] must equal id after compaction round {round}"
@@ -848,9 +1092,10 @@ mod tests {
         }
         d.compact().unwrap();
         let high_water = d.id_to_term.len() as u64;
+        let owned = d.compacted.expect_owned();
         for raw_id in 0..high_water {
-            let rank = d.compacted.id2rank.index_value(raw_id as usize);
-            let back = d.compacted.rank2id.index_value(rank);
+            let rank = owned.id2rank.index_value(raw_id as usize);
+            let back = owned.rank2id.index_value(rank);
             assert_eq!(back as u64, raw_id);
         }
 
@@ -985,5 +1230,116 @@ mod tests {
 
         assert_eq!(d.get_id(&triple_term), Some(triple_id));
         assert_eq!(d.get_term_arc(triple_id).as_deref(), Some(&triple_term));
+    }
+
+    // ── mmap snapshot round-trip tests ──────────────────────────────────
+
+    /// Real `load_mmap` round-trip of a `to_snapshot()`-produced
+    /// `DictSnapshot`, reconstructed via `from_mapped`, verifying every
+    /// term/graph/quoted-triple survives byte-identically.
+    #[test]
+    fn dict_snapshot_mmap_round_trip() {
+        use epserde::deser::{Deserialize, Flags};
+        use epserde::ser::Serialize;
+
+        let mut d = Dictionary::new();
+        let mut ids = Vec::new();
+        let terms: Vec<Term> = (0..40)
+            .map(|i| nn(&format!("http://example.org/mmap/{i}")))
+            .chain((0..10).map(|i| lit(&format!("mmap-literal-{i}"))))
+            .collect();
+        for t in &terms {
+            ids.push(d.intern(t).unwrap());
+        }
+        let g = GraphName::NamedNode(NamedNode::new_unchecked("http://ex/g"));
+        let gid = d.intern_graph(&g).unwrap();
+
+        // Quoted triple, referencing already-interned components.
+        let s = nn("http://example.org/mmap/0");
+        let p = NamedNode::new_unchecked("http://ex/p");
+        let o = lit("mmap-literal-0");
+        let triple_term = Term::Triple(Box::new(oxrdf::Triple {
+            subject: oxrdf::NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(
+                "http://example.org/mmap/0",
+            )),
+            predicate: p.clone(),
+            object: o.clone(),
+        }));
+        d.intern(&Term::NamedNode(p)).unwrap();
+        let triple_id = d.intern(&triple_term).unwrap();
+        let _ = s;
+
+        d.compact().unwrap();
+
+        let snap = d.to_snapshot();
+        let mut buf: Vec<u8> = Vec::new();
+        unsafe {
+            snap.serialize(&mut buf).expect("serialize DictSnapshot");
+        }
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("nova_dict_mmap_test_{pid}_{n}.dict"));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, &buf).expect("write temp dict snapshot");
+
+        let mem = std::sync::Arc::new(unsafe {
+            DictSnapshot::load_mmap(&path, Flags::empty()).expect("load_mmap DictSnapshot")
+        });
+
+        let loaded = Dictionary::from_mapped(mem).expect("from_mapped");
+
+        for (t, &id) in terms.iter().zip(ids.iter()) {
+            assert_eq!(loaded.get_id(t), Some(id));
+            assert_eq!(loaded.get_term_arc(id).as_deref(), Some(t));
+        }
+        assert_eq!(loaded.get_graph_id(&g), Some(gid));
+        assert_eq!(loaded.get_graph(gid), Some(&g));
+        assert_eq!(loaded.get_id(&triple_term), Some(triple_id));
+        assert_eq!(
+            loaded.get_term_arc(triple_id).as_deref(),
+            Some(&triple_term)
+        );
+
+        // A fresh intern after reload must NOT collide with existing IDs.
+        let mut loaded = loaded;
+        let fresh_id = loaded.intern(&nn("http://example.org/mmap/fresh")).unwrap();
+        assert!(fresh_id.as_u64() as usize >= loaded.len() - 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_dict_snapshot_round_trip() {
+        use epserde::deser::{Deserialize, Flags};
+        use epserde::ser::Serialize;
+
+        let d = Dictionary::new();
+        let snap = d.to_snapshot();
+        let mut buf: Vec<u8> = Vec::new();
+        unsafe {
+            snap.serialize(&mut buf)
+                .expect("serialize empty DictSnapshot");
+        }
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("nova_dict_mmap_empty_test_{pid}_{n}.dict"));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, &buf).expect("write temp dict snapshot");
+
+        let mem = std::sync::Arc::new(unsafe {
+            DictSnapshot::load_mmap(&path, Flags::empty()).expect("load_mmap DictSnapshot")
+        });
+        let loaded = Dictionary::from_mapped(mem).expect("from_mapped");
+        assert!(loaded.is_empty());
+        assert_eq!(
+            loaded.get_graph_id(&GraphName::DefaultGraph),
+            Some(GRAPH_DEFAULT)
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

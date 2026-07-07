@@ -12,7 +12,9 @@ oxrdf         = { workspace = true }
 anyhow        = { workspace = true }
 thiserror     = { workspace = true }
 crc32fast     = "1.5"     # WAL record + MANIFEST framing checksum
-zstd          = { workspace = true }  # compress on-disk dict snapshot files
+epserde       = { version = "0.12.5", features = ["derive", "mmap", "std"] } # mmap load of nova.dict.<gen> (DictSnapshot)
+# NOTE: `nova.dict.<gen>` is written uncompressed (see dict_snapshot.rs) so
+# it can be mmap'd directly, mirroring `nova-storage-ring`'s `nova.snapshot.<gen>`
 
 
 [dev-dependencies]
