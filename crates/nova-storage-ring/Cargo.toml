@@ -23,11 +23,10 @@ value-traits  = "0.2.0"  # SliceByValue::index_value for safe BitFieldVec reads
 mem_dbg       = "0.4"     # MemSize trait — sux's Rank9/SelectAdapt/BitFieldVec already derive it;
                            # used for real per-component memory-breakdown diagnostics.
 epserde       = { version = "0.12.5", features = ["derive", "mmap", "std"] } # mmap snapshot format for LoudsTrie T/L arrays
-# NOTE: zstd was removed from this crate's dependencies as part of Phase 1 of
-# the mmap'd ε-serde snapshot plan (CLAUDE.md item 14): `nova.snapshot.<gen>`
-# is now written uncompressed (see snapshot.rs) so that a future Phase 3 can
-# mmap it directly. `nova-storage-common`'s `dict_snapshot.rs` still uses zstd
-# for `nova.dict.<gen>` (unaffected — that's a separate crate/dependency).
+# NOTE: this crate has no zstd dependency: `nova.snapshot.<gen>` is written
+# uncompressed (see snapshot.rs) so it can be mmap'd directly.
+# `nova-storage-common`'s `dict_snapshot.rs` still uses zstd for
+# `nova.dict.<gen>` (a separate crate/dependency, unaffected by this).
 
 
 

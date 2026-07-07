@@ -37,7 +37,6 @@ use crate::louds::{
     BorrowedL, BorrowedLouds, BorrowedS, BorrowedT, LoudsCore, LoudsMemBreakdown, LoudsNav,
     LoudsTrie, t_backend,
 };
-
 use epserde::Epserde;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 use std::collections::HashMap;
@@ -78,17 +77,14 @@ impl SortOrder {
 /// Generic over the vocab representation `V` (see [`CltjData`]/[`CltjTrie`]
 /// in `cltj.rs`) so that a future mmap'd/zero-copy snapshot load can populate
 /// `cltj`'s vocab with borrowed `&[u64]` slices, with no code duplication
-/// versus the owned `Vec<u64>` path — see CLAUDE.md item 14, Phase 3.
+/// versus the owned `Vec<u64>` path.
 struct RingData<Louds = LoudsTrie, V = Vec<u64>> {
     /// Six LOUDS tries (one per ordering) — O(1) navigation per step.
     /// `contains()`, `match_triples()`, and `spo_triples()` are all derived
     /// from these tries via O(1)-per-step LOUDS navigation. There is no
-    /// redundant `spo: Vec<[u64;3]>` raw copy — that used to account for
-    /// ~53% of Ring memory before it was removed.
+    /// redundant `spo: Vec<[u64;3]>` raw copy.
     cltj: CltjData<Louds, V>,
 }
-
-
 
 // ── LFTJ ordering selection ───────────────────────────────────────────────────
 
@@ -124,10 +120,10 @@ fn choose_array_for_lftj(bound_fields: &[usize], target_field: usize) -> SortOrd
 ///
 /// Generic over the vocab representation `V` (defaulted to owned `Vec<u64>`)
 /// so that a future mmap'd/zero-copy snapshot load can produce a
-/// `GraphRing<&[u64]>`-style value with no code duplication — see CLAUDE.md
-/// item 14, Phase 3. All existing callers use the default `GraphRing`
-/// (`V = Vec<u64>`) and are unaffected by this generic parameter.
-pub struct GraphRing<Louds = LoudsTrie, V = Vec<u64>> {
+/// `GraphRing<&[u64]>`-style value with no code duplication. All existing
+/// callers use the default `GraphRing` (`V = Vec<u64>`) and are unaffected by
+/// this generic parameter.
+pub(crate) struct GraphRing<Louds = LoudsTrie, V = Vec<u64>> {
     /// Number of distinct triples stored in this graph.
     pub n: usize,
     data: Option<Arc<RingData<Louds, V>>>,
@@ -136,8 +132,6 @@ pub struct GraphRing<Louds = LoudsTrie, V = Vec<u64>> {
 impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 'static>
     GraphRing<Louds, V>
 {
-
-
     /// All triples in SPO order (for testing / serialisation).
     ///
     /// Derived by a full depth-3 traversal of the SPO LOUDS trie (O(n) over
@@ -199,6 +193,14 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
     }
 
     /// Depth-0 `TrieIterator` for the given ordering.
+    ///
+    /// Only exercised by `#[cfg(test)]` code — production code (the
+    /// `spo_triples`/`contains`/`match_triples`/`join_scan` methods above,
+    /// plus `GraphRingHandle`'s delegating methods) all call
+    /// `data.cltj.trie_iter(...)` (`CltjData::trie_iter`) directly instead,
+    /// since they already have `data` in scope and don't need this
+    /// `Option`-unwrapping convenience wrapper.
+    #[allow(dead_code)]
     pub fn trie_iter(&self, ordering: SortOrder) -> Box<dyn TrieIterator> {
         match &self.data {
             None => Box::new(EmptyTrieIter),
@@ -375,7 +377,6 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
 
         it
     }
-
 }
 
 impl GraphRing {
@@ -403,9 +404,7 @@ impl GraphRing {
         };
         RingSnapshot { n: self.n, cltj }
     }
-
 }
-
 
 // ── Reconstruction from snapshot (generic over substrate) ─────────────────────
 //
@@ -414,8 +413,7 @@ impl GraphRing {
 // — this is what lets a future borrowed/mmap'd
 // `RingSnapshot<CltjSnapshot<DeserType<Vec<u64>>, ..., [DeserType<LoudsCore>; 6]>>`
 // reconstruct directly into a navigable `GraphRing<LoudsTrie<B, L, S>, V>`
-// with **zero extra code** versus the owned round-trip path (Phase 3.3c step
-// 2a, CLAUDE.md item 14).
+// with **zero extra code** versus the owned round-trip path.
 impl<B, L, S, V: AsRef<[u64]>> GraphRing<LoudsTrie<B, L, S>, V> {
     /// Reconstruct a `GraphRing` from a [`RingSnapshot`] loaded from disk (or
     /// from an in-memory round-trip buffer, or a borrowed `load_mmap`'d
@@ -438,7 +436,7 @@ impl<B, L, S, V: AsRef<[u64]>> GraphRing<LoudsTrie<B, L, S>, V> {
     }
 }
 
-// ── Construction from a mmap'd view (Phase 3.3c step 2b) ───────────────────────
+// ── Construction from a mmap'd view ─────────────────────────────────────────
 //
 // Builds a navigable `GraphRing<BorrowedLouds, VocabRepr>` directly from a
 // borrowed `&DeserType<RingSnapshot>` view produced by `load_mmap`, reusing
@@ -462,20 +460,15 @@ impl GraphRing<BorrowedLouds, VocabRepr> {
         // slices borrow from the same `MemCase` mapped memory that the
         // caller is required to keep alive for as long as this
         // `GraphRing` is reachable, exactly like `VocabRepr::Mapped`'s
-        // existing documented pattern in `cltj.rs`. (Prior to the
-        // `RingSnapshot::cltj` `Option` removal, `c.vocab_s` etc. were
-        // owned `Vec<u64>` at this nesting level — an epserde `Option<T>`
-        // zero-copy limitation, not a bug in this reconstruction code; see
-        // `RingSnapshot`'s doc comment. Now that `cltj` is a bare `Cltj`,
-        // `c.vocab_s`/`vocab_p`/`vocab_o` are genuinely borrowed `&[u64]`
-        // slices, so `.as_slice()` below is just a `&[u64] -> &[u64]`
-        // no-op reborrow kept for clarity at the transmute call site.)
+        // existing documented pattern in `cltj.rs`. `c.vocab_s`/`vocab_p`/
+        // `vocab_o` are genuinely borrowed `&[u64]` slices, so the transmute
+        // below is a lifetime-only extension, not a type-punning cast.
         let vocab_s: &'static [u64] =
-            unsafe { std::mem::transmute::<&[u64], &'static [u64]>(&c.vocab_s) };
+            unsafe { std::mem::transmute::<&[u64], &'static [u64]>(c.vocab_s) };
         let vocab_p: &'static [u64] =
-            unsafe { std::mem::transmute::<&[u64], &'static [u64]>(&c.vocab_p) };
+            unsafe { std::mem::transmute::<&[u64], &'static [u64]>(c.vocab_p) };
         let vocab_o: &'static [u64] =
-            unsafe { std::mem::transmute::<&[u64], &'static [u64]>(&c.vocab_o) };
+            unsafe { std::mem::transmute::<&[u64], &'static [u64]>(c.vocab_o) };
 
         // SAFETY: `c.tries`'s real type (confirmed empirically via
         // `std::any::type_name_of_val` on a real `load_mmap`'d value — see
@@ -494,9 +487,8 @@ impl GraphRing<BorrowedLouds, VocabRepr> {
         // it is reachable — enforced structurally (not just by convention)
         // by `MappedGraphRing`'s encapsulation, which is the sole caller of
         // `from_mapped` (see `MappedGraphRing::new`).
-        let tries: [LoudsCore<t_backend::TBitvec<BorrowedT>, BorrowedL, BorrowedS>; 6] = unsafe {
-            std::mem::transmute_copy(&c.tries)
-        };
+        let tries: [LoudsCore<t_backend::TBitvec<BorrowedT>, BorrowedL, BorrowedS>; 6] =
+            unsafe { std::mem::transmute_copy(&c.tries) };
 
         let cltj = CltjSnapshot {
             vocab_s: VocabRepr::Mapped(vocab_s),
@@ -514,18 +506,15 @@ impl GraphRing<BorrowedLouds, VocabRepr> {
             >,
         > = RingSnapshot { n: view.n, cltj };
         GraphRing::from_snapshot(snap)
-
     }
 }
-
-
 
 /// Owns the mmap'd backing memory for one graph's zero-copy `GraphRing` and
 /// exposes it only through a private field + accessor, so the
 /// MemCase-outlives-ring invariant is enforced **structurally** by the type
 /// system rather than by caller convention.
 ///
-/// ## Design rationale (per review discussion, CLAUDE.md item 14 Phase 3.3c)
+/// ## Design rationale
 ///
 /// `GraphRing::from_mapped` (above) builds a navigable
 /// `GraphRing<BorrowedLouds, VocabRepr>` whose every borrowed field carries a
@@ -711,36 +700,31 @@ impl GraphRingHandle {
 /// [`CltjSnapshot`] (a structurally valid but empty snapshot — see
 /// [`CltjSnapshot::empty`] — for an empty graph, i.e. `n == 0`).
 ///
-
 /// This is the persistent on-disk representation.  See [`GraphRing::into_snapshot`] and
 /// [`GraphRing::from_snapshot`].
 ///
 /// Generic over `Cltj` (default [`CltjSnapshot`]) so that a future mmap'd
 /// load can substitute ε-serde's borrowed `DeserType<CltjSnapshot>` form here
 /// with **zero extra code** — this mirrors the "bare generic parameter with
-/// a default" pattern used throughout `louds.rs`/`cltj.rs` (Phase 3.3c probe,
-/// CLAUDE.md item 14).
+/// a default" pattern used throughout `louds.rs`/`cltj.rs`.
 ///
-/// `cltj` is a **bare** `Cltj` (not `Option<Cltj>`). An earlier version of
-/// this format used `Option<Cltj>` (`None` for an empty graph, mirroring
-/// `GraphRing`'s own `data: Option<Arc<RingData>>` in-memory representation)
-/// — but ε-serde deserializes `Option<T>` fields as fully-owned copies even
-/// under `load_mmap` (confirmed empirically: with the field as
+/// `cltj` is a **bare** `Cltj` (not `Option<Cltj>`), with `n == 0` as the
+/// empty-graph sentinel (see [`GraphRing::from_snapshot`]). This avoids
+/// `Option<T>`: ε-serde deserializes `Option<T>` fields as fully-owned copies
+/// even under `load_mmap` (confirmed empirically: with the field as
 /// `Option<CltjSnapshot>`, a `load_mmap`'d view's `vocab_s` came back as an
 /// owned `alloc::vec::Vec<u64>` and `tries[0]` at the fully-owned `LoudsCore`
 /// size, instead of the borrowed `&[u64]`/borrowed-`LoudsCore` shapes seen
-/// when loading a bare `CltjSnapshot` directly) — silently defeating Phase 3's
-/// entire zero-copy purpose for every graph in the store. Removing the
-/// `Option` and using `n == 0` as the sentinel (see [`GraphRing::from_snapshot`])
-/// is the standard zero-copy-format fix: it also removes a previously
-/// representable invalid state (`n > 0` with `cltj` empty, or vice versa).
+/// when loading a bare `CltjSnapshot` directly), which would defeat the
+/// zero-copy purpose for every graph in the store. A bare `Cltj` with `n ==
+/// 0` as the sentinel also has only one representable state per `n` value
+/// (no `n > 0` with `cltj` empty, or vice versa).
+
 #[derive(Epserde)]
 pub(crate) struct RingSnapshot<Cltj = CltjSnapshot> {
     pub(crate) n: usize,
     pub(crate) cltj: Cltj,
 }
-
-
 
 // ── Trie suffix enumeration helper ────────────────────────────────────────────
 
@@ -787,7 +771,7 @@ fn enumerate_suffix(
 // ── RingBuilder ───────────────────────────────────────────────────────────────
 
 /// Accumulates `(s_id, p_id, o_id)` tuples and builds a `GraphRing`.
-pub struct RingBuilder {
+pub(crate) struct RingBuilder {
     triples: Vec<[u64; 3]>,
 }
 
@@ -808,6 +792,13 @@ impl RingBuilder {
         Self { triples }
     }
 
+    /// Push a single triple onto the builder.
+    ///
+    /// Only exercised by test-helper `build_ring()` functions (in this
+    /// module's and `snapshot.rs`'s `#[cfg(test)]` blocks) for incrementally
+    /// constructing small test rings one triple at a time — production code
+    /// always has the full triple set up front and uses `from_vec` instead.
+    #[allow(dead_code)]
     pub fn add(&mut self, s: u64, p: u64, o: u64) {
         self.triples.push([s, p, o]);
     }
@@ -816,7 +807,7 @@ impl RingBuilder {
     ///
     /// O(n log n) construction (6 sorts + LOUDS trie construction per ordering).
     /// Deduplication is applied automatically.
-    pub fn build(self) -> GraphRing {
+    pub(crate) fn build(self) -> GraphRing {
         let mut triples = self.triples;
         triples.sort_unstable();
         triples.dedup();
@@ -976,7 +967,6 @@ mod tests {
 
     // ── TrieIterator tests ────────────────────────────────────────────────────
 
-
     #[test]
     fn trie_iter_depth0_key_seek_advance() {
         let r = build_ring(&[[1, 2, 10], [1, 3, 11], [2, 2, 12], [3, 4, 13]]);
@@ -1084,7 +1074,7 @@ mod tests {
         assert!(it.at_end());
     }
 
-    // ── Phase 3.3c step 2b: from_mapped / MappedGraphRing tests ──────────────
+    // ── from_mapped / MappedGraphRing tests ──────────────────────────────────
 
     /// Build a `StoreSnapshot` containing one non-empty and one empty graph,
     /// serialize it, and `load_mmap` it into a `MappedGraphRing` for each
@@ -1150,14 +1140,22 @@ mod tests {
         // future change reintroduces an `Option<Cltj>`-shaped zero-copy
         // break, either the size-checked transmute in `from_mapped` will
         // fail to compile, or (if it still happens to compile) the
-        // navigation results below would no longer come from `Borrowed*`
-        // types at all — this test exercises the exact same code path
+        // navigation results below would come from data that is not
+        // actually borrowed — this test exercises the exact same code path
         // `MappedGraphRing::new` uses in production.
         assert_eq!(view.graph_ids.len(), 2);
         assert_eq!(view.rings.len(), 2);
 
-        let non_empty_idx = view.graph_ids.iter().position(|&g| g == GRAPH_DEFAULT.as_u8()).unwrap();
-        let empty_idx = view.graph_ids.iter().position(|&g| g == GraphId(2).as_u8()).unwrap();
+        let non_empty_idx = view
+            .graph_ids
+            .iter()
+            .position(|&g| g == GRAPH_DEFAULT.as_u8())
+            .unwrap();
+        let empty_idx = view
+            .graph_ids
+            .iter()
+            .position(|&g| g == GraphId(2).as_u8())
+            .unwrap();
 
         let mapped_non_empty = GraphRing::from_mapped(&view.rings[non_empty_idx]);
         let mapped_empty = GraphRing::from_mapped(&view.rings[empty_idx]);
@@ -1214,8 +1212,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let pid = std::process::id();
-        let path =
-            std::env::temp_dir().join(format!("nova_mapped_graph_ring_e2e_{pid}_{n}.snap"));
+        let path = std::env::temp_dir().join(format!("nova_mapped_graph_ring_e2e_{pid}_{n}.snap"));
         let _ = std::fs::remove_file(&path);
 
         let _ = StoreSnapshot::round_trip_and_maybe_save(graphs, Some(&path)).unwrap();
@@ -1246,7 +1243,12 @@ mod tests {
         assert!(!mapped_default.ring().contains(1, 2, 4));
 
         assert_eq!(mapped_empty.ring().n, 0);
-        assert!(mapped_empty.ring().match_triples(None, None, None).is_empty());
+        assert!(
+            mapped_empty
+                .ring()
+                .match_triples(None, None, None)
+                .is_empty()
+        );
 
         let _ = std::fs::remove_file(&path);
     }

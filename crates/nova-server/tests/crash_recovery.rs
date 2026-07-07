@@ -82,8 +82,8 @@ fn insert_update_body(i: usize) -> String {
 fn send_insert(port: u16, i: usize) -> bool {
     let url = format!("http://127.0.0.1:{port}/sparql/update");
     ureq::post(&url)
-        .set("Content-Type", "application/sparql-update")
-        .send_string(&insert_update_body(i))
+        .header("Content-Type", "application/sparql-update")
+        .send(insert_update_body(i))
         .is_ok()
 }
 
@@ -96,11 +96,12 @@ fn recovered_indices(port: u16) -> Vec<usize> {
     for i in 0..TOTAL_INSERTS {
         let query = format!("ASK {{ <http://ex/s{i}> <http://ex/p> \"{i}\" . }}");
         let url = format!("http://127.0.0.1:{port}/sparql?query={}", urlencode(&query));
-        let resp = ureq::get(&url)
+        let mut resp = ureq::get(&url)
             .call()
             .unwrap_or_else(|e| panic!("ASK query for index {i} failed: {e}"));
         let body_str = resp
-            .into_string()
+            .body_mut()
+            .read_to_string()
             .expect("ASK response body was not UTF-8 text");
         let body: serde_json::Value =
             serde_json::from_str(&body_str).expect("ASK response was not JSON");

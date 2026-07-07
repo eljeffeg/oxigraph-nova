@@ -13,7 +13,6 @@
 use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, Quad};
 use oxigraph_nova_query::{Evaluator, QueryResult, StoreDataset};
-
 use oxigraph_nova_storage_ring::RingStore;
 use oxttl::NTriplesParser;
 use serde::Deserialize;
@@ -42,7 +41,10 @@ fn main() {
         .get(2)
         .cloned()
         .unwrap_or_else(|| "/tmp/oxigraph-nova-bench/dataset.queries.json".to_string());
-    let query_name = args.get(3).cloned().unwrap_or_else(|| "path_2hop".to_string());
+    let query_name = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "path_2hop".to_string());
     let n: usize = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(60);
 
     eprintln!("[profile_eval_mimalloc] Loading {path} ...");

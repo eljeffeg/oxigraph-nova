@@ -26,7 +26,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -195,12 +194,11 @@ fn fetch_cached(url: &str) -> Result<PathBuf> {
     fs::create_dir_all(local.parent().unwrap())
         .with_context(|| format!("mkdir {}", local.parent().unwrap().display()))?;
 
-    let mut body = String::new();
-    ureq::get(url)
+    let body = ureq::get(url)
         .call()
         .with_context(|| format!("GET {url}"))?
-        .into_reader()
-        .read_to_string(&mut body)
+        .body_mut()
+        .read_to_string()
         .with_context(|| format!("read body for {url}"))?;
 
     fs::write(&local, &body).with_context(|| format!("write {}", local.display()))?;

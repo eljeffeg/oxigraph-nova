@@ -20,5 +20,5 @@ spargebra  = { workspace = true }
 sparesults = { workspace = true }
 
 anyhow     = { workspace = true }
-ureq       = "2"           # blocking HTTP for fetch+cache of W3C test files
+ureq       = "3"           # blocking HTTP for fetch+cache of W3C test files
 

@@ -151,7 +151,6 @@ fn run_query<D: Dataset>(ds: &D, name: &str, sparql: &str, iters: usize, count_a
             );
         }
         n_results = match result {
-
             QueryResult::Solutions(s) => s.len(),
             QueryResult::Boolean(b) => b as usize,
             QueryResult::Triples(t) => t.len(),
@@ -273,8 +272,10 @@ fn main() {
                 .and_then(|o| String::from_utf8(o.stdout).ok())
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(0);
-            println!("[rss-loop] iter={i} rows={rows} rss_mb={:.1}", rss_kb as f64 / 1024.0);
-
+            println!(
+                "[rss-loop] iter={i} rows={rows} rss_mb={:.1}",
+                rss_kb as f64 / 1024.0
+            );
         }
         return;
     }
@@ -288,4 +289,3 @@ fn main() {
         run_query(&ds, &qd.name, &qd.sparql, iters, count_allocs);
     }
 }
-

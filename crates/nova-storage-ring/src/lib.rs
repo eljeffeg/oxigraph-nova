@@ -55,5 +55,5 @@ pub mod store;
 // keep working unchanged.
 pub use louds::LoudsMemBreakdown;
 pub use oxigraph_nova_storage_common::{WalRecord, WalWriter, wal};
-pub use ring::{GraphRing, RingBuilder, SortOrder};
+pub use ring::SortOrder;
 pub use store::{MemoryBreakdown, PerOrderingBreakdown, RingStore, SyncPolicy};

@@ -57,7 +57,6 @@
 use crate::louds::{
     LoudsCore, LoudsMemBreakdown, LoudsNav, LoudsTrie, build_louds_from_sorted, t_backend,
 };
-
 use crate::ring::SortOrder;
 use epserde::Epserde;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
@@ -68,8 +67,7 @@ use std::sync::Arc;
 /// Vocab representation for [`CltjTrie`]/[`CltjData`]: either owned
 /// (heap-allocated, as produced by a fresh build or a heap-copy
 /// `deserialize_full` round-trip) or **borrowed** from a `load_mmap`'d
-/// snapshot file (Phase 3.3 of the mmap'd ε-serde snapshot plan — CLAUDE.md
-/// item 14).
+/// snapshot file.
 ///
 /// `Mapped`'s `&'static [u64]` is not truly `'static` data — it is a
 /// lifetime-extended borrow into the backing memory owned by an
@@ -79,12 +77,21 @@ use std::sync::Arc;
 /// the owning `MemCase`'s mapped memory outlives every `VocabRepr::Mapped`
 /// constructed from it, which the store's ownership structure guarantees).
 ///
-/// This is the substrate that lets [`CltjTrie<V>`]/[`CltjData<V>`] (generic
-/// since Phase 3.2a) hold zero-copy vocab slices with **no code
-/// duplication** versus the owned path — every navigation method already
-/// works generically over any `V: AsRef<[u64]>`.
+/// This is the substrate that lets [`CltjTrie<V>`]/[`CltjData<V>`] hold
+/// zero-copy vocab slices with **no code duplication** versus the owned
+/// path — every navigation method already works generically over any
+/// `V: AsRef<[u64]>`.
 pub(crate) enum VocabRepr {
     /// Heap-allocated owned vocab (fresh build, or in-memory round-trip).
+    ///
+    /// Retained for API symmetry with `Mapped` (and exercised directly by
+    /// this module's unit tests below) — in practice, owned/freshly-built
+    /// vocabs are represented via the bare `V = Vec<u64>` generic parameter
+    /// (the default for `CltjTrie`/`GraphRing`) rather than being routed
+    /// through this enum; only `GraphRing::from_mapped`'s reconstruction
+    /// path (which always produces a fully mmap'd ring) constructs a
+    /// `VocabRepr` value, and it always chooses `Mapped`.
+    #[allow(dead_code)]
     Owned(Vec<u64>),
     /// Borrowed vocab slice, zero-copy from a `load_mmap`'d snapshot file.
     /// See the type-level doc comment above for the lifetime-extension
@@ -104,7 +111,6 @@ impl AsRef<[u64]> for VocabRepr {
 
 // ── CltjTrie ──────────────────────────────────────────────────────────────────
 
-
 /// A single LOUDS trie for one sort ordering, with vocabulary for global-ID
 /// translation.
 ///
@@ -113,17 +119,17 @@ impl AsRef<[u64]> for VocabRepr {
 /// future mmap'd/zero-copy snapshot load can populate `vocab` with borrowed
 /// `&[u64]` slices directly, with **no code duplication** versus the owned
 /// `Vec<u64>` path — this mirrors the `LoudsTrie<B, L, S>` generic-substrate
-/// pattern established in Phase 2b (CLAUDE.md item 14).
+/// pattern used throughout this module.
 ///
 /// Direct indexing keeps `key()` at O(1) with no bit-unpacking, and `seek()`
 /// can use `partition_point` which the compiler can SIMD-vectorise, for both
 /// the owned and borrowed representations.
-pub struct CltjTrie<Louds = LoudsTrie, V = Vec<u64>> {
+pub(crate) struct CltjTrie<Louds = LoudsTrie, V = Vec<u64>> {
     /// LOUDS bitvector + label array.  Generic over the LOUDS navigation
     /// substrate (bounded by [`LoudsNav`]) so a future mmap'd/zero-copy
     /// snapshot load can populate this with a borrowed, ε-serde `DeserType`
     /// LOUDS structure directly, with **no code duplication** versus the
-    /// owned `LoudsTrie` path (CLAUDE.md item 14, Phase 3.3).
+    /// owned `LoudsTrie` path.
     louds: Louds,
     /// `vocab[d]` = sorted global IDs for depth `d` (0, 1, or 2).
     /// `vocab[d][local_id]` → global TermId as `u64`.
@@ -131,8 +137,6 @@ pub struct CltjTrie<Louds = LoudsTrie, V = Vec<u64>> {
 }
 
 impl CltjTrie {
-
-
     /// Consume this trie, discarding the vocab `Arc`s (vocab is hoisted to
     /// the top-level [`CltjSnapshot`], deduped across all six tries) and
     /// keeping only the ε-serde-serializable [`LoudsCore`].
@@ -162,7 +166,6 @@ impl<Louds: LoudsNav, V: AsRef<[u64]>> CltjTrie<Louds, V> {
         (*self.vocab[d]).as_ref()
     }
 
-
     /// Number of distinct values (vocabulary size) at depth `d` (0, 1, or 2).
     ///
     /// Used by [`CltjData::vocab_size_for_field`] to produce cardinality
@@ -170,7 +173,6 @@ impl<Louds: LoudsNav, V: AsRef<[u64]>> CltjTrie<Louds, V> {
     pub fn vocab_len(&self, d: usize) -> usize {
         if d < 3 { self.vocab_slice(d).len() } else { 0 }
     }
-
 
     /// Real allocated byte size of this trie's LOUDS structure (T + L +
     /// sidecar), **excluding** vocab (vocab is `Arc`-shared across multiple
@@ -195,18 +197,13 @@ impl<Louds: LoudsNav, V: AsRef<[u64]>> CltjTrie<Louds, V> {
     /// Counts only the raw `u64` payload (`len() * 8` bytes) plus one
     /// `size_of::<V>()` header — accurate for the owned `Vec<u64>` case and a
     /// reasonable approximation for a borrowed slice reference `V` (whose
-    /// backing bytes live in the mmap, not the heap, once Phase 3.3 wires in
-    /// real mmap loading).
+    /// backing bytes live in the mmap, not the heap).
     pub fn vocab_bytes_undeduped(&self) -> usize {
         self.vocab
             .iter()
-            .map(|v| {
-                std::mem::size_of::<V>()
-                    + AsRef::<[u64]>::as_ref(&**v).len() * std::mem::size_of::<u64>()
-            })
+            .map(|v| std::mem::size_of::<V>() + std::mem::size_of_val(AsRef::<[u64]>::as_ref(&**v)))
             .sum()
     }
-
 
     /// Pointer identities of this trie's three vocab `Arc` allocations, for
     /// dedup accounting at the `CltjData` level.
@@ -237,68 +234,7 @@ impl<Louds: LoudsNav, V: AsRef<[u64]>> CltjTrie<Louds, V> {
             depth: 0,
         })
     }
-
-    /// Zero-allocation equivalent of `iter_d0()` followed by a `seek`/`open`
-    /// sequence for each value in `bound_vals` (in trie-column order), ending
-    /// with a `remaining_count()` read at the resulting depth.
-    ///
-    /// Unlike navigating via `Box<dyn TrieIterator>` (which allocates one
-    /// heap `CltjTrieIter` per depth), this walks the raw `(hi, pos, depth)`
-    /// LOUDS-navigation state entirely on the stack — used by adaptive VEO's
-    /// cardinality probe (`GraphRing::real_count_no_alloc`), which needs to
-    /// evaluate this for *every* candidate variable at *every* recursion
-    /// depth, most of which are discarded immediately (only the winning
-    /// candidate's scan is actually retained and used for leapfrogging).
-    ///
-    /// Returns `0` if the trie is empty, any bound value is not found, or
-    /// `bound_vals.len() >= 3` (deeper than this height-3 trie supports).
-    pub fn real_count_no_alloc(&self, bound_vals: &[u64]) -> u64 {
-        let degree = self.louds.root_degree();
-        if degree == 0 {
-            return 0;
-        }
-        let mut hi = degree;
-        let mut pos = 1usize;
-
-        for (depth, &val) in bound_vals.iter().enumerate() {
-            if depth >= 3 || pos > hi {
-                return 0;
-            }
-            let vocab = self.vocab_slice(depth);
-            // seek: no-op if val <= current key, else exponential-search leap.
-            let cur_local = self.louds.label_at(pos) as usize;
-            if val > vocab[cur_local] {
-
-                let local_target = vocab.partition_point(|&v| v < val);
-                if local_target >= vocab.len() {
-                    return 0;
-                }
-                pos = self.louds.leap(pos, hi, local_target as u32);
-                if pos > hi {
-                    return 0;
-                }
-            }
-            let local_id = self.louds.label_at(pos) as usize;
-            if vocab[local_id] != val {
-                return 0;
-            }
-            // open: descend into the child range.
-            if depth >= 2 {
-                return 0; // leaf level has no children
-            }
-            let child_v = self.louds.child_from_label_pos(pos);
-            let child_degree = self.louds.degree(child_v);
-            if child_degree == 0 {
-                return 0;
-            }
-            hi = child_v + child_degree;
-            pos = child_v + 1;
-        }
-
-        (hi - pos + 1) as u64
-    }
 }
-
 
 // ── CltjData ──────────────────────────────────────────────────────────────────
 
@@ -306,14 +242,13 @@ impl<Louds: LoudsNav, V: AsRef<[u64]>> CltjTrie<Louds, V> {
 ///
 /// Generic over the vocab representation `V` (see [`CltjTrie`]) so that the
 /// borrowed (mmap'd) form can share this same implementation.
-pub struct CltjData<Louds = LoudsTrie, V = Vec<u64>> {
+pub(crate) struct CltjData<Louds = LoudsTrie, V = Vec<u64>> {
     tries: [Arc<CltjTrie<Louds, V>>; 6],
 }
 
 impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 'static>
     CltjData<Louds, V>
 {
-
     /// Index into `tries` for a given ordering.
     #[inline]
     fn idx(ord: SortOrder) -> usize {
@@ -330,18 +265,6 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
     /// Depth-0 `CltjTrieIter` for the given ordering.
     pub fn trie_iter(&self, ord: SortOrder) -> Box<dyn TrieIterator> {
         self.tries[Self::idx(ord)].iter_d0()
-    }
-
-    /// Zero-allocation cardinality probe: navigate `ord`'s trie through
-    /// `bound_vals` (in trie-column order) and return the number of distinct
-    /// values remaining at the resulting depth — the same value
-    /// `join_scan(...).remaining_count()` would report, but without
-    /// constructing any `Box<dyn TrieIterator>`.
-    ///
-    /// See [`CltjTrie::real_count_no_alloc`] and adaptive VEO's usage in
-    /// `crates/nova-query/src/lftj.rs`'s `veo_sort`.
-    pub fn real_count_no_alloc(&self, ord: SortOrder, bound_vals: &[u64]) -> u64 {
-        self.tries[Self::idx(ord)].real_count_no_alloc(bound_vals)
     }
 
     /// Number of distinct global values for the given SPO field (0=S, 1=P, 2=O).
@@ -372,12 +295,11 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
         let mut seen: HashSet<*const V> = HashSet::new();
         let mut vocab_total = 0usize;
         for trie in &self.tries {
-            for (ptr, len) in trie
-                .vocab_arc_ptrs()
-                .into_iter()
-                .zip(trie.vocab.iter().map(|v| AsRef::<[u64]>::as_ref(&**v).len()))
-            {
-
+            for (ptr, len) in trie.vocab_arc_ptrs().into_iter().zip(
+                trie.vocab
+                    .iter()
+                    .map(|v| AsRef::<[u64]>::as_ref(&**v).len()),
+            ) {
                 if seen.insert(ptr) {
                     vocab_total += std::mem::size_of::<V>() + len * std::mem::size_of::<u64>();
                 }
@@ -386,8 +308,6 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
 
         louds_total + vocab_total
     }
-
-
 
     /// Per-ordering memory breakdown.
     ///
@@ -426,15 +346,12 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
             for (ptr, arc) in trie.vocab_arc_ptrs().into_iter().zip(trie.vocab.iter()) {
                 if seen.insert(ptr) {
                     total += std::mem::size_of::<V>()
-                        + AsRef::<[u64]>::as_ref(&**arc).len() * std::mem::size_of::<u64>();
+                        + std::mem::size_of_val(AsRef::<[u64]>::as_ref(&**arc));
                 }
             }
-
         }
         total
     }
-
-
 }
 
 impl CltjData {
@@ -473,7 +390,6 @@ impl CltjData {
             tries,
         }
     }
-
 }
 
 impl CltjSnapshot {
@@ -481,12 +397,12 @@ impl CltjSnapshot {
     /// plus six empty [`LoudsCore`]s (via `LoudsTrie::from_raw(&[], &[])`).
     ///
     /// Used as the empty-graph sentinel in [`RingSnapshot`] (see its doc
-    /// comment) — replaces the previous `Option<CltjSnapshot> = None`
-    /// representation, which broke ε-serde's zero-copy `load_mmap` chain
-    /// (an `Option<T>` field always deserializes as a fully-owned copy, even
-    /// under `load_mmap` — see CLAUDE.md item 14, Phase 3.3c step 2b
-    /// investigation notes). `n == 0` on the enclosing `RingSnapshot` is the
-    /// sentinel that lets `GraphRing::from_snapshot`/`from_mapped` skip
+    /// comment): an `Option<T>` field always deserializes as a fully-owned
+    /// copy even under `load_mmap`, which would defeat zero-copy loading, so
+    /// the enclosing `RingSnapshot` instead always holds a bare (non-`Option`)
+    /// `CltjSnapshot`, using this empty value for an empty graph. `n == 0` on
+    /// the enclosing `RingSnapshot` is the sentinel that lets
+    /// `GraphRing::from_snapshot`/`from_mapped` skip
     /// reconstructing a `RingData` at all, so this empty `CltjSnapshot` is
     /// never actually read back — its only job is to be a valid, cheap
     /// (few-hundred-byte) placeholder in the on-disk/in-memory byte layout.
@@ -507,8 +423,7 @@ impl CltjSnapshot {
 // vocab representation `V: AsRef<[u64]>` — this is what lets a future
 // borrowed/mmap'd `CltjSnapshot<DeserType<Vec<u64>>, ..., [DeserType<LoudsCore>; 6]>`
 // reconstruct directly into a navigable `CltjData<LoudsTrie<B, L, S>, V>` with
-// **zero extra code** versus the owned round-trip path (Phase 3.3c step 2a,
-// CLAUDE.md item 14).
+// **zero extra code** versus the owned round-trip path.
 impl<B, L, S, V: AsRef<[u64]>> CltjData<LoudsTrie<B, L, S>, V> {
     /// Reconstruct a `CltjData` from a [`CltjSnapshot`] loaded from disk (or
     /// from an in-memory round-trip buffer, or a borrowed `load_mmap`'d
@@ -574,7 +489,6 @@ impl<B, L, S, V: AsRef<[u64]>> CltjData<LoudsTrie<B, L, S>, V> {
     }
 }
 
-
 /// ε-serde-serializable snapshot of a [`CltjData`]: three deduped vocab
 /// arrays (plain `Vec<u64>`, not `Arc`-wrapped — `Arc` is not directly
 /// epserde-serializable) plus six [`LoudsCore`]s (T+L only, sidecar
@@ -604,7 +518,6 @@ pub(crate) struct CltjSnapshot<
     pub(crate) vocab_o: VocabO,
     pub(crate) tries: Tries,
 }
-
 
 // ── Pair builder ──────────────────────────────────────────────────────────────
 
@@ -690,7 +603,7 @@ fn build_pair_shared_c0(
 /// | O-pair | 1 (OPS)    | 1 (OSP: per-O sort of S↔P) |
 ///
 /// Total: **2 full sorts** instead of 6 — approximately a 25% reduction in build time.
-pub fn build_cltj_data(
+pub(crate) fn build_cltj_data(
     spo_sorted: &[[u64; 3]],
     map_s: &std::collections::HashMap<u64, usize>,
     map_p: &std::collections::HashMap<u64, usize>,
@@ -786,7 +699,7 @@ pub fn build_cltj_data(
 ///
 /// Navigation is O(1) per step (LOUDS rank/select), with O(log ℓ) seek via
 /// exponential search — replacing the WaveletMatrix Ring's O(log σ) per step.
-pub struct CltjTrieIter<Louds = LoudsTrie, V = Vec<u64>> {
+pub(crate) struct CltjTrieIter<Louds = LoudsTrie, V = Vec<u64>> {
     /// The parent trie (shared between parent and child iterators).
     trie: Arc<CltjTrie<Louds, V>>,
     /// Inclusive upper bound of the current node's children label-range in L.
@@ -800,7 +713,6 @@ pub struct CltjTrieIter<Louds = LoudsTrie, V = Vec<u64>> {
 impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 'static> TrieIterator
     for CltjTrieIter<Louds, V>
 {
-
     /// Return the global term ID at the current position.
     ///
     /// O(1): direct Vec index (local_id from LOUDS L, then vocab lookup).
@@ -809,7 +721,6 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
         let local_id = self.trie.louds.label_at(self.pos) as usize;
         self.trie.vocab_slice(self.depth as usize)[local_id]
     }
-
 
     /// Advance to the first position where `key() >= target`.
     ///
@@ -867,7 +778,6 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
         self.pos > self.hi
     }
 }
-
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -1078,14 +988,13 @@ mod tests {
         assert!(it1.at_end());
     }
 
-    /// Phase 3.1b probe: real `load_mmap` round-trip of a `CltjSnapshot` to a
-    /// temp file, confirming that epserde's zero-copy `DeserType` form
-    /// actually materializes (i.e. `load_mmap` succeeds and the resulting
-    /// `MemCase`'s `.uncase()` produces a navigable borrowed structure).
+    /// Real `load_mmap` round-trip of a `CltjSnapshot` to a temp file,
+    /// confirming that epserde's zero-copy `DeserType` form actually
+    /// materializes (i.e. `load_mmap` succeeds and the resulting `MemCase`'s
+    /// `.uncase()` produces a navigable borrowed structure).
     ///
-    /// This does NOT yet wire the borrowed form into `CltjTrie`/`CltjData` —
-    /// it is a standalone feasibility probe informing the Phase 3.1 design
-    /// (see CLAUDE.md item 14, Phase 3).
+    /// This does NOT wire the borrowed form into `CltjTrie`/`CltjData` — it
+    /// is a standalone feasibility check for the mmap'd snapshot format.
     #[test]
     fn cltj_snapshot_load_mmap_probe() {
         use epserde::deser::{Deserialize, Flags};
@@ -1098,8 +1007,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let pid = std::process::id();
-        let path =
-            std::env::temp_dir().join(format!("nova_cltj_mmap_probe_{pid}_{n}.snap"));
+        let path = std::env::temp_dir().join(format!("nova_cltj_mmap_probe_{pid}_{n}.snap"));
         let _ = std::fs::remove_file(&path);
 
         {
@@ -1117,8 +1025,6 @@ mod tests {
         };
         let view: &epserde::deser::DeserType<CltjSnapshot> = mem_case.uncase();
 
-
-
         // vocab_s/vocab_p/vocab_o should be borrowed `&[u64]` slices (zero-copy),
         // not freshly-allocated owned `Vec<u64>` copies.
         assert!(!view.vocab_s.is_empty());
@@ -1130,7 +1036,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-
     /// End-to-end round-trip of the persistent snapshot format:
     /// build a `CltjData`, convert to `CltjSnapshot`, serialize via ε-serde
     /// into an in-memory buffer, deserialize back, reconstruct a `CltjData`
@@ -1138,7 +1043,6 @@ mod tests {
     /// across all six orderings compared to the original.
     #[test]
     fn cltj_snapshot_round_trip() {
-
         use epserde::deser::Deserialize;
         use epserde::ser::Serialize;
 
@@ -1224,7 +1128,7 @@ mod tests {
     /// two variants are interchangeable for every navigation method that is
     /// generic over `V: AsRef<[u64]>` (all of `CltjTrie`/`CltjData`'s
     /// read-only methods). Uses `Box::leak` to simulate the lifetime
-    /// extension that will, in Phase 3.3's full wiring, come from an
+    /// extension that in real use comes from an
     /// `Arc<epserde::deser::MemCase<StoreSnapshot>>` kept alive by the store.
     #[test]
     fn vocab_repr_mapped_as_ref() {
@@ -1249,7 +1153,6 @@ mod tests {
     /// Uses only the public `TrieIterator` API (no internal field access).
     #[test]
     fn cltj_spo_sop_triple_count_matches() {
-
         let triples = &[[1u64, 2, 3], [1, 3, 4], [2, 2, 5], [2, 4, 3]];
         let cltj = make_cltj(triples);
 

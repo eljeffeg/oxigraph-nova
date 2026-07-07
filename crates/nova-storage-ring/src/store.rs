@@ -64,7 +64,6 @@ use crate::delta::Delta;
 use crate::louds::LoudsMemBreakdown;
 use crate::ring::{GraphRing, GraphRingHandle, RingBuilder, SortOrder};
 use crate::snapshot::StoreSnapshot;
-
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, NamedNode, Oxigraph, Quad,
     QuadStore, StoredQuad, Subject, Term, TermId,
@@ -448,10 +447,9 @@ impl RingStoreInner {
                 //    `load_mmap` it back in — the servable representation
                 //    becomes a genuine zero-copy view of exactly the bytes
                 //    just written (see `snapshot.rs`'s `write_and_load_mmap`
-                //    doc comment / this module's "Phase 3" reference).
+                //    doc comment).
                 let snap_path = manifest::snapshot_path(&dir, new_gen);
                 let graphs = StoreSnapshot::write_and_load_mmap(new_graphs, &snap_path)?;
-
 
                 // 1b. Persist the Dictionary alongside this snapshot
                 //     generation (see `dict_snapshot.rs` module docs for why
@@ -511,11 +509,9 @@ fn build_graphs_from_triples(
         }
         // Hand the already-collected Vec straight to the builder — `build()`
         // performs its own sort_unstable+dedup, so there is no need to
-        // sort/dedup here first (that used to cause a redundant second
-        // sort/dedup pass) nor to copy element-by-element via `add()` (which
-        // used to force a second Vec to grow via repeated reallocation from
-        // empty capacity). This removes one full-size transient Vec
-        // allocation per graph per compaction/bulk-load.
+        // sort/dedup here first, nor to copy element-by-element via `add()`.
+        // This avoids one full-size transient Vec allocation per graph per
+        // compaction/bulk-load.
         let builder = RingBuilder::from_vec(triples);
         new_graphs.insert(g_id, Arc::new(builder.build()));
     }

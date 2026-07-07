@@ -106,17 +106,9 @@ enum SidecarPayload {
     Ef(EfDict<usize>),
 }
 
-/// ε-serde-serializable sidecar (Phase 2 of the mmap'd ε-serde snapshot plan —
-/// see CLAUDE.md item 14).
+/// ε-serde-serializable sidecar.
 ///
-/// Previously the sidecar was an owned `HashMap<usize, (usize, SidecarPayload)>`
-/// keyed by `hi` with an enum payload — neither `HashMap` nor enums with
-/// heap-allocated variants are directly ε-serde-serializable, so the sidecar
-/// used to be excluded from the persistent snapshot format entirely and
-/// rebuilt from scratch (an O(n) walk) every time a trie was loaded from disk
-/// or round-tripped in memory.
-///
-/// This representation instead stores **sorted parallel vectors** keyed by
+/// Stores **sorted parallel vectors** keyed by
 /// `hi` (ascending) with **binary-search** lookup (`his.binary_search`)
 /// replacing the hash lookup, and both payload kinds (SIMD slice / Elias-Fano)
 /// flattened into shared backing arrays instead of a payload enum:
@@ -138,14 +130,12 @@ enum SidecarPayload {
 ///
 /// Every field here is a plain `Vec` of a primitive or an `Epserde` type, so
 /// `SidecarCore` (and therefore all of [`LoudsCore`]) is now **fully**
-/// ε-serde-serializable — the sidecar no longer needs to be excluded from the
-/// snapshot or rebuilt on load.
+/// ε-serde-serializable.
 // `Clone` is derived (with per-field-type bounds auto-added by the derive
 // macro) so that a *borrowed* `SidecarCore<&[usize], ..., &[EfDict<usize>]>`
 // view (produced by `load_mmap`, whose fields are all cheap-to-copy slice
 // references) can be cloned out of a shared `&DeserType<...>` reference into
-// an owned-by-value instance — see `GraphRing::from_mapped` (Phase 3.3c step
-// 2b, CLAUDE.md item 14).
+// an owned-by-value instance — see `GraphRing::from_mapped`.
 #[derive(Epserde, Default, Clone)]
 pub(crate) struct SidecarCore<
     His = Vec<usize>,
@@ -156,7 +146,6 @@ pub(crate) struct SidecarCore<
     SliceFlat = Vec<u32>,
     EfDicts = Vec<EfDict<usize>>,
 > {
-
     his: His,
     los: Los,
     kind: Kind,
@@ -188,7 +177,14 @@ impl EfDictsSub for Vec<EfDict<usize>> {
         self[idx].succ(target)
     }
     fn ef_mem_size(&self) -> usize {
-        self.iter().map(|ef| ef.mem_size(SizeFlags::default())).sum()
+        // `FOLLOW_REFS` is required so that `Borrowed*`-substrate fields
+        // (mmap'd `&'static [_]` slices, see `BorrowedEfDict` below) report
+        // their real referenced-data size instead of just the reference's
+        // own pointer width; it is a no-op for owned `Vec`/`Box`-backed
+        // fields (their `MemSize` impls do not gate on this flag).
+        self.iter()
+            .map(|ef| ef.mem_size(SizeFlags::FOLLOW_REFS))
+            .sum()
     }
 }
 
@@ -266,18 +262,8 @@ where
     }
 }
 
-impl SidecarCore {
-    /// Binary-search `his` (sorted ascending) for an exact match, returning
-    /// the shared entry index on success.
-    #[inline]
-    fn find(&self, hi: usize) -> Option<usize> {
-        self.his.binary_search(&hi).ok()
-    }
-}
-
-
 // ── T bitvector backend ───────────────────────────────────────────────────────
-//
+
 // The `t_backend` module exposes:
 //   pub(super) struct TBitvec
 //   pub(super) fn build(bits: impl Iterator<Item = bool>) -> TBitvec
@@ -346,14 +332,12 @@ pub(crate) mod t_backend {
     // (copying only the slice pointer/length/`num_ones` fields — no deep data
     // copy) into an owned-by-value `TBitvec<BorrowedT>` that can then be fed
     // into the existing (owned-only-signature) `from_core`/`from_snapshot`
-    // reconstruction chain. See `GraphRing::from_mapped` (Phase 3.3c step 2b,
-    // CLAUDE.md item 14).
+    // reconstruction chain. See `GraphRing::from_mapped`.
     #[derive(Epserde, Clone)]
     pub(crate) struct TBitvec<B = SuxRS> {
         rs: B,
         num_ones: usize,
     }
-
 
     impl TBitvec<SuxRS> {
         /// Construction only ever produces the owned form.
@@ -406,11 +390,16 @@ pub(crate) mod t_backend {
         /// Rank9 counters + SelectAdapt inventory), for memory-breakdown
         /// diagnostics.  Uses `sux`'s derived `MemSize` (accounts for every
         /// heap allocation in the nested Deref chain).
+        ///
+        /// `FOLLOW_REFS` is required so that a `Borrowed*`-substrate `B`
+        /// (mmap'd, holding `&'static [_]` fields internally) reports the
+        /// real size of the referenced data rather than just the reference's
+        /// own pointer width; it is a no-op for the owned `SuxRS` substrate.
         pub(super) fn mem_size_bytes(&self) -> usize
         where
             B: MemSize,
         {
-            self.rs.mem_size(SizeFlags::default())
+            self.rs.mem_size(SizeFlags::FOLLOW_REFS)
         }
     }
 }
@@ -533,9 +522,7 @@ pub(crate) struct LoudsTrie<B = t_backend::SuxRS, L = BitFieldVec, S = SidecarCo
 }
 
 /// Fully ε-serde-serializable core of a [`LoudsTrie`] — T, L, **and** the
-/// sidecar (Phase 2 of the mmap'd ε-serde snapshot plan; see
-/// [`SidecarCore`]'s docs for why the sidecar is now included here rather
-/// than excluded-and-rebuilt-on-load as it was pre-Phase-2).
+/// sidecar.
 ///
 /// `t_backend::TBitvec`, `sux::bits::BitFieldVec`, and [`SidecarCore`] all
 /// derive `epserde::Epserde`, so this struct composes cleanly through
@@ -545,10 +532,9 @@ pub(crate) struct LoudsTrie<B = t_backend::SuxRS, L = BitFieldVec, S = SidecarCo
 /// BorrowedL, BorrowedS>` view produced by `load_mmap` can be cheaply cloned
 /// out of a shared `&DeserType<...>` reference (all fields are borrowed
 /// slices, so this only copies pointer/length data) — see
-/// `GraphRing::from_mapped` (Phase 3.3c step 2b, CLAUDE.md item 14).
+/// `GraphRing::from_mapped`.
 #[derive(Epserde, Clone)]
 pub(crate) struct LoudsCore<T = t_backend::TBitvec, L = BitFieldVec, S = SidecarCore> {
-
     t: T,
     l: L,
     l_len: usize,
@@ -561,12 +547,11 @@ pub(crate) struct LoudsCore<T = t_backend::TBitvec, L = BitFieldVec, S = Sidecar
 // substrate `B`/`L`/`S` — this is what lets a future borrowed/mmap'd
 // `LoudsCore<DeserType<TBitvec<B>>, DeserType<L>, DeserType<S>>` reconstruct
 // directly into a navigable `LoudsTrie<B, L, S>` with **zero extra code**
-// versus the owned round-trip path (Phase 3.3c step 2a, CLAUDE.md item 14).
+// versus the owned round-trip path.
 impl<B, L, S> LoudsTrie<B, L, S> {
     /// Reconstruct a full `LoudsTrie` from a [`LoudsCore`] loaded from disk
     /// (or from an in-memory round-trip buffer, or a borrowed `load_mmap`'d
-    /// view). The sidecar travels with the core as-is — no rebuild required
-    /// (Phase 2).
+    /// view). The sidecar travels with the core as-is — no rebuild required.
     pub(crate) fn from_core(core: LoudsCore<t_backend::TBitvec<B>, L, S>) -> Self {
         LoudsTrie {
             t: core.t,
@@ -584,7 +569,6 @@ impl<B, L, S> LoudsTrie<B, L, S> {
 // scratch, or converting to/from the ε-serde core, always produces/consumes
 // owned data.  Read-only navigation (below) is generic over any substrate.
 impl LoudsTrie {
-
     /// Consume this trie into its fully ε-serde-serializable [`LoudsCore`]
     /// (T + L + sidecar — no information is discarded or needs rebuilding).
     ///
@@ -600,7 +584,6 @@ impl LoudsTrie {
     }
 
     /// Build from T bits and L labels in paper format (no dummy entries).
-
     ///
     /// Prepends dummy `false` / `0` entries automatically.
     ///
@@ -661,14 +644,12 @@ impl LoudsTrie {
     ///
     /// Builds an intermediate `Vec<(hi, lo, SidecarPayload)>` during the BFS
     /// walk (order is BFS, not sorted by `hi`), then sorts by `hi` and
-    /// flattens into the ε-serde-serializable [`SidecarCore`] representation
-    /// (Phase 2 of the mmap'd ε-serde snapshot plan).
+    /// flattens into the ε-serde-serializable [`SidecarCore`] representation.
     fn build_sidecar(t: &t_backend::TBitvec, l: &BitFieldVec, l_len: usize) -> SidecarCore {
         let mut entries: Vec<(usize, usize, SidecarPayload)> = Vec::new();
         if l_len <= 1 {
             return SidecarCore::default(); // empty trie
         }
-
 
         // Enumerate nodes by walking the T bitvector BFS-style.
         // A node at T-position v has degree = selectnext1(v+1) - v.
@@ -813,11 +794,15 @@ where
     pub fn mem_breakdown(&self) -> LoudsMemBreakdown {
         LoudsMemBreakdown {
             t_bytes: self.t.mem_size_bytes(),
-            l_bytes: self.l.mem_size(SizeFlags::default()),
+            // `FOLLOW_REFS` is required so that a `Borrowed*`-substrate `L`
+            // (mmap'd `BitFieldVec<&'static [usize]>`, see `BorrowedL`)
+            // reports the real size of the referenced backing slice rather
+            // than just the reference's own pointer width; it is a no-op
+            // for the owned `BitFieldVec<Vec<usize>>` substrate.
+            l_bytes: self.l.mem_size(SizeFlags::FOLLOW_REFS),
             sidecar_bytes: self.sidecar.mem_size_bytes(),
         }
     }
-
 
     /// Position of the first 1-bit at T-index ≥ `k`.
     ///
@@ -832,6 +817,11 @@ where
     /// T-position of the i-th child of node v (1-indexed i).
     ///
     /// Paper: `select1(v + i)`.  Rust (0-indexed select1): `select1(v + i − 1)`.
+    ///
+    /// Only exercised by `#[cfg(test)]` code (paper-formula correctness
+    /// pinning) — production hot paths use `leap`/`selectnext1`/
+    /// `child_from_label_pos`/`degree` instead.
+    #[allow(dead_code)]
     #[inline]
     pub fn child(&self, v: usize, i: usize) -> usize {
         self.t
@@ -861,6 +851,10 @@ where
     /// Label (local ID) of the i-th child of node v (1-indexed i).
     ///
     /// Paper: `L[v + i]`.
+    ///
+    /// Only exercised by `#[cfg(test)]` code (paper-formula correctness
+    /// pinning) — production hot paths use `label_at` directly.
+    #[allow(dead_code)]
     #[inline]
     pub fn access(&self, v: usize, i: usize) -> u32 {
         self.label_at(v + i)
@@ -924,7 +918,6 @@ where
                 }
             };
         }
-
 
         // ── Scalar path for low-degree nodes (degree < SIDECAR_THRESH) ────────
         //
@@ -1001,8 +994,7 @@ where
 /// above — this includes both the owned/default instantiation
 /// (`LoudsTrie<t_backend::SuxRS, BitFieldVec, SidecarCore>`, produced by
 /// `from_raw`/`from_core`) and a future borrowed/mmap'd instantiation whose
-/// `B`/`L`/`S` are ε-serde's `DeserType` forms (Phase 3.3 of the mmap'd
-/// ε-serde snapshot plan — CLAUDE.md item 14), with **zero code
+/// `B`/`L`/`S` are ε-serde's `DeserType` forms, with **zero code
 /// duplication**: `CltjTrie`/`CltjData`/`GraphRing` only need to be generic
 /// over one `Louds: LoudsNav` parameter instead of three.
 pub(crate) trait LoudsNav {
@@ -1050,7 +1042,6 @@ where
 }
 
 // ── Construction helpers ──────────────────────────────────────────────────────
-
 
 /// Append `d − 1` `false` bits then one `true` bit to `t`.
 #[inline]
@@ -1125,14 +1116,14 @@ pub(crate) fn build_louds_from_sorted(sorted: &[[u32; 3]]) -> Option<LoudsTrie> 
     Some(LoudsTrie::from_raw(&t_bits, &l_labels))
 }
 
-// ── Borrowed substrate (Phase 3.3c step 2b) ───────────────────────────────────
+// ── Borrowed substrate ─────────────────────────────────────────────────────────
 //
 // Concrete types that ε-serde's `DeserType<LoudsCore>`/`DeserType<TBitvec>`/
 // `DeserType<BitFieldVec>`/`DeserType<SidecarCore>` resolve to when loaded via
 // `load_mmap`. Determined empirically by compiling a deliberately-wrong probe
 // (`let _: () = view.t;` etc.) against a real `load_mmap`'d value and reading
-// off the type-mismatch error's "found" type (Phase 3.3c step 2b, CLAUDE.md
-// item 14). These are exactly the `B`/`L`/`S` substrate parameters that
+// off the type-mismatch error's "found" type. These are exactly the
+// `B`/`L`/`S` substrate parameters that
 // instantiate a **borrowed/zero-copy** `LoudsTrie<B, L, S>` — matched against
 // the `LoudsNav` blanket impl's bounds (`Rank + SelectUnchecked + MemSize` for
 // `B`; `SliceByValue<Value = usize> + MemSize` for `L`; `SidecarSub` for `S`),
@@ -1159,8 +1150,8 @@ pub(crate) type BorrowedL = BitFieldVec<&'static [usize]>;
 // `Box<[usize]>` fields deserialize to borrowed `&[usize]` slices. This is
 // exactly `EliasFano<usize, SelectZeroAdaptConst<BitVec<&[usize]>,
 // &[usize], 12, 3>, BitFieldVec<&[usize]>>` — confirmed empirically via
-// `std::any::type_name_of_val` on a real `load_mmap`'d value (Phase 3.3c
-// step 2b, CLAUDE.md item 14). No transmute is needed for this field: an
+// `std::any::type_name_of_val` on a real `load_mmap`'d value. No transmute
+// is needed for this field: an
 // owned `Vec` of partially-borrowed elements clones cheaply (no deep data
 // copy — see `Clone` derived on `SidecarCore`/`LoudsCore`) and assigns
 // directly.
@@ -1184,8 +1175,11 @@ impl EfDictsSub for Vec<BorrowedEfDict> {
         self[idx].succ(target)
     }
     fn ef_mem_size(&self) -> usize {
+        // `FOLLOW_REFS`: these `EfDict` elements are themselves borrowed
+        // (`&'static [_]`-backed) — without it, only the reference/pointer
+        // width would be counted instead of the referenced mmap'd data.
         self.iter()
-            .map(|ef| ef.mem_size(SizeFlags::default()))
+            .map(|ef| ef.mem_size(SizeFlags::FOLLOW_REFS))
             .sum()
     }
 }
@@ -1200,14 +1194,12 @@ pub(crate) type BorrowedS = SidecarCore<
     Vec<BorrowedEfDict>,
 >;
 
-
 /// Borrowed/mmap'd instantiation of [`LoudsTrie`] — zero-copy, all fields
 /// borrowed slices tied to a `MemCase`'s mapped memory (see [`BorrowedT`]/
 /// [`BorrowedL`]/[`BorrowedS`]'s doc comments for the lifetime-safety
 /// argument). Satisfies [`LoudsNav`] via the same blanket impl the owned form
 /// uses — no extra trait implementation required.
 pub(crate) type BorrowedLouds = LoudsTrie<BorrowedT, BorrowedL, BorrowedS>;
-
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -1216,7 +1208,7 @@ mod tests {
     use super::*;
 
     /// Construct the exact trie from Example 10 of the CompactLTJ paper
-
+    ///
     /// and verify every formula from the paper.
     ///
     /// T = 00001 111101 1111000010001  (24 bits)
@@ -1414,7 +1406,6 @@ mod tests {
             trie.sidecar.find(hi).is_some(),
             "sidecar must contain entry for hi={hi} (degree=20 >= SIDECAR_THRESH={SIDECAR_THRESH})"
         );
-
 
         // Every possible target — compare against manually expected position.
         for target in 0u32..20 {

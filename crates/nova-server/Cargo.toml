@@ -38,7 +38,7 @@ tower             = { workspace = true }   # Router::oneshot for integration tes
 serde_json        = { workspace = true }
 pretty_assertions = { workspace = true }
 tokio             = { workspace = true }
-ureq              = "2"    # blocking HTTP client for the crash-recovery integration
+ureq              = "3"    # blocking HTTP client for the crash-recovery integration
                              # test (tests/crash_recovery.rs) — spawns and talks to a
                              # real `nova_serve` subprocess; matches the same `ureq`
                              # version already used by tests/w3c's harness.

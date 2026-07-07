@@ -35,10 +35,8 @@
 //!   later be loaded from disk. Since ε-serde's on-disk byte format
 //!   is identical for both loading strategies (`deserialize_full`'s heap copy
 //!   or `load_mmap`'s zero-copy mapping), the loading strategy can be
-//!   changed later with **zero** file-format migration — this is exactly
-//!   what Phase 3 of the mmap'd ε-serde snapshot plan (CLAUDE.md item 14)
-//!   does. This round-trip happens in
-//!   `compact()`/`bulk_load()`, never on the query hot path
+//!   changed later with **zero** file-format migration. This round-trip
+//!   happens in `compact()`/`bulk_load()`, never on the query hot path
 //!   (`quads_for_pattern`/`join_scan`), so it cannot affect query latency.
 //!
 //! - **Snapshot writing is purely additive.**  `compact()` continues to
@@ -47,19 +45,16 @@
 //!   round-trip (for all stores) are both side effects layered on top with
 //!   no behavioural change to `RingStore`'s query or write semantics.
 //!
-//! ## Phase 1 of the mmap'd ε-serde snapshot plan (CLAUDE.md item 14)
+//! ## On-disk format
 //!
 //! This file's `nova.snapshot.<gen>` on-disk format is **uncompressed**
-//! (no zstd) — a deliberate, documented reversal of the earlier zstd-on-
-//! snapshot optimisation. This reintroduces an on-disk size regression
-//! (roughly 2.3 MiB -> 43-45 MiB on the disk benchmark dataset), but it is
-//! a prerequisite for Phase 3 ("map after compact"): mmap-based zero-copy
-//! loading is only possible against a file whose bytes are byte-identical
-//! to the in-memory ε-serde layout, which zstd compression would break.
-//! Still roughly 9x smaller than Oxigraph's 416.5 MiB RocksDB directory on
-//! the same dataset. The dictionary file (`nova.dict.<gen>`, see
-//! `dict_snapshot.rs`) is unaffected by this — it keeps its zstd
-//! compression until Phase 4. In-memory mode (`path: None`) is also
+//! (no zstd). Mmap-based zero-copy loading is only possible against a file
+//! whose bytes are byte-identical to the in-memory ε-serde layout, which
+//! zstd compression would break; the on-disk size (roughly 43-45 MiB on the
+//! disk benchmark dataset) is still roughly 9x smaller than Oxigraph's
+//! 416.5 MiB RocksDB directory on the same dataset. The dictionary file
+//! (`nova.dict.<gen>`, see `dict_snapshot.rs`) is a separate file and keeps
+//! its own zstd compression. In-memory mode (`path: None`) is also
 //! unaffected, since `round_trip_and_maybe_save`'s file-writing branch is
 //! skipped entirely when `path` is `None`.
 
@@ -72,21 +67,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-
 /// Whole-store ε-serde-serializable snapshot: one [`RingSnapshot`] per graph,
 /// keyed by the parallel `graph_ids` vector (index-aligned with `rings`).
 ///
 /// Generic over `Rings` (default `Vec<RingSnapshot>`) so that a future
 /// mmap'd load can substitute ε-serde's borrowed `DeserType<Vec<RingSnapshot>>`
 /// form here with **zero extra code** — mirrors the "bare generic parameter
-/// with a default" pattern used for `CltjSnapshot`'s `Tries = [LoudsCore; 6]`
-/// (Phase 3.3c probe, CLAUDE.md item 14).
+/// with a default" pattern used for `CltjSnapshot`'s `Tries = [LoudsCore; 6]`.
 #[derive(Epserde)]
 pub(crate) struct StoreSnapshot<Rings = Vec<RingSnapshot>> {
     pub(crate) graph_ids: Vec<u8>,
     pub(crate) rings: Rings,
 }
-
 
 impl StoreSnapshot {
     /// Build a snapshot from a per-graph `Arc<GraphRing>` map, consuming each
@@ -138,8 +130,8 @@ impl StoreSnapshot {
                 .map_err(|e| Oxigraph::Storage(format!("snapshot serialize failed: {e}")))?;
         }
 
-        // Phase 1 (see module docs above): write the raw ε-serde bytes
-        // directly, with NO zstd compression.
+        // Write the raw ε-serde bytes directly, with NO zstd compression
+        // (see module docs above).
         if let Some(path) = path {
             let tmp_path = {
                 let mut s = path.as_os_str().to_os_string();
@@ -169,14 +161,15 @@ impl StoreSnapshot {
     /// `RingStore::open`/`commit_compaction` actually use now) as a
     /// full-heap-copy alternative and for its existing regression test
     /// coverage.
+    #[allow(dead_code)]
     pub(crate) fn load_from_file(
         path: &Path,
     ) -> Result<HashMap<GraphId, Arc<GraphRing>>, Oxigraph> {
         if !path.exists() {
             return Ok(HashMap::new());
         }
-        // The file on disk is raw, uncompressed ε-serde bytes (see Phase 1
-        // module docs above) — read it directly and deserialize via
+        // The file on disk is raw, uncompressed ε-serde bytes (see module
+        // docs above) — read it directly and deserialize via
         // `deserialize_full`.
         let buf = std::fs::read(path)
             .map_err(|e| Oxigraph::Storage(format!("snapshot read failed: {e}")))?;
@@ -208,7 +201,7 @@ impl StoreSnapshot {
             StoreSnapshot::load_mmap(path, Flags::empty())
                 .map_err(|e| Oxigraph::Storage(format!("snapshot load_mmap failed: {e}")))?
         });
-        let graph_ids: Vec<u8> = mem.uncase().graph_ids.iter().copied().collect();
+        let graph_ids: Vec<u8> = mem.uncase().graph_ids.to_vec();
         let mut out = HashMap::with_capacity(graph_ids.len());
         for (i, g) in graph_ids.into_iter().enumerate() {
             let mapped = MappedGraphRing::new(Arc::clone(&mem), i);
@@ -222,7 +215,7 @@ impl StoreSnapshot {
     /// the just-written file back in — so the servable representation is a
     /// genuine zero-copy view of exactly the bytes on disk, never a
     /// redundant owned heap copy. Used by `commit_compaction`'s
-    /// persistent-store branch (see this module's doc comment, "Phase 3").
+    /// persistent-store branch.
     pub(crate) fn write_and_load_mmap(
         graphs: HashMap<GraphId, Arc<GraphRing>>,
         path: &Path,
@@ -247,7 +240,6 @@ impl StoreSnapshot {
         Self::load_mmap_from_file(path)
     }
 }
-
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -331,21 +323,19 @@ mod tests {
         assert!(loaded.is_empty());
     }
 
-    /// Phase 3.3c step 1 (probe): real `load_mmap` round-trip of a whole
-    /// [`StoreSnapshot`] (not just a single [`crate::cltj::CltjSnapshot`] as
-    /// `cltj_snapshot_load_mmap_probe` in `cltj.rs` already proved) to a temp
-    /// file, confirming that the generic-with-defaults threading added to
-    /// [`StoreSnapshot`]/[`RingSnapshot`] this session actually produces a
-    /// navigable, zero-copy `DeserType` view all the way down through
+    /// Probe: real `load_mmap` round-trip of a whole [`StoreSnapshot`] (not
+    /// just a single [`crate::cltj::CltjSnapshot`] as
+    /// `cltj_snapshot_load_mmap_probe` in `cltj.rs` already proves) to a temp
+    /// file, confirming that the generic-with-defaults threading on
+    /// [`StoreSnapshot`]/[`RingSnapshot`] produces a navigable, zero-copy
+    /// `DeserType` view all the way down through
     /// `StoreSnapshot -> RingSnapshot -> CltjSnapshot`, with vocab slices and
     /// tries still directly inspectable/borrowed at the innermost layer.
     ///
-    /// This is deliberately scoped to *inspecting* the borrowed view (not yet
+    /// This is deliberately scoped to *inspecting* the borrowed view (not
     /// constructing a navigable `GraphRing<BorrowedLouds, VocabRepr>` from
-    /// it) — that reconstruction is genuinely new code (an `Option A`/`Option
-    /// D` concern for Step 2/3 of the mmap'd ε-serde snapshot plan, CLAUDE.md
-    /// item 14), whereas this probe's job is only to de-risk the type-level
-    /// plumbing added in this step.
+    /// it, which `GraphRing::from_mapped` in `ring.rs` handles) — this
+    /// probe's job is only to de-risk the type-level plumbing.
     #[test]
     fn store_snapshot_load_mmap_probe() {
         use epserde::deser::Flags;
@@ -405,4 +395,3 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
-
