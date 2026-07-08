@@ -1,4 +1,4 @@
-//! File-format detection + parsing for `nova-cli load` / `nova-cli serve --file`.
+//! File-format detection + parsing for `oxigraph load` / `oxigraph serve --file`.
 //!
 //! Mirrors the same by-Content-Type dispatch `nova-server`'s
 //! `parse_body_triples` uses (see `crates/nova-server/src/lib.rs`), but keyed
@@ -85,7 +85,7 @@ pub fn parse_file(
 
     if fmt.is_dataset_format() && graph.is_some() {
         eprintln!(
-            "[nova-cli] warning: --graph is ignored for dataset formats (N-Quads/TriG/JSON-LD); \
+            "[oxigraph] warning: --graph is ignored for dataset formats (N-Quads/TriG/JSON-LD); \
              each quad's own graph is used instead."
         );
     }

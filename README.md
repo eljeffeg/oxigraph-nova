@@ -293,6 +293,43 @@ See [`benches/external/README.md`](./benches/external/README.md) for the full me
 
 ---
 
+## Command-line interface (`oxigraph`)
+
+Building the workspace also produces a standalone `oxigraph` binary
+(`crates/nova-cli`, package `oxigraph-nova-cli`) that mirrors a subset of
+upstream `oxigraph-cli`'s subcommands — `load`, `backup`, and `serve` —
+against Nova's own `RingStore`, under the same binary name so scripts/muscle
+memory carry over:
+
+```sh
+cargo build --release --bin oxigraph
+```
+
+| Subcommand | Purpose |
+|---|---|
+| `oxigraph load --location <dir> --file <path> [--format <fmt>] [--graph <iri>]` | Bulk-load a file directly into a persistent store, bypassing HTTP entirely (much faster than the Graph Store Protocol for large datasets) |
+| `oxigraph backup --location <dir> --destination <dir>` | Create a crash-safe, independent copy of a persistent store's WAL + MANIFEST + snapshot |
+| `oxigraph serve [--location <dir>] [--file <path>] [--bind <addr>]` | Start the same SPARQL 1.2 HTTP server described below, as a subcommand instead of a separate binary |
+
+```sh
+# Bulk-load a dataset directly into a persistent store
+cargo run --release --bin oxigraph -- load --location ./data --file dataset.nt
+
+# Back up a store's on-disk data into an independent directory
+cargo run --release --bin oxigraph -- backup --location ./data --destination ./backup
+
+# Serve a persistent store over HTTP (equivalent to nova_serve --location ./data)
+cargo run --release --bin oxigraph -- serve --location ./data --bind 0.0.0.0:3030
+```
+
+Run `oxigraph <subcommand> --help` for the full flag reference for each
+subcommand. `oxigraph serve` is a thin wrapper around the exact same server
+logic as the standalone `nova_serve` binary documented next — everything in
+the following section (endpoints, protocols, formats) applies equally to
+`oxigraph serve`.
+
+---
+
 ## Running the server
 
 `nova_serve` is a standalone SPARQL 1.1 HTTP server binary, built on the same

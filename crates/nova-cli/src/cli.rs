@@ -1,16 +1,17 @@
-//! `clap` argument definitions for the `nova-cli` binary.
+//! `clap` argument definitions for the `oxigraph` binary.
 //!
 //! Subcommand/flag names deliberately mirror upstream `oxigraph-cli`
 //! (see `./research/oxigraph/cli/src/cli.rs`) wherever Nova's feature surface
-//! overlaps, so muscle memory / scripts written against one carry over to
-//! the other. Nova currently ships a smaller subset (`load`, `backup`,
-//! `serve`) than `oxigraph-cli`'s nine subcommands — see `CLAUDE.md`.
+//! overlaps — this binary is even named `oxigraph`, so scripts/muscle
+//! memory written against one carry over to the other. Nova currently
+//! ships a smaller subset (`load`, `backup`, `serve`) than
+//! `oxigraph-cli`'s nine subcommands — see `CLAUDE.md`.
 
 use clap::{Parser, Subcommand, ValueHint};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about, version, name = "nova-cli")]
+#[command(about, version, name = "oxigraph")]
 /// Oxigraph Nova offline CLI tooling: bulk-load, backup, and serve a
 /// persistent `RingStore` without going through HTTP.
 pub struct Args {
@@ -69,7 +70,7 @@ pub enum Command {
     /// A thin wrapper around the same store-construction + `Server::run`
     /// logic as the standalone `nova_serve` binary (see
     /// `crates/nova-server/src/bin/nova_serve.rs`), exposed here as a
-    /// subcommand of the unified `nova-cli` tool. `nova_serve` itself is
+    /// subcommand of the unified `oxigraph` CLI tool. `nova_serve` itself is
     /// kept unchanged (and unaffected by this command) since external
     /// benchmark scripts depend on its exact flags.
     Serve {
