@@ -91,6 +91,8 @@
 //! semantics", for the storage-level explanation), demonstrated directly by
 //! `crates/nova-server/tests/isolation.rs`'s two integration tests.
 
+mod service_description;
+
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query as AxumQuery, State};
@@ -98,8 +100,6 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use oxigraph_nova_core::QuadStore;
-use tower_http::cors::CorsLayer;
-
 use oxigraph_nova_query::{
     Evaluator, QueryResult, Solutions, StoreDataset, clear_graph, execute_update,
 };
@@ -113,12 +113,14 @@ use oxttl::{
     TurtleParser, TurtleSerializer,
 };
 use serde::Deserialize;
+use service_description::generate_service_description_graph;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use spargebra::algebra::GraphPattern;
 use spargebra::{Query, SparqlParser};
 use std::io::Write as _;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::cors::CorsLayer;
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -188,6 +190,11 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
                     .post(store_post::<S>)
                     .delete(store_delete::<S>),
             )
+            // Machine-readable SPARQL Service Description (`sd:` vocabulary),
+            // matching upstream Oxigraph's `oxigraph serve`. Some SPARQL
+            // tooling fetches this before sending real requests.
+            .route("/", get(service_description_get))
+
             // Permissive CORS so browser-based SPARQL clients (e.g. YASGUI,
             // or any web app served from a different origin/port) can query
             // this endpoint directly via `fetch`/XHR without a proxy.
@@ -316,6 +323,29 @@ async fn sparql_update<S: QuadStore + 'static>(
     };
 
     execute_sparql_update(&state.store, &update_str)
+}
+
+/// `GET /` — SPARQL Service Description.
+///
+/// Returns a machine-readable capabilities document (the `sd:` vocabulary,
+/// `http://www.w3.org/ns/sparql-service-description#`) describing this
+/// endpoint, content-negotiated via `Accept` the same way as CONSTRUCT/
+/// DESCRIBE results (see `serialize_triples`). Some SPARQL tooling (e.g.
+/// query builders) fetches this before sending real requests, to discover
+/// which result/RDF formats and query/update languages are supported rather
+/// than guessing.
+///
+/// `sd:endpoint` is derived from the request's `Host` header (falling back
+/// to a relative-URL-friendly empty value if absent), naming the `/sparql`
+/// query endpoint.
+async fn service_description_get(headers: HeaderMap) -> Response {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let endpoint_url = format!("http://{host}/sparql");
+    let graph = generate_service_description_graph(&endpoint_url);
+    serialize_triples(&graph, accept_header(&headers))
 }
 
 /// Parse → execute a SPARQL Update request against the store.
@@ -2156,6 +2186,108 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ── SPARQL Service Description: GET / ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_service_description_default_turtle() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("n-triples"), "wrong content-type: {ct}");
+
+        let body = body_text(resp).await;
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql-service-description#Service"),
+            "missing sd:Service triple: {body}"
+        );
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql-service-description#endpoint"),
+            "missing sd:endpoint triple: {body}"
+        );
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql-service-description#supportedLanguage"),
+            "missing sd:supportedLanguage triple: {body}"
+        );
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql-service-description#SPARQLQuery"),
+            "missing sd:SPARQLQuery language declaration: {body}"
+        );
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql-service-description#SPARQLUpdate"),
+            "missing sd:SPARQLUpdate language declaration: {body}"
+        );
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql-service-description#supportedVersion"),
+            "missing sd:supportedVersion triple: {body}"
+        );
+        // Note: matched with the closing `>` so this doesn't just pass as a
+        // substring of the `version-1.2-basic` assertion below.
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql#version-1.2>"),
+            "missing SPARQL 1.2 version declaration: {body}"
+        );
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql#version-1.2-basic"),
+            "missing SPARQL 1.2-basic version declaration: {body}"
+        );
+
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql-service-description#resultFormat"),
+            "missing sd:resultFormat triple: {body}"
+        );
+
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql-service-description#feature"),
+            "missing sd:feature triple: {body}"
+        );
+        assert!(
+            body.contains(
+                "http://www.w3.org/ns/sparql-service-description#defaultEntailmentRegime"
+            ),
+            "missing sd:defaultEntailmentRegime triple: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_description_turtle_via_accept() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header("accept", "text/turtle")
+            .header("host", "example.org")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/turtle"), "wrong content-type: {ct}");
+
+        let body = body_text(resp).await;
+        assert!(
+            body.contains("http://example.org/sparql"),
+            "expected sd:endpoint to use Host header: {body}"
+        );
     }
 
     // ── Graph Store HTTP Protocol: DELETE /store ──────────────────────────────

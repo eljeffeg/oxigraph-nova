@@ -102,7 +102,6 @@ fn optimize_pattern(pattern: &GP) -> GP {
     pattern.clone()
 }
 
-
 // ── XSD numeric tower ─────────────────────────────────────────────────────────
 
 /// Parsed XSD numeric literal — carries the full type so that comparison and
@@ -250,7 +249,6 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 let active_graph = dataset_clause_selector(query.dataset());
                 let pattern = optimize_pattern(pattern);
                 let solutions = self.eval_pattern(&pattern, &active_graph)?;
-
 
                 let mut triples = Vec::new();
                 for sol in &solutions {
