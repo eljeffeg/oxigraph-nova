@@ -19,11 +19,15 @@ services:
       - nova-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf -X POST http://localhost:3030/sparql -H 'Content-Type: application/sparql-query' --data 'ASK { ?s ?p ?o }' || exit 1"]
+      # GET / returns the SPARQL Service Description graph — a lightweight,
+      # always-available endpoint that doesn't touch the store, unlike a
+      # full SPARQL query.
+      test: ["CMD-SHELL", "curl -sf http://localhost:3030/ || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
 
   # YASGUI — browser-based SPARQL query editor/results viewer, served as a
   # static single-page app (see yasgui/index.html) and pre-pointed at the

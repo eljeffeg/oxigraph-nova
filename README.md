@@ -351,9 +351,41 @@ See `nova_serve --help` for the full flag reference, and
 `crates/nova-server/src/lib.rs`'s module doc comment for the complete list of
 supported RDF/SPARQL-results serialization formats.
 
+### Running with Docker
+
+A `Dockerfile` and `docker-compose.yml` are provided for a zero-toolchain way
+to run `nova_serve`, along with [YASGUI](https://github.com/TriplyDB/YASGUI) —
+a browser-based SPARQL query editor — pre-wired to the endpoint.
+
+```sh
+docker compose up -d
+```
+
+This starts two services:
+
+| Service | URL | Purpose |
+|---|---|---|
+| `nova-serve` | http://localhost:3030 | SPARQL 1.1 Protocol + Graph Store Protocol endpoint, persisted to a named Docker volume (`nova-data`) so data survives restarts |
+| `yasgui` | http://localhost:8091 | Browser-based SPARQL query UI, pre-pointed at `http://localhost:3030/sparql` (override via `?endpoint=<url>`) |
+
+CORS is enabled permissively on `nova-serve` so the YASGUI page (a different
+origin/port) can query it directly via `fetch` with no proxy required.
+
+To build/run just the server image directly (no Compose, no YASGUI):
+
+```sh
+docker build -t oxigraph-nova .
+docker run --rm -p 3030:3030 -v nova-data:/data oxigraph-nova \
+    --location /data --bind 0.0.0.0:3030
+```
+
+See the comments atop `Dockerfile` for bulk-loading a mounted dataset instead
+of (or in addition to) a persistent volume.
+
 ---
 
 ## Design papers
+
 
 
 The compact storage and join algorithms are described in published research. Listed in reading order:

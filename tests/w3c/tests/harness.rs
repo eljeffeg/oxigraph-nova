@@ -13,15 +13,22 @@
 //!   OXIGRAPH_W3C11_FAIL=1         — hard-fail (non-zero exit) on unexpected SPARQL 1.1 failures (CI)
 //!   OXIGRAPH_W3C12_FAIL=1         — same, for the SPARQL 1.2 Working Draft suite (off by default)
 //!   OXIGRAPH_W3C_DEBUG=1          — print got/expected triples on CONSTRUCT mismatches
+//!   OXIGRAPH_W3C_SPAREVAL_ORACLE=1 — cross-check Nova's evaluator output against spareval
+//!                                    (Oxigraph's own nested-loop/hash-join evaluator) on the
+//!                                    same store/query for every QueryEval test case. Purely
+//!                                    diagnostic: disagreements are reported in the summary but
+//!                                    never turn a PASS into a FAIL.
 
 use anyhow::{Context, Result, anyhow};
 use oxigraph_nova_core::{GraphName, Oxigraph, Quad, QuadStore};
 use oxigraph_nova_query::{Evaluator, QueryResult, Solution, StoreDataset};
 use oxigraph_nova_storage_ring::RingStore;
-use oxrdf::{NamedNode, NamedOrBlankNode, Term, Triple, Variable};
+use oxrdf::{Dataset as OxrdfDataset, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use oxttl::{NTriplesParser, TriGParser, TurtleParser};
 use sparesults::{QueryResultsFormat, QueryResultsParser, ReaderQueryResultsParserOutput};
 use spargebra::SparqlParser;
+use spareval::{QueryEvaluator as SparevalEvaluator, QueryResults as SparevalResults};
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -402,7 +409,7 @@ fn extract_test(g: &RdfGraph, entry: &Term) -> Option<TestCase> {
 
 // ── Data loading ──────────────────────────────────────────────────────────────
 
-fn load_into_store<S: QuadStore>(store: &S, url: &str, graph: &GraphName) -> Result<()> {
+fn load_into_store<S: QuadStore>(store: &S, url: &str, graph: &GraphName) -> Result<Vec<Quad>> {
     // Register the named graph up front — this ensures that even empty graphs
     // (Turtle files with no triples) are returned by named_graphs() and
     // therefore participate in GRAPH ?g enumeration.
@@ -410,6 +417,7 @@ fn load_into_store<S: QuadStore>(store: &S, url: &str, graph: &GraphName) -> Res
         .register_named_graph(graph)
         .map_err(|e| anyhow!("register graph: {e}"))?;
     let content = read_url(url)?;
+
 
     // TriG is a distinct format from Turtle: it adds `GRAPH <iri> { ... }`
     // blocks for defining multiple named graphs (plus default-graph triples)
@@ -439,11 +447,12 @@ fn load_into_store<S: QuadStore>(store: &S, url: &str, graph: &GraphName) -> Res
                 .register_named_graph(&q.graph_name)
                 .map_err(|e| anyhow!("register graph: {e}"))?;
         }
-        for q in quads {
-            store.insert(&q)?;
+        for q in &quads {
+            store.insert(q)?;
         }
-        return Ok(());
+        return Ok(quads);
     }
+
 
     // Dispatch by file extension: most W3C SPARQL 1.1 test fixtures are
     // Turtle, but the subquery (`sq0*`) tests ship `.rdf` (RDF/XML) data
@@ -473,11 +482,15 @@ fn load_into_store<S: QuadStore>(store: &S, url: &str, graph: &GraphName) -> Res
             .map_err(|e| anyhow!("{e}"))?
     };
 
+    let mut quads = Vec::with_capacity(triples.len());
     for t in triples {
-        store.insert(&Quad::new(t.subject, t.predicate, t.object, graph.clone()))?;
+        let q = Quad::new(t.subject, t.predicate, t.object, graph.clone());
+        store.insert(&q)?;
+        quads.push(q);
     }
-    Ok(())
+    Ok(quads)
 }
+
 
 // ── Blank-node-identity-preserving term representation ────────────────────────
 
@@ -1101,8 +1114,83 @@ fn solutions_to_rows(sols: &[Solution], vars: &[Variable]) -> Vec<BTreeMap<Strin
         .collect()
 }
 
+/// Cross-check Nova's own evaluator result against spareval (Oxigraph's
+/// independent nested-loop/hash-join evaluator) run on the same quads/query.
+/// Purely diagnostic — never affects PASS/FAIL, only prints a warning to
+/// stderr on disagreement. Gated by `OXIGRAPH_W3C_SPAREVAL_ORACLE=1` at the
+/// call site in `run_test`.
+fn run_spareval_oracle(
+    test_name: &str,
+    quads: &[Quad],
+    query: &spargebra::Query,
+    nova_result: &QueryResult,
+) {
+    // oxrdf::Dataset has a blanket `spareval::QueryableDataset` impl (for
+    // `&Dataset`), so mirroring the same quads already loaded into Nova's
+    // store into a plain owned `oxrdf::Dataset` is all that's needed here —
+    // no custom trait adapter over Nova's own `Dataset`/`QuadStore` traits.
+    let dataset: OxrdfDataset = quads.iter().cloned().collect();
+    let evaluator = SparevalEvaluator::new();
+    let spareval_result = match evaluator.prepare(query).execute(&dataset) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[spareval-oracle] {test_name}: evaluation error: {e}");
+            return;
+        }
+    };
+
+    let matches = match (nova_result, spareval_result) {
+        (QueryResult::Boolean(got), SparevalResults::Boolean(exp)) => *got == exp,
+        (QueryResult::Solutions(sols), SparevalResults::Solutions(sol_iter)) => {
+            let vars = sol_iter.variables().to_vec();
+            let mut exp_rows = Vec::new();
+            for sol in sol_iter {
+                let sol = match sol {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[spareval-oracle] {test_name}: solution error: {e}");
+                        return;
+                    }
+                };
+                let mut row = BTreeMap::new();
+                for (v, t) in sol.iter() {
+                    row.insert(v.as_str().to_string(), term_to_repr(t));
+                }
+                exp_rows.push(row);
+            }
+            let got_rows = solutions_to_rows(sols, &vars);
+            facts_isomorphic(&rows_to_facts(&got_rows), &rows_to_facts(&exp_rows))
+        }
+        (QueryResult::Triples(ts), SparevalResults::Graph(triple_iter)) => {
+            let mut exp = Vec::new();
+            for t in triple_iter {
+                let t = match t {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("[spareval-oracle] {test_name}: triple error: {e}");
+                        return;
+                    }
+                };
+                exp.push(triple_to_repr(&t));
+            }
+            let exp = dedup_triples(exp);
+            let got = dedup_triples(ts.iter().map(triple_to_repr).collect());
+            facts_isomorphic(&triples_to_facts(&got), &triples_to_facts(&exp))
+        }
+        // Mismatched result shapes (e.g. Nova errored before producing a
+        // comparable QueryResult) aren't directly comparable — skip silently
+        // rather than reporting a spurious oracle disagreement.
+        _ => true,
+    };
+
+    if !matches {
+        eprintln!("[spareval-oracle] MISMATCH on {test_name}");
+    }
+}
+
 fn projected_vars(query: &spargebra::Query) -> Vec<Variable> {
     use spargebra::algebra::GraphPattern;
+
     fn extract(p: &GraphPattern) -> Vec<Variable> {
         match p {
             GraphPattern::Project { variables, .. } => variables.clone(),
@@ -1186,15 +1274,20 @@ fn run_test<S: TestStore + 'static>(tc: &TestCase) -> Result<bool> {
             let qtext = read_url(query_url)?;
             let expected = parse_expected(result_url)?;
 
-            // Build store and load data.
+            // Build store and load data. `all_quads` mirrors everything
+            // inserted into `store`, purely so the spareval oracle (below)
+            // can build an independent `oxrdf::Dataset` from the exact same
+            // data without a second network fetch/parse.
             let store = Arc::new(S::default());
+            let mut all_quads: Vec<Quad> = Vec::new();
             for url in &tc.data_urls {
-                load_into_store(store.as_ref(), url, &GraphName::DefaultGraph)?;
+                all_quads.extend(load_into_store(store.as_ref(), url, &GraphName::DefaultGraph)?);
             }
             for (graph_iri, url) in &tc.named_urls {
                 let gname = GraphName::NamedNode(NamedNode::new_unchecked(graph_iri.clone()));
-                load_into_store(store.as_ref(), url, &gname)?;
+                all_quads.extend(load_into_store(store.as_ref(), url, &gname)?);
             }
+
             // Compact the delta into the Ring so LFTJ can fire.
             // Without this, lftj_has_delta() returns true and every query falls
             // back to the nested-loop evaluator — LFTJ would never be exercised.
@@ -1209,6 +1302,14 @@ fn run_test<S: TestStore + 'static>(tc: &TestCase) -> Result<bool> {
 
             let ds = StoreDataset::new(Arc::clone(&store));
             let result = Evaluator::new(&ds).evaluate(&query)?;
+
+            // Optional differential-testing oracle: cross-check Nova's own
+            // result against spareval (Oxigraph's independent nested-loop/
+            // hash-join evaluator) on the exact same quads/query. Purely
+            // diagnostic — never affects the PASS/FAIL verdict below.
+            if std::env::var("OXIGRAPH_W3C_SPAREVAL_ORACLE").is_ok() {
+                run_spareval_oracle(&tc.name, &all_quads, &query, &result);
+            }
 
             // Compare — blank-node-bearing results are compared via a true
             // isomorphism check (Weisfeiler-Lehman refinement + verified

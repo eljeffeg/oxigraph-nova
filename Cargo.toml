@@ -74,9 +74,14 @@ rand = "0.9"   # SPARQL RAND() built-in
 
 # ── Testing utilities ───────────────────────────────────────────────────────
 pretty_assertions = "1.4"
-# spareval is NOT listed here: spareval 0.2.x is incompatible with oxrdf 0.3.3
-# (Literal::destruct() now returns a 4-tuple) and spargebra 0.4.6 sparql-12
-# (unhandled Triple variants).  Re-add when a compatible version ships.
+# spareval 0.2.6 pins the exact same oxrdf/spargebra/sparopt/sparesults
+# versions as this workspace and compiles cleanly against them. It is used
+# only by tests/w3c, as a differential-testing oracle cross-checking Nova's
+# own evaluator against Oxigraph's independent nested-loop/hash-join
+# evaluator on the same W3C test cases — not a dependency of any production
+# crate, and not a replacement for Nova's own LFTJ-based evaluator.
+spareval = { version = "0.2.6", features = ["sparql-12"] }
+
 
 [profile.release]
 opt-level      = 3

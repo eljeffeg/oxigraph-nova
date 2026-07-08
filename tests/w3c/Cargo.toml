@@ -18,7 +18,9 @@ oxttl      = { workspace = true }
 oxrdfxml   = { workspace = true }  # some W3C SPARQL 1.1 subquery fixtures ship .rdf (RDF/XML) data
 spargebra  = { workspace = true }
 sparesults = { workspace = true }
+spareval   = { workspace = true } # differential-testing oracle, gated behind OXIGRAPH_W3C_SPAREVAL_ORACLE=1
 
 anyhow     = { workspace = true }
 ureq       = "3"           # blocking HTTP for fetch+cache of W3C test files
+
 

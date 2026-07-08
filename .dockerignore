@@ -14,3 +14,7 @@ profile.json.gz
 *.pyc
 *.csv
 benches/external
+# Static YASGUI assets are bind-mounted directly by docker-compose (see
+# docker-compose.yml's yasgui service); not needed in the Rust build context.
+yasgui
+
