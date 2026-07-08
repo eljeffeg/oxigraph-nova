@@ -23,7 +23,7 @@ use clap::Parser;
 use cli::{Args, Command};
 use mimalloc::MiMalloc;
 use oxigraph_nova_core::GraphName;
-use oxigraph_nova_server::Server;
+use oxigraph_nova_server::{Server, mimalloc_tuning};
 use oxigraph_nova_storage_ring::{RingStore, SyncPolicy};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +36,12 @@ use std::time::{Duration, Instant};
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() -> anyhow::Result<()> {
+    // Must run before any other allocation — see
+    // `oxigraph_nova_server::mimalloc_tuning`'s module doc comment (bulk-load/
+    // compaction transient-memory fix, shared with `nova_serve`'s binary
+    // since `oxigraph load`/`oxigraph serve` also call `bulk_load()`).
+    mimalloc_tuning::tune_mimalloc_purge_delay();
+
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
@@ -103,10 +109,15 @@ fn run_load(
 
     println!("[oxigraph load] Bulk-loading {parsed} quads ...");
     let count = store.bulk_load(quads)?;
+    // See `oxigraph_nova_server::mimalloc_tuning::mimalloc_collect_now`'s doc
+    // comment: force an eager purge pass right after the build's transient
+    // scratch-buffer allocation burst.
+    mimalloc_tuning::mimalloc_collect_now();
     println!(
         "[oxigraph load] Loaded + compacted {count} quads in {:.2}s.",
         t0.elapsed().as_secs_f64()
     );
+
     println!(
         "[oxigraph load] Store now has {} triples total.",
         store.triple_count()
@@ -174,6 +185,9 @@ async fn run_serve(
             let t0 = Instant::now();
             let quads = load::parse_file(file, None, None)?;
             let count = store.bulk_load(quads)?;
+            // See `oxigraph_nova_server::mimalloc_tuning::mimalloc_collect_now`'s
+            // doc comment.
+            mimalloc_tuning::mimalloc_collect_now();
             println!(
                 "[oxigraph serve] Loaded + compacted {count} triples in {:.2}s.",
                 t0.elapsed().as_secs_f64()

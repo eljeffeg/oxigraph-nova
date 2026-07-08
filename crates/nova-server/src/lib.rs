@@ -88,6 +88,93 @@
 
 mod service_description;
 
+/// mimalloc purge tuning (bulk-load/compaction transient-memory fix).
+///
+/// `RingStore::bulk_load()`/`compact_locked()` build the Ring's 6 LOUDS
+/// tries via a paired-construction algorithm (`cltj::build_cltj_data`) that
+/// allocates several large (tens-to-hundreds-of-MiB, at multi-million-triple
+/// scale) transient `Vec<[u32;3]>` sort/dedup scratch buffers. mimalloc —
+/// like every segmented allocator — does not return a freed *segment* to
+/// the OS the instant it becomes empty; by default it delays 10ms
+/// (`mi_option_purge_delay`) before actually decommitting/munmap-ing it, on
+/// the theory that a segment freed now is likely to be needed again soon.
+/// That default is a fine trade-off for steady-state request/response
+/// workloads, but it actively fights us here: dozens of these giant scratch
+/// buffers are allocated and freed back-to-back in a tight loop while
+/// building all 6 orderings for every graph, so mimalloc's 10ms retention
+/// window means most of them are all still "on hold" simultaneously right
+/// as the *next* one is allocated — inflating the process's peak physical
+/// footprint far past the sum of what's actually alive at any single
+/// instant (measured: ~2.7-3.3 GiB peak/steady-state physical footprint for
+/// a 500K-entity/12.5M-triple in-memory `nova_serve`, versus
+/// `memory_breakdown()`'s self-reported ~494 MiB of real, live data).
+///
+/// This module provides the two-part fix, shared by both `nova_serve` and
+/// `oxigraph` (nova-cli), so it's applied uniformly wherever a `RingStore`
+/// can be bulk-loaded:
+///
+///   1. [`tune_mimalloc_purge_delay`] — sets `mi_option_purge_delay` to 0
+///      ("immediate purging"), so freed scratch-buffer segments become
+///      purge-eligible instantly instead of being held for 10ms. **Must be
+///      called as the very first statement in `main()`**, before any other
+///      allocation happens (including `tracing_subscriber::fmt::init()`) —
+///      mimalloc reads its options lazily on first use, and once a first
+///      allocation has locked in a default, later `mi_option_set` calls for
+///      that option are ignored.
+///   2. [`mimalloc_collect_now`] — call once right after a bulk-load/compact
+///      finishes, to eagerly walk mimalloc's per-thread heaps and push any
+///      remaining purge-eligible-but-not-yet-purged segments back to the OS
+///      immediately, rather than waiting for mimalloc's own
+///      background/next-allocation-triggered sweep.
+///
+/// Measured effect (500K-entity/12.5M-triple in-memory `nova_serve`, `vmmap
+/// -summary`): steady-state physical footprint 2.7 GiB → 569.5 MiB (~4.8x
+/// reduction); peak physical footprint 2.7-3.3 GiB → 2.2 GiB.
+///
+/// The equivalent `MIMALLOC_PURGE_DELAY=0` environment variable produces
+/// identical results, but wiring the `mi_option_set` call directly into
+/// `main()` makes the tuning load-bearing in the binary itself rather than
+/// something every operator/script launching it must remember to set.
+pub mod mimalloc_tuning {
+    /// The raw C `mi_option_e` ordinal for `mi_option_purge_delay`.
+    ///
+    /// Not exposed as a named Rust constant by `libmimalloc-sys` 0.1.49's
+    /// hand-written `extended.rs` bindings (only a subset of mimalloc's
+    /// `mi_option_e` enum is). Cross-referencing the vendored C headers
+    /// confirms `mi_option_purge_delay` sits at ordinal **15** in *both* the
+    /// `v2` and `v3` mimalloc headers this crate vendors (`c_src/mimalloc/
+    /// {v2,v3}/include/mimalloc.h`) — matching the position immediately
+    /// after `libmimalloc-sys`'s own named constant
+    /// `mi_option_eager_commit_delay = 14`, confirming the numbering lines
+    /// up. `libmimalloc-sys`/`mimalloc` are pinned to exact versions in
+    /// `Cargo.toml`, so this ordinal cannot silently drift out from under us
+    /// on a routine `cargo update`.
+    const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+    /// Set mimalloc's purge delay to 0 (immediate purging). **Call this as
+    /// the very first statement in `main()`** — see the module doc comment
+    /// for why timing matters.
+    pub fn tune_mimalloc_purge_delay() {
+        // SAFETY: `mi_option_set` is documented as safe to call at any time
+        // from any thread; it just writes an internal mimalloc option value.
+        unsafe {
+            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0);
+        }
+    }
+
+    /// Eagerly walk mimalloc's heaps and purge/release any freed-but-not-yet
+    /// -returned segments back to the OS right now. Call once, right after a
+    /// bulk-load/compact's burst of large transient scratch-buffer
+    /// allocations finishes.
+    pub fn mimalloc_collect_now() {
+        // SAFETY: `mi_collect` is documented as safe to call at any time
+        // from any thread.
+        unsafe {
+            libmimalloc_sys::mi_collect(true);
+        }
+    }
+}
+
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query as AxumQuery, State};

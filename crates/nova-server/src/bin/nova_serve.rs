@@ -63,6 +63,11 @@ use std::fs::File;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+// See `oxigraph_nova_server::mimalloc_tuning`'s module doc comment for the
+// full rationale behind this bulk-load/compaction transient-memory tuning
+// (measured ~4.8x steady-state / ~1.5x peak physical-footprint reduction on
+// a 500K-entity/12.5M-triple in-memory dataset).
+use oxigraph_nova_server::mimalloc_tuning;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,9 +75,14 @@ use std::time::{Duration, Instant};
 
 #[tokio::main]
 async fn main() {
+    // Must run before any other allocation — see
+    // `oxigraph_nova_server::mimalloc_tuning`'s module doc comment.
+    mimalloc_tuning::tune_mimalloc_purge_delay();
+
     tracing_subscriber::fmt::init();
 
     let mut file: Option<PathBuf> = None;
+
     let mut location: Option<PathBuf> = None;
     let mut bind: String = "0.0.0.0:3030".to_string();
     let mut compact_threshold: Option<usize> = None;
@@ -266,6 +276,12 @@ async fn main() {
                 "[nova_serve] Loaded + compacted {count} triples in {:.2}s.",
                 t0.elapsed().as_secs_f64()
             );
+
+            // Force an eager collection pass right after the build's burst
+            // of large transient scratch-buffer allocations — see
+            // `oxigraph_nova_server::mimalloc_tuning::mimalloc_collect_now`'s
+            // doc comment.
+            mimalloc_tuning::mimalloc_collect_now();
         }
     } else if location.is_none() {
         panic!("either --file <dataset.nt> or --location <dir> is required");
