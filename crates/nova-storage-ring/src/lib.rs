@@ -56,4 +56,7 @@ pub mod store;
 pub use louds::LoudsMemBreakdown;
 pub use oxigraph_nova_storage_common::{WalRecord, WalWriter, wal};
 pub use ring::SortOrder;
-pub use store::{MemoryBreakdown, PerOrderingBreakdown, RingStore, SyncPolicy};
+pub use store::{
+    MemoryBreakdown, PerOrderingBreakdown, RingStore, SyncPolicy, compaction_count,
+    compaction_duration_seconds_total,
+};

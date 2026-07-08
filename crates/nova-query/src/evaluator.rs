@@ -38,6 +38,17 @@ use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 use std::collections::HashMap;
 use std::str::FromStr;
 
+/// Short label for a query's top-level kind, used as a `tracing` span field
+/// in `Evaluator::evaluate` (`SELECT` / `ASK` / `CONSTRUCT` / `DESCRIBE`).
+fn query_kind_label(query: &Query) -> &'static str {
+    match query {
+        Query::Select { .. } => "SELECT",
+        Query::Ask { .. } => "ASK",
+        Query::Construct { .. } => "CONSTRUCT",
+        Query::Describe { .. } => "DESCRIBE",
+    }
+}
+
 // ── XSD namespace helper ──────────────────────────────────────────────────────
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -90,8 +101,29 @@ fn dataset_clause_selector(dataset: Option<&spargebra::algebra::QueryDataset>) -
 // them) — Nova doesn't consume those anyway, since join execution and the
 // CLTJ*/WCOJ variable ordering are driven by `lftj.rs`'s own adaptive VEO,
 // not by sparopt's static join order.
+//
+// `sparopt` 0.3.6 has confirmed optimizer bugs around `GRAPH ?var { ... }`
+// (a variable-named graph clause): it can hoist a `Group`/aggregation out
+// from inside the `Graph` node so aggregation runs once over the whole
+// dataset instead of once per named graph ("COUNT: no GROUP BY inside of
+// GRAPH"), drop the `Graph` wrapper entirely around a `Values` clause so
+// `?g` loses its graph-name binding ("VALUES inside GRAPH binding the same
+// variable as the graph name"), and distribute a single outer `Graph` node
+// into *both* branches of a `Minus` so the left and right sides spuriously
+// share the `?g` variable and are no longer compared for disjointness
+// correctly ("outer GRAPH operator does not affect MINUS disjointness") —
+// all three are W3C SPARQL 1.1 conformance-test regressions traced (via a
+// minimal `sparopt`-only repro, independent of this evaluator) to the
+// optimizer's round-trip, not to anything in this crate. Since a
+// variable-named `GRAPH` clause anywhere in the pattern is the common
+// trigger, skip sparopt optimization for the entire query in that case
+// (falling back to the unoptimized pattern, which this evaluator has always
+// executed correctly) rather than trying to patch sparopt's internals.
 #[cfg(feature = "sparopt")]
 fn optimize_pattern(pattern: &GP) -> GP {
+    if contains_variable_graph(pattern) {
+        return pattern.clone();
+    }
     use sparopt::Optimizer;
     use sparopt::algebra::GraphPattern as OptGP;
     let opt = Optimizer::optimize_graph_pattern(OptGP::from(pattern));
@@ -101,6 +133,36 @@ fn optimize_pattern(pattern: &GP) -> GP {
 #[cfg(not(feature = "sparopt"))]
 fn optimize_pattern(pattern: &GP) -> GP {
     pattern.clone()
+}
+
+/// Recursively check whether `pattern` contains a `GRAPH ?var { ... }` clause
+/// (a variable-named graph, as opposed to `GRAPH <iri> { ... }`) anywhere —
+/// see the doc comment on `optimize_pattern` above for why this disables the
+/// sparopt optimization pass for the whole query.
+#[cfg(feature = "sparopt")]
+fn contains_variable_graph(pattern: &GP) -> bool {
+    match pattern {
+        GP::Graph {
+            name: NamedNodePattern::Variable(_),
+            ..
+        } => true,
+        GP::Graph { inner, .. } => contains_variable_graph(inner),
+        GP::Join { left, right } | GP::Union { left, right } | GP::Minus { left, right } => {
+            contains_variable_graph(left) || contains_variable_graph(right)
+        }
+        GP::LeftJoin { left, right, .. } => {
+            contains_variable_graph(left) || contains_variable_graph(right)
+        }
+        GP::Filter { inner, .. }
+        | GP::Extend { inner, .. }
+        | GP::OrderBy { inner, .. }
+        | GP::Project { inner, .. }
+        | GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Slice { inner, .. }
+        | GP::Group { inner, .. } => contains_variable_graph(inner),
+        GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } | GP::Service { .. } => false,
+    }
 }
 
 // ── XSD numeric tower ─────────────────────────────────────────────────────────
@@ -210,6 +272,8 @@ pub struct Evaluator<'a, D: Dataset> {
     dataset: &'a D,
     /// BASE IRI extracted from the current query; used by IRI()/URI() to resolve relative strings.
     base_iri: std::cell::RefCell<Option<String>>,
+    /// Per-query cancellation/result-cap limits; see `crate::options`.
+    options: crate::options::QueryOptions,
 }
 
 impl<'a, D: Dataset> Evaluator<'a, D> {
@@ -217,11 +281,29 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         Self {
             dataset,
             base_iri: std::cell::RefCell::new(None),
+            options: crate::options::QueryOptions::default(),
+        }
+    }
+
+    /// Construct an evaluator with explicit execution limits (cancellation
+    /// token and/or a result-row cap) — see `crate::options::QueryOptions`.
+    pub fn with_options(dataset: &'a D, options: crate::options::QueryOptions) -> Self {
+        Self {
+            dataset,
+            base_iri: std::cell::RefCell::new(None),
+            options,
         }
     }
 
     // ── Top-level entry point ─────────────────────────────────────────────
 
+    /// Evaluate a parsed query against `self.dataset`.
+    ///
+    /// Wrapped in a `tracing` span (`query_kind` field distinguishes
+    /// SELECT/ASK/CONSTRUCT/DESCRIBE) so `nova-server`'s tracing-subscriber
+    /// output can show evaluation latency per query. `skip_all` avoids requiring
+    /// `Query`/`Self` to implement `Debug` just for span field capture.
+    #[tracing::instrument(name = "evaluate", skip_all, fields(query_kind = query_kind_label(query)))]
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
         // Extract BASE IRI from the query so IRI()/URI() can resolve relative strings.
         *self.base_iri.borrow_mut() = match query {
@@ -452,14 +534,24 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         // ── Fast path: Leapfrog Triejoin ──────────────────────────────────────
         // Try LFTJ first; falls back to nested-loop if the dataset doesn't
         // support it, the delta is non-empty, or the BGP has blank nodes / unknown terms.
-        if let Some(result) = crate::lftj::eval_bgp_lftj(self.dataset, patterns, active_graph) {
+        if let Some(result) = crate::lftj::eval_bgp_lftj_cancellable(
+            self.dataset,
+            patterns,
+            active_graph,
+            self.options.cancellation.as_ref(),
+        ) {
+            crate::lftj::record_lftj_used();
             return result;
         }
+        crate::lftj::record_lftj_fallback();
 
         // ── Fallback: nested-loop evaluation ──────────────────────────────────
         let mut solutions: Solutions = vec![Solution::new()];
 
         for tp in patterns {
+            self.options
+                .check(solutions.len())
+                .map_err(anyhow::Error::from)?;
             let mut next: Solutions = Vec::new();
 
             for current in &solutions {
@@ -1697,13 +1789,14 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             None => None,
         };
 
-        crate::path::ring_bfs_transitive_bound(
+        crate::path::ring_bfs_transitive_bound_cancellable(
             self.dataset,
             p_id,
             source_id,
             target_id,
             include_identity,
             ag,
+            self.options.cancellation.as_ref(),
         )
     }
 
@@ -1748,7 +1841,14 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             None => None,
         };
 
-        crate::path::ring_eval_rpq(self.dataset, path, source_id, target_id, ag)
+        crate::path::ring_eval_rpq_cancellable(
+            self.dataset,
+            path,
+            source_id,
+            target_id,
+            ag,
+            self.options.cancellation.as_ref(),
+        )
     }
 
     /// Enumerate all (subject, object) pairs reachable via `path` in `ag`.
@@ -1955,7 +2055,14 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 Err(e) => return Some(Err(e)),
             }
         };
-        crate::path::ring_bfs_transitive(self.dataset, p_id, &start_ids, include_identity, ag)
+        crate::path::ring_bfs_transitive_cancellable(
+            self.dataset,
+            p_id,
+            &start_ids,
+            include_identity,
+            ag,
+            self.options.cancellation.as_ref(),
+        )
     }
 
     /// Collect all distinct subjects and objects in the active graph.

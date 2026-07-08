@@ -14,6 +14,7 @@ sparopt       = { workspace = true, optional = true }  # algebra optimizer: filt
 oxsdatatypes  = { workspace = true }   # Correct XSD value semantics for comparison / arithmetic
 oxiri         = { workspace = true }   # RFC 3987 IRI parsing/resolution for the IRI()/URI() SPARQL function
 anyhow        = { workspace = true }
+tracing       = { workspace = true }
 sha2          = { workspace = true }   # SHA-256/384/512 hash functions
 sha1          = { workspace = true }   # SHA-1 hash function
 md-5          = { workspace = true }   # MD5 hash function

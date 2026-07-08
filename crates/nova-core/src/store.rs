@@ -178,4 +178,32 @@ pub trait QuadStore: Send + Sync {
         }
         Ok(count)
     }
+
+    // ── Observability (optional) ──────────────────────────────────────────────
+    //
+    // Storage-specific metrics for the `/metrics` endpoint (see
+    // `oxigraph_nova_server`). Every method here defaults to `None`,
+    // meaning "this backend doesn't track that metric" — `nova-server`
+    // simply omits the corresponding line from its Prometheus-text-format
+    // output rather than reporting a misleading `0`. Only `RingStore`
+    // currently overrides these (see its `QuadStore` impl); `MemoryStore`
+    // and any other backend inherit the defaults.
+
+    /// Number of live entries (inserts + tombstones) sitting in an
+    /// uncompacted write-buffer/delta, if this backend has one.
+    fn delta_len(&self) -> Option<usize> {
+        None
+    }
+
+    /// Total number of completed compactions (manual + automatic) since
+    /// process start, if this backend supports compaction.
+    fn compaction_count(&self) -> Option<u64> {
+        None
+    }
+
+    /// Cumulative wall-clock time spent inside compaction since process
+    /// start, in fractional seconds, if this backend supports compaction.
+    fn compaction_duration_seconds_total(&self) -> Option<f64> {
+        None
+    }
 }

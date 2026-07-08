@@ -23,7 +23,8 @@ serde          = { workspace = true }
 anyhow         = { workspace = true }
 tracing        = { workspace = true }
 tracing-subscriber = { workspace = true }
-mimalloc = "0.1.52"
+mimalloc         = { version = "0.1.52", features = ["extended"] }
+libmimalloc-sys  = { version = "0.1.49", features = ["extended"] }
 
 
 [[bin]]
@@ -40,4 +41,3 @@ ureq              = "3"    # blocking HTTP client for the crash-recovery integra
                              # test (tests/crash_recovery.rs) — spawns and talks to a
                              # real `nova_serve` subprocess; matches the same `ureq`
                              # version already used by tests/w3c's harness.
-

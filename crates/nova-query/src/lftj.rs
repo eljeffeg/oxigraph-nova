@@ -69,10 +69,45 @@
 //! 4. At `unbound.is_empty()`, emit a solution from `bindings`.
 
 use crate::dataset::{Dataset, GraphSelector};
+use crate::options::CancellationToken;
 use crate::solution::{Solution, Solutions};
 use oxigraph_nova_core::{GraphName, Variable};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ── LFTJ vs nested-loop fallback counters (process-wide) ──────────────────────
+//
+// Global, process-wide counters tracking how often BGP evaluation took the
+// Leapfrog Triejoin fast path vs. falling back to nested-loop join.
+// Incremented once per `eval_bgp` call in `evaluator.rs` (not
+// per-triple-pattern), at the same point that decides which path to take;
+// read by `nova-server`'s `/metrics` endpoint.
+static LFTJ_USED: AtomicU64 = AtomicU64::new(0);
+static LFTJ_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+/// Record that a BGP evaluation took the LFTJ fast path.
+pub fn record_lftj_used() {
+    LFTJ_USED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record that a BGP evaluation fell back to nested-loop join (LFTJ was
+/// gated off — unsupported dataset, non-empty delta, blank nodes, etc.).
+pub fn record_lftj_fallback() {
+    LFTJ_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total number of BGP evaluations that used the LFTJ fast path since
+/// process start.
+pub fn lftj_used_total() -> u64 {
+    LFTJ_USED.load(Ordering::Relaxed)
+}
+
+/// Total number of BGP evaluations that fell back to nested-loop join since
+/// process start.
+pub fn lftj_fallback_total() -> u64 {
+    LFTJ_FALLBACK.load(Ordering::Relaxed)
+}
 
 // ── Field specification ────────────────────────────────────────────────────────
 
@@ -378,6 +413,16 @@ fn leapfrog_sync(scans: &mut [Box<dyn oxigraph_nova_core::TrieIterator>]) -> Opt
 /// - `unbound` — var indices (into `join_vars`) yet to be bound, in the caller's
 ///   suggested order.  This function re-sorts them via `veo_sort` before iterating.
 /// - `bindings` — indexed by `var_idx`; `Some(val)` = bound, `None` = unbound.
+/// - `cancellation` — checked once per recursive call (cheap relaxed atomic
+///   load); when set, `*aborted` is flipped to `true` and the whole subtree
+///   unwinds immediately without emitting further solutions. Checking once
+///   per call (rather than per leapfrog-loop iteration) keeps the overhead
+///   proportional to the number of *bound* intermediate rows, not to every
+///   scan advance, so this does not regress the hot leapfrog-sync path.
+/// - `aborted` — set to `true` the moment cancellation is observed; every
+///   recursive call and loop iteration checks it first so cancellation
+///   propagates back up to `eval_bgp_lftj` promptly.
+#[allow(clippy::too_many_arguments)]
 fn lftj_step<D: Dataset>(
     dataset: &D,
     specs: &[PatternSpec],
@@ -386,7 +431,19 @@ fn lftj_step<D: Dataset>(
     unbound: &[usize],
     bindings: &mut Vec<Option<u64>>,
     results: &mut Solutions,
+    cancellation: Option<&CancellationToken>,
+    aborted: &mut bool,
 ) {
+    if *aborted {
+        return;
+    }
+    if let Some(token) = cancellation
+        && token.is_cancelled()
+    {
+        *aborted = true;
+        return;
+    }
+
     // Base case: all variables bound → emit a solution.
     //
     // Builds the row via `Solution::positional`, sharing `join_vars`'s
@@ -439,7 +496,15 @@ fn lftj_step<D: Dataset>(
         // No pattern constrains this variable (degenerate; should not arise in
         // a well-formed BGP but handled defensively).
         lftj_step(
-            dataset, specs, join_vars, graph, remaining, bindings, results,
+            dataset,
+            specs,
+            join_vars,
+            graph,
+            remaining,
+            bindings,
+            results,
+            cancellation,
+            aborted,
         );
         return;
     }
@@ -461,14 +526,29 @@ fn lftj_step<D: Dataset>(
 
     // ── Leapfrog loop ────────────────────────────────────────────────────────
     loop {
+        if *aborted {
+            break;
+        }
         match leapfrog_sync(&mut scans) {
             None => break, // one or more scans exhausted
             Some(val) => {
                 bindings[var_idx] = Some(val);
                 lftj_step(
-                    dataset, specs, join_vars, graph, remaining, bindings, results,
+                    dataset,
+                    specs,
+                    join_vars,
+                    graph,
+                    remaining,
+                    bindings,
+                    results,
+                    cancellation,
+                    aborted,
                 );
                 bindings[var_idx] = None;
+
+                if *aborted {
+                    break;
+                }
 
                 // Advance the first scan past `val`; leapfrog_sync will re-sync.
                 scans[0].advance();
@@ -502,6 +582,17 @@ pub fn eval_bgp_lftj<D: Dataset>(
     patterns: &[TriplePattern],
     active_graph: &GraphSelector,
 ) -> Option<anyhow::Result<Solutions>> {
+    eval_bgp_lftj_cancellable(dataset, patterns, active_graph, None)
+}
+
+/// Same as [`eval_bgp_lftj`] but with an optional cancellation token checked
+/// periodically in the leapfrog recursion — see `lftj_step`'s doc comment.
+pub fn eval_bgp_lftj_cancellable<D: Dataset>(
+    dataset: &D,
+    patterns: &[TriplePattern],
+    active_graph: &GraphSelector,
+    cancellation: Option<&CancellationToken>,
+) -> Option<anyhow::Result<Solutions>> {
     // ── Gate conditions ────────────────────────────────────────────────────────
     if !dataset.supports_lftj() {
         return None;
@@ -512,10 +603,10 @@ pub fn eval_bgp_lftj<D: Dataset>(
     match active_graph {
         GraphSelector::Default | GraphSelector::Named(_) => {}
         GraphSelector::AnyNamed => {
-            return eval_bgp_lftj_multi_graph(dataset, patterns, false);
+            return eval_bgp_lftj_multi_graph(dataset, patterns, false, cancellation);
         }
         GraphSelector::Union => {
-            return eval_bgp_lftj_multi_graph(dataset, patterns, true);
+            return eval_bgp_lftj_multi_graph(dataset, patterns, true, cancellation);
         }
         // A specific (FROM-clause-derived) set of graphs merged into "the"
         // default graph. LFTJ's single-graph-id fast path doesn't model an
@@ -554,6 +645,7 @@ pub fn eval_bgp_lftj<D: Dataset>(
     let mut bindings: Vec<Option<u64>> = vec![None; join_vars.len()];
     let unbound: Vec<usize> = (0..join_vars.len()).collect();
     let mut results: Solutions = Vec::new();
+    let mut aborted = false;
 
     lftj_step(
         dataset,
@@ -563,7 +655,15 @@ pub fn eval_bgp_lftj<D: Dataset>(
         &unbound,
         &mut bindings,
         &mut results,
+        cancellation,
+        &mut aborted,
     );
+
+    if aborted {
+        return Some(Err(anyhow::Error::from(
+            crate::options::EvalLimitError::Cancelled,
+        )));
+    }
 
     Some(Ok(results))
 }
@@ -582,6 +682,7 @@ fn eval_bgp_lftj_multi_graph<D: Dataset>(
     dataset: &D,
     patterns: &[TriplePattern],
     include_default: bool,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<anyhow::Result<Solutions>> {
     if !dataset.supports_lftj() || dataset.lftj_has_delta() {
         return None;
@@ -593,7 +694,7 @@ fn eval_bgp_lftj_multi_graph<D: Dataset>(
     let mut all_results: Solutions = Vec::new();
 
     if include_default {
-        match eval_bgp_lftj(dataset, patterns, &GraphSelector::Default) {
+        match eval_bgp_lftj_cancellable(dataset, patterns, &GraphSelector::Default, cancellation) {
             Some(Ok(sols)) => all_results.extend(sols),
             Some(Err(e)) => return Some(Err(e)),
             None => return None, // LFTJ not applicable for default graph → fallback
@@ -605,7 +706,7 @@ fn eval_bgp_lftj_multi_graph<D: Dataset>(
             continue;
         }
         let sel = GraphSelector::Named(g);
-        match eval_bgp_lftj(dataset, patterns, &sel) {
+        match eval_bgp_lftj_cancellable(dataset, patterns, &sel, cancellation) {
             Some(Ok(sols)) => all_results.extend(sols),
             Some(Err(e)) => return Some(Err(e)),
             None => return None, // LFTJ not applicable for this graph → fallback
