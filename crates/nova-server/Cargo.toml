@@ -11,9 +11,7 @@ oxigraph-nova-core         = { path = "../nova-core" }
 oxigraph-nova-query        = { path = "../nova-query" }
 oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
 oxrdf          = { workspace = true }
-oxttl          = { workspace = true }
-oxrdfxml       = { workspace = true }
-oxjsonld       = { workspace = true }
+oxrdfio        = { workspace = true }
 spargebra      = { workspace = true }
 
 sparesults     = { workspace = true }

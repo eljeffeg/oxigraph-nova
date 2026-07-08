@@ -22,6 +22,7 @@
 use crate::dataset::{Dataset, GraphSelector, PatternTerm, QuadPattern};
 use crate::solution::{Solution, Solutions};
 use anyhow::Result;
+use oxiri::{Iri, IriRef};
 use oxrdf::{BaseDirection, BlankNode, GraphName, Literal, NamedNode, Term, Variable};
 use oxsdatatypes::{
     Date as XsdDate, DateTime as XsdDateTime, Decimal as XsdDec, Double as XsdDbl,
@@ -1068,8 +1069,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 if s.is_empty() {
                     return None;
                 }
-                let resolved = resolve_iri_against_base(&s, self.base_iri.borrow().as_deref());
-                Some(Term::NamedNode(NamedNode::new_unchecked(resolved)))
+                resolve_iri_against_base(&s, self.base_iri.borrow().as_deref()).map(Term::NamedNode)
             }
             Function::BNode => {
                 // SPARQL 1.1 §17.4.2.7: BNODE(strExpr) — repeated calls with the
@@ -2695,60 +2695,35 @@ fn encode_for_uri(s: &str) -> String {
 
 // ── IRI resolution ────────────────────────────────────────────────────────────
 
-/// Returns true if `s` looks like an absolute IRI (has a scheme like `http:`).
-/// A URI scheme starts with a letter, followed by letters/digits/+/-/., then `:`.
-fn is_absolute_iri(s: &str) -> bool {
-    match s.find(':') {
-        None | Some(0) => false,
-        Some(i) => {
-            let scheme = &s[..i];
-            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-        }
-    }
-}
-
-/// Resolve `s` against `base`, following RFC 3986 rules (simplified for SPARQL use).
+/// Resolve `s` (a possibly-relative IRI reference) against `base` using
+/// oxiri's RFC 3986/3987-compliant resolution algorithm.
 ///
-/// - Absolute IRI (has scheme) → returned as-is.
-/// - Starts with `//`          → prepend scheme from base.
-/// - Starts with `/`           → prepend scheme + authority from base.
-/// - Relative path             → resolved against the base's last `/`.
-/// - No base                   → `s` returned unchanged.
-fn resolve_iri_against_base(s: &str, base: Option<&str>) -> String {
-    if is_absolute_iri(s) {
-        return s.to_string();
-    }
-    let Some(base_iri) = base else {
-        return s.to_string();
-    };
-
-    if s.starts_with("//") {
-        // Protocol-relative: prepend scheme from base
-        if let Some(colon) = base_iri.find(':') {
-            return format!("{}{}", &base_iri[..=colon], s);
+/// Returns `None` if:
+/// - `s` fails to parse as a valid IRI reference,
+/// - a `base` is given but fails to parse as an absolute IRI,
+/// - resolution against `base` fails (e.g. produces an invalid IRI), or
+/// - no `base` is given and `s` is not itself already an absolute IRI.
+///
+/// `oxiri::Iri::resolve` correctly implements RFC 3986 §5.3 relative
+/// reference resolution, including dot-segment removal (`../`, `./`),
+/// fragment-only (`#frag`) and query-only (`?q`) references, and
+/// authority-less bases (e.g. `urn:`) — all cases the previous hand-rolled
+/// implementation only partially handled.
+fn resolve_iri_against_base(s: &str, base: Option<&str>) -> Option<NamedNode> {
+    let iri_ref = IriRef::parse(s.to_string()).ok()?;
+    match base {
+        Some(base_str) => {
+            let base_iri = Iri::parse(base_str.to_string()).ok()?;
+            let resolved = base_iri.resolve(&iri_ref).ok()?;
+            Some(NamedNode::new_unchecked(resolved.into_inner()))
         }
-        return s.to_string();
-    }
-
-    if s.starts_with('/') {
-        // Absolute-path reference: keep scheme + authority from base
-        if let Some(auth_end) = base_iri.find("://") {
-            let after_scheme = &base_iri[auth_end + 3..];
-            let path_start = after_scheme.find('/').unwrap_or(after_scheme.len());
-            let origin = &base_iri[..auth_end + 3 + path_start];
-            return format!("{}{}", origin, s);
+        None => {
+            // No base IRI available: s must already be an absolute IRI.
+            let s_owned = iri_ref.into_inner();
+            Iri::parse(s_owned)
+                .ok()
+                .map(|i| NamedNode::new_unchecked(i.into_inner()))
         }
-        return format!("{}{}", base_iri, s);
-    }
-
-    // Relative-path reference: resolve against the base's directory
-    if let Some(pos) = base_iri.rfind('/') {
-        format!("{}{}", &base_iri[..=pos], s)
-    } else {
-        format!("{}/{}", base_iri, s)
     }
 }
 

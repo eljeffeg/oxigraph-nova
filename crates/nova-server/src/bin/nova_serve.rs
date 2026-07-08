@@ -41,7 +41,7 @@ use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, Quad};
 use oxigraph_nova_server::Server;
 use oxigraph_nova_storage_ring::{RingStore, SyncPolicy};
-use oxttl::NTriplesParser;
+use oxrdfio::{RdfFormat, RdfParser};
 use std::env;
 use std::fs::File;
 
@@ -192,19 +192,21 @@ async fn main() {
             let reader = BufReader::new(f);
 
             let mut parsed: usize = 0;
-            let quads = NTriplesParser::new().for_reader(reader).map(|result| {
-                let triple = result.expect("N-Triples parse error");
-                parsed += 1;
-                if parsed.is_multiple_of(200_000) {
-                    eprintln!("[nova_serve]   ... {parsed} triples parsed");
-                }
-                Quad::new(
-                    triple.subject,
-                    triple.predicate,
-                    triple.object,
-                    GraphName::DefaultGraph,
-                )
-            });
+            let quads = RdfParser::from_format(RdfFormat::NTriples)
+                .for_reader(reader)
+                .map(|result| {
+                    let quad = result.expect("N-Triples parse error");
+                    parsed += 1;
+                    if parsed.is_multiple_of(200_000) {
+                        eprintln!("[nova_serve]   ... {parsed} triples parsed");
+                    }
+                    Quad::new(
+                        quad.subject,
+                        quad.predicate,
+                        quad.object,
+                        GraphName::DefaultGraph,
+                    )
+                });
 
             // `bulk_load()` bypasses both the delta `BTreeMap` *and* the WAL
             // entirely: it builds the Ring directly in memory, then commits

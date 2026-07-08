@@ -31,6 +31,7 @@ oxttl         = { version = "0.2.3",  features = ["rdf-12"] }
 # rdf-12 feature flag oxrdf itself is compiled with workspace-wide.
 oxrdfxml      = { version = "0.2",    features = ["rdf-12"] } # RDF/XML parser — needed by the W3C harness for .rdf test fixtures
 oxjsonld      = { version = "0.2.5",  features = ["rdf-12"] } # JSON-LD parser/serializer — pins oxrdf =0.3.3, composes directly
+oxrdfio       = { version = "0.2.5",  features = ["rdf-12"] } # Unified RdfParser/RdfSerializer/RdfFormat facade over oxttl/oxrdfxml/oxjsonld
 
 spargebra     = { version = "0.4.6",  features = ["sparql-12"] }
 sparopt       = { version = "0.3.6",  features = ["sparql-12"] }  # SPARQL algebra optimizer (filter pushdown, join reordering)
@@ -38,6 +39,7 @@ sparopt       = { version = "0.3.6",  features = ["sparql-12"] }  # SPARQL algeb
 sparesults    = { version = "0.3.3",  features = ["sparql-12"] }  # .srx / .srj / .tsv result I/O
 
 oxsdatatypes  = { version = "0.2" }    # Correct XSD typed-value semantics; route evaluator comparison through this
+oxiri         = { version = "0.2.11" } # RFC 3987 IRI parsing/resolution — already a transitive dep via oxrdf/oxttl/spargebra/oxjsonld/oxrdfxml
 
 # ── Async runtime + HTTP ────────────────────────────────────────────────────
 tokio        = { version = "1.52",  features = ["full"] }

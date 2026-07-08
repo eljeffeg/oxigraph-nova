@@ -11,9 +11,7 @@ oxigraph-nova-core         = { path = "../nova-core" }
 oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
 oxigraph-nova-server       = { path = "../nova-server" }
 oxrdf          = { workspace = true }
-oxttl          = { workspace = true }
-oxrdfxml       = { workspace = true }
-oxjsonld       = { workspace = true }
+oxrdfio        = { workspace = true }
 clap           = { workspace = true }
 anyhow         = { workspace = true }
 tokio          = { workspace = true }

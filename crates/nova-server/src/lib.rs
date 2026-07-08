@@ -30,25 +30,20 @@
 //!                          (`sparesults` XML), `text/csv` (CSV), `text/tab-separated-values`
 //!                          (TSV), or `application/sparql-results+json` (default, and used
 //!                          whenever `Accept` doesn't specifically ask for one of the others).
-//!   CONSTRUCT/DESCRIBE   → content-negotiated via `Accept`: `application/ld+json`
-//!                          (via `oxjsonld::JsonLdSerializer`), `text/turtle` (via
-//!                          `oxttl::TurtleSerializer`), `application/rdf+xml` (via
-//!                          `oxrdfxml::RdfXmlSerializer`), `application/n-quads` (via
-//!                          `oxttl::NQuadsSerializer`), `application/trig` (via
-//!                          `oxttl::TriGSerializer`), or `application/n-triples`
-//!                          (default, and used whenever `Accept` doesn't ask for one of
-//!                          the others specifically). N-Quads/TriG output places every
+//!   CONSTRUCT/DESCRIBE   → content-negotiated via `Accept`: `application/ld+json`,
+//!                          `text/turtle`, `application/rdf+xml`, `application/n-quads`,
+//!                          `application/trig`, or `application/n-triples` (default, and
+//!                          used whenever `Accept` doesn't ask for one of the others
+//!                          specifically) — all served via `oxrdfio::RdfSerializer`
+//!                          (see `serialize_triples`). N-Quads/TriG output places every
 //!                          triple in the default graph, since CONSTRUCT/DESCRIBE results
 //!                          are graph-agnostic in this server's `QueryResult::Triples`
 //!                          representation.
 //!
-//! Bulk-load / Graph Store PUT/POST bodies are parsed by Content-Type:
-//!   `text/turtle` (default / unrecognised) → `oxttl::TurtleParser`
-//!   `application/n-triples`                → `oxttl::NTriplesParser`
-//!   `application/n-quads`                  → `oxttl::NQuadsParser`
-//!   `application/trig`                     → `oxttl::TriGParser`
-//!   `application/rdf+xml`                  → `oxrdfxml::RdfXmlParser`
-//!   `application/ld+json`                  → `oxjsonld::JsonLdParser`
+//! Bulk-load / Graph Store PUT/POST bodies are parsed by Content-Type via
+//! `oxrdfio::RdfFormat::from_media_type` + `oxrdfio::RdfParser` (see
+//! `parse_body_triples`), falling back to Turtle for an unrecognised/absent
+//! Content-Type.
 //!
 //! As with JSON-LD, N-Quads/TriG bulk-load bodies may carry their own named-graph
 //! information, but since `parse_body_triples` always returns plain `Triple`s for
@@ -103,15 +98,8 @@ use oxigraph_nova_core::QuadStore;
 use oxigraph_nova_query::{
     Evaluator, QueryResult, Solutions, StoreDataset, clear_graph, execute_update,
 };
-use oxjsonld::{JsonLdParser, JsonLdSerializer};
-use oxrdf::{
-    GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, QuadRef, Term, Triple, Variable,
-};
-use oxrdfxml::{RdfXmlParser, RdfXmlSerializer};
-use oxttl::{
-    NQuadsParser, NQuadsSerializer, NTriplesParser, NTriplesSerializer, TriGParser, TriGSerializer,
-    TurtleParser, TurtleSerializer,
-};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
+use oxrdfio::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
 use serde::Deserialize;
 use service_description::generate_service_description_graph;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
@@ -425,58 +413,30 @@ fn graph_exists<S: QuadStore>(store: &Arc<S>, g: &GraphName) -> Result<bool, Box
     Ok(matches.next().is_some())
 }
 
-/// Parse an RDF body into `Triple`s, dispatching on `Content-Type`:
-///   - `application/n-triples`  → `oxttl::NTriplesParser`
-///   - `application/rdf+xml`    → `oxrdfxml::RdfXmlParser`
-///   - `application/ld+json`    → `oxjsonld::JsonLdParser`
-///   - `text/turtle` / anything else (default) → `oxttl::TurtleParser`
+/// Parse an RDF body into `Triple`s, resolving `Content-Type` to an
+/// [`RdfFormat`] via `oxrdfio::RdfFormat::from_media_type` (falling back to
+/// Turtle for an unrecognised or absent Content-Type — matches the previous
+/// hand-rolled dispatch's "default: Turtle" behavior), then parsing via
+/// `oxrdfio::RdfParser`.
 ///
-/// JSON-LD parses to `Quad`s (it can express named graphs); since this
-/// function only returns `Triple`s (per the Graph Store Protocol / bulk-load
-/// callers, which always target one specific graph), any non-default-graph
-/// component on a parsed quad is simply dropped and only its triple is kept —
-/// mirroring how a JSON-LD document's own `@graph` nesting still ultimately
-/// gets inserted into the one target graph named by the request.
+/// Dataset formats (N-Quads/TriG/JSON-LD) parse to `Quad`s (they can express
+/// named graphs); since this function only returns `Triple`s (per the Graph
+/// Store Protocol / bulk-load callers, which always target one specific
+/// graph), any non-default-graph component on a parsed quad is simply
+/// dropped and only its triple is kept — mirroring how e.g. a JSON-LD
+/// document's own `@graph` nesting still ultimately gets inserted into the
+/// one target graph named by the request.
 fn parse_body_triples(content_type: &str, body: &[u8]) -> Result<Vec<Triple>, Box<Response>> {
     let err = |e: String| {
         Box::new((StatusCode::BAD_REQUEST, format!("RDF parse error: {e}")).into_response())
     };
 
-    if content_type.starts_with("application/n-triples") {
-        NTriplesParser::new()
-            .for_reader(body)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| err(e.to_string()))
-    } else if content_type.starts_with("application/n-quads") {
-        NQuadsParser::new()
-            .for_reader(body)
-            .map(|r| r.map(|q| Triple::new(q.subject, q.predicate, q.object)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| err(e.to_string()))
-    } else if content_type.starts_with("application/trig") {
-        TriGParser::new()
-            .for_reader(body)
-            .map(|r| r.map(|q| Triple::new(q.subject, q.predicate, q.object)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| err(e.to_string()))
-    } else if content_type.starts_with("application/rdf+xml") {
-        RdfXmlParser::new()
-            .for_reader(body)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| err(e.to_string()))
-    } else if content_type.starts_with("application/ld+json") {
-        JsonLdParser::new()
-            .for_reader(body)
-            .map(|r| r.map(|q| Triple::new(q.subject, q.predicate, q.object)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| err(e.to_string()))
-    } else {
-        // Default: Turtle (also used for text/turtle and unrecognised types).
-        TurtleParser::new()
-            .for_reader(body)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| err(e.to_string()))
-    }
+    let format = RdfFormat::from_media_type(content_type).unwrap_or(RdfFormat::Turtle);
+    RdfParser::from_format(format)
+        .for_reader(body)
+        .map(|r| r.map(|q| Triple::new(q.subject, q.predicate, q.object)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| err(e.to_string()))
 }
 
 /// Insert parsed `Triple`s into `graph` as `Quad`s.
@@ -846,154 +806,55 @@ fn results_content_type(format: QueryResultsFormat) -> &'static str {
     }
 }
 
-/// Serialize a CONSTRUCT/DESCRIBE result, content-negotiated via `Accept`:
-///   - `Accept` contains `application/ld+json` → JSON-LD (`oxjsonld::JsonLdSerializer`)
-///   - `Accept` contains `text/turtle`         → Turtle (`oxttl::TurtleSerializer`)
-///   - `Accept` contains `application/rdf+xml` → RDF/XML (`oxrdfxml::RdfXmlSerializer`)
-///   - `Accept` contains `application/n-quads` → N-Quads (`oxttl::NQuadsSerializer`)
-///   - `Accept` contains `application/trig`    → TriG (`oxttl::TriGSerializer`)
-///   - anything else (default)                 → `application/n-triples`
-///
-/// N-Quads/TriG output places every triple in the default graph, since
+/// Resolve the `Accept` header to an [`RdfFormat`] for CONSTRUCT/DESCRIBE
+/// (and Graph Store Protocol `GET`) serialization:
+///   - `Accept` contains `application/ld+json` → JSON-LD
+///   - `Accept` contains `text/turtle`         → Turtle
+///   - `Accept` contains `application/rdf+xml` → RDF/XML
+///   - `Accept` contains `application/n-quads` → N-Quads
+///   - `Accept` contains `application/trig`    → TriG
+///   - anything else (default)                 → N-Triples
+fn triples_format_for_accept(accept: &str) -> RdfFormat {
+    if accept.contains("application/ld+json") {
+        RdfFormat::JsonLd {
+            profile: JsonLdProfileSet::empty(),
+        }
+    } else if accept.contains("text/turtle") {
+        RdfFormat::Turtle
+    } else if accept.contains("application/rdf+xml") {
+        RdfFormat::RdfXml
+    } else if accept.contains("application/n-quads") {
+        RdfFormat::NQuads
+    } else if accept.contains("application/trig") {
+        RdfFormat::TriG
+    } else {
+        RdfFormat::NTriples
+    }
+}
+
+/// Serialize a CONSTRUCT/DESCRIBE result, content-negotiated via `Accept`
+/// (see `triples_format_for_accept`), via `oxrdfio::RdfSerializer`.
+/// `RdfSerializer::serialize_triple` works uniformly across every
+/// `RdfFormat` variant, including the dataset formats (N-Quads/TriG/JSON-LD)
+/// — for those, every triple is placed in the default graph, since
 /// CONSTRUCT/DESCRIBE results are graph-agnostic in this server's
 /// `QueryResult::Triples` representation.
 ///
 /// Also used directly by the Graph Store Protocol's `GET /store` handler so
 /// both code paths share one serializer.
 fn serialize_triples(triples: &[Triple], accept: &str) -> Response {
-    if accept.contains("application/ld+json") {
-        serialize_triples_jsonld(triples)
-    } else if accept.contains("text/turtle") {
-        serialize_triples_turtle(triples)
-    } else if accept.contains("application/rdf+xml") {
-        serialize_triples_rdfxml(triples)
-    } else if accept.contains("application/n-quads") {
-        serialize_triples_nquads(triples)
-    } else if accept.contains("application/trig") {
-        serialize_triples_trig(triples)
-    } else {
-        serialize_triples_ntriples(triples)
-    }
-}
-
-fn serialize_triples_jsonld(triples: &[Triple]) -> Response {
-    let mut writer = JsonLdSerializer::new().for_writer(Vec::new());
-    for t in triples {
-        let quad = QuadRef::new(
-            &t.subject,
-            &t.predicate,
-            &t.object,
-            GraphNameRef::DefaultGraph,
-        );
-        if let Err(e) = writer.serialize_quad(quad) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    }
-    match writer.finish() {
-        Ok(buf) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/ld+json; charset=utf-8")],
-            buf,
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-fn serialize_triples_ntriples(triples: &[Triple]) -> Response {
-    let mut writer = NTriplesSerializer::new().for_writer(Vec::new());
-    for t in triples {
-        if let Err(e) = writer.serialize_triple(t) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    }
-    let buf = writer.finish();
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/n-triples; charset=utf-8")],
-        buf,
-    )
-        .into_response()
-}
-
-fn serialize_triples_turtle(triples: &[Triple]) -> Response {
-    let mut writer = TurtleSerializer::new().for_writer(Vec::new());
+    let format = triples_format_for_accept(accept);
+    let mut writer = RdfSerializer::from_format(format).for_writer(Vec::new());
     for t in triples {
         if let Err(e) = writer.serialize_triple(t) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     }
     match writer.finish() {
-        Ok(buf) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/turtle; charset=utf-8")],
-            buf,
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-fn serialize_triples_rdfxml(triples: &[Triple]) -> Response {
-    let mut writer = RdfXmlSerializer::new().for_writer(Vec::new());
-    for t in triples {
-        if let Err(e) = writer.serialize_triple(t) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        Ok(buf) => {
+            let content_type = format!("{}; charset=utf-8", format.media_type());
+            (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], buf).into_response()
         }
-    }
-    match writer.finish() {
-        Ok(buf) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/rdf+xml; charset=utf-8")],
-            buf,
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-fn serialize_triples_nquads(triples: &[Triple]) -> Response {
-    let mut writer = NQuadsSerializer::new().for_writer(Vec::new());
-    for t in triples {
-        let quad = QuadRef::new(
-            &t.subject,
-            &t.predicate,
-            &t.object,
-            GraphNameRef::DefaultGraph,
-        );
-        if let Err(e) = writer.serialize_quad(quad) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    }
-    let buf = writer.finish();
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/n-quads; charset=utf-8")],
-        buf,
-    )
-        .into_response()
-}
-
-fn serialize_triples_trig(triples: &[Triple]) -> Response {
-    let mut writer = TriGSerializer::new().for_writer(Vec::new());
-    for t in triples {
-        let quad = QuadRef::new(
-            &t.subject,
-            &t.predicate,
-            &t.object,
-            GraphNameRef::DefaultGraph,
-        );
-        if let Err(e) = writer.serialize_quad(quad) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    }
-    match writer.finish() {
-        Ok(buf) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/trig; charset=utf-8")],
-            buf,
-        )
-            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
