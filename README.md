@@ -345,6 +345,10 @@ overlap, so a script or muscle memory built around `oxigraph serve`/
 | `--bind <addr>`         | `-b`      | Listen address, default `0.0.0.0:3030` (matches `oxigraph serve --bind`) |
 | `--compact-threshold <n>` |          | Delta-size threshold that triggers automatic inline compaction (persistent stores only) |
 | `--sync-interval-ms <n>` |          | Override the default 500ms WAL fsync/group-commit interval (persistent stores only) |
+| `--query-timeout-s <n>` |          | Abort a `/sparql` query that runs longer than `<n>` seconds with `504 Gateway Timeout`. Unset by default (no timeout). Matches upstream Oxigraph's `--timeout` flag |
+| `--max-results <n>` |          | Cap the number of result rows/triples a single `/sparql` query may produce; exceeding it returns `413 Payload Too Large`. Unset by default (no cap) |
+| `--max-parallel-queries <n>` |          | Bound the number of `/sparql` query evaluations running concurrently; a request arriving once `<n>` evaluations are already in flight is rejected immediately with `503 Service Unavailable`. Unset by default (unbounded) |
+
 
 ```sh
 # In-memory only (no persistence) — bulk-loads a dataset and serves it:
@@ -382,11 +386,35 @@ curl -X POST http://localhost:3030/update \
 curl http://localhost:3030/store?default
 curl -X PUT http://localhost:3030/store?graph=http://ex/g1 \
     -H 'Content-Type: text/turtle' --data-binary @graph.ttl
+
+# Prometheus-format metrics — dataset/delta size, compaction count/duration,
+# query counters, LFTJ vs nested-loop fallback rate
+curl http://localhost:3030/metrics
 ```
 
 See `nova_serve --help` for the full flag reference, and
 `crates/nova-server/src/lib.rs`'s module doc comment for the complete list of
 supported RDF/SPARQL-results serialization formats.
+
+### Authentication
+
+`nova_serve` has no built-in authentication, matching upstream Oxigraph's own
+stance: put it behind a reverse proxy and let the proxy handle access control
+rather than duplicating that logic in the server itself. For example, an
+nginx `auth_basic` gate in front of the write-capable endpoints (`/update`
+and `PUT`/`POST`/`DELETE` on `/store`) is enough for most deployments:
+
+```nginx
+location /update {
+    auth_basic           "nova";
+    auth_basic_user_file /etc/nginx/nova.htpasswd;
+    proxy_pass           http://localhost:3030;
+}
+```
+
+Leave `/sparql`, `/store` `GET`s, and `/metrics` open (or behind their own
+proxy rule) as read-only traffic.
+
 
 ### Running with Docker
 

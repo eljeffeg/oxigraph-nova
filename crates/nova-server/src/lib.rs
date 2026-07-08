@@ -96,7 +96,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use oxigraph_nova_core::QuadStore;
 use oxigraph_nova_query::{
-    Evaluator, QueryResult, Solutions, StoreDataset, clear_graph, execute_update,
+    CancellationToken, EvalLimitError, Evaluator, QueryOptions, QueryResult, Solutions,
+    StoreDataset, clear_graph, execute_update,
 };
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
 use oxrdfio::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
@@ -105,10 +106,27 @@ use service_description::generate_service_description_graph;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use spargebra::algebra::GraphPattern;
 use spargebra::{Query, SparqlParser};
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
+
+// ── Server-level metrics (process-wide) ────────────────────────────────────────
+//
+// Counters for the hand-rolled `/metrics` endpoint (Prometheus text format;
+// Deliberately simple `AtomicU64`s rather than a metrics crate dependency
+// — this process
+// normally runs exactly one `Server`, so process-wide statics are sufficient
+// and avoid adding a new dependency for a handful of counters.
+static QUERIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QUERY_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QUERY_TIMEOUTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QUERY_RESULT_LIMIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QUERY_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -116,6 +134,21 @@ use tower_http::cors::CorsLayer;
 /// cheaply clone it for every request without requiring `S: Clone`.
 pub struct AppState<S: QuadStore + 'static> {
     pub store: Arc<S>,
+    /// Per-query wall-clock timeout, if configured via
+    /// `Server::with_query_timeout` / `--query-timeout-s`.
+    pub query_timeout: Option<Duration>,
+    /// Cap on the number of result rows/triples a single query may produce,
+    /// if configured via `Server::with_max_results` / `--max-results`.
+    pub max_results: Option<usize>,
+    /// Bounds the number of query evaluations running concurrently, if
+    /// configured via `Server::with_max_parallel_queries` /
+    /// `--max-parallel-queries`. `None` means unbounded.
+    pub query_semaphore: Option<Arc<Semaphore>>,
+    /// The configured permit count backing `query_semaphore`, kept alongside
+    /// it so `/metrics` can report a true in-flight count
+    /// (`max_parallel_queries - available_permits()`) rather than just the
+    /// raw available-permits figure. Always `Some` iff `query_semaphore` is.
+    pub max_parallel_queries: Option<usize>,
 }
 
 /// Manual `Clone` impl — `Arc<S>` is always `Clone` regardless of whether `S`
@@ -124,6 +157,10 @@ impl<S: QuadStore + 'static> Clone for AppState<S> {
     fn clone(&self) -> Self {
         Self {
             store: Arc::clone(&self.store),
+            query_timeout: self.query_timeout,
+            max_results: self.max_results,
+            query_semaphore: self.query_semaphore.clone(),
+            max_parallel_queries: self.max_parallel_queries,
         }
     }
 }
@@ -150,11 +187,46 @@ pub struct GraphStoreParams {
 /// Oxigraph Nova SPARQL server.
 pub struct Server<S: QuadStore + 'static> {
     store: Arc<S>,
+    query_timeout: Option<Duration>,
+    max_results: Option<usize>,
+    max_parallel_queries: Option<usize>,
 }
 
 impl<S: QuadStore + Send + Sync + 'static> Server<S> {
     pub fn new(store: Arc<S>) -> Self {
-        Self { store }
+        Self {
+            store,
+            query_timeout: None,
+            max_results: None,
+            max_parallel_queries: None,
+        }
+    }
+
+    /// Enforce a wall-clock timeout on `/sparql` query evaluation. Queries
+    /// running longer than `timeout` are cancelled cooperatively (via
+    /// `oxigraph_nova_query::CancellationToken`) and the request fails with
+    /// `504 Gateway Timeout`. Mirrors upstream Oxigraph's `--timeout` flag.
+    pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = Some(timeout);
+        self
+    }
+
+    /// Cap the number of result rows (SELECT) / triples (CONSTRUCT/DESCRIBE)
+    /// a single `/sparql` query may produce. Exceeding the cap aborts
+    /// evaluation early and the request fails with `413 Payload Too Large`.
+    pub fn with_max_results(mut self, max: usize) -> Self {
+        self.max_results = Some(max);
+        self
+    }
+
+    /// Bound the number of `/sparql` query evaluations that may run
+    /// concurrently. A request arriving while `max` evaluations are already
+    /// in flight is rejected immediately with `503 Service Unavailable`
+    /// rather than being queued, so a burst of expensive queries can't pile
+    /// up unboundedly waiting on the single `Mutex<RingStoreInner>`.
+    pub fn with_max_parallel_queries(mut self, max: usize) -> Self {
+        self.max_parallel_queries = Some(max);
+        self
     }
 
     /// Build the axum `Router`.
@@ -162,7 +234,15 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
     /// Returns a router that can be used directly in integration tests via
     /// `tower::ServiceExt::oneshot`, or passed to `axum::serve`.
     pub fn into_router(self) -> Router {
-        let state = AppState { store: self.store };
+        let state = AppState {
+            store: self.store,
+            query_timeout: self.query_timeout,
+            max_results: self.max_results,
+            query_semaphore: self
+                .max_parallel_queries
+                .map(|n| Arc::new(Semaphore::new(n))),
+            max_parallel_queries: self.max_parallel_queries,
+        };
         Router::new()
             .route("/sparql", get(sparql_get::<S>).post(sparql_post::<S>))
             // `/query` is an alias matching upstream Oxigraph's endpoint
@@ -182,6 +262,10 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             // matching upstream Oxigraph's `oxigraph serve`. Some SPARQL
             // tooling fetches this before sending real requests.
             .route("/", get(service_description_get))
+            // Prometheus text-format observability endpoint (dataset size,
+            // delta size, compaction count/duration, query counters, LFTJ
+            // vs nested-loop fallback rate — see `metrics_get`'s doc comment).
+            .route("/metrics", get(metrics_get::<S>))
 
             // Permissive CORS so browser-based SPARQL clients (e.g. YASGUI,
             // or any web app served from a different origin/port) can query
@@ -210,7 +294,7 @@ async fn sparql_get<S: QuadStore + 'static>(
 ) -> Response {
     match params.query {
         None => (StatusCode::BAD_REQUEST, "Missing ?query= parameter").into_response(),
-        Some(q) => execute_sparql_query(&state.store, &q, accept_header(&headers)),
+        Some(q) => execute_sparql_query(&state, &q, accept_header(&headers)).await,
     }
 }
 
@@ -258,7 +342,7 @@ async fn sparql_post<S: QuadStore + 'static>(
             .into_response();
     };
 
-    execute_sparql_query(&state.store, &query_str, accept_header(&headers))
+    execute_sparql_query(&state, &query_str, accept_header(&headers)).await
 }
 
 /// `POST /update` — SPARQL 1.1 Update.
@@ -334,6 +418,154 @@ async fn service_description_get(headers: HeaderMap) -> Response {
     let endpoint_url = format!("http://{host}/sparql");
     let graph = generate_service_description_graph(&endpoint_url);
     serialize_triples(&graph, accept_header(&headers))
+}
+
+/// `GET /metrics` — Prometheus text-exposition-format observability endpoint.
+///
+/// Hand-rolled rather than pulled in via a metrics crate dependency — a
+/// deliberate choice to avoid a new dependency for a handful of gauges/
+/// counters. Exposes:
+///
+///   - `nova_store_triples`               (gauge) — total quads in the store.
+///   - `nova_store_delta_entries`         (gauge) — live entries in the
+///     uncompacted write buffer, if the backend has one (omitted otherwise).
+///   - `nova_compactions_total`           (counter) — completed compactions
+///     (manual + automatic), if the backend supports compaction.
+///   - `nova_compaction_duration_seconds_total` (counter) — cumulative time
+///     spent inside compaction, if the backend supports compaction.
+///   - `nova_queries_total`               (counter) — `/sparql` requests received.
+///   - `nova_query_errors_total`          (counter) — evaluation errors (parse
+///     errors are not counted here; they never reach the evaluator).
+///   - `nova_query_timeouts_total`        (counter) — queries aborted by
+///     `--query-timeout-s`.
+///   - `nova_query_result_limit_exceeded_total` (counter) — queries aborted by
+///     `--max-results`.
+///   - `nova_queries_rejected_total`      (counter) — queries rejected outright
+///     by `--max-parallel-queries` (503 Service Unavailable).
+///   - `nova_queries_in_flight`           (gauge) — currently-executing queries,
+///     derived from the configured semaphore's available permits (omitted if
+///     `--max-parallel-queries` is not set, since there is then no semaphore
+///     to derive it from).
+///   - `nova_lftj_queries_total` / `nova_lftj_fallback_total` (counters) —
+///     how many BGP evaluations took the Leapfrog Triejoin fast path vs.
+///     fell back to nested-loop join, process-wide (see
+///     `oxigraph_nova_query::lftj`'s module doc comment, "LFTJ fallback
+///     conditions", for why a fallback might happen).
+///
+/// All counters are process-wide (not per-request-scoped), consistent with
+/// normal Prometheus semantics — a scraper polls this endpoint periodically
+/// and computes rates itself.
+async fn metrics_get<S: QuadStore + 'static>(State(state): State<AppState<S>>) -> Response {
+    let mut out = String::new();
+
+    macro_rules! metric {
+        ($name:expr, $help:expr, $type:expr, $value:expr) => {
+            let _ = writeln!(out, "# HELP {} {}", $name, $help);
+            let _ = writeln!(out, "# TYPE {} {}", $name, $type);
+            let _ = writeln!(out, "{} {}", $name, $value);
+        };
+    }
+
+    match state.store.len() {
+        Ok(n) => {
+            metric!(
+                "nova_store_triples",
+                "Total number of quads currently in the store.",
+                "gauge",
+                n
+            );
+        }
+        Err(e) => {
+            tracing::warn!("metrics: failed to read store.len(): {e}");
+        }
+    }
+
+    if let Some(n) = state.store.delta_len() {
+        metric!(
+            "nova_store_delta_entries",
+            "Live entries (inserts + tombstones) in the uncompacted write buffer.",
+            "gauge",
+            n
+        );
+    }
+    if let Some(n) = state.store.compaction_count() {
+        metric!(
+            "nova_compactions_total",
+            "Total number of completed compactions (manual + automatic).",
+            "counter",
+            n
+        );
+    }
+    if let Some(s) = state.store.compaction_duration_seconds_total() {
+        metric!(
+            "nova_compaction_duration_seconds_total",
+            "Cumulative wall-clock time spent inside compaction, in seconds.",
+            "counter",
+            s
+        );
+    }
+
+    metric!(
+        "nova_queries_total",
+        "Total number of /sparql (SELECT/ASK/CONSTRUCT/DESCRIBE) requests received.",
+        "counter",
+        QUERIES_TOTAL.load(Ordering::Relaxed)
+    );
+    metric!(
+        "nova_query_errors_total",
+        "Total number of query evaluation errors (excludes parse errors and limit/cancellation outcomes).",
+        "counter",
+        QUERY_ERRORS_TOTAL.load(Ordering::Relaxed)
+    );
+    metric!(
+        "nova_query_timeouts_total",
+        "Total number of queries aborted by the configured --query-timeout-s.",
+        "counter",
+        QUERY_TIMEOUTS_TOTAL.load(Ordering::Relaxed)
+    );
+    metric!(
+        "nova_query_result_limit_exceeded_total",
+        "Total number of queries aborted by the configured --max-results.",
+        "counter",
+        QUERY_RESULT_LIMIT_EXCEEDED_TOTAL.load(Ordering::Relaxed)
+    );
+    metric!(
+        "nova_queries_rejected_total",
+        "Total number of queries rejected outright by --max-parallel-queries (503 Service Unavailable).",
+        "counter",
+        QUERY_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    if let (Some(sem), Some(max)) = (&state.query_semaphore, state.max_parallel_queries) {
+        // `Semaphore` doesn't track "in use" directly; derive a true
+        // in-flight count as `max_parallel_queries - available_permits()`.
+        let in_flight = max.saturating_sub(sem.available_permits());
+        metric!(
+            "nova_queries_in_flight",
+            "Currently-executing /sparql query evaluations (max_parallel_queries - available permits).",
+            "gauge",
+            in_flight
+        );
+    }
+
+    metric!(
+        "nova_lftj_queries_total",
+        "Total number of BGP evaluations that used the Leapfrog Triejoin fast path.",
+        "counter",
+        oxigraph_nova_query::lftj_used_total()
+    );
+    metric!(
+        "nova_lftj_fallback_total",
+        "Total number of BGP evaluations that fell back to nested-loop join.",
+        "counter",
+        oxigraph_nova_query::lftj_fallback_total()
+    );
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        out,
+    )
+        .into_response()
 }
 
 /// Parse → execute a SPARQL Update request against the store.
@@ -611,38 +843,139 @@ async fn store_delete<S: QuadStore + 'static>(
 
 /// Parse → adapt store → evaluate → serialise.
 ///
-/// This is sync because the evaluator is sync; the async handlers just call it.
-fn execute_sparql_query<S: QuadStore + 'static>(
-    store: &Arc<S>,
+/// Evaluation itself is synchronous (the evaluator is sync), so it always
+/// runs on a blocking-pool thread via `tokio::task::spawn_blocking` — this
+/// keeps a single expensive query from stalling the async runtime's worker
+/// threads, and is what makes the timeout/cancellation racing below
+/// possible (the async task doing the racing needs to stay responsive to
+/// the `tokio::time::sleep` future while the blocking evaluation runs
+/// concurrently on another thread).
+///
+/// Resource limits applied here, all configured via `Server`/CLI flags and
+/// stored on `AppState` (see the module doc's "Operational hardening" note
+/// and `oxigraph_nova_query::options`):
+///   - `query_semaphore`: bounds the number of concurrent evaluations. A
+///     request arriving when the semaphore is saturated is rejected
+///     immediately with `503 Service Unavailable` (no queueing).
+///   - `query_timeout`: races evaluation against a `tokio::time::sleep`. On
+///     timeout, the evaluator's `CancellationToken` is flipped (cooperative
+///     cancellation — see `oxigraph_nova_query::options::CancellationToken`
+///     and the per-loop checks in `lftj.rs`/`path.rs`/`evaluator.rs`) and the
+///     request fails with `504 Gateway Timeout` once the blocking task
+///     actually observes the cancellation and returns.
+///   - `max_results`: caps the number of result rows/triples; exceeding it
+///     aborts evaluation early with `413 Payload Too Large`.
+async fn execute_sparql_query<S: QuadStore + 'static>(
+    state: &AppState<S>,
     sparql: &str,
     accept: &str,
 ) -> Response {
+    QUERIES_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+    // 0. Concurrency limit — reject immediately rather than queue, so a
+    //    burst of expensive queries can't pile up waiting on the store.
+    let _permit = if let Some(sem) = &state.query_semaphore {
+        match Arc::clone(sem).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                QUERY_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Too many concurrent queries; please try again later",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
     // 1. Parse
-    let query = match SparqlParser::new().parse_query(sparql) {
-        Ok(q) => q,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("SPARQL parse error: {e}")).into_response();
+    let query = {
+        let _span = tracing::info_span!("parse_query").entered();
+        match SparqlParser::new().parse_query(sparql) {
+            Ok(q) => q,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("SPARQL parse error: {e}"))
+                    .into_response();
+            }
         }
     };
 
-    // 2. Build the Dataset adapter (bridges any QuadStore → Dataset trait)
-    let dataset = StoreDataset::new(Arc::clone(store));
+    // 2. Build per-query options (cancellation token only allocated if a
+    //    timeout is actually configured) and hand evaluation to a blocking
+    //    thread so this async task stays free to race it against a timer.
+    let mut options = QueryOptions::new();
+    if let Some(max) = state.max_results {
+        options = options.with_max_results(max);
+    }
+    let cancellation = state.query_timeout.map(|_| CancellationToken::new());
+    if let Some(token) = &cancellation {
+        options = options.with_cancellation(token.clone());
+    }
 
-    // 3. Evaluate
-    let evaluator = Evaluator::new(&dataset);
-    match evaluator.evaluate(&query) {
-        Err(e) => (
+    let store = Arc::clone(&state.store);
+    let query_for_eval = query.clone();
+    let mut join = tokio::task::spawn_blocking(move || {
+        let dataset = StoreDataset::new(store);
+        let evaluator = Evaluator::with_options(&dataset, options);
+        evaluator.evaluate(&query_for_eval)
+    });
+
+    // 3. Evaluate, racing against the configured timeout (if any).
+    let outcome = if let Some(timeout) = state.query_timeout {
+        tokio::select! {
+            res = &mut join => res,
+            _ = tokio::time::sleep(timeout) => {
+                if let Some(token) = &cancellation {
+                    token.cancel();
+                }
+                // Wait for the blocking task to observe cancellation and
+                // return, so its result (now an `EvalLimitError::Cancelled`)
+                // is still reported below rather than the task being
+                // silently detached.
+                (&mut join).await
+            }
+        }
+    } else {
+        (&mut join).await
+    };
+
+    // 4. Serialise (or map an evaluation/limit error to an HTTP status).
+    match outcome {
+        Err(join_err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Evaluation error: {e}"),
+            format!("internal error: {join_err}"),
         )
             .into_response(),
-        Ok(QueryResult::Boolean(b)) => serialize_boolean(b, accept),
-        Ok(QueryResult::Solutions(solutions)) => {
+        Ok(Err(e)) => match e.downcast_ref::<EvalLimitError>() {
+            Some(EvalLimitError::Cancelled) => {
+                QUERY_TIMEOUTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::GATEWAY_TIMEOUT, "Query timed out").into_response()
+            }
+            Some(EvalLimitError::ResultLimitExceeded(n)) => {
+                QUERY_RESULT_LIMIT_EXCEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Query exceeded the result limit of {n} row(s)"),
+                )
+                    .into_response()
+            }
+            None => {
+                QUERY_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Evaluation error: {e}"),
+                )
+                    .into_response()
+            }
+        },
+        Ok(Ok(QueryResult::Boolean(b))) => serialize_boolean(b, accept),
+        Ok(Ok(QueryResult::Solutions(solutions))) => {
             let vars = query_select_vars(&query);
             serialize_solutions(&vars, solutions, accept)
         }
-
-        Ok(QueryResult::Triples(triples)) => serialize_triples(&triples, accept),
+        Ok(Ok(QueryResult::Triples(triples))) => serialize_triples(&triples, accept),
     }
 }
 
@@ -2183,6 +2516,179 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ── Operational hardening: timeout / max-results / max-parallel-queries ──
+
+    /// A `QuadStore` wrapper that sleeps for a configurable duration on every
+    /// `quads_for_pattern` call before delegating to the inner store — used
+    /// to make timeout-cancellation deterministic in tests (see
+    /// `test_query_timeout_returns_504`) without racing real wall-clock
+    /// scheduling against a trivially-fast in-memory query.
+    struct SlowStore {
+        inner: Arc<MemoryStore>,
+        delay: std::time::Duration,
+    }
+
+    impl oxigraph_nova_core::QuadStore for SlowStore {
+        fn insert(&self, quad: &oxigraph_nova_core::Quad) -> oxigraph_nova_core::Result<bool> {
+            self.inner.insert(quad)
+        }
+        fn remove(&self, quad: &oxigraph_nova_core::Quad) -> oxigraph_nova_core::Result<bool> {
+            self.inner.remove(quad)
+        }
+        fn quads_for_pattern(
+            &self,
+            subject: Option<&Term>,
+            predicate: Option<&NamedNode>,
+            object: Option<&Term>,
+            graph_name: Option<&oxigraph_nova_core::GraphName>,
+        ) -> oxigraph_nova_core::Result<
+            Box<
+                dyn Iterator<Item = oxigraph_nova_core::Result<oxigraph_nova_core::StoredQuad>>
+                    + '_,
+            >,
+        > {
+            std::thread::sleep(self.delay);
+            self.inner
+                .quads_for_pattern(subject, predicate, object, graph_name)
+        }
+        fn len(&self) -> oxigraph_nova_core::Result<usize> {
+            self.inner.len()
+        }
+        fn contains(&self, quad: &oxigraph_nova_core::Quad) -> oxigraph_nova_core::Result<bool> {
+            self.inner.contains(quad)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_timeout_returns_504() {
+        // The store sleeps 200ms on every pattern scan; the second triple
+        // pattern's between-pattern cancellation check (see
+        // `Evaluator::eval_bgp`'s nested-loop fallback) observes the
+        // timeout-triggered cancellation and aborts before completing —
+        // deterministic regardless of machine speed, since the configured
+        // timeout (20ms) is far shorter than the store's fixed 200ms delay.
+        let store = Arc::new(SlowStore {
+            inner: make_store(),
+            delay: Duration::from_millis(200),
+        });
+        let router = Server::new(store)
+            .with_query_timeout(Duration::from_millis(20))
+            .into_router();
+
+        let sparql = "SELECT ?s ?p ?o ?s2 ?p2 ?o2 WHERE { ?s ?p ?o . ?s2 ?p2 ?o2 }";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn test_query_without_timeout_still_succeeds() {
+        // Sanity check: a generous timeout doesn't interfere with a normal query.
+        let store = make_store();
+        let router = Server::new(store)
+            .with_query_timeout(Duration::from_secs(60))
+            .into_router();
+
+        let sparql = "SELECT ?s WHERE { ?s <http://ex/name> ?n }";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let bindings = json["results"]["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_max_results_exceeded_returns_413() {
+        // The result cap is enforced between triple-pattern joins in the
+        // nested-loop fallback (see `Evaluator::eval_bgp`), so a two-pattern
+        // BGP is used: the 3 rows produced by the first pattern are checked
+        // against `max_results` before the second pattern (a cross join) is
+        // ever evaluated.
+        let store = make_store();
+        let router = Server::new(store).with_max_results(1).into_router();
+
+        let sparql = "SELECT ?s ?p ?o ?s2 ?p2 ?o2 WHERE { ?s ?p ?o . ?s2 ?p2 ?o2 }";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_max_results_not_exceeded_succeeds() {
+        let store = make_store();
+        let router = Server::new(store).with_max_results(10).into_router();
+
+        let sparql = "SELECT ?s ?p ?o WHERE { ?s ?p ?o }";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_max_parallel_queries_zero_returns_503() {
+        // A semaphore with 0 permits is permanently saturated — every query
+        // is rejected immediately with 503, without ever touching the store.
+        let store = make_store();
+        let router = Server::new(store)
+            .with_max_parallel_queries(0)
+            .into_router();
+
+        let sparql = "SELECT ?s WHERE { ?s ?p ?o }";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_max_parallel_queries_allows_within_limit() {
+        let store = make_store();
+        let router = Server::new(store)
+            .with_max_parallel_queries(4)
+            .into_router();
+
+        let sparql = "SELECT ?s WHERE { ?s <http://ex/name> ?n }";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(sparql))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn test_store_delete_existing_named_graph_returns_204() {
         let store = make_store();
@@ -2215,5 +2721,162 @@ mod tests {
                 ))
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_returns_200_with_expected_metric_names() {
+        let store = make_store();
+        let router = Server::new(store).into_router();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4"
+        );
+        let text = body_text(resp).await;
+        // Always-present metrics (store size, query counters, LFTJ counters).
+        for name in [
+            "nova_store_triples",
+            "nova_queries_total",
+            "nova_query_errors_total",
+            "nova_query_timeouts_total",
+            "nova_query_result_limit_exceeded_total",
+            "nova_queries_rejected_total",
+            "nova_lftj_queries_total",
+            "nova_lftj_fallback_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {name} ")),
+                "missing metric {name} in:\n{text}"
+            );
+        }
+        // `MemoryStore` doesn't track delta/compaction stats, and no
+        // `--max-parallel-queries` was configured, so these should be
+        // omitted rather than reported as misleading zeros.
+        for name in [
+            "nova_store_delta_entries",
+            "nova_compactions_total",
+            "nova_compaction_duration_seconds_total",
+            "nova_queries_in_flight",
+        ] {
+            assert!(
+                !text.contains(name),
+                "unexpected metric {name} present for a backend/config that doesn't support it:\n{text}"
+            );
+        }
+    }
+
+    /// Extract the value of a single-line Prometheus metric (`name value`)
+    /// from exposition-format text, ignoring `# HELP`/`# TYPE` lines.
+    fn metric_value(text: &str, name: &str) -> u64 {
+        text.lines()
+            .find(|l| l.starts_with(&format!("{name} ")))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("metric {name} not found in:\n{text}"))
+    }
+
+    #[tokio::test]
+    async fn test_metrics_query_counters_increment_after_queries() {
+        // `nova_queries_total` is a process-wide counter shared across every
+        // test in this binary (they run concurrently in the same process),
+        // so this asserts a *delta* across 3 queries rather than an absolute
+        // value.
+        let store = make_store();
+        let router = Server::new(store).into_router();
+
+        let scrape = |router: Router| async {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            body_text(resp).await
+        };
+        let before = metric_value(&scrape(router.clone()).await, "nova_queries_total");
+
+        let sparql = "SELECT ?s WHERE { ?s <http://ex/name> ?n }";
+        for _ in 0..3 {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/sparql")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // `>=` rather than `==`: `nova_queries_total` is a single
+        // process-wide counter shared by every test in this binary, which
+        // `cargo test` runs concurrently on multiple threads, so other
+        // tests' queries may also land between the two scrapes. The
+        // counter is monotonically increasing, so this test's 3 queries are
+        // guaranteed to be reflected in the delta regardless of what else
+        // is running.
+        let after = metric_value(&scrape(router).await, "nova_queries_total");
+        assert!(
+            after - before >= 3,
+            "expected nova_queries_total to increase by at least 3, went from {before} to {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_reports_in_flight_gauge_when_max_parallel_queries_configured() {
+        let store = make_store();
+        let router = Server::new(store)
+            .with_max_parallel_queries(4)
+            .into_router();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = body_text(resp).await;
+        // No queries in flight at the time of the scrape itself.
+        assert!(
+            text.contains("nova_queries_in_flight 0"),
+            "expected nova_queries_in_flight 0 in:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_reports_ring_store_delta_and_compaction_stats() {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("nova_server_metrics_test_{pid}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(oxigraph_nova_storage_ring::RingStore::open(&dir).unwrap());
+        let router = Server::new(store).into_router();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = body_text(resp).await;
+        for name in [
+            "nova_store_delta_entries",
+            "nova_compactions_total",
+            "nova_compaction_duration_seconds_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {name} ")),
+                "missing metric {name} for RingStore in:\n{text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

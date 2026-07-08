@@ -24,10 +24,17 @@
 //! adjacency query is considerably faster than a `find_quads` round-trip.
 
 use crate::dataset::{Dataset, GraphSelector};
+use crate::options::CancellationToken;
 use anyhow::Result;
 use oxrdf::{NamedNode, Term};
 use spargebra::algebra::PropertyPathExpression as PPE;
 use std::collections::{HashSet, VecDeque};
+
+/// Returns `true` and short-circuits with a cancellation error if `cancellation`
+/// is set and has been flipped. Shared by every BFS/traversal loop below.
+fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
+    cancellation.is_some_and(|c| c.is_cancelled())
+}
 
 // ── Pair enumeration ──────────────────────────────────────────────────────────
 
@@ -154,11 +161,32 @@ pub fn ring_bfs_transitive<D: Dataset>(
     include_identity: bool,
     ag: &GraphSelector,
 ) -> Option<Result<Vec<(Term, Term)>>> {
+    ring_bfs_transitive_cancellable(dataset, pred_id, start_ids, include_identity, ag, None)
+}
+
+/// [`ring_bfs_transitive`] with an optional [`CancellationToken`] checked
+/// periodically during the BFS, so a long-running transitive closure over a
+/// densely-connected predicate can be aborted promptly on client disconnect
+/// or timeout.
+pub fn ring_bfs_transitive_cancellable<D: Dataset>(
+    dataset: &D,
+    pred_id: u64,
+    start_ids: &[u64],
+    include_identity: bool,
+    ag: &GraphSelector,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Result<Vec<(Term, Term)>>> {
     let mut result: Vec<(Term, Term)> = Vec::new();
     // (start_id, reachable_id) deduplication across all BFS roots.
     let mut global_seen: HashSet<(u64, u64)> = HashSet::new();
 
     for &start_id in start_ids {
+        if is_cancelled(cancellation) {
+            return Some(Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            )));
+        }
+
         let start_term = match dataset.lftj_decode_term(start_id) {
             Some(t) => t,
             None => continue,
@@ -182,6 +210,12 @@ pub fn ring_bfs_transitive<D: Dataset>(
         queue.push_back(start_id);
 
         while let Some(curr_id) = queue.pop_front() {
+            if is_cancelled(cancellation) {
+                return Some(Err(anyhow::Error::from(
+                    crate::options::EvalLimitError::Cancelled,
+                )));
+            }
+
             let mut nbr_iter = dataset.lftj_join_scan(Some(curr_id), Some(pred_id), None, 2, ag)?;
 
             while !nbr_iter.at_end() {
@@ -245,25 +279,60 @@ pub fn ring_bfs_transitive_bound<D: Dataset>(
     include_identity: bool,
     ag: &GraphSelector,
 ) -> Option<Result<Vec<(Term, Term)>>> {
+    ring_bfs_transitive_bound_cancellable(
+        dataset,
+        pred_id,
+        source_id,
+        target_id,
+        include_identity,
+        ag,
+        None,
+    )
+}
+
+/// [`ring_bfs_transitive_bound`] with an optional [`CancellationToken`]
+/// threaded into every internal branch (bidirectional meet-in-the-middle,
+/// forward, and backward BFS).
+#[allow(clippy::too_many_arguments)]
+pub fn ring_bfs_transitive_bound_cancellable<D: Dataset>(
+    dataset: &D,
+    pred_id: u64,
+    source_id: Option<u64>,
+    target_id: Option<u64>,
+    include_identity: bool,
+    ag: &GraphSelector,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Result<Vec<(Term, Term)>>> {
     match (source_id, target_id) {
-        (Some(s), Some(t)) => match bidirectional_reachable(dataset, pred_id, s, t, ag)? {
-            Ok(true) => {
-                let st = dataset.lftj_decode_term(s)?;
-                let tt = dataset.lftj_decode_term(t)?;
-                Some(Ok(vec![(st, tt)]))
-            }
-            Ok(false) => {
-                if include_identity && s == t {
+        (Some(s), Some(t)) => {
+            match bidirectional_reachable(dataset, pred_id, s, t, ag, cancellation)? {
+                Ok(true) => {
                     let st = dataset.lftj_decode_term(s)?;
-                    Some(Ok(vec![(st.clone(), st)]))
-                } else {
-                    Some(Ok(vec![]))
+                    let tt = dataset.lftj_decode_term(t)?;
+                    Some(Ok(vec![(st, tt)]))
                 }
+                Ok(false) => {
+                    if include_identity && s == t {
+                        let st = dataset.lftj_decode_term(s)?;
+                        Some(Ok(vec![(st.clone(), st)]))
+                    } else {
+                        Some(Ok(vec![]))
+                    }
+                }
+                Err(e) => Some(Err(e)),
             }
-            Err(e) => Some(Err(e)),
-        },
-        (Some(s), None) => ring_bfs_transitive(dataset, pred_id, &[s], include_identity, ag),
-        (None, Some(t)) => ring_bfs_transitive_backward(dataset, pred_id, t, include_identity, ag),
+        }
+        (Some(s), None) => ring_bfs_transitive_cancellable(
+            dataset,
+            pred_id,
+            &[s],
+            include_identity,
+            ag,
+            cancellation,
+        ),
+        (None, Some(t)) => {
+            ring_bfs_transitive_backward(dataset, pred_id, t, include_identity, ag, cancellation)
+        }
         (None, None) => None,
     }
 }
@@ -280,6 +349,7 @@ fn ring_bfs_transitive_backward<D: Dataset>(
     target_id: u64,
     include_identity: bool,
     ag: &GraphSelector,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<Result<Vec<(Term, Term)>>> {
     let target_term = dataset.lftj_decode_term(target_id)?;
     let mut result: Vec<(Term, Term)> = Vec::new();
@@ -294,6 +364,12 @@ fn ring_bfs_transitive_backward<D: Dataset>(
     queue.push_back(target_id);
 
     while let Some(curr_id) = queue.pop_front() {
+        if is_cancelled(cancellation) {
+            return Some(Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            )));
+        }
+
         let mut pred_iter = dataset.lftj_join_scan(None, Some(pred_id), Some(curr_id), 0, ag)?;
         while !pred_iter.at_end() {
             let s_id = pred_iter.key();
@@ -330,6 +406,7 @@ fn bidirectional_reachable<D: Dataset>(
     source_id: u64,
     target_id: u64,
     ag: &GraphSelector,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<Result<bool>> {
     let mut fwd_visited: HashSet<u64> = HashSet::new();
     let mut bwd_visited: HashSet<u64> = HashSet::new();
@@ -342,6 +419,12 @@ fn bidirectional_reachable<D: Dataset>(
     bwd_frontier.push_back(target_id);
 
     loop {
+        if is_cancelled(cancellation) {
+            return Some(Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            )));
+        }
+
         if fwd_frontier.is_empty() && bwd_frontier.is_empty() {
             return Some(Ok(false));
         }
@@ -621,6 +704,7 @@ fn product_bfs<D: Dataset>(
     accept_state: usize,
     start_id: u64,
     ag: &GraphSelector,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<Result<HashSet<u64>>> {
     let mut visited: HashSet<(u64, usize)> = HashSet::new();
     let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
@@ -650,6 +734,12 @@ fn product_bfs<D: Dataset>(
     );
 
     while let Some((node_id, state)) = queue.pop_front() {
+        if is_cancelled(cancellation) {
+            return Some(Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            )));
+        }
+
         for edge in &nfa.edges[state] {
             match edge {
                 Edge::Eps(_) => {} // handled via epsilon_closure
@@ -772,6 +862,22 @@ pub fn ring_eval_rpq<D: Dataset>(
     target_id: Option<u64>,
     ag: &GraphSelector,
 ) -> Option<Result<Vec<(Term, Term)>>> {
+    ring_eval_rpq_cancellable(dataset, path, source_id, target_id, ag, None)
+}
+
+/// [`ring_eval_rpq`] with an optional [`CancellationToken`] checked
+/// periodically during the product-automaton BFS (and once per candidate
+/// root node in the unbound-endpoints case), so a runaway RPQ over a densely
+/// connected graph can be aborted promptly.
+#[allow(clippy::too_many_arguments)]
+pub fn ring_eval_rpq_cancellable<D: Dataset>(
+    dataset: &D,
+    path: &PPE,
+    source_id: Option<u64>,
+    target_id: Option<u64>,
+    ag: &GraphSelector,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Result<Vec<(Term, Term)>>> {
     if is_simple_predicate_path(path) {
         return None;
     }
@@ -781,7 +887,7 @@ pub fn ring_eval_rpq<D: Dataset>(
             let normalized = normalize_reverse(path);
             let mut nfa = Nfa::new();
             let (start, accept) = nfa.compile(&normalized);
-            let accept_ids = match product_bfs(dataset, &nfa, start, accept, s, ag)? {
+            let accept_ids = match product_bfs(dataset, &nfa, start, accept, s, ag, cancellation)? {
                 Ok(ids) => ids,
                 Err(e) => return Some(Err(e)),
             };
@@ -803,7 +909,8 @@ pub fn ring_eval_rpq<D: Dataset>(
             let reversed = normalize_reverse(&PPE::Reverse(Box::new(path.clone())));
             let mut nfa = Nfa::new();
             let (start, accept) = nfa.compile(&reversed);
-            let accept_ids = match product_bfs(dataset, &nfa, start, accept, tid, ag)? {
+            let accept_ids = match product_bfs(dataset, &nfa, start, accept, tid, ag, cancellation)?
+            {
                 Ok(ids) => ids,
                 Err(e) => return Some(Err(e)),
             };
@@ -827,10 +934,17 @@ pub fn ring_eval_rpq<D: Dataset>(
             let mut pairs = Vec::new();
             let mut seen: HashSet<(u64, u64)> = HashSet::new();
             for sid in all_ids {
-                let accept_ids = match product_bfs(dataset, &nfa, start, accept, sid, ag)? {
-                    Ok(ids) => ids,
-                    Err(e) => return Some(Err(e)),
-                };
+                if is_cancelled(cancellation) {
+                    return Some(Err(anyhow::Error::from(
+                        crate::options::EvalLimitError::Cancelled,
+                    )));
+                }
+
+                let accept_ids =
+                    match product_bfs(dataset, &nfa, start, accept, sid, ag, cancellation)? {
+                        Ok(ids) => ids,
+                        Err(e) => return Some(Err(e)),
+                    };
                 if accept_ids.is_empty() {
                     continue;
                 }

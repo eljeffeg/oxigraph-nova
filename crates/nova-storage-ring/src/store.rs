@@ -75,13 +75,38 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default delta-size threshold (number of live entries) that triggers an
 /// automatic inline compaction for a persistent (`RingStore::open`) store.
 /// See `maybe_auto_compact`. In-memory (`RingStore::new`) stores never
 /// auto-compact (no `data_dir` to persist to).
 const DEFAULT_AUTO_COMPACT_THRESHOLD: usize = 1_000_000;
+
+// ── Compaction metrics (process-wide) ──────────────────────────────────────────
+//
+// Global counters tracking how many times `compact_locked` has run (manual
+// `RingStore::compact()` calls plus automatic threshold-triggered
+// compactions via `maybe_auto_compact`) and the cumulative wall-clock time
+// spent inside it. Read by `nova-server`'s `/metrics`
+// endpoint. Process-wide (not per-`RingStore`) for the same reason as
+// `nova_query::lftj`'s counters: simplicity, and there is normally exactly
+// one `RingStore` per process.
+static COMPACTION_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COMPACTION_DURATION_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Total number of completed compactions (manual + automatic) since process
+/// start.
+pub fn compaction_count() -> u64 {
+    COMPACTION_COUNT.load(Ordering::Relaxed)
+}
+
+/// Cumulative wall-clock time spent inside compaction since process start,
+/// in fractional seconds.
+pub fn compaction_duration_seconds_total() -> f64 {
+    COMPACTION_DURATION_NANOS.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
+}
 
 /// Configurable WAL durability policy — the user-facing knob for trading a
 /// small durability window for much higher write throughput (see
@@ -371,7 +396,9 @@ impl RingStoreInner {
     /// `maybe_auto_compact`. Assumes `self` is already locked (called with
     /// `&mut self` from inside the single `Mutex<RingStoreInner>` critical
     /// section — never re-enters the lock).
+    #[tracing::instrument(name = "compact", skip_all, fields(delta_len = self.delta.len()))]
     fn compact_locked(&mut self) -> Result<(), Oxigraph> {
+        let t0 = Instant::now();
         let mut per_graph: HashMap<GraphId, Vec<[u64; 3]>> = HashMap::new();
         for (&g_id, ring) in &self.graphs {
             per_graph.insert(g_id, ring.spo_triples());
@@ -392,7 +419,10 @@ impl RingStoreInner {
         // In-memory Front-Coding compaction of the Dictionary  — runs on the same
         // cadence as the Ring trie rebuild above, regardless of persistence mode.
         self.dict.compact()?;
-        self.commit_compaction(new_graphs, true)
+        let result = self.commit_compaction(new_graphs, true);
+        COMPACTION_COUNT.fetch_add(1, Ordering::Relaxed);
+        COMPACTION_DURATION_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        result
     }
 
     /// If this is a persistent store and the delta has crossed
@@ -902,6 +932,15 @@ impl RingStore {
         ring_total.saturating_sub(delta_tombstones) + delta_inserts
     }
 
+    /// Number of live entries (inserts + tombstones) currently sitting in the
+    /// uncompacted LSM delta — i.e. writes since the last `compact()`. A good
+    /// observability signal for how close a persistent store is to its next
+    /// automatic compaction (see `maybe_auto_compact`/`set_auto_compact_threshold`).
+    pub fn delta_len(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.delta.len()
+    }
+
     /// Real per-component memory breakdown across all graphs' Ring indexes
     /// plus the dictionary, for memory-breakdown diagnostics (see
     /// `benches/external/RESULTS.md`).
@@ -1086,6 +1125,20 @@ impl QuadStore for RingStore {
 
     fn supports_lftj(&self) -> bool {
         true
+    }
+
+    // ── Observability ─────────────────────────────────────────────────────────
+
+    fn delta_len(&self) -> Option<usize> {
+        Some(RingStore::delta_len(self))
+    }
+
+    fn compaction_count(&self) -> Option<u64> {
+        Some(compaction_count())
+    }
+
+    fn compaction_duration_seconds_total(&self) -> Option<f64> {
+        Some(compaction_duration_seconds_total())
     }
 
     fn supports_veo_estimates(&self) -> bool {

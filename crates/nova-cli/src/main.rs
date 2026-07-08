@@ -1,8 +1,8 @@
 //! `oxigraph` — standalone offline CLI tooling for Oxigraph Nova.
 //!
 //! Mirrors a subset of `oxigraph-cli`'s subcommands (see
-//! `./research/oxigraph/cli` and `CLAUDE.md`'s "What's Next" item 3),
-//! adapted to Nova's own `RingStore`/`Server` API surface, and shipped under
+//! `./research/oxigraph/cli`), adapted to Nova's own `RingStore`/`Server`
+//! API surface, and shipped under
 //! the same binary name (`oxigraph`) so scripts/muscle memory written
 //! against upstream `oxigraph-cli` work unchanged:
 //!
@@ -56,6 +56,9 @@ fn main() -> anyhow::Result<()> {
             bind,
             compact_threshold,
             sync_interval_ms,
+            query_timeout_s,
+            max_results,
+            max_parallel_queries,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_serve(
@@ -64,6 +67,9 @@ fn main() -> anyhow::Result<()> {
                 bind,
                 compact_threshold,
                 sync_interval_ms,
+                query_timeout_s,
+                max_results,
+                max_parallel_queries,
             ))
         }
     }
@@ -129,6 +135,9 @@ async fn run_serve(
     bind: String,
     compact_threshold: Option<usize>,
     sync_interval_ms: Option<u64>,
+    query_timeout_s: Option<u64>,
+    max_results: Option<usize>,
+    max_parallel_queries: Option<usize>,
 ) -> anyhow::Result<()> {
     let store = match &location {
         Some(dir) => {
@@ -180,6 +189,16 @@ async fn run_serve(
     );
 
     let store = Arc::new(store);
-    Server::new(store).run(&bind).await?;
+    let mut server = Server::new(store);
+    if let Some(secs) = query_timeout_s {
+        server = server.with_query_timeout(Duration::from_secs(secs));
+    }
+    if let Some(n) = max_results {
+        server = server.with_max_results(n);
+    }
+    if let Some(n) = max_parallel_queries {
+        server = server.with_max_parallel_queries(n);
+    }
+    server.run(&bind).await?;
     Ok(())
 }

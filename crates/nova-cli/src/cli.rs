@@ -5,7 +5,7 @@
 //! overlaps — this binary is even named `oxigraph`, so scripts/muscle
 //! memory written against one carry over to the other. Nova currently
 //! ships a smaller subset (`load`, `backup`, `serve`) than
-//! `oxigraph-cli`'s nine subcommands — see `CLAUDE.md`.
+//! `oxigraph-cli`'s nine subcommands.
 
 use clap::{Parser, Subcommand, ValueHint};
 use std::path::PathBuf;
@@ -100,5 +100,21 @@ pub enum Command {
         /// without --location.
         #[arg(long)]
         sync_interval_ms: Option<u64>,
+        /// Abort a `/sparql` query that runs longer than this many seconds,
+        /// returning 504 Gateway Timeout. Unset by default (no timeout).
+        /// Matches upstream Oxigraph's `--timeout` flag.
+        #[arg(long)]
+        query_timeout_s: Option<u64>,
+        /// Cap the number of result rows/triples a single `/sparql` query
+        /// may produce; exceeding it returns 413 Payload Too Large. Unset
+        /// by default (no cap).
+        #[arg(long)]
+        max_results: Option<usize>,
+        /// Bound the number of `/sparql` query evaluations running
+        /// concurrently; a request arriving while this many evaluations are
+        /// already in flight is rejected immediately with 503 Service
+        /// Unavailable. Unset by default (unbounded).
+        #[arg(long)]
+        max_parallel_queries: Option<usize>,
     },
 }

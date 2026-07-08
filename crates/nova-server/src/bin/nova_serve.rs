@@ -77,6 +77,9 @@ async fn main() {
     let mut bind: String = "0.0.0.0:3030".to_string();
     let mut compact_threshold: Option<usize> = None;
     let mut sync_interval_ms: Option<u64> = None;
+    let mut query_timeout_s: Option<u64> = None;
+    let mut max_results: Option<usize> = None;
+    let mut max_parallel_queries: Option<usize> = None;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -108,6 +111,27 @@ async fn main() {
                         panic!("--sync-interval-ms must be a positive integer")
                     }));
             }
+            "--query-timeout-s" => {
+                i += 1;
+                query_timeout_s =
+                    Some(args[i].parse().unwrap_or_else(|_| {
+                        panic!("--query-timeout-s must be a positive integer")
+                    }));
+            }
+            "--max-results" => {
+                i += 1;
+                max_results = Some(
+                    args[i]
+                        .parse()
+                        .unwrap_or_else(|_| panic!("--max-results must be a positive integer")),
+                );
+            }
+            "--max-parallel-queries" => {
+                i += 1;
+                max_parallel_queries = Some(args[i].parse().unwrap_or_else(|_| {
+                    panic!("--max-parallel-queries must be a positive integer")
+                }));
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: nova_serve [--file <dataset.nt>] [--location <dir>] [--bind 0.0.0.0:3030] \
@@ -136,7 +160,20 @@ async fn main() {
                      interval in milliseconds instead, trading a bounded durability window\n\
                      (writes acknowledged since the last flush can be lost on a crash) for\n\
                      write throughput. Has no effect without --location. See\n\
-                     oxigraph_nova_storage_ring::SyncPolicy docs."
+                     oxigraph_nova_storage_ring::SyncPolicy docs.\n\
+                     \n\
+                     --query-timeout-s <n>: abort a `/sparql` query that runs longer than\n\
+                     <n> seconds, returning 504 Gateway Timeout. Unset by default (no\n\
+                     timeout). Matches upstream Oxigraph's `--timeout` flag.\n\
+                     \n\
+                     --max-results <n>: cap the number of result rows/triples a single\n\
+                     `/sparql` query may produce; exceeding it returns 413 Payload Too\n\
+                     Large. Unset by default (no cap).\n\
+                     \n\
+                     --max-parallel-queries <n>: bound the number of `/sparql` query\n\
+                     evaluations running concurrently; a request arriving while <n>\n\
+                     evaluations are in flight is rejected immediately with 503 Service\n\
+                     Unavailable. Unset by default (unbounded)."
                 );
                 return;
             }
@@ -295,5 +332,15 @@ async fn main() {
     eprintln!("[nova_serve] Ready. Serving on http://{bind}/sparql");
 
     let store = Arc::new(store);
-    Server::new(store).run(&bind).await.expect("server failed");
+    let mut server = Server::new(store);
+    if let Some(secs) = query_timeout_s {
+        server = server.with_query_timeout(Duration::from_secs(secs));
+    }
+    if let Some(n) = max_results {
+        server = server.with_max_results(n);
+    }
+    if let Some(n) = max_parallel_queries {
+        server = server.with_max_parallel_queries(n);
+    }
+    server.run(&bind).await.expect("server failed");
 }

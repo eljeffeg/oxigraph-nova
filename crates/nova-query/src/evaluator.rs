@@ -38,6 +38,17 @@ use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 use std::collections::HashMap;
 use std::str::FromStr;
 
+/// Short label for a query's top-level kind, used as a `tracing` span field
+/// in `Evaluator::evaluate` (`SELECT` / `ASK` / `CONSTRUCT` / `DESCRIBE`).
+fn query_kind_label(query: &Query) -> &'static str {
+    match query {
+        Query::Select { .. } => "SELECT",
+        Query::Ask { .. } => "ASK",
+        Query::Construct { .. } => "CONSTRUCT",
+        Query::Describe { .. } => "DESCRIBE",
+    }
+}
+
 // ── XSD namespace helper ──────────────────────────────────────────────────────
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -210,6 +221,8 @@ pub struct Evaluator<'a, D: Dataset> {
     dataset: &'a D,
     /// BASE IRI extracted from the current query; used by IRI()/URI() to resolve relative strings.
     base_iri: std::cell::RefCell<Option<String>>,
+    /// Per-query cancellation/result-cap limits; see `crate::options`.
+    options: crate::options::QueryOptions,
 }
 
 impl<'a, D: Dataset> Evaluator<'a, D> {
@@ -217,11 +230,29 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         Self {
             dataset,
             base_iri: std::cell::RefCell::new(None),
+            options: crate::options::QueryOptions::default(),
+        }
+    }
+
+    /// Construct an evaluator with explicit execution limits (cancellation
+    /// token and/or a result-row cap) — see `crate::options::QueryOptions`.
+    pub fn with_options(dataset: &'a D, options: crate::options::QueryOptions) -> Self {
+        Self {
+            dataset,
+            base_iri: std::cell::RefCell::new(None),
+            options,
         }
     }
 
     // ── Top-level entry point ─────────────────────────────────────────────
 
+    /// Evaluate a parsed query against `self.dataset`.
+    ///
+    /// Wrapped in a `tracing` span (`query_kind` field distinguishes
+    /// SELECT/ASK/CONSTRUCT/DESCRIBE) so `nova-server`'s tracing-subscriber
+    /// output can show evaluation latency per query. `skip_all` avoids requiring
+    /// `Query`/`Self` to implement `Debug` just for span field capture.
+    #[tracing::instrument(name = "evaluate", skip_all, fields(query_kind = query_kind_label(query)))]
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
         // Extract BASE IRI from the query so IRI()/URI() can resolve relative strings.
         *self.base_iri.borrow_mut() = match query {
@@ -452,14 +483,24 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         // ── Fast path: Leapfrog Triejoin ──────────────────────────────────────
         // Try LFTJ first; falls back to nested-loop if the dataset doesn't
         // support it, the delta is non-empty, or the BGP has blank nodes / unknown terms.
-        if let Some(result) = crate::lftj::eval_bgp_lftj(self.dataset, patterns, active_graph) {
+        if let Some(result) = crate::lftj::eval_bgp_lftj_cancellable(
+            self.dataset,
+            patterns,
+            active_graph,
+            self.options.cancellation.as_ref(),
+        ) {
+            crate::lftj::record_lftj_used();
             return result;
         }
+        crate::lftj::record_lftj_fallback();
 
         // ── Fallback: nested-loop evaluation ──────────────────────────────────
         let mut solutions: Solutions = vec![Solution::new()];
 
         for tp in patterns {
+            self.options
+                .check(solutions.len())
+                .map_err(anyhow::Error::from)?;
             let mut next: Solutions = Vec::new();
 
             for current in &solutions {
@@ -1697,13 +1738,14 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             None => None,
         };
 
-        crate::path::ring_bfs_transitive_bound(
+        crate::path::ring_bfs_transitive_bound_cancellable(
             self.dataset,
             p_id,
             source_id,
             target_id,
             include_identity,
             ag,
+            self.options.cancellation.as_ref(),
         )
     }
 
@@ -1748,7 +1790,14 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             None => None,
         };
 
-        crate::path::ring_eval_rpq(self.dataset, path, source_id, target_id, ag)
+        crate::path::ring_eval_rpq_cancellable(
+            self.dataset,
+            path,
+            source_id,
+            target_id,
+            ag,
+            self.options.cancellation.as_ref(),
+        )
     }
 
     /// Enumerate all (subject, object) pairs reachable via `path` in `ag`.
@@ -1955,7 +2004,14 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 Err(e) => return Some(Err(e)),
             }
         };
-        crate::path::ring_bfs_transitive(self.dataset, p_id, &start_ids, include_identity, ag)
+        crate::path::ring_bfs_transitive_cancellable(
+            self.dataset,
+            p_id,
+            &start_ids,
+            include_identity,
+            ag,
+            self.options.cancellation.as_ref(),
+        )
     }
 
     /// Collect all distinct subjects and objects in the active graph.

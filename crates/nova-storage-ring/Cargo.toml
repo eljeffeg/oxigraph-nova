@@ -18,6 +18,7 @@ oxigraph-nova-storage-common = { path = "../nova-storage-common" } # generic WAL
 oxrdf         = { workspace = true }
 anyhow        = { workspace = true }
 thiserror     = { workspace = true }
+tracing       = { workspace = true }
 sux           = { version = "0.14", features = ["epserde", "mmap"] } # T backend (Rank9+SelectAdapt), L array (BitFieldVec); epserde+mmap for mmap-based snapshot persistence
 value-traits  = "0.2.0"  # SliceByValue::index_value for safe BitFieldVec reads
 mem_dbg       = "0.4"     # MemSize trait — sux's Rank9/SelectAdapt/BitFieldVec already derive it;
