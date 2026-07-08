@@ -101,8 +101,29 @@ fn dataset_clause_selector(dataset: Option<&spargebra::algebra::QueryDataset>) -
 // them) — Nova doesn't consume those anyway, since join execution and the
 // CLTJ*/WCOJ variable ordering are driven by `lftj.rs`'s own adaptive VEO,
 // not by sparopt's static join order.
+//
+// `sparopt` 0.3.6 has confirmed optimizer bugs around `GRAPH ?var { ... }`
+// (a variable-named graph clause): it can hoist a `Group`/aggregation out
+// from inside the `Graph` node so aggregation runs once over the whole
+// dataset instead of once per named graph ("COUNT: no GROUP BY inside of
+// GRAPH"), drop the `Graph` wrapper entirely around a `Values` clause so
+// `?g` loses its graph-name binding ("VALUES inside GRAPH binding the same
+// variable as the graph name"), and distribute a single outer `Graph` node
+// into *both* branches of a `Minus` so the left and right sides spuriously
+// share the `?g` variable and are no longer compared for disjointness
+// correctly ("outer GRAPH operator does not affect MINUS disjointness") —
+// all three are W3C SPARQL 1.1 conformance-test regressions traced (via a
+// minimal `sparopt`-only repro, independent of this evaluator) to the
+// optimizer's round-trip, not to anything in this crate. Since a
+// variable-named `GRAPH` clause anywhere in the pattern is the common
+// trigger, skip sparopt optimization for the entire query in that case
+// (falling back to the unoptimized pattern, which this evaluator has always
+// executed correctly) rather than trying to patch sparopt's internals.
 #[cfg(feature = "sparopt")]
 fn optimize_pattern(pattern: &GP) -> GP {
+    if contains_variable_graph(pattern) {
+        return pattern.clone();
+    }
     use sparopt::Optimizer;
     use sparopt::algebra::GraphPattern as OptGP;
     let opt = Optimizer::optimize_graph_pattern(OptGP::from(pattern));
@@ -112,6 +133,36 @@ fn optimize_pattern(pattern: &GP) -> GP {
 #[cfg(not(feature = "sparopt"))]
 fn optimize_pattern(pattern: &GP) -> GP {
     pattern.clone()
+}
+
+/// Recursively check whether `pattern` contains a `GRAPH ?var { ... }` clause
+/// (a variable-named graph, as opposed to `GRAPH <iri> { ... }`) anywhere —
+/// see the doc comment on `optimize_pattern` above for why this disables the
+/// sparopt optimization pass for the whole query.
+#[cfg(feature = "sparopt")]
+fn contains_variable_graph(pattern: &GP) -> bool {
+    match pattern {
+        GP::Graph {
+            name: NamedNodePattern::Variable(_),
+            ..
+        } => true,
+        GP::Graph { inner, .. } => contains_variable_graph(inner),
+        GP::Join { left, right } | GP::Union { left, right } | GP::Minus { left, right } => {
+            contains_variable_graph(left) || contains_variable_graph(right)
+        }
+        GP::LeftJoin { left, right, .. } => {
+            contains_variable_graph(left) || contains_variable_graph(right)
+        }
+        GP::Filter { inner, .. }
+        | GP::Extend { inner, .. }
+        | GP::OrderBy { inner, .. }
+        | GP::Project { inner, .. }
+        | GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Slice { inner, .. }
+        | GP::Group { inner, .. } => contains_variable_graph(inner),
+        GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } | GP::Service { .. } => false,
+    }
 }
 
 // ── XSD numeric tower ─────────────────────────────────────────────────────────
