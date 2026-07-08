@@ -707,6 +707,95 @@ impl RingStore {
         manifest::wal_segment_path(dir, 1)
     }
 
+    /// Create a consistent, restorable copy of this store's on-disk state
+    /// into `destination` (created if it doesn't exist).
+    ///
+    /// Mirrors upstream Oxigraph's `Store::backup(destination)`: after this
+    /// call returns, `RingStore::open(destination)` recovers exactly the
+    /// same data as the source store had at the moment `backup` was called,
+    /// and the backup is a fully independent store thereafter (no shared
+    /// file handles or further coupling to the source).
+    ///
+    /// Only valid for a **persistent** store (opened via [`RingStore::open`]);
+    /// returns an error for an in-memory (`RingStore::new()`) store, since
+    /// there is no on-disk state to copy.
+    ///
+    /// ## Consistency
+    ///
+    /// The entire operation runs under the single `Mutex<RingStoreInner>`
+    /// lock (the same lock every read/write already serialises through), so
+    /// no concurrent write or compaction can rotate the snapshot/WAL-segment
+    /// files out from under the copy. Before copying, the active WAL
+    /// segment is explicitly `fsync`ed (regardless of the current
+    /// [`SyncPolicy`]) so the backup never misses a write that had already
+    /// been acknowledged to a caller.
+    ///
+    /// Only the files the current MANIFEST actually references are copied
+    /// (the MANIFEST itself, the current snapshot generation's
+    /// `nova.snapshot.<gen>` + `nova.dict.<gen>`, and the active
+    /// `nova.wal.<seq>` segment) — any orphaned older-generation files
+    /// still sitting in the source directory (pending best-effort cleanup)
+    /// are intentionally not copied.
+    pub fn backup(&self, destination: &Path) -> Result<(), Oxigraph> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+
+        let dir = inner.data_dir.clone().ok_or_else(|| {
+            Oxigraph::Storage(
+                "RingStore::backup requires a persistent store (opened via RingStore::open); \
+                 an in-memory store (RingStore::new()) has no on-disk state to copy"
+                    .to_string(),
+            )
+        })?;
+
+        // Make sure every acknowledged write is actually durable before
+        // copying, regardless of the current SyncPolicy (Interval policy
+        // writes are not fsynced until the background flusher runs).
+        if let Some(w) = &inner.wal {
+            w.sync()
+                .map_err(|e| Oxigraph::Storage(format!("WAL flush before backup failed: {e}")))?;
+        }
+
+        std::fs::create_dir_all(destination)?;
+
+        let manifest_src = dir.join(manifest::MANIFEST_FILE_NAME);
+        if manifest_src.exists() {
+            std::fs::copy(
+                &manifest_src,
+                destination.join(manifest::MANIFEST_FILE_NAME),
+            )?;
+        }
+
+        if inner.snapshot_gen > 0 {
+            let snap_src = manifest::snapshot_path(&dir, inner.snapshot_gen);
+            if snap_src.exists() {
+                std::fs::copy(
+                    &snap_src,
+                    manifest::snapshot_path(destination, inner.snapshot_gen),
+                )?;
+            }
+            let dict_src = manifest::dict_path(&dir, inner.snapshot_gen);
+            if dict_src.exists() {
+                std::fs::copy(
+                    &dict_src,
+                    manifest::dict_path(destination, inner.snapshot_gen),
+                )?;
+            }
+        }
+
+        let wal_src = manifest::wal_segment_path(&dir, inner.wal_seq);
+        if wal_src.exists() {
+            std::fs::copy(
+                &wal_src,
+                manifest::wal_segment_path(destination, inner.wal_seq),
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Merge the delta into the Ring index.
     ///
     /// After compaction:
@@ -1899,6 +1988,52 @@ mod tests {
         assert!(!store.contains(&q2).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_round_trips_into_independent_store() {
+        let src_dir = temp_dir("backup_src");
+        let dst_dir = temp_dir("backup_dst");
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+
+        let g = ng("http://ex/g");
+        let q1 = make_quad("http://ex/s1", "http://ex/p", "a", dg());
+        let q2 = make_quad("http://ex/s2", "http://ex/p", "b", g.clone());
+
+        let store = RingStore::open(&src_dir).unwrap();
+        store.insert(&q1).unwrap();
+        store.insert(&q2).unwrap();
+        store.compact().unwrap();
+        // A post-compaction write, still in the WAL tail (not yet snapshotted).
+        let q3 = make_quad("http://ex/s3", "http://ex/p", "c", dg());
+        store.insert(&q3).unwrap();
+
+        store.backup(&dst_dir).unwrap();
+
+        // Backup must be independently openable and contain everything.
+        let restored = RingStore::open(&dst_dir).unwrap();
+        assert_eq!(restored.len().unwrap(), 3);
+        assert!(restored.contains(&q1).unwrap());
+        assert!(restored.contains(&q2).unwrap());
+        assert!(restored.contains(&q3).unwrap());
+
+        // The backup must be independent: further writes to the source
+        // must not affect the backup, and vice versa.
+        let q4 = make_quad("http://ex/s4", "http://ex/p", "d", dg());
+        store.insert(&q4).unwrap();
+        assert!(!restored.contains(&q4).unwrap());
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn backup_of_in_memory_store_errors() {
+        let store = RingStore::new();
+        let dst_dir = temp_dir("backup_in_memory_dst");
+        let _ = std::fs::remove_dir_all(&dst_dir);
+        assert!(store.backup(&dst_dir).is_err());
     }
 
     #[test]

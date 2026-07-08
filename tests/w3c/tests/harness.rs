@@ -26,9 +26,8 @@ use oxigraph_nova_storage_ring::RingStore;
 use oxrdf::{Dataset as OxrdfDataset, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use oxttl::{NTriplesParser, TriGParser, TurtleParser};
 use sparesults::{QueryResultsFormat, QueryResultsParser, ReaderQueryResultsParserOutput};
-use spargebra::SparqlParser;
 use spareval::{QueryEvaluator as SparevalEvaluator, QueryResults as SparevalResults};
-
+use spargebra::SparqlParser;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -418,7 +417,6 @@ fn load_into_store<S: QuadStore>(store: &S, url: &str, graph: &GraphName) -> Res
         .map_err(|e| anyhow!("register graph: {e}"))?;
     let content = read_url(url)?;
 
-
     // TriG is a distinct format from Turtle: it adds `GRAPH <iri> { ... }`
     // blocks for defining multiple named graphs (plus default-graph triples)
     // within a single file. `TurtleParser` has no notion of these blocks and
@@ -452,7 +450,6 @@ fn load_into_store<S: QuadStore>(store: &S, url: &str, graph: &GraphName) -> Res
         }
         return Ok(quads);
     }
-
 
     // Dispatch by file extension: most W3C SPARQL 1.1 test fixtures are
     // Turtle, but the subquery (`sq0*`) tests ship `.rdf` (RDF/XML) data
@@ -490,7 +487,6 @@ fn load_into_store<S: QuadStore>(store: &S, url: &str, graph: &GraphName) -> Res
     }
     Ok(quads)
 }
-
 
 // ── Blank-node-identity-preserving term representation ────────────────────────
 
@@ -1281,7 +1277,11 @@ fn run_test<S: TestStore + 'static>(tc: &TestCase) -> Result<bool> {
             let store = Arc::new(S::default());
             let mut all_quads: Vec<Quad> = Vec::new();
             for url in &tc.data_urls {
-                all_quads.extend(load_into_store(store.as_ref(), url, &GraphName::DefaultGraph)?);
+                all_quads.extend(load_into_store(
+                    store.as_ref(),
+                    url,
+                    &GraphName::DefaultGraph,
+                )?);
             }
             for (graph_iri, url) in &tc.named_urls {
                 let gname = GraphName::NamedNode(NamedNode::new_unchecked(graph_iri.clone()));

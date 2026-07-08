@@ -1,0 +1,26 @@
+[package]
+name        = "oxigraph-nova-cli"
+description = "Standalone offline CLI tooling for Oxigraph Nova (load / backup / serve)"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+oxigraph-nova-core         = { path = "../nova-core" }
+oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
+oxigraph-nova-server       = { path = "../nova-server" }
+oxrdf          = { workspace = true }
+oxttl          = { workspace = true }
+oxrdfxml       = { workspace = true }
+oxjsonld       = { workspace = true }
+clap           = { workspace = true }
+anyhow         = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+mimalloc = "0.1.52"
+
+[[bin]]
+name = "nova-cli"
+path = "src/main.rs"
