@@ -1,0 +1,17 @@
+[package]
+name        = "oxigraph-nova-reasoning"
+description = "OWL 2 RL reasoning: LFTJ-native semi-naive fixpoint driver for Oxigraph Nova"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+oxigraph-nova-core = { path = "../nova-core" }
+
+[dev-dependencies]
+# Only the integration spike test (tests/transitivity_spike.rs) needs a real
+# storage backend + oxrdf term constructors — the library itself has no
+# dependency on any concrete QuadStore, only on TermIds (`u64`).
+oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
+oxrdf = { workspace = true }
