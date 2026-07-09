@@ -167,7 +167,6 @@ impl FulltextIndex {
 
     /// Delete the (at most one) document previously indexed for this exact
     /// packed quad key — the tombstone counterpart to
-
     /// [`Self::add_literal`]. Safe to call even if no document was ever
     /// indexed for this key (e.g. a non-literal-object quad being removed).
     pub fn remove_by_key(&self, quad_key: u128) -> anyhow::Result<()> {
@@ -203,7 +202,6 @@ impl FulltextIndex {
         writer.delete_all_documents()?;
         Ok(())
     }
-
 
     fn doc_field_u64(doc: &TantivyDocument, field: Field) -> Option<u64> {
         doc.get_first(field).and_then(|v| v.as_u64())
@@ -248,9 +246,7 @@ impl TextSearch for FulltextIndex {
             Err(_) => return Vec::new(),
         };
 
-
         top_docs
-
             .into_iter()
             .filter_map(|(_score, addr)| {
                 let doc: TantivyDocument = searcher.doc(addr).ok()?;
@@ -344,7 +340,11 @@ mod tests {
             .unwrap();
         idx.commit().unwrap();
         let hits = idx.search("fox", None, 10);
-        assert_eq!(hits.len(), 1, "re-inserting the same quad_key must not duplicate the document");
+        assert_eq!(
+            hits.len(),
+            1,
+            "re-inserting the same quad_key must not duplicate the document"
+        );
     }
 
     /// Fix #2 regression: `clear()` must remove every document, so a
@@ -373,4 +373,3 @@ mod tests {
         assert_eq!(idx.search("fox", None, 10).len(), 1);
     }
 }
-

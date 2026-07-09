@@ -164,7 +164,6 @@ fn text_search_call(expr: &Expression) -> Option<(Variable, String, TextFn)> {
     Some((var.clone(), lit.value().to_string(), mode))
 }
 
-
 // ── Dataset clause (FROM / FROM NAMED) → GraphSelector ────────────────────────
 
 /// Compute the top-level graph selector to use for pattern matching, per
@@ -1678,7 +1677,6 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 }
             }
 
-
             // ── UUID / STRUUID ────────────────────────────────────────────
             Function::Uuid => {
                 let id = uuid::Uuid::new_v4();
@@ -1794,12 +1792,13 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         if !matches!(bound_term, Term::Literal(_)) {
             return Some(bool_term(false));
         }
-        let target_id = self.dataset.lftj_intern_term(bound_term, &GraphSelector::Union)?;
+        let target_id = self
+            .dataset
+            .lftj_intern_term(bound_term, &GraphSelector::Union)?;
         let effective = mode.effective_query(query);
         let hits = ts.search(&effective, None, DEFAULT_TEXT_SEARCH_LIMIT);
         Some(bool_term(hits.iter().any(|m| m.object_id == target_id)))
     }
-
 
     /// Real pushdown: if `expr` is a `text:query`/`text:contains(?var, "...")`
     /// call, and `?var` is bound by `inner` as the object of some triple
@@ -1904,8 +1903,6 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         });
         Ok(sols)
     }
-
-
 
     // =========================================================================
     // Property path evaluation
@@ -2473,7 +2470,6 @@ fn substitute_var_in_term_pattern(tp: &TermPattern, var: &Variable, term: &Term)
         other => other.clone(),
     }
 }
-
 
 fn bind_var(sol: &mut Solution, var: &Option<Variable>, value: &Term) -> bool {
     match var {
@@ -3881,7 +3877,8 @@ mod tests {
         fn pushdown_filter_over_bgp_finds_match() {
             let store = make_store_with_text();
             let dataset = StoreDataset::new(Arc::clone(&store));
-            let options = QueryOptions::new().with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
+            let options = QueryOptions::new()
+                .with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
             let ev = Evaluator::with_options(&dataset, options);
             let q = SparqlParser::new()
                 .parse_query(
@@ -3906,7 +3903,8 @@ mod tests {
         fn pushdown_filter_no_match_returns_empty() {
             let store = make_store_with_text();
             let dataset = StoreDataset::new(Arc::clone(&store));
-            let options = QueryOptions::new().with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
+            let options = QueryOptions::new()
+                .with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
             let ev = Evaluator::with_options(&dataset, options);
             let q = SparqlParser::new()
                 .parse_query(
@@ -3972,7 +3970,8 @@ mod tests {
             store.compact().unwrap();
 
             let dataset = StoreDataset::new(Arc::clone(&store));
-            let options = QueryOptions::new().with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
+            let options = QueryOptions::new()
+                .with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
             let ev = Evaluator::with_options(&dataset, options);
             // `?o` is bound as the object of <name> (a literal, matched by
             // the search) AND as the predicate of a second triple pattern
@@ -4004,14 +4003,14 @@ mod tests {
 
         #[test]
         fn scalar_fallback_when_not_direct_filter_child() {
-
             // Wrapping in a BIND/nested boolean expression bypasses the
             // pushdown pattern-match (`text_search_call` only recognizes a
             // direct FunctionCall), exercising the `eval_fn` scalar-fallback
             // path (`Function::Custom` arm) instead.
             let store = make_store_with_text();
             let dataset = StoreDataset::new(Arc::clone(&store));
-            let options = QueryOptions::new().with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
+            let options = QueryOptions::new()
+                .with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
             let ev = Evaluator::with_options(&dataset, options);
             let q = SparqlParser::new()
                 .parse_query(

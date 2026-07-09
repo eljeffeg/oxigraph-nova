@@ -61,17 +61,17 @@
 //! direction a fix would take.
 
 use crate::delta::Delta;
+#[cfg(feature = "fulltext")]
+use crate::fulltext;
 use crate::louds::LoudsMemBreakdown;
 use crate::ring::{GraphRing, GraphRingHandle, RingBuilder, SortOrder};
 use crate::snapshot::StoreSnapshot;
-#[cfg(feature = "fulltext")]
-use crate::fulltext;
-#[cfg(feature = "fulltext")]
-use oxigraph_nova_fulltext::FulltextIndex;
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, NamedNode, Oxigraph, Quad,
     QuadStore, StoredQuad, Subject, Term, TermId,
 };
+#[cfg(feature = "fulltext")]
+use oxigraph_nova_fulltext::FulltextIndex;
 use oxigraph_nova_storage_common::dict_snapshot;
 use oxigraph_nova_storage_common::manifest::{self, Manifest};
 use oxigraph_nova_storage_common::wal::{self, WalRecord, WalWriter};
@@ -487,7 +487,6 @@ impl RingStoreInner {
         COMPACTION_DURATION_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         result
     }
-
 
     /// Add/remove literal-object documents for every entry currently in
     /// `self.delta` (an insert or a tombstone), using the `quad_key` term
@@ -1730,8 +1729,7 @@ mod tests {
         }
 
         fn temp_dir(name: &str) -> std::path::PathBuf {
-            static COUNTER: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let pid = std::process::id();
             std::env::temp_dir().join(format!("nova_ringstore_fulltext_test_{pid}_{n}_{name}"))
@@ -1744,10 +1742,20 @@ mod tests {
 
             let p = pred("http://ex/p");
             store
-                .insert(&Quad::new(nn("http://ex/s1"), p.clone(), lit("the quick brown fox"), dg()))
+                .insert(&Quad::new(
+                    nn("http://ex/s1"),
+                    p.clone(),
+                    lit("the quick brown fox"),
+                    dg(),
+                ))
                 .unwrap();
             store
-                .insert(&Quad::new(nn("http://ex/s2"), p.clone(), lit("a lazy dog sleeps"), dg()))
+                .insert(&Quad::new(
+                    nn("http://ex/s2"),
+                    p.clone(),
+                    lit("a lazy dog sleeps"),
+                    dg(),
+                ))
                 .unwrap();
 
             // Not yet compacted: compaction-eventually-consistent, so no hits yet.
@@ -1784,7 +1792,12 @@ mod tests {
                 store.enable_fulltext().unwrap();
                 let p = pred("http://ex/p");
                 store
-                    .insert(&Quad::new(nn("http://ex/s"), p, lit("persistent content"), dg()))
+                    .insert(&Quad::new(
+                        nn("http://ex/s"),
+                        p,
+                        lit("persistent content"),
+                        dg(),
+                    ))
                     .unwrap();
                 store.compact().unwrap();
                 assert_eq!(store.search("persistent", None, 10).len(), 1);
@@ -1811,7 +1824,12 @@ mod tests {
                 let store = RingStore::open(&dir).unwrap();
                 let p = pred("http://ex/p");
                 store
-                    .insert(&Quad::new(nn("http://ex/s"), p, lit("preexisting data"), dg()))
+                    .insert(&Quad::new(
+                        nn("http://ex/s"),
+                        p,
+                        lit("preexisting data"),
+                        dg(),
+                    ))
                     .unwrap();
                 store.compact().unwrap();
             }
@@ -1835,10 +1853,20 @@ mod tests {
             let p1 = pred("http://ex/p1");
             let p2 = pred("http://ex/p2");
             store
-                .insert(&Quad::new(nn("http://ex/s1"), p1.clone(), lit("shared term"), dg()))
+                .insert(&Quad::new(
+                    nn("http://ex/s1"),
+                    p1.clone(),
+                    lit("shared term"),
+                    dg(),
+                ))
                 .unwrap();
             store
-                .insert(&Quad::new(nn("http://ex/s2"), p2.clone(), lit("shared term"), dg()))
+                .insert(&Quad::new(
+                    nn("http://ex/s2"),
+                    p2.clone(),
+                    lit("shared term"),
+                    dg(),
+                ))
                 .unwrap();
             store.compact().unwrap();
 
@@ -1877,7 +1905,12 @@ mod tests {
             store.enable_fulltext().unwrap();
             let p = pred("http://ex/p");
             store
-                .insert(&Quad::new(nn("http://ex/before"), p.clone(), lit("before text"), dg()))
+                .insert(&Quad::new(
+                    nn("http://ex/before"),
+                    p.clone(),
+                    lit("before text"),
+                    dg(),
+                ))
                 .unwrap();
             store.compact().unwrap();
             assert_eq!(store.search("before", None, 10).len(), 1);
@@ -1891,7 +1924,12 @@ mod tests {
             std::fs::set_permissions(&ft_dir, perms).unwrap();
 
             store
-                .insert(&Quad::new(nn("http://ex/after"), p.clone(), lit("after text"), dg()))
+                .insert(&Quad::new(
+                    nn("http://ex/after"),
+                    p.clone(),
+                    lit("after text"),
+                    dg(),
+                ))
                 .unwrap();
             // Must NOT propagate the fulltext I/O error — core compaction
             // (Ring/Dictionary/WAL) must still succeed.
@@ -1918,7 +1956,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
-
 
     fn nn(s: &str) -> Subject {
         Subject::NamedNode(NamedNode::new_unchecked(s))

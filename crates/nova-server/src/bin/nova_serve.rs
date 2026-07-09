@@ -364,9 +364,7 @@ async fn main() {
     // ── Optional full-text search (`--fulltext`) ────────────────────────────
     #[cfg(feature = "fulltext")]
     let text_search: Option<Arc<dyn oxigraph_nova_core::TextSearch>> = if fulltext {
-        eprintln!(
-            "[nova_serve] Enabling full-text search (text:query/text:contains) ..."
-        );
+        eprintln!("[nova_serve] Enabling full-text search (text:query/text:contains) ...");
         store
             .enable_fulltext()
             .expect("RingStore::enable_fulltext failed");

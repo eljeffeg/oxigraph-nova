@@ -26,12 +26,11 @@
 //! rebuild is triggered by walking every graph's `spo_triples()` rather than
 //! silently serving a stale or empty index.
 
+use crate::ring::GraphRingHandle;
 use oxigraph_nova_core::{Dictionary, GraphId, Oxigraph, Term, TermId};
 use oxigraph_nova_fulltext::FulltextIndex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-use crate::ring::GraphRingHandle;
 
 /// Subdirectory (under a persistent store's data dir) holding the Tantivy
 /// index files.
@@ -143,7 +142,6 @@ pub(crate) fn rebuild_all(
     ft.clear()
         .map_err(|e| Oxigraph::Storage(format!("fulltext clear (rebuild) failed: {e}")))?;
     for (&g_id, handle) in graphs {
-
         for [s, p, o] in handle.spo_triples() {
             let (s_id, p_id, o_id) = (
                 TermId::new(s).map_err(|_| Oxigraph::IdSpaceExhausted)?,

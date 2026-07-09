@@ -527,8 +527,7 @@ async fn service_description_get<S: QuadStore + 'static>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
     let endpoint_url = format!("http://{host}/sparql");
-    let graph =
-        generate_service_description_graph(&endpoint_url, state.text_search.is_some());
+    let graph = generate_service_description_graph(&endpoint_url, state.text_search.is_some());
     serialize_triples(&graph, accept_header(&headers))
 }
 

@@ -11,8 +11,6 @@ pub use dict::{
 };
 pub use dict_compact::DictSnapshot;
 pub use error::Oxigraph;
-pub use text_search::{TextMatch, TextSearch};
-
 // Re-export the Oxigraph RDF type system directly — no custom wrappers.
 // These are battle-tested, W3C-correct, and used by oxttl/spargebra already.
 // Variable is included here so downstream crates share the exact same type
@@ -22,6 +20,7 @@ pub use oxrdf::{
 };
 use std::sync::Arc;
 pub use store::QuadStore;
+pub use text_search::{TextMatch, TextSearch};
 pub use trie::{EmptyTrieIter, TrieIterator};
 
 // oxrdf 0.3 exports `Subject = NamedOrBlankNode` but marks it deprecated

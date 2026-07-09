@@ -10,7 +10,6 @@ use oxigraph_nova_core::TextSearch;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-
 /// A cheap-to-clone flag that signals a running query should stop.
 ///
 /// Cloning shares the same underlying flag (it's an `Arc<AtomicBool>`), so
