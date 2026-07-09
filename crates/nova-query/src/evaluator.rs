@@ -57,6 +57,114 @@ fn xsd_nn(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{XSD}{local}"))
 }
 
+// ── Full-text search extension functions (`text:query`/`text:contains`) ─────────
+//
+// Non-standard SPARQL extension functions, parsed by `spargebra` as
+// `Function::Custom(NamedNode)` — the same convention used by Jena Text/
+// GraphDB/Stardog for their full-text extensions (a dedicated function-IRI
+// namespace, e.g. `text:query("...")`). Both functions are treated
+// identically for v1 (a boolean membership test against a bound object
+// variable): `text:query(?var, "search string")` runs the underlying
+// `TextSearch::search`'s implementation-defined query syntax (Tantivy's
+// query-parser syntax for the reference implementation);
+// `text:contains(?var, "term")` is currently just an alias. Distinguishing
+// them (e.g. `contains` as a plain substring/phrase match vs. `query` as
+// full query-syntax) is a later extension, not required for v1.
+//
+// Dispatched from two places:
+// - `eval_fn`'s `Function::Custom` arm (`eval_text_scalar`): a per-solution-row
+//   scalar fallback, used whenever the call can't be pushed down (e.g. the
+//   object variable isn't otherwise bound by the surrounding BGP, or the
+//   surrounding pattern isn't a plain BGP `Filter` sits directly over).
+// - `eval_pattern`'s `GP::Filter` arm (`try_text_search_pushdown`): real
+//   pushdown — when a `text:query`/`text:contains` FILTER wraps a BGP that
+//   itself binds the same variable (as a triple pattern's object), the
+//   search runs *first* to produce a candidate `TermId` set, seeding the
+//   BGP evaluation so the object variable's domain is constrained before
+//   the join runs, rather than materializing the full unconstrained join
+//   and filtering afterward.
+const TEXT_NS: &str = "http://oxigraph-nova.dev/fn/text#";
+
+/// Default cap on the number of Tantivy hits fetched for the BGP-pushdown
+/// path ([`Evaluator::try_text_search_pushdown`]). Not currently
+/// configurable via [`crate::QueryOptions`] -- a query whose search string
+/// matches more than this many literal objects will silently only consider
+/// the top-scoring `DEFAULT_TEXT_SEARCH_LIMIT` of them, potentially omitting
+/// some otherwise-valid solution rows. Acceptable for now because full-text
+/// predicates are expected to be highly selective in practice; revisit if
+/// this proves too small for real workloads (e.g. by threading a
+/// `text_search_limit: Option<usize>` through `QueryOptions`).
+const DEFAULT_TEXT_SEARCH_LIMIT: usize = 10_000;
+
+/// Which of the two full-text extension functions a `text:` call site used
+/// -- they share the same pushdown/scalar-fallback machinery but differ in
+/// how the search-string argument is turned into a Tantivy query (see
+/// [`Self::effective_query`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextFn {
+    /// `text:query(?var, "...")`: the string is passed to Tantivy's
+    /// `QueryParser` as-is, so callers can use its full query syntax
+    /// (`AND`/`OR`/field queries/wildcards/etc.).
+    Query,
+    /// `text:contains(?var, "...")`: the string is treated as a literal
+    /// substring/phrase to search for -- escaped and wrapped in double
+    /// quotes so any `QueryParser` syntax characters in it (`"`, `\`, `AND`,
+    /// `*`, ...) are matched literally rather than parsed as query syntax.
+    Contains,
+}
+
+impl TextFn {
+    /// Turn the raw search-string argument into the actual string handed to
+    /// [`oxigraph_nova_core::TextSearch::search`], per this variant's
+    /// semantics.
+    fn effective_query(self, raw: &str) -> String {
+        match self {
+            TextFn::Query => raw.to_string(),
+            TextFn::Contains => {
+                let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\"")
+            }
+        }
+    }
+}
+
+/// `Some(TextFn)` if `nn_str` is one of this crate's full-text extension
+/// function IRIs; `None` for anything else (including other
+/// `Function::Custom` IRIs, e.g. XSD casts).
+fn text_function_local(nn_str: &str) -> Option<TextFn> {
+    let local = nn_str.strip_prefix(TEXT_NS)?;
+    match local {
+        "query" => Some(TextFn::Query),
+        "contains" => Some(TextFn::Contains),
+        _ => None,
+    }
+}
+
+/// If `expr` is exactly `text:query(?var, "literal string")` or
+/// `text:contains(?var, "literal string")` (a direct `FunctionCall`, not
+/// nested inside `And`/`Or`/etc. -- see `try_text_search_pushdown`'s doc
+/// comment for why only this shape is recognized for v1), return
+/// `(var, search_string, which_fn)`. Used by `eval_pattern`'s `GP::Filter`
+/// arm to decide whether to attempt pushdown before falling back to plain
+/// per-row filtering.
+fn text_search_call(expr: &Expression) -> Option<(Variable, String, TextFn)> {
+    let Expression::FunctionCall(Function::Custom(nn), args) = expr else {
+        return None;
+    };
+    let mode = text_function_local(nn.as_str())?;
+    if args.len() != 2 {
+        return None;
+    }
+    let Expression::Variable(var) = &args[0] else {
+        return None;
+    };
+    let Expression::Literal(lit) = &args[1] else {
+        return None;
+    };
+    Some((var.clone(), lit.value().to_string(), mode))
+}
+
+
 // ── Dataset clause (FROM / FROM NAMED) → GraphSelector ────────────────────────
 
 /// Compute the top-level graph selector to use for pattern matching, per
@@ -381,6 +489,19 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             }
 
             GP::Filter { expr, inner } => {
+                // Full-text search pushdown: if `expr` is a
+                // `text:query`/`text:contains(?var, "...")` call and `?var`
+                // is bound by `inner` (a top-level BGP) as an object, run
+                // the search first to constrain `?var`'s domain before the
+                // join, rather than joining everything and then filtering.
+                // Falls through to plain evaluation if no pushdown
+                // opportunity is found (e.g. no `TextSearch` backend
+                // configured, `inner` isn't a plain BGP, or the FILTER
+                // expression isn't this exact shape).
+                if let Some(result) = self.try_text_search_pushdown(expr, inner, active_graph) {
+                    return result;
+                }
+
                 let solutions = self.eval_pattern(inner, active_graph)?;
                 Ok(solutions
                     .into_iter()
@@ -1542,7 +1663,21 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             }
 
             // ── Custom functions (XSD casts + user extensions) ────────────
-            Function::Custom(nn) => eval_xsd_cast(nn.as_str(), arg(0).as_ref()),
+            Function::Custom(nn) => {
+                if let Some(mode) = text_function_local(nn.as_str()) {
+                    // `text:query(?var, "search string")` /
+                    // `text:contains(?var, "term")`: arg 0 is the (already
+                    // solution-bound) object term being tested, arg 1 is the
+                    // search string. This is the scalar-fallback path (used
+                    // when the pushdown in `eval_pattern`'s `GP::Filter` arm
+                    // didn't apply) — it re-runs the search per row and
+                    // checks whether `arg(0)`'s TermId is among the hits.
+                    self.eval_text_scalar(arg(0).as_ref(), str_val(1).as_deref(), mode)
+                } else {
+                    eval_xsd_cast(nn.as_str(), arg(0).as_ref())
+                }
+            }
+
 
             // ── UUID / STRUUID ────────────────────────────────────────────
             Function::Uuid => {
@@ -1636,6 +1771,141 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             _ => None,
         }
     }
+
+    /// Scalar-fallback evaluation of `text:query`/`text:contains`: re-run
+    /// the search and check whether `bound_term`'s interned `TermId` is
+    /// among the hits. Used by `eval_fn`'s `Function::Custom` arm whenever
+    /// the pushdown path (`try_text_search_pushdown`, invoked from
+    /// `eval_pattern`'s `GP::Filter` arm) didn't apply.
+    ///
+    /// Returns `None` (SPARQL type error / unbound) if no `TextSearch`
+    /// backend is configured (`self.options.text_search`), `bound_term`
+    /// isn't a literal, or the search string argument is missing/non-string
+    /// -- otherwise `Some(bool_term(...))`.
+    fn eval_text_scalar(
+        &self,
+        bound_term: Option<&Term>,
+        query: Option<&str>,
+        mode: TextFn,
+    ) -> Option<Term> {
+        let ts = self.options.text_search.as_ref()?;
+        let bound_term = bound_term?;
+        let query = query?;
+        if !matches!(bound_term, Term::Literal(_)) {
+            return Some(bool_term(false));
+        }
+        let target_id = self.dataset.lftj_intern_term(bound_term, &GraphSelector::Union)?;
+        let effective = mode.effective_query(query);
+        let hits = ts.search(&effective, None, DEFAULT_TEXT_SEARCH_LIMIT);
+        Some(bool_term(hits.iter().any(|m| m.object_id == target_id)))
+    }
+
+
+    /// Real pushdown: if `expr` is a `text:query`/`text:contains(?var, "...")`
+    /// call, and `?var` is bound by `inner` as the object of some triple
+    /// pattern in a top-level BGP, run the search *first* to get a
+    /// candidate `TermId` set, and evaluate `inner` once per candidate
+    /// binding rather than materializing the full unconstrained join and
+    /// filtering afterward. Returns `None` if no pushdown opportunity is
+    /// found (caller falls back to plain `eval_pattern` + scalar filtering).
+    fn try_text_search_pushdown(
+        &self,
+        expr: &Expression,
+        inner: &GP,
+        active_graph: &GraphSelector,
+    ) -> Option<Result<Solutions>> {
+        let ts = self.options.text_search.as_ref()?;
+        let (var, query_str, mode) = text_search_call(expr)?;
+        let GP::Bgp { patterns } = inner else {
+            return None;
+        };
+        let predicate_id = patterns.iter().find_map(|tp| match &tp.object {
+            TermPattern::Variable(v) if v == &var => match &tp.predicate {
+                NamedNodePattern::NamedNode(p) => self
+                    .dataset
+                    .lftj_intern_term(&Term::NamedNode(p.clone()), active_graph),
+                NamedNodePattern::Variable(_) => None,
+            },
+            _ => None,
+        });
+        let object_var_bound = patterns
+            .iter()
+            .any(|tp| matches!(&tp.object, TermPattern::Variable(v) if v == &var));
+        if !object_var_bound {
+            return None;
+        }
+
+        let effective_query = mode.effective_query(&query_str);
+        let hits = ts.search(&effective_query, predicate_id, DEFAULT_TEXT_SEARCH_LIMIT);
+        if hits.is_empty() {
+            return Some(Ok(Vec::new()));
+        }
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for hit in &hits {
+            if !seen_ids.insert(hit.object_id) {
+                continue;
+            }
+            let Some(term) = self.dataset.lftj_decode_term(hit.object_id) else {
+                continue;
+            };
+            match self.eval_bgp_with_bound_var(patterns, &var, &term, active_graph) {
+                Ok(sols) => result.extend(sols),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok(result))
+    }
+
+    /// Evaluate `patterns` as a BGP with every occurrence of `TermPattern::
+    /// Variable(var)` replaced by the ground `term` first -- used by
+    /// `try_text_search_pushdown` to evaluate one candidate binding at a
+    /// time.
+    ///
+    /// This is the real pushdown: rather than evaluating the full
+    /// unconstrained BGP once per search hit and then joining against a
+    /// single-row seed (`O(hits × full-BGP)`), the ground term is
+    /// substituted directly into the pattern so `eval_bgp` (and therefore
+    /// LFTJ, when applicable) sees a BGP that is already constrained by
+    /// `var`'s binding -- e.g. `?s <p> ?o` with `?o := "fox"` substituted
+    /// becomes `?s <p> "fox"`, which LFTJ can join in O(deg) rather than
+    /// O(|graph|). `var` is re-inserted into every resulting solution
+    /// afterward, since a ground `TermPattern` does not itself bind
+    /// anything in the returned `Solution`s.
+    ///
+    /// `var` may also occur elsewhere in `patterns` in a position that
+    /// substitution does not touch -- e.g. as a *predicate*
+    /// (`NamedNodePattern::Variable`), which only ever unifies with an IRI,
+    /// never with the literal `term` a text-search hit produces. In that
+    /// case `eval_bgp` on the substituted patterns can still bind `var`
+    /// itself (to some unrelated IRI it matched as a predicate elsewhere in
+    /// the BGP), which would be *incompatible* with the hit's binding. Such
+    /// rows must be dropped rather than kept, so any solution that already
+    /// binds `var` is checked for compatibility with `term` and discarded
+    /// on mismatch instead of being silently accepted.
+    fn eval_bgp_with_bound_var(
+        &self,
+        patterns: &[TriplePattern],
+        var: &Variable,
+        term: &Term,
+        active_graph: &GraphSelector,
+    ) -> Result<Solutions> {
+        let substituted: Vec<TriplePattern> = patterns
+            .iter()
+            .map(|tp| substitute_var_in_triple_pattern(tp, var, term))
+            .collect();
+        let mut sols = self.eval_bgp(&substituted, active_graph)?;
+        sols.retain_mut(|sol| match sol.get(var) {
+            None => {
+                sol.insert(var.clone(), term.clone());
+                true
+            }
+            Some(bound) => bound == term,
+        });
+        Ok(sols)
+    }
+
+
 
     // =========================================================================
     // Property path evaluation
@@ -2171,6 +2441,39 @@ fn nn_pattern_with_sol(nnp: &NamedNodePattern, sol: &Solution) -> (PatternTerm, 
         }
     }
 }
+
+/// Replace every occurrence of `TermPattern::Variable(v) if v == var` (in
+/// subject or object position -- predicate position uses `NamedNodePattern`,
+/// which can never hold a *literal* full-text search result, so it's left
+/// untouched) with `term` as a ground `TermPattern`, for use by
+/// [`Evaluator::eval_bgp_with_bound_var`]'s pushdown substitution. Leaves
+/// every other part of `tp` unchanged (including nested `TermPattern::
+/// Triple` patterns' own variable occurrences, which are also substituted
+/// recursively via `substitute_var_in_term_pattern`).
+fn substitute_var_in_triple_pattern(
+    tp: &TriplePattern,
+    var: &Variable,
+    term: &Term,
+) -> TriplePattern {
+    TriplePattern {
+        subject: substitute_var_in_term_pattern(&tp.subject, var, term),
+        predicate: tp.predicate.clone(),
+        object: substitute_var_in_term_pattern(&tp.object, var, term),
+    }
+}
+
+fn substitute_var_in_term_pattern(tp: &TermPattern, var: &Variable, term: &Term) -> TermPattern {
+    match tp {
+        TermPattern::Variable(v) if v == var => TermPattern::from(term.clone()),
+        TermPattern::Triple(inner) => TermPattern::Triple(Box::new(TriplePattern {
+            subject: substitute_var_in_term_pattern(&inner.subject, var, term),
+            predicate: inner.predicate.clone(),
+            object: substitute_var_in_term_pattern(&inner.object, var, term),
+        })),
+        other => other.clone(),
+    }
+}
+
 
 fn bind_var(sol: &mut Solution, var: &Option<Variable>, value: &Term) -> bool {
     match var {
@@ -3539,5 +3842,194 @@ mod tests {
             sols[0].get(&Variable::new_unchecked("x")),
             Some(&iri("http://ex/c"))
         );
+    }
+
+    // ── Full-text search dispatch (text:query / text:contains) ─────────────
+
+    mod fulltext_dispatch {
+        use super::*;
+        use crate::dataset::StoreDataset;
+        use crate::options::QueryOptions;
+        use oxigraph_nova_core::QuadStore;
+        use oxigraph_nova_storage_ring::RingStore;
+        use std::sync::Arc;
+
+        fn make_store_with_text() -> Arc<RingStore> {
+            let store = Arc::new(RingStore::new());
+            store.enable_fulltext().unwrap();
+            store
+                .insert(&oxrdf::Quad::new(
+                    NamedNode::new_unchecked("http://ex/s1"),
+                    NamedNode::new_unchecked("http://ex/name"),
+                    Literal::new_simple_literal("the quick brown fox"),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap();
+            store
+                .insert(&oxrdf::Quad::new(
+                    NamedNode::new_unchecked("http://ex/s2"),
+                    NamedNode::new_unchecked("http://ex/name"),
+                    Literal::new_simple_literal("a lazy dog sleeps"),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap();
+            store.compact().unwrap();
+            store
+        }
+
+        #[test]
+        fn pushdown_filter_over_bgp_finds_match() {
+            let store = make_store_with_text();
+            let dataset = StoreDataset::new(Arc::clone(&store));
+            let options = QueryOptions::new().with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
+            let ev = Evaluator::with_options(&dataset, options);
+            let q = SparqlParser::new()
+                .parse_query(
+                    r#"PREFIX text: <http://oxigraph-nova.dev/fn/text#>
+                       SELECT ?s ?o WHERE {
+                           ?s <http://ex/name> ?o .
+                           FILTER(text:query(?o, "fox"))
+                       }"#,
+                )
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert_eq!(sols.len(), 1);
+            assert_eq!(
+                sols[0].get(&Variable::new_unchecked("s")),
+                Some(&iri("http://ex/s1"))
+            );
+        }
+
+        #[test]
+        fn pushdown_filter_no_match_returns_empty() {
+            let store = make_store_with_text();
+            let dataset = StoreDataset::new(Arc::clone(&store));
+            let options = QueryOptions::new().with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
+            let ev = Evaluator::with_options(&dataset, options);
+            let q = SparqlParser::new()
+                .parse_query(
+                    r#"PREFIX text: <http://oxigraph-nova.dev/fn/text#>
+                       SELECT ?s WHERE {
+                           ?s <http://ex/name> ?o .
+                           FILTER(text:contains(?o, "nonexistentword"))
+                       }"#,
+                )
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert!(sols.is_empty());
+        }
+
+        #[test]
+        fn no_text_search_backend_configured_yields_empty() {
+            // No `with_text_search` call at all: text:query must behave as
+            // an always-false filter (SPARQL type error -> filtered out),
+            // not panic or error.
+            let store = make_store_with_text();
+            let dataset = StoreDataset::new(Arc::clone(&store));
+            let ev = Evaluator::new(&dataset); // default QueryOptions, no text_search
+            let q = SparqlParser::new()
+                .parse_query(
+                    r#"PREFIX text: <http://oxigraph-nova.dev/fn/text#>
+                       SELECT ?s WHERE {
+                           ?s <http://ex/name> ?o .
+                           FILTER(text:query(?o, "fox"))
+                       }"#,
+                )
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert!(sols.is_empty());
+        }
+
+        /// Regression test for the var-as-predicate compatibility fix in
+        /// `eval_bgp_with_bound_var`: when the text-search variable also
+        /// occurs in *predicate* position of another triple pattern in the
+        /// same BGP, substitution can't touch that occurrence (predicates
+        /// are `NamedNodePattern`, never literals), so `eval_bgp` is free to
+        /// bind it to some unrelated predicate IRI there. Such rows must be
+        /// dropped as incompatible with the search hit's literal binding,
+        /// not silently kept.
+        #[test]
+        fn pushdown_drops_rows_where_var_rebound_incompatibly_as_predicate() {
+            let store = make_store_with_text();
+            // Add a second predicate whose *name* is used as a subject in an
+            // unrelated triple, and reuse the search variable `?o` in
+            // predicate position of a second triple pattern so it can be
+            // bound to an IRI incompatible with the literal hit.
+            store
+                .insert(&oxrdf::Quad::new(
+                    NamedNode::new_unchecked("http://ex/s1"),
+                    NamedNode::new_unchecked("http://ex/other"),
+                    NamedNode::new_unchecked("http://ex/irrelevant"),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap();
+            store.compact().unwrap();
+
+            let dataset = StoreDataset::new(Arc::clone(&store));
+            let options = QueryOptions::new().with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
+            let ev = Evaluator::with_options(&dataset, options);
+            // `?o` is bound as the object of <name> (a literal, matched by
+            // the search) AND as the predicate of a second triple pattern
+            // `?a ?o ?b` -- since no quad in the store actually uses the
+            // literal "the quick brown fox" as a predicate, `?a ?o ?b`
+            // cannot match with `?o` bound to that literal, so the
+            // pushdown-evaluated BGP must yield zero rows once
+            // `eval_bgp_with_bound_var`'s compatibility check runs -- not a
+            // spurious row with `?o` incompatibly rebound to some other IRI
+            // matched via the unconstrained `?a ?o ?b` pattern.
+            let q = SparqlParser::new()
+                .parse_query(
+                    r#"PREFIX text: <http://oxigraph-nova.dev/fn/text#>
+                       SELECT ?s ?o ?a ?b WHERE {
+                           ?s <http://ex/name> ?o .
+                           ?a ?o ?b .
+                           FILTER(text:query(?o, "fox"))
+                       }"#,
+                )
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert!(
+                sols.is_empty(),
+                "rows with ?o incompatibly rebound as a predicate must be dropped, got: {sols:?}"
+            );
+        }
+
+        #[test]
+        fn scalar_fallback_when_not_direct_filter_child() {
+
+            // Wrapping in a BIND/nested boolean expression bypasses the
+            // pushdown pattern-match (`text_search_call` only recognizes a
+            // direct FunctionCall), exercising the `eval_fn` scalar-fallback
+            // path (`Function::Custom` arm) instead.
+            let store = make_store_with_text();
+            let dataset = StoreDataset::new(Arc::clone(&store));
+            let options = QueryOptions::new().with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
+            let ev = Evaluator::with_options(&dataset, options);
+            let q = SparqlParser::new()
+                .parse_query(
+                    r#"PREFIX text: <http://oxigraph-nova.dev/fn/text#>
+                       SELECT ?s WHERE {
+                           ?s <http://ex/name> ?o .
+                           FILTER(text:query(?o, "fox") && true)
+                       }"#,
+                )
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert_eq!(sols.len(), 1);
+            assert_eq!(
+                sols[0].get(&Variable::new_unchecked("s")),
+                Some(&iri("http://ex/s1"))
+            );
+        }
     }
 }

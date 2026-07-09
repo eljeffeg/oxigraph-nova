@@ -43,6 +43,8 @@
 
 pub mod cltj;
 pub mod delta;
+#[cfg(feature = "fulltext")]
+mod fulltext;
 pub mod louds;
 pub mod ring;
 mod snapshot;

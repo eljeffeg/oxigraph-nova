@@ -6,11 +6,13 @@ members = [
     "crates/nova-storage-memory",
     "crates/nova-storage-common",
     "crates/nova-storage-ring",
+    "crates/nova-fulltext",
     "crates/nova-server",
     "crates/nova-cli",
     "tests/w3c",
     "benches",
 ]
+
 
 
 [workspace.package]
@@ -80,8 +82,15 @@ uuid = { version = "1", features = ["v4"] }
 # ── Random number generation ─────────────────────────────────────────────────
 rand = "0.9"   # SPARQL RAND() built-in
 
+# ── Full-text search ────────────────────────────────────────────────────────
+# Opt-in via nova-storage-ring's `fulltext` cargo feature (crates/nova-fulltext).
+# Zero-cost when the feature is disabled: no crate in the default build graph
+# depends on tantivy.
+tantivy = "0.26"
+
 # ── Testing utilities ───────────────────────────────────────────────────────
 pretty_assertions = "1.4"
+
 # spareval 0.2.6 pins the exact same oxrdf/spargebra/sparopt/sparesults
 # versions as this workspace and compiles cleanly against them. It is used
 # only by tests/w3c, as a differential-testing oracle cross-checking Nova's

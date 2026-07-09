@@ -64,6 +64,10 @@ use crate::delta::Delta;
 use crate::louds::LoudsMemBreakdown;
 use crate::ring::{GraphRing, GraphRingHandle, RingBuilder, SortOrder};
 use crate::snapshot::StoreSnapshot;
+#[cfg(feature = "fulltext")]
+use crate::fulltext;
+#[cfg(feature = "fulltext")]
+use oxigraph_nova_fulltext::FulltextIndex;
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, NamedNode, Oxigraph, Quad,
     QuadStore, StoredQuad, Subject, Term, TermId,
@@ -236,6 +240,14 @@ struct RingStoreInner {
     /// `Always` or for in-memory stores. Replaced whenever the active WAL
     /// file changes.
     flusher: Option<Flusher>,
+
+    /// Opt-in Tantivy full-text index (see `crate::fulltext`), present only
+    /// when the `fulltext` cargo feature is enabled AND
+    /// `RingStore::enable_fulltext` has been called. `None` means either the
+    /// feature is compiled out, or it simply hasn't been turned on for this
+    /// store — `text:query`/`text:contains` then have nothing to search.
+    #[cfg(feature = "fulltext")]
+    fulltext: Option<Arc<FulltextIndex>>,
 }
 
 impl RingStoreInner {
@@ -252,6 +264,8 @@ impl RingStoreInner {
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
             sync_policy: SyncPolicy::default(),
             flusher: None,
+            #[cfg(feature = "fulltext")]
+            fulltext: None,
         }
     }
 
@@ -415,14 +429,104 @@ impl RingStoreInner {
             }
         }
 
+        // Incremental Tantivy indexing: walk exactly the delta entries this
+        // compaction is already merging (before `commit_compaction` clears
+        // the delta below), adding/removing literal-object documents. This
+        // must happen before the dictionary/Ring commit below only in the
+        // sense that it needs `self.delta` intact — it does not need to
+        // happen before `self.dict.compact()`, since `get_term_arc` works
+        // identically against either dictionary tier.
+        //
+        // Deliberately NOT propagated via `?`: a Tantivy I/O error here must
+        // not abort the core Ring/Dictionary compaction (which has already
+        // succeeded or is about to, independently of the text index). We
+        // log the error and drop `self.fulltext` to `None` instead —
+        // `enable_fulltext` can then be called again later to rebuild it
+        // from scratch (its stale-marker/absent-marker path already handles
+        // "index doesn't reflect the current snapshot" by walking every
+        // graph's current triples), rather than leaving a
+        // partially-updated, silently-wrong index sitting behind
+        // `Some(fulltext)` forever.
+        #[cfg(feature = "fulltext")]
+        if let Err(e) = self.index_delta_into_fulltext() {
+            tracing::error!(
+                error = %e,
+                "fulltext indexing failed during compaction; disabling full-text search for this store until `enable_fulltext` is called again"
+            );
+            self.fulltext = None;
+        }
+
         let new_graphs = build_graphs_from_triples(per_graph);
         // In-memory Front-Coding compaction of the Dictionary  — runs on the same
         // cadence as the Ring trie rebuild above, regardless of persistence mode.
         self.dict.compact()?;
         let result = self.commit_compaction(new_graphs, true);
+
+        // Only finalize (commit + write the generation marker) once the
+        // Ring/Dictionary/WAL commit above has itself succeeded — an error
+        // partway through `commit_compaction` must not leave a
+        // partially-committed Tantivy segment referenced by a marker that
+        // claims it's complete. Same non-propagation policy as above: a
+        // failure here degrades full-text search (disabled until
+        // `enable_fulltext` rebuilds it) rather than failing the whole
+        // compaction, since the core Ring/Dictionary/WAL state has already
+        // been committed successfully at this point.
+        #[cfg(feature = "fulltext")]
+        if result.is_ok()
+            && self.fulltext.is_some()
+            && let Err(e) = self.finalize_fulltext_commit()
+        {
+            tracing::error!(
+                error = %e,
+                "fulltext commit failed after successful compaction; disabling full-text search for this store until `enable_fulltext` is called again"
+            );
+            self.fulltext = None;
+        }
+
         COMPACTION_COUNT.fetch_add(1, Ordering::Relaxed);
         COMPACTION_DURATION_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         result
+    }
+
+
+    /// Add/remove literal-object documents for every entry currently in
+    /// `self.delta` (an insert or a tombstone), using the `quad_key` term
+    /// for tombstone deletes. No-op (including no error) if fulltext isn't
+    /// enabled on this store. Does **not** call `FulltextIndex::commit` —
+    /// that happens once, in `finalize_fulltext_commit`, after the Ring
+    /// commit has itself succeeded.
+    #[cfg(feature = "fulltext")]
+    fn index_delta_into_fulltext(&self) -> Result<(), Oxigraph> {
+        let Some(ft) = &self.fulltext else {
+            return Ok(());
+        };
+        for (&key, &is_insert) in self.delta.iter() {
+            let (g_id, s_id, p_id, o_id) = Dictionary::unpack_quad(key);
+            if is_insert {
+                fulltext::index_quad_insert(ft, &self.dict, g_id, s_id, p_id, o_id)?;
+            } else {
+                fulltext::index_quad_remove(ft, g_id, s_id, p_id, o_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit the pending Tantivy writer (making this compaction's
+    /// add/remove calls visible to `search`), and — for a persistent store —
+    /// record the now-current `snapshot_gen` in the generation marker so a
+    /// future `RingStore::open` + `enable_fulltext` knows this index is
+    /// caught up. No-op if fulltext isn't enabled.
+    #[cfg(feature = "fulltext")]
+    fn finalize_fulltext_commit(&self) -> Result<(), Oxigraph> {
+        let Some(ft) = &self.fulltext else {
+            return Ok(());
+        };
+        ft.commit()
+            .map_err(|e| Oxigraph::Storage(format!("fulltext commit failed: {e}")))?;
+        if let Some(dir) = &self.data_dir {
+            fulltext::write_marker(dir, self.snapshot_gen)?;
+        }
+        Ok(())
     }
 
     /// If this is a persistent store and the delta has crossed
@@ -702,6 +806,68 @@ impl RingStore {
         Ok(Self {
             inner: Mutex::new(inner),
         })
+    }
+
+    /// Turn on Tantivy full-text search for this store (requires the
+    /// `fulltext` cargo feature). For an in-memory store, creates a fresh
+    /// `tantivy::Index::create_in_ram` and does a one-time full index build
+    /// by walking every graph's current triples (there is no prior state to
+    /// compare against). For a persistent store, opens (or creates)
+    /// `<data_dir>/fulltext/`, and compares the generation marker recorded
+    /// there against `snapshot_gen`: if they match, the on-disk index is
+    /// already caught up and is used as-is (fast path — the common case on
+    /// every restart after the first); if they don't match (feature just
+    /// turned on for a pre-existing database, or a crash between the Ring
+    /// commit and the Tantivy commit left the marker stale), a one-time
+    /// rebuild walks every graph's `spo_triples()` and commits, bringing the
+    /// marker up to date.
+    ///
+    /// Idempotent: calling this again on a store that already has fulltext
+    /// enabled is a no-op (returns `Ok(())` without re-opening or
+    /// re-indexing anything).
+    ///
+    /// Quads still sitting in the (not-yet-compacted) delta at the moment
+    /// this is called are intentionally **not** indexed here — they will be
+    /// picked up by the next `compact()`, consistent with the documented
+    /// "compaction-eventually-consistent" model (see
+    /// [`oxigraph_nova_core::TextSearch`]'s module docs).
+    #[cfg(feature = "fulltext")]
+    pub fn enable_fulltext(&self) -> Result<(), Oxigraph> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+
+        if inner.fulltext.is_some() {
+            return Ok(()); // already enabled
+        }
+
+        let (ft, needs_rebuild) = match &inner.data_dir {
+            None => (
+                FulltextIndex::create_in_ram()
+                    .map_err(|e| Oxigraph::Storage(format!("fulltext init failed: {e}")))?,
+                true, // no marker concept for in-memory stores — always (re)build
+            ),
+            Some(dir) => {
+                let dir = dir.clone();
+                let ft = FulltextIndex::open_or_create(&fulltext::index_dir(&dir))
+                    .map_err(|e| Oxigraph::Storage(format!("fulltext open failed: {e}")))?;
+                let up_to_date = fulltext::read_marker(&dir) == Some(inner.snapshot_gen);
+                (ft, !up_to_date)
+            }
+        };
+
+        if needs_rebuild {
+            fulltext::rebuild_all(&ft, &inner.dict, &inner.graphs)?;
+            ft.commit()
+                .map_err(|e| Oxigraph::Storage(format!("fulltext commit failed: {e}")))?;
+            if let Some(dir) = inner.data_dir.clone() {
+                fulltext::write_marker(&dir, inner.snapshot_gen)?;
+            }
+        }
+
+        inner.fulltext = Some(Arc::new(ft));
+        Ok(())
     }
 
     /// Set the WAL durability policy (see [`SyncPolicy`]). Default is
@@ -1066,6 +1232,31 @@ impl MemoryBreakdown {
 impl Default for RingStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(feature = "fulltext")]
+impl oxigraph_nova_core::TextSearch for RingStore {
+    fn search(
+        &self,
+        query: &str,
+        predicate_id: Option<u64>,
+        limit: usize,
+    ) -> Vec<oxigraph_nova_core::TextMatch> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        match &inner.fulltext {
+            Some(ft) => ft.search(query, predicate_id, limit),
+            None => Vec::new(),
+        }
+    }
+
+    fn text_search_ready(&self) -> bool {
+        match self.inner.lock() {
+            Ok(inner) => inner.fulltext.is_some(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -1519,6 +1710,215 @@ impl QuadStore for RingStore {
 mod tests {
     use super::*;
     use oxigraph_nova_core::{Literal, NamedNode};
+
+    #[cfg(feature = "fulltext")]
+    mod fulltext_tests {
+        use super::super::*;
+        use oxigraph_nova_core::{Literal, NamedNode, TextSearch as _};
+
+        fn nn(s: &str) -> Subject {
+            Subject::NamedNode(NamedNode::new_unchecked(s))
+        }
+        fn pred(s: &str) -> NamedNode {
+            NamedNode::new_unchecked(s)
+        }
+        fn lit(s: &str) -> Term {
+            Term::Literal(Literal::new_simple_literal(s))
+        }
+        fn dg() -> GraphName {
+            GraphName::DefaultGraph
+        }
+
+        fn temp_dir(name: &str) -> std::path::PathBuf {
+            static COUNTER: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let pid = std::process::id();
+            std::env::temp_dir().join(format!("nova_ringstore_fulltext_test_{pid}_{n}_{name}"))
+        }
+
+        #[test]
+        fn in_memory_search_after_compact() {
+            let store = RingStore::new();
+            store.enable_fulltext().unwrap();
+
+            let p = pred("http://ex/p");
+            store
+                .insert(&Quad::new(nn("http://ex/s1"), p.clone(), lit("the quick brown fox"), dg()))
+                .unwrap();
+            store
+                .insert(&Quad::new(nn("http://ex/s2"), p.clone(), lit("a lazy dog sleeps"), dg()))
+                .unwrap();
+
+            // Not yet compacted: compaction-eventually-consistent, so no hits yet.
+            assert!(store.search("fox", None, 10).is_empty());
+
+            store.compact().unwrap();
+
+            let hits = store.search("fox", None, 10);
+            assert_eq!(hits.len(), 1);
+        }
+
+        #[test]
+        fn tombstone_removed_on_next_compact() {
+            let store = RingStore::new();
+            store.enable_fulltext().unwrap();
+            let p = pred("http://ex/p");
+            let q = Quad::new(nn("http://ex/s"), p.clone(), lit("hello world"), dg());
+            store.insert(&q).unwrap();
+            store.compact().unwrap();
+            assert_eq!(store.search("hello", None, 10).len(), 1);
+
+            store.remove(&q).unwrap();
+            store.compact().unwrap();
+            assert!(store.search("hello", None, 10).is_empty());
+        }
+
+        #[test]
+        fn persistent_store_marker_survives_reopen_without_rebuild() {
+            let dir = temp_dir("marker_fresh");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            {
+                let store = RingStore::open(&dir).unwrap();
+                store.enable_fulltext().unwrap();
+                let p = pred("http://ex/p");
+                store
+                    .insert(&Quad::new(nn("http://ex/s"), p, lit("persistent content"), dg()))
+                    .unwrap();
+                store.compact().unwrap();
+                assert_eq!(store.search("persistent", None, 10).len(), 1);
+            }
+
+            // Reopen: marker matches snapshot_gen, so this is the fast path
+            // (no rebuild needed) — the index must already have the content.
+            {
+                let store = RingStore::open(&dir).unwrap();
+                store.enable_fulltext().unwrap();
+                assert_eq!(store.search("persistent", None, 10).len(), 1);
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn enabling_fulltext_on_preexisting_store_triggers_rebuild() {
+            let dir = temp_dir("marker_stale");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            {
+                // Populate + compact WITHOUT ever enabling fulltext.
+                let store = RingStore::open(&dir).unwrap();
+                let p = pred("http://ex/p");
+                store
+                    .insert(&Quad::new(nn("http://ex/s"), p, lit("preexisting data"), dg()))
+                    .unwrap();
+                store.compact().unwrap();
+            }
+
+            {
+                // Now enable fulltext for the first time on this pre-existing
+                // store — the marker is absent (stale), so a full rebuild via
+                // spo_triples() must occur automatically.
+                let store = RingStore::open(&dir).unwrap();
+                store.enable_fulltext().unwrap();
+                assert_eq!(store.search("preexisting", None, 10).len(), 1);
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn predicate_filter_narrows_results() {
+            let store = RingStore::new();
+            store.enable_fulltext().unwrap();
+            let p1 = pred("http://ex/p1");
+            let p2 = pred("http://ex/p2");
+            store
+                .insert(&Quad::new(nn("http://ex/s1"), p1.clone(), lit("shared term"), dg()))
+                .unwrap();
+            store
+                .insert(&Quad::new(nn("http://ex/s2"), p2.clone(), lit("shared term"), dg()))
+                .unwrap();
+            store.compact().unwrap();
+
+            assert_eq!(store.search("shared", None, 10).len(), 2);
+
+            let p1_id = store.lftj_intern_term(&Term::NamedNode(p1)).unwrap();
+            let hits = store.search("shared", Some(p1_id), 10);
+            assert_eq!(hits.len(), 1);
+        }
+
+        #[test]
+        fn enable_fulltext_is_idempotent() {
+            let store = RingStore::new();
+            store.enable_fulltext().unwrap();
+            store.enable_fulltext().unwrap(); // must not error or reset state
+            assert!(store.text_search_ready());
+        }
+
+        /// Fix #6 regression: a Tantivy I/O error during `compact_locked`'s
+        /// fulltext step must not abort the core Ring/Dictionary/WAL
+        /// compaction. We force a real I/O error by making the on-disk
+        /// `fulltext/` directory read-only (so Tantivy's segment/commit
+        /// writes fail), then confirm `compact()` still returns `Ok(())`,
+        /// the core data is still correctly compacted/committed, and
+        /// `text_search_ready()` degrades to `false` (rather than the store
+        /// silently serving a now-stale index under `Some(fulltext)`).
+        #[test]
+        #[cfg(unix)]
+        fn fulltext_io_error_during_compaction_does_not_abort_core_compaction() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = temp_dir("fulltext_degrade");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let store = RingStore::open(&dir).unwrap();
+            store.enable_fulltext().unwrap();
+            let p = pred("http://ex/p");
+            store
+                .insert(&Quad::new(nn("http://ex/before"), p.clone(), lit("before text"), dg()))
+                .unwrap();
+            store.compact().unwrap();
+            assert_eq!(store.search("before", None, 10).len(), 1);
+            assert!(store.text_search_ready());
+
+            // Make the fulltext index directory read-only so any further
+            // Tantivy writer I/O (segment files, commit) fails.
+            let ft_dir = crate::fulltext::index_dir(&dir);
+            let mut perms = std::fs::metadata(&ft_dir).unwrap().permissions();
+            perms.set_mode(0o555); // r-xr-xr-x: no write
+            std::fs::set_permissions(&ft_dir, perms).unwrap();
+
+            store
+                .insert(&Quad::new(nn("http://ex/after"), p.clone(), lit("after text"), dg()))
+                .unwrap();
+            // Must NOT propagate the fulltext I/O error — core compaction
+            // (Ring/Dictionary/WAL) must still succeed.
+            let compact_result = store.compact();
+
+            // Restore permissions before any assertion panics/cleanup, so
+            // `remove_dir_all` below can always succeed.
+            let mut perms = std::fs::metadata(&ft_dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&ft_dir, perms).unwrap();
+
+            assert!(
+                compact_result.is_ok(),
+                "core compaction must succeed even if fulltext indexing/commit fails"
+            );
+            // Core data (Ring/Dictionary) must reflect the new quad despite
+            // the fulltext failure.
+            assert_eq!(store.len().unwrap(), 2);
+            // Full-text search must have been disabled (degraded) rather
+            // than silently serving a now-permanently-stale index.
+            assert!(!store.text_search_ready());
+            assert!(store.search("after", None, 10).is_empty());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
 
     fn nn(s: &str) -> Subject {
         Subject::NamedNode(NamedNode::new_unchecked(s))

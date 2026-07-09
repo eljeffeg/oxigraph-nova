@@ -6,8 +6,10 @@
 //! join evaluation, property-path BFS) via [`CancellationToken::check`].
 //! [`QueryOptions`] bundles this together with an optional result-row cap.
 
+use oxigraph_nova_core::TextSearch;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
 
 /// A cheap-to-clone flag that signals a running query should stop.
 ///
@@ -93,6 +95,12 @@ pub struct QueryOptions {
     /// stops early and returns `Err` carrying
     /// `EvalLimitError::ResultLimitExceeded`. `None` means unlimited.
     pub max_results: Option<usize>,
+    /// Optional storage-backed full-text search capability (see
+    /// [`oxigraph_nova_core::TextSearch`]). `None` means the store has no
+    /// full-text index configured (the default) — `text:query`/
+    /// `text:contains` calls then evaluate as unbound rather than
+    /// performing a search.
+    pub text_search: Option<Arc<dyn TextSearch>>,
 }
 
 impl QueryOptions {
@@ -107,6 +115,13 @@ impl QueryOptions {
 
     pub fn with_max_results(mut self, max: usize) -> Self {
         self.max_results = Some(max);
+        self
+    }
+
+    /// Attach a full-text search backend, enabling `text:query`/
+    /// `text:contains` extension-function dispatch in the evaluator.
+    pub fn with_text_search(mut self, ts: Arc<dyn TextSearch>) -> Self {
+        self.text_search = Some(ts);
         self
     }
 

@@ -181,7 +181,7 @@ use axum::extract::{Query as AxumQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use oxigraph_nova_core::QuadStore;
+use oxigraph_nova_core::{QuadStore, TextSearch};
 use oxigraph_nova_query::{
     CancellationToken, EvalLimitError, Evaluator, QueryOptions, QueryResult, Solutions,
     StoreDataset, clear_graph, execute_update,
@@ -236,6 +236,12 @@ pub struct AppState<S: QuadStore + 'static> {
     /// (`max_parallel_queries - available_permits()`) rather than just the
     /// raw available-permits figure. Always `Some` iff `query_semaphore` is.
     pub max_parallel_queries: Option<usize>,
+    /// Opt-in full-text search backend, if configured via
+    /// `Server::with_text_search` / `--fulltext`. Threaded into every
+    /// query's `QueryOptions` so `text:query`/`text:contains` extension
+    /// functions can be dispatched by the evaluator (see
+    /// `oxigraph_nova_query::options::QueryOptions::text_search`).
+    pub text_search: Option<Arc<dyn TextSearch>>,
 }
 
 /// Manual `Clone` impl — `Arc<S>` is always `Clone` regardless of whether `S`
@@ -248,6 +254,7 @@ impl<S: QuadStore + 'static> Clone for AppState<S> {
             max_results: self.max_results,
             query_semaphore: self.query_semaphore.clone(),
             max_parallel_queries: self.max_parallel_queries,
+            text_search: self.text_search.clone(),
         }
     }
 }
@@ -277,6 +284,7 @@ pub struct Server<S: QuadStore + 'static> {
     query_timeout: Option<Duration>,
     max_results: Option<usize>,
     max_parallel_queries: Option<usize>,
+    text_search: Option<Arc<dyn TextSearch>>,
 }
 
 impl<S: QuadStore + Send + Sync + 'static> Server<S> {
@@ -286,6 +294,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             query_timeout: None,
             max_results: None,
             max_parallel_queries: None,
+            text_search: None,
         }
     }
 
@@ -316,6 +325,17 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
         self
     }
 
+    /// Attach a full-text search backend (see `oxigraph_nova_core::TextSearch`),
+    /// enabling `text:query`/`text:contains` extension-function dispatch for
+    /// every query this server evaluates. Typically `store.clone() as
+    /// Arc<dyn TextSearch>` when `S` is `RingStore` built with the
+    /// `fulltext` cargo feature and `RingStore::enable_fulltext` has been
+    /// called — see `--fulltext` in `nova_serve`/`oxigraph serve`.
+    pub fn with_text_search(mut self, ts: Arc<dyn TextSearch>) -> Self {
+        self.text_search = Some(ts);
+        self
+    }
+
     /// Build the axum `Router`.
     ///
     /// Returns a router that can be used directly in integration tests via
@@ -329,6 +349,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
                 .max_parallel_queries
                 .map(|n| Arc::new(Semaphore::new(n))),
             max_parallel_queries: self.max_parallel_queries,
+            text_search: self.text_search,
         };
         Router::new()
             .route("/sparql", get(sparql_get::<S>).post(sparql_post::<S>))
@@ -348,7 +369,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             // Machine-readable SPARQL Service Description (`sd:` vocabulary),
             // matching upstream Oxigraph's `oxigraph serve`. Some SPARQL
             // tooling fetches this before sending real requests.
-            .route("/", get(service_description_get))
+            .route("/", get(service_description_get::<S>))
             // Prometheus text-format observability endpoint (dataset size,
             // delta size, compaction count/duration, query counters, LFTJ
             // vs nested-loop fallback rate — see `metrics_get`'s doc comment).
@@ -497,13 +518,17 @@ async fn sparql_update<S: QuadStore + 'static>(
 /// `sd:endpoint` is derived from the request's `Host` header (falling back
 /// to a relative-URL-friendly empty value if absent), naming the `/sparql`
 /// query endpoint.
-async fn service_description_get(headers: HeaderMap) -> Response {
+async fn service_description_get<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+) -> Response {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
     let endpoint_url = format!("http://{host}/sparql");
-    let graph = generate_service_description_graph(&endpoint_url);
+    let graph =
+        generate_service_description_graph(&endpoint_url, state.text_search.is_some());
     serialize_triples(&graph, accept_header(&headers))
 }
 
@@ -995,6 +1020,9 @@ async fn execute_sparql_query<S: QuadStore + 'static>(
     let mut options = QueryOptions::new();
     if let Some(max) = state.max_results {
         options = options.with_max_results(max);
+    }
+    if let Some(ts) = &state.text_search {
+        options = options.with_text_search(Arc::clone(ts));
     }
     let cancellation = state.query_timeout.map(|_| CancellationToken::new());
     if let Some(token) = &cancellation {

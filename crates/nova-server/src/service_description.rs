@@ -89,6 +89,16 @@ mod sd {
     pub fn sparql_update() -> NamedNode {
         NamedNode::new_unchecked("http://www.w3.org/ns/sparql-service-description#SPARQLUpdate")
     }
+    /// `sd:extensionFunction` — relates `sd:Service` to a `NamedNode` naming
+    /// a non-standard SPARQL extension function this endpoint recognizes.
+    /// Used to advertise `text:query`/`text:contains` when the `fulltext`
+    /// feature is enabled (see `generate_service_description_graph`'s
+    /// `fulltext_enabled` parameter).
+    pub fn extension_function() -> NamedNode {
+        NamedNode::new_unchecked(
+            "http://www.w3.org/ns/sparql-service-description#extensionFunction",
+        )
+    }
 }
 
 /// SPARQL language version resources (`http://www.w3.org/ns/sparql#`
@@ -138,11 +148,26 @@ const RDF_FORMAT_IRIS: [&str; 6] = [
     "https://www.w3.org/ns/formats/data/JSON-LD",
 ];
 
+/// Function-IRI namespace for Nova's full-text search extension functions
+/// (`text:query`/`text:contains`) — must match `oxigraph_nova_query::evaluator`'s
+/// private `TEXT_NS` constant exactly (duplicated here rather than shared,
+/// since that constant is a private evaluator-internal detail, not part of
+/// `nova-query`'s public API).
+const TEXT_FN_NS: &str = "http://oxigraph-nova.dev/fn/text#";
+
 /// Build the `sd:Service` description graph for this endpoint.
 ///
 /// `endpoint_url` is an absolute IRI naming the primary query endpoint
 /// (`/sparql`, aliased as `/query`) — used as the `sd:endpoint` value.
-pub fn generate_service_description_graph(endpoint_url: &str) -> Vec<Triple> {
+///
+/// `fulltext_enabled`: when `true`, advertises `text:query`/`text:contains`
+/// as `sd:extensionFunction`s — set from whether the server was constructed
+/// with `Server::with_text_search` (i.e. `--fulltext` was passed and the
+/// binary was built with the `fulltext` cargo feature).
+pub fn generate_service_description_graph(
+    endpoint_url: &str,
+    fulltext_enabled: bool,
+) -> Vec<Triple> {
     let root = NamedOrBlankNode::BlankNode(BlankNode::default());
     let mut graph = Vec::new();
 
@@ -227,10 +252,20 @@ pub fn generate_service_description_graph(endpoint_url: &str) -> Vec<Triple> {
     graph.push(Triple::new(root.clone(), sd::feature(), sd::empty_graphs()));
 
     graph.push(Triple::new(
-        root,
+        root.clone(),
         sd::default_entailment_regime(),
         NamedNode::new_unchecked("http://www.w3.org/ns/entailment/Simple"),
     ));
+
+    if fulltext_enabled {
+        for local in ["query", "contains"] {
+            graph.push(Triple::new(
+                root.clone(),
+                sd::extension_function(),
+                NamedNode::new_unchecked(format!("{TEXT_FN_NS}{local}")),
+            ));
+        }
+    }
 
     graph
 }

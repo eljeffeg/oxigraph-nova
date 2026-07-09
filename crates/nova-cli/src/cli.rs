@@ -116,5 +116,15 @@ pub enum Command {
         /// Unavailable. Unset by default (unbounded).
         #[arg(long)]
         max_parallel_queries: Option<usize>,
+        /// Enable Tantivy-backed full-text search (`text:query`/
+        /// `text:contains` SPARQL extension functions), indexed
+        /// incrementally on the store's compaction cycle.
+        ///
+        /// Requires this binary to have been built with the `fulltext`
+        /// cargo feature (`cargo run -p oxigraph-nova-cli --features
+        /// fulltext`); passing this flag without that feature enabled is a
+        /// hard error at startup.
+        #[arg(long)]
+        fulltext: bool,
     },
 }

@@ -90,6 +90,8 @@ async fn main() {
     let mut query_timeout_s: Option<u64> = None;
     let mut max_results: Option<usize> = None;
     let mut max_parallel_queries: Option<usize> = None;
+    #[cfg_attr(not(feature = "fulltext"), allow(unused_mut))]
+    let mut fulltext = false;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -142,6 +144,9 @@ async fn main() {
                     panic!("--max-parallel-queries must be a positive integer")
                 }));
             }
+            "--fulltext" => {
+                fulltext = true;
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: nova_serve [--file <dataset.nt>] [--location <dir>] [--bind 0.0.0.0:3030] \
@@ -183,7 +188,14 @@ async fn main() {
                      --max-parallel-queries <n>: bound the number of `/sparql` query\n\
                      evaluations running concurrently; a request arriving while <n>\n\
                      evaluations are in flight is rejected immediately with 503 Service\n\
-                     Unavailable. Unset by default (unbounded)."
+                     Unavailable. Unset by default (unbounded).\n\
+                     \n\
+                     --fulltext: enable Tantivy-backed full-text search\n\
+                     (`text:query`/`text:contains` SPARQL extension functions), indexed\n\
+                     incrementally on the store's compaction cycle. Requires this binary\n\
+                     to have been built with the `fulltext` cargo feature\n\
+                     (`cargo run -p oxigraph-nova-server --features fulltext --bin nova_serve`);\n\
+                     passing --fulltext without that feature enabled is a hard error."
                 );
                 return;
             }
@@ -348,6 +360,31 @@ async fn main() {
     eprintln!("[nova_serve] Ready. Serving on http://{bind}/sparql");
 
     let store = Arc::new(store);
+
+    // ── Optional full-text search (`--fulltext`) ────────────────────────────
+    #[cfg(feature = "fulltext")]
+    let text_search: Option<Arc<dyn oxigraph_nova_core::TextSearch>> = if fulltext {
+        eprintln!(
+            "[nova_serve] Enabling full-text search (text:query/text:contains) ..."
+        );
+        store
+            .enable_fulltext()
+            .expect("RingStore::enable_fulltext failed");
+        Some(Arc::clone(&store) as Arc<dyn oxigraph_nova_core::TextSearch>)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "fulltext"))]
+    let text_search: Option<Arc<dyn oxigraph_nova_core::TextSearch>> = {
+        if fulltext {
+            panic!(
+                "--fulltext was passed, but this binary was not built with the `fulltext` \
+                 cargo feature (rebuild with `--features fulltext`)"
+            );
+        }
+        None
+    };
+
     let mut server = Server::new(store);
     if let Some(secs) = query_timeout_s {
         server = server.with_query_timeout(Duration::from_secs(secs));
@@ -357,6 +394,9 @@ async fn main() {
     }
     if let Some(n) = max_parallel_queries {
         server = server.with_max_parallel_queries(n);
+    }
+    if let Some(ts) = text_search {
+        server = server.with_text_search(ts);
     }
     server.run(&bind).await.expect("server failed");
 }

@@ -11,10 +11,15 @@ repository.workspace = true
 # Overrides the adaptive threshold to force EF for all sidecar nodes.
 # Usage: cargo bench -p oxigraph-nova-bench --features l-opt-ef -- large/feature_lookup
 l-opt-ef     = []
+# Opt-in Tantivy-backed full-text search (see `crates/nova-fulltext`),
+# indexed incrementally on RingStore's compaction cycle. Zero-cost when
+# disabled: no tantivy dependency is even compiled in.
+fulltext     = ["dep:oxigraph-nova-fulltext"]
 
 [dependencies]
 oxigraph-nova-core = { path = "../nova-core" }
 oxigraph-nova-storage-common = { path = "../nova-storage-common" } # generic WAL/MANIFEST/dict-persistence machinery (backend-agnostic)
+oxigraph-nova-fulltext = { path = "../nova-fulltext", optional = true }
 oxrdf         = { workspace = true }
 anyhow        = { workspace = true }
 thiserror     = { workspace = true }
