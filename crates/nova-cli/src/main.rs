@@ -65,6 +65,7 @@ fn main() -> anyhow::Result<()> {
             query_timeout_s,
             max_results,
             max_parallel_queries,
+            fulltext,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_serve(
@@ -76,6 +77,7 @@ fn main() -> anyhow::Result<()> {
                 query_timeout_s,
                 max_results,
                 max_parallel_queries,
+                fulltext,
             ))
         }
     }
@@ -149,6 +151,7 @@ async fn run_serve(
     query_timeout_s: Option<u64>,
     max_results: Option<usize>,
     max_parallel_queries: Option<usize>,
+    fulltext: bool,
 ) -> anyhow::Result<()> {
     let store = match &location {
         Some(dir) => {
@@ -203,6 +206,27 @@ async fn run_serve(
     );
 
     let store = Arc::new(store);
+
+    // ── Optional full-text search (`--fulltext`) ────────────────────────────
+    #[cfg(feature = "fulltext")]
+    let text_search: Option<Arc<dyn oxigraph_nova_core::TextSearch>> = if fulltext {
+        println!("[oxigraph serve] Enabling full-text search (text:query/text:contains) ...");
+        store.enable_fulltext()?;
+        Some(Arc::clone(&store) as Arc<dyn oxigraph_nova_core::TextSearch>)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "fulltext"))]
+    let text_search: Option<Arc<dyn oxigraph_nova_core::TextSearch>> = {
+        if fulltext {
+            anyhow::bail!(
+                "--fulltext was passed, but this binary was not built with the `fulltext` \
+                 cargo feature (rebuild with `--features fulltext`)"
+            );
+        }
+        None
+    };
+
     let mut server = Server::new(store);
     if let Some(secs) = query_timeout_s {
         server = server.with_query_timeout(Duration::from_secs(secs));
@@ -212,6 +236,9 @@ async fn run_serve(
     }
     if let Some(n) = max_parallel_queries {
         server = server.with_max_parallel_queries(n);
+    }
+    if let Some(ts) = text_search {
+        server = server.with_text_search(ts);
     }
     server.run(&bind).await?;
     Ok(())

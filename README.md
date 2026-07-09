@@ -40,7 +40,7 @@ Oxigraph Nova does **not** re-implement RDF parsing, SPARQL parsing, result seri
 | [`axum`](https://crates.io/crates/axum) | Tokio project | Async HTTP server for the SPARQL endpoint |
 | [`sux`](https://crates.io/crates/sux) | Sebastiano Vigna | Rank9 + SelectAdapt bitvectors and `BitFieldVec` — the LOUDS trie substrate |
 | [`epserde`](https://crates.io/crates/epserde) | Sebastiano Vigna | ε-copy serialization — mmap'd, near-zero-copy load of the Ring and dictionary snapshots |
-| [`tantivy`](https://crates.io/crates/tantivy) | community | Full-text search engine (planned — not yet a workspace dependency) |
+| [`tantivy`](https://crates.io/crates/tantivy) | community | Full-text search engine |
 | [`reasonable`](https://github.com/gtfierro/reasonable) | Gabe Fierro | OWL 2 RL Reasoner (planned — not yet a workspace dependency) |
 
 
@@ -186,10 +186,63 @@ The ontology graph (`GraphId(1)`) is the input to the planned OWL 2 RL reasoner.
 | `oxigraph-nova-storage-memory` | In-memory backend — `Vec`-based linear scan; testing and development |
 | `oxigraph-nova-storage-common` | Backend-agnostic WAL + MANIFEST + dictionary-persistence machinery, reusable by any `QuadStore` that wants crash-safe durability |
 | `oxigraph-nova-storage-ring` | CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + `BTreeMap<u128>` LSM delta + Leapfrog Triejoin; live-write, WAL-backed persistent storage engine with mmap'd ε-serde snapshot loading |
+| `oxigraph-nova-fulltext` | Tantivy-backed full-text index — opt-in via the `fulltext` cargo feature on `oxigraph-nova-storage-ring`; indexed incrementally on the compaction cycle |
 | `oxigraph-nova-server` | SPARQL 1.2 HTTP endpoint (`axum`), SPARQL Query/Update, Graph Store Protocol |
 | `oxigraph-nova-w3c-harness` | W3C SPARQL conformance test runner — fetches and caches real W3C manifests (test-only; not published) |
 | `oxigraph-nova-bench` | Criterion benchmarks comparing Ring+LFTJ vs in-memory and vs. other RDF stores (not published) |
 
+
+---
+
+## Full-text search (opt-in)
+
+An optional Tantivy-backed full-text index sits alongside the Ring, gated
+behind a `fulltext` cargo feature on `oxigraph-nova-storage-ring` so the
+dependency and index-file overhead are zero-cost until explicitly enabled:
+
+```sh
+# Server binary built with full-text search support:
+cargo run -p oxigraph-nova-server --release --features fulltext --bin nova_serve -- \
+    --location ./data --fulltext --bind 0.0.0.0:3030
+
+# Or via the `oxigraph` CLI's `serve` subcommand:
+cargo run --release --bin oxigraph --features fulltext -- \
+    serve --location ./data --fulltext --bind 0.0.0.0:3030
+```
+
+Once enabled, two SPARQL extension functions become available under a
+dedicated function-IRI namespace — the same convention Jena/GraphDB/Stardog
+use for their own full-text extensions:
+
+```sparql
+PREFIX text: <http://oxigraph-nova.dev/fn/text#>
+SELECT ?s ?o WHERE {
+    ?s <http://example.org/name> ?o .
+    FILTER(text:query(?o, "fox AND quick"))
+}
+```
+
+`text:query(?var, "...")` passes the string straight through to Tantivy's
+query-parser syntax; `text:contains(?var, "term")` is a plain substring/
+phrase match. When the search variable is also bound as a triple pattern's
+object elsewhere in the same basic graph pattern, the evaluator pushes the
+search down — Tantivy narrows that variable's candidate set *before* the
+join runs, rather than scanning every row and re-checking the filter
+afterward.
+
+**Consistency model:** the index is rebuilt incrementally on the same
+compaction cycle that rebuilds the Ring (`RingStore::compact()`), not on
+every write — search results are eventually consistent with the live delta,
+matching the existing LFTJ nested-loop-fallback semantics for uncompacted
+writes. A generation marker recorded alongside a persistent store's snapshot
+detects a stale or missing index at `enable_fulltext()` time (e.g. turning
+the feature on for the first time against a pre-existing database, or
+recovering from a prior crash) and triggers a one-time full rebuild
+automatically rather than silently serving stale results.
+
+See `crates/nova-fulltext/src/lib.rs` for the Tantivy schema and
+`crates/nova-storage-ring/src/fulltext.rs` for the compaction-time indexing
+glue.
 
 ---
 
@@ -203,7 +256,7 @@ QLever (C++) is a high-performance RDF store optimized for bulk-loaded static da
 | 2–3 way join, selective | Fast | Fast (dictionary integer IDs, no Term clone overhead) |
 | Cyclic joins | Merge-join based | LFTJ: worst-case optimal over Ring `TrieIterator`s |
 | Live writes | SPARQL UPDATE via offline diff/merge | O(log n) per write into `BTreeMap` delta; Ring rebuild with no read downtime |
-| Full-text + SPARQL | Integrated | Tantivy binding injection (planned) |
+| Full-text + SPARQL | Integrated | Tantivy-backed, opt-in (`--fulltext`), incrementally indexed on the compaction cycle |
 | Reasoning | None | OWL 2 RL reasoning via `reasonable` (planned) |
 | Memory footprint | Six sorted compressed arrays | Single compact Ring (tens of bytes/triple at benchmark scale) |
 | Persistence | On-disk from the start | Optional: in-memory by default, or a crash-safe WAL + MANIFEST + mmap'd ε-serde snapshot store (`--location <dir>`) with near-zero-copy load of both the Ring index and the term dictionary |
@@ -348,6 +401,7 @@ overlap, so a script or muscle memory built around `oxigraph serve`/
 | `--query-timeout-s <n>` |          | Abort a `/sparql` query that runs longer than `<n>` seconds with `504 Gateway Timeout`. Unset by default (no timeout). Matches upstream Oxigraph's `--timeout` flag |
 | `--max-results <n>` |          | Cap the number of result rows/triples a single `/sparql` query may produce; exceeding it returns `413 Payload Too Large`. Unset by default (no cap) |
 | `--max-parallel-queries <n>` |          | Bound the number of `/sparql` query evaluations running concurrently; a request arriving once `<n>` evaluations are already in flight is rejected immediately with `503 Service Unavailable`. Unset by default (unbounded) |
+| `--fulltext` |          | Enable Tantivy-backed full-text search (`text:query`/`text:contains` extension functions — see "Full-text search" above). Requires building with `cargo ... --features fulltext`; passing the flag without that feature is a hard startup error |
 
 
 ```sh

@@ -6,6 +6,11 @@ edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
+[features]
+# Opt-in Tantivy full-text search (`text:query`/`text:contains`), forwarded
+# straight through to `oxigraph-nova-storage-ring`'s own `fulltext` feature.
+fulltext = ["oxigraph-nova-storage-ring/fulltext"]
+
 [dependencies]
 oxigraph-nova-core         = { path = "../nova-core" }
 oxigraph-nova-query        = { path = "../nova-query" }

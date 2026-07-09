@@ -3,6 +3,7 @@ mod dict_compact;
 pub mod error;
 
 pub mod store;
+pub mod text_search;
 pub mod trie;
 
 pub use dict::{
@@ -10,6 +11,8 @@ pub use dict::{
 };
 pub use dict_compact::DictSnapshot;
 pub use error::Oxigraph;
+pub use text_search::{TextMatch, TextSearch};
+
 // Re-export the Oxigraph RDF type system directly — no custom wrappers.
 // These are battle-tested, W3C-correct, and used by oxttl/spargebra already.
 // Variable is included here so downstream crates share the exact same type

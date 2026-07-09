@@ -28,5 +28,6 @@ sparopt = ["dep:sparopt"]
 
 [dev-dependencies]
 oxigraph-nova-storage-memory = { path = "../nova-storage-memory" }
+oxigraph-nova-storage-ring = { path = "../nova-storage-ring", features = ["fulltext"] }
 pretty_assertions = { workspace = true }
 
