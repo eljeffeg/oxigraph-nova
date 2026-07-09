@@ -6,9 +6,26 @@
 
 use crate::{GraphName, NamedNode, Oxigraph, Quad, StoredQuad, Term};
 
-pub trait QuadStore: Send + Sync {
-    // ── LFTJ optional capability ──────────────────────────────────────────────
-
+/// Optional Leapfrog Triejoin (LFTJ) / Worst-Case-Optimal-Join acceleration
+/// capability for a [`QuadStore`].
+///
+/// This is a **separate supertrait** rather than being folded directly into
+/// [`QuadStore`] so that:
+///
+/// - The LFTJ-specific surface area (9 methods) is named and documented as
+///   one cohesive unit, rather than being interleaved with `QuadStore`'s
+///   core CRUD/observability methods.
+/// - A backend author implementing a brand-new [`QuadStore`] only ever sees
+///   one extra `impl LftjSource for MyStore {}` line (every method defaults
+///   to "unsupported") — the acceleration surface is discoverable but never
+///   in the way.
+///
+/// Every method here is defaulted to "not supported"/"unknown", so any
+/// `QuadStore` implementor can opt out entirely with an empty
+/// `impl LftjSource for MyStore {}` block. Only Ring-backed (CLTJ) stores
+/// currently override these to enable the accelerated join path — see
+/// `oxigraph_nova_storage_ring::RingStore`'s `impl LftjSource` block.
+pub trait LftjSource: Send + Sync {
     /// Returns `true` if this store supports Leapfrog Triejoin acceleration.
     ///
     /// Only `RingStore` (and future Ring-backed stores) return `true`.
@@ -114,7 +131,27 @@ pub trait QuadStore: Send + Sync {
     fn lftj_has_delta(&self) -> bool {
         false
     }
+}
 
+/// A single write operation for batch/transactional application via
+/// [`QuadStore::apply_batch`].
+///
+/// This exists so that a caller with a *mix* of inserts and removes to apply
+/// (e.g. a SPARQL `DELETE/INSERT` update, or a bulk-load routine that also
+/// needs to retract some superseded facts) can hand the whole batch to the
+/// store as a single logical unit, rather than issuing separate `insert`/
+/// `remove` calls (each of which may acquire a lock and hit the WAL
+/// independently on a persistent backend). See [`QuadStore::apply_batch`]'s
+/// doc comment for the durability/atomicity contract.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum QuadOp {
+    /// Insert this quad (idempotent if already present).
+    Insert(Quad),
+    /// Remove this quad (no-op if not present).
+    Remove(Quad),
+}
+
+pub trait QuadStore: Send + Sync + LftjSource {
     /// Insert a quad. Returns `true` if the quad was newly inserted, `false` if
     /// it was already present.
     fn insert(&self, quad: &Quad) -> Result<bool, Oxigraph>;
@@ -167,9 +204,21 @@ pub trait QuadStore: Send + Sync {
         Ok(())
     }
 
-    /// Bulk-insert from an iterator. Default impl calls `insert` in a loop;
-    /// backends may override for efficiency (e.g. batch writes, skip WAL).
-    fn extend(&self, quads: impl IntoIterator<Item = Quad>) -> Result<usize, Oxigraph> {
+    /// Bulk-insert from a boxed iterator. Default impl calls `insert` in a
+    /// loop; backends may override for efficiency (e.g. batch writes, skip
+    /// WAL).
+    ///
+    /// Takes `Box<dyn Iterator<...>>` rather than a generic `impl
+    /// IntoIterator` parameter so this method stays **object-safe** — a
+    /// generic method on a trait prevents that trait from being used as
+    /// `dyn QuadStore`/`Box<dyn QuadStore>`, which is otherwise a completely
+    /// reasonable way to select a storage backend at runtime (e.g. a
+    /// downstream project switching between `MemoryStore` and `RingStore`
+    /// based on a config flag). Call sites that have a concrete iterator
+    /// type can still pass it directly via `Box::new(iter)`; see
+    /// [`QuadStoreExt::extend`] for an ergonomic generic wrapper that
+    /// accepts any `impl IntoIterator<Item = Quad>` and boxes it for you.
+    fn extend_boxed(&self, quads: Box<dyn Iterator<Item = Quad> + '_>) -> Result<usize, Oxigraph> {
         let mut count = 0usize;
         for quad in quads {
             if self.insert(&quad)? {
@@ -179,8 +228,87 @@ pub trait QuadStore: Send + Sync {
         Ok(count)
     }
 
+    /// Apply a mixed batch of inserts/removes as a single logical unit.
+    ///
+    /// This is the transactional/batch seam for callers that need to apply
+    /// more than one write — e.g. a SPARQL `DELETE { .. } INSERT { .. }
+    /// WHERE { .. }` update, or any bulk routine that needs to retract some
+    /// facts while adding others — without issuing N independent `insert`/
+    /// `remove` calls.
+    ///
+    /// Returns `(inserted, removed)`: the number of `QuadOp::Insert` ops that
+    /// were newly inserted (i.e. `insert` would have returned `true`) and the
+    /// number of `QuadOp::Remove` ops that actually removed a present quad
+    /// (i.e. `remove` would have returned `true`) — mirroring the existing
+    /// `bool` return convention of `insert`/`remove` and the `usize` count
+    /// returned by `extend_boxed`, just split two ways since a batch can
+    /// contain both kinds of op.
+    ///
+    /// ## Default implementation
+    ///
+    /// The default here simply loops, calling `insert`/`remove` per-op in
+    /// order. This is always *correct* (each op is applied, in order), but
+    /// on a backend with its own internal lock and/or write-ahead log this
+    /// means N lock acquisitions and (worst case) N fsyncs — no different
+    /// from the caller doing the loop itself.
+    ///
+    /// ## Backends with a WAL/lock (e.g. `RingStore`)
+    ///
+    /// Should override this method to:
+    /// 1. Acquire their internal lock **once** for the whole batch.
+    /// 2. Write every resulting `WalRecord` (in the same order as `ops`) in
+    ///    a **single** `append_batch` call — one `fsync` for the whole
+    ///    batch instead of one per op — exactly mirroring the existing
+    ///    `extend_boxed` bulk-insert override, just generalized to mixed
+    ///    insert/remove ops.
+    /// 3. Only then apply each op to in-memory state, in order.
+    ///
+    /// ## Durability vs. atomicity — no rollback on partial failure
+    ///
+    /// The "log intent durably BEFORE applying" discipline guarantees that a
+    /// crash partway through step 3 is always *recoverable*: replaying the
+    /// WAL from the start of the batch on the next `open()` re-applies every
+    /// op, including ones that hadn't yet been applied to in-memory state at
+    /// the moment of the crash. It also guarantees concurrent readers never
+    /// observe a *partially-applied* batch mid-flight (the lock is held for
+    /// the whole operation, so a batch's writes become visible atomically
+    /// from a reader's perspective).
+    ///
+    /// It does **not**, however, guarantee that an in-process error raised
+    /// by `apply_insert`/`apply_remove` partway through step 3 (as opposed to
+    /// a process crash) can be rolled back: by the time step 3 begins, every
+    /// op's `WalRecord` has already been durably written in step 2. If step
+    /// 3 then fails on, say, the 5th of 10 ops, the in-memory state reflects
+    /// only ops 1–4, but the WAL now claims the full batch was intended. A
+    /// subsequent crash-and-replay (even one unrelated to this failure) would
+    /// apply all 10 ops, which may diverge from the state the store was
+    /// actually left in immediately after the failure. In practice
+    /// `apply_insert`/`apply_remove` only fail on dictionary-interning I/O
+    /// errors (not on ordinary content), making this a rare edge case, but it
+    /// means `apply_batch` is a **durability/visibility** batching seam, not
+    /// a full ACID transaction with in-process rollback.
+    fn apply_batch(&self, ops: &[QuadOp]) -> Result<(usize, usize), Oxigraph> {
+        let mut inserted = 0usize;
+        let mut removed = 0usize;
+        for op in ops {
+            match op {
+                QuadOp::Insert(q) => {
+                    if self.insert(q)? {
+                        inserted += 1;
+                    }
+                }
+                QuadOp::Remove(q) => {
+                    if self.remove(q)? {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        Ok((inserted, removed))
+    }
+
     // ── Observability (optional) ──────────────────────────────────────────────
-    //
+
     // Storage-specific metrics for the `/metrics` endpoint (see
     // `oxigraph_nova_server`). Every method here defaults to `None`,
     // meaning "this backend doesn't track that metric" — `nova-server`
@@ -207,3 +335,23 @@ pub trait QuadStore: Send + Sync {
         None
     }
 }
+
+/// Ergonomic, generic bulk-insert helper for any `QuadStore` (object-safe or
+/// not — this extension trait, unlike `QuadStore` itself, is allowed a
+/// generic method since it is never used as `dyn QuadStoreExt`).
+///
+/// Blanket-implemented for every `QuadStore`, so callers can write
+/// `store.extend(quads)` exactly as before this dyn-safety fix, passing any
+/// `impl IntoIterator<Item = Quad>` (a `Vec<Quad>`, a parser iterator, etc.)
+/// without manually boxing it first.
+pub trait QuadStoreExt: QuadStore {
+    /// Bulk-insert from any iterable. Boxes the iterator and forwards to
+    /// [`QuadStore::extend_boxed`] — see that method's doc comment for why
+    /// the underlying trait method takes a boxed iterator instead of a
+    /// generic parameter.
+    fn extend(&self, quads: impl IntoIterator<Item = Quad>) -> Result<usize, Oxigraph> {
+        self.extend_boxed(Box::new(quads.into_iter()))
+    }
+}
+
+impl<T: QuadStore + ?Sized> QuadStoreExt for T {}

@@ -183,8 +183,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use oxigraph_nova_core::{QuadStore, TextSearch};
 use oxigraph_nova_query::{
-    CancellationToken, EvalLimitError, Evaluator, QueryOptions, QueryResult, Solutions,
-    StoreDataset, clear_graph, execute_update,
+    CancellationToken, EvalLimitError, Evaluator, QueryOptions, QueryResult, ServiceHandler,
+    Solutions, StoreDataset, clear_graph, execute_update,
 };
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
 use oxrdfio::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
@@ -242,6 +242,11 @@ pub struct AppState<S: QuadStore + 'static> {
     /// functions can be dispatched by the evaluator (see
     /// `oxigraph_nova_query::options::QueryOptions::text_search`).
     pub text_search: Option<Arc<dyn TextSearch>>,
+    /// Opt-in SPARQL 1.1 Federated Query (`SERVICE`) handler, if configured
+    /// via `Server::with_service_handler`. Threaded into every query's
+    /// `QueryOptions` so `SERVICE` clauses can be dispatched (see
+    /// `oxigraph_nova_query::options::QueryOptions::service_handler`).
+    pub service_handler: Option<Arc<dyn ServiceHandler>>,
 }
 
 /// Manual `Clone` impl — `Arc<S>` is always `Clone` regardless of whether `S`
@@ -255,6 +260,7 @@ impl<S: QuadStore + 'static> Clone for AppState<S> {
             query_semaphore: self.query_semaphore.clone(),
             max_parallel_queries: self.max_parallel_queries,
             text_search: self.text_search.clone(),
+            service_handler: self.service_handler.clone(),
         }
     }
 }
@@ -285,6 +291,7 @@ pub struct Server<S: QuadStore + 'static> {
     max_results: Option<usize>,
     max_parallel_queries: Option<usize>,
     text_search: Option<Arc<dyn TextSearch>>,
+    service_handler: Option<Arc<dyn ServiceHandler>>,
 }
 
 impl<S: QuadStore + Send + Sync + 'static> Server<S> {
@@ -295,6 +302,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             max_results: None,
             max_parallel_queries: None,
             text_search: None,
+            service_handler: None,
         }
     }
 
@@ -336,6 +344,17 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
         self
     }
 
+    /// Attach a [`ServiceHandler`], enabling SPARQL 1.1 Federated Query
+    /// `SERVICE` clause evaluation for every query this server evaluates.
+    /// Without this, a non-`SILENT` `SERVICE` clause errors and a
+    /// `SILENT` one evaluates to zero solutions (see
+    /// `oxigraph_nova_query::service::ServiceHandler` and
+    /// `QueryOptions::with_service_handler`).
+    pub fn with_service_handler(mut self, handler: Arc<dyn ServiceHandler>) -> Self {
+        self.service_handler = Some(handler);
+        self
+    }
+
     /// Build the axum `Router`.
     ///
     /// Returns a router that can be used directly in integration tests via
@@ -350,6 +369,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
                 .map(|n| Arc::new(Semaphore::new(n))),
             max_parallel_queries: self.max_parallel_queries,
             text_search: self.text_search,
+            service_handler: self.service_handler,
         };
         Router::new()
             .route("/sparql", get(sparql_get::<S>).post(sparql_post::<S>))
@@ -1022,6 +1042,9 @@ async fn execute_sparql_query<S: QuadStore + 'static>(
     }
     if let Some(ts) = &state.text_search {
         options = options.with_text_search(Arc::clone(ts));
+    }
+    if let Some(handler) = &state.service_handler {
+        options = options.with_service_handler(Arc::clone(handler));
     }
     let cancellation = state.query_timeout.map(|_| CancellationToken::new());
     if let Some(token) = &cancellation {
@@ -2641,6 +2664,8 @@ mod tests {
         inner: Arc<MemoryStore>,
         delay: std::time::Duration,
     }
+
+    impl oxigraph_nova_core::LftjSource for SlowStore {}
 
     impl oxigraph_nova_core::QuadStore for SlowStore {
         fn insert(&self, quad: &oxigraph_nova_core::Quad) -> oxigraph_nova_core::Result<bool> {

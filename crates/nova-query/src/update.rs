@@ -49,7 +49,7 @@ use crate::dataset::StoreDataset;
 use crate::evaluator::{Evaluator, QueryResult};
 use crate::solution::Solution;
 use anyhow::{Result, anyhow};
-use oxigraph_nova_core::QuadStore;
+use oxigraph_nova_core::{QuadOp, QuadStore, QuadStoreExt};
 use oxrdf::{BlankNode, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use spargebra::algebra::{GraphPattern, GraphTarget, QueryDataset};
 use spargebra::term::{
@@ -133,28 +133,39 @@ fn spargebra_graph_name_to_oxrdf(g: &spargebra::term::GraphName) -> GraphName {
 }
 
 fn insert_data<S: QuadStore>(store: &Arc<S>, data: &[spargebra::term::Quad]) -> Result<()> {
-    for q in data {
-        let quad = Quad::new(
+    // All-insert batch: `QuadStoreExt::extend` boxes the iterator and hands
+    // it to `QuadStore::extend_boxed`, which backends with a WAL/lock (e.g.
+    // `RingStore`) override to append the whole batch in one `fsync` instead
+    // of one per quad — see `QuadStore::apply_batch`'s doc comment for the
+    // same rationale applied to mixed insert/remove batches below.
+    let quads = data.iter().map(|q| {
+        Quad::new(
             q.subject.clone(),
             q.predicate.clone(),
             q.object.clone(),
             spargebra_graph_name_to_oxrdf(&q.graph_name),
-        );
-        store.insert(&quad).map_err(|e| anyhow!("{e}"))?;
-    }
+        )
+    });
+    store.extend(quads).map_err(|e| anyhow!("{e}"))?;
     Ok(())
 }
 
 fn delete_data<S: QuadStore>(store: &Arc<S>, data: &[GroundQuad]) -> Result<()> {
-    for q in data {
-        let quad = Quad::new(
-            NamedOrBlankNode::NamedNode(q.subject.clone()),
-            q.predicate.clone(),
-            ground_term_to_term(&q.object),
-            spargebra_graph_name_to_oxrdf(&q.graph_name),
-        );
-        store.remove(&quad).map_err(|e| anyhow!("{e}"))?;
-    }
+    // All-remove batch: use `apply_batch` so a WAL-backed store applies the
+    // whole batch under a single lock acquisition / fsync instead of one per
+    // quad (see `QuadStore::apply_batch`'s doc comment).
+    let ops: Vec<QuadOp> = data
+        .iter()
+        .map(|q| {
+            QuadOp::Remove(Quad::new(
+                NamedOrBlankNode::NamedNode(q.subject.clone()),
+                q.predicate.clone(),
+                ground_term_to_term(&q.object),
+                spargebra_graph_name_to_oxrdf(&q.graph_name),
+            ))
+        })
+        .collect();
+    store.apply_batch(&ops).map_err(|e| anyhow!("{e}"))?;
     Ok(())
 }
 
@@ -192,14 +203,24 @@ fn delete_insert<S: QuadStore + 'static>(
         _ => unreachable!("Query::Select always evaluates to QueryResult::Solutions"),
     };
 
+    // Collect every row's deletes-then-inserts into a single ops batch and
+    // apply it in one `apply_batch` call, instead of issuing one `remove`/
+    // `insert` call per instantiated quad. This preserves the existing
+    // per-row DELETE-before-INSERT order (each row's deletes are pushed
+    // before that row's inserts), which continues to guarantee a
+    // just-inserted quad from row N can't be observed by row N's own delete
+    // pass — that guarantee never actually depended on deletes/inserts being
+    // applied to the store *immediately* (the WHERE clause was already fully
+    // evaluated into `solutions` before any mutation begins), so batching
+    // every row into one call is behavior-preserving while cutting the
+    // number of lock acquisitions/fsyncs on a WAL-backed store from O(ops)
+    // to 1. See `QuadStore::apply_batch`'s doc comment for the
+    // durability/atomicity contract this relies on.
+    let mut ops: Vec<QuadOp> = Vec::new();
     for sol in &solutions {
-        // DELETE before INSERT for each solution row: the WHERE clause was
-        // already fully evaluated above, so deletions can't affect which
-        // solutions exist, but ordering DELETE-then-INSERT per row avoids a
-        // just-inserted quad being visible to this same row's delete pass.
         for gqp in delete {
             if let Some(quad) = instantiate_ground_quad_pattern(gqp, sol) {
-                store.remove(&quad).map_err(|e| anyhow!("{e}"))?;
+                ops.push(QuadOp::Remove(quad));
             }
         }
         // Fresh blank-node map per solution row (SPARQL 1.1 § 3.1.3, the
@@ -207,10 +228,11 @@ fn delete_insert<S: QuadStore + 'static>(
         let mut bnode_map: HashMap<BlankNode, BlankNode> = HashMap::new();
         for qp in insert {
             if let Some(quad) = instantiate_quad_pattern(qp, sol, &mut bnode_map) {
-                store.insert(&quad).map_err(|e| anyhow!("{e}"))?;
+                ops.push(QuadOp::Insert(quad));
             }
         }
     }
+    store.apply_batch(&ops).map_err(|e| anyhow!("{e}"))?;
     Ok(())
 }
 
@@ -366,6 +388,11 @@ fn clear_one_graph<S: QuadStore>(store: &Arc<S>, g: &GraphName) -> Result<()> {
         .map_err(|e| anyhow!("{e}"))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("{e}"))?;
+    // All-remove batch: apply every removal for this graph in one
+    // `apply_batch` call rather than one `remove` call per quad (see
+    // `QuadStore::apply_batch`'s doc comment) — matters most for `CLEAR
+    // DEFAULT`/`CLEAR ALL`/`DROP ALL` on a large graph.
+    let mut ops: Vec<QuadOp> = Vec::with_capacity(stored.len());
     for sq in stored {
         let subject = match sq.subject.as_ref() {
             Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n.clone()),
@@ -376,9 +403,14 @@ fn clear_one_graph<S: QuadStore>(store: &Arc<S>, g: &GraphName) -> Result<()> {
             _ => continue,
         };
         let object = Arc::unwrap_or_clone(sq.object);
-        let quad = Quad::new(subject, sq.predicate, object, sq.graph_name);
-        store.remove(&quad).map_err(|e| anyhow!("{e}"))?;
+        ops.push(QuadOp::Remove(Quad::new(
+            subject,
+            sq.predicate,
+            object,
+            sq.graph_name,
+        )));
     }
+    store.apply_batch(&ops).map_err(|e| anyhow!("{e}"))?;
 
     Ok(())
 }

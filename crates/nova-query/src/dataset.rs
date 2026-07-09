@@ -117,23 +117,27 @@ pub struct QuadMatch {
 /// Lifetime `'a` is tied to the borrow of the [`Dataset`].
 pub type QuadIter<'a> = Box<dyn Iterator<Item = Result<QuadMatch>> + 'a>;
 
-// ── Dataset trait ─────────────────────────────────────────────────────────────
+// ── DatasetLftjSource trait ────────────────────────────────────────────────────
 
-/// The storage-agnostic interface the SPARQL evaluator uses.
+/// Optional Leapfrog Triejoin (LFTJ) / Worst-Case-Optimal-Join acceleration
+/// capability for a [`Dataset`].
 ///
-/// Every storage backend is accessed through this trait; the evaluator never
-/// knows whether it is talking to a `Vec`, a hypertrie, or a remote endpoint.
-pub trait Dataset: Send + Sync {
-    // ── Core query interface ──────────────────────────────────────────────────
-
-    /// Iterate lazily over all quads matching the given pattern.
-    ///
-    /// Pattern terms set to [`PatternTerm::Variable`] match any value.
-    /// The [`GraphSelector`] controls which graph(s) are searched.
-    fn find_quads<'a>(&'a self, pattern: &QuadPattern) -> Result<QuadIter<'a>>;
-
-    // ── LFTJ optional capability ──────────────────────────────────────────────
-
+/// This mirrors [`oxigraph_nova_core::LftjSource`] — the equivalent
+/// supertrait on the storage-level [`QuadStore`] trait — but cannot literally
+/// be the *same* trait: `Dataset`'s LFTJ methods key on a
+/// [`GraphSelector`] (a query-level abstraction that can mean "the default
+/// graph", "any named graph", or a `FROM`-clause union of several named
+/// graphs), whereas `QuadStore`'s LFTJ methods key on a concrete numeric
+/// `u8` graph id. [`StoreDataset`] is exactly the adapter that bridges the
+/// two: it resolves a `GraphSelector` down to a `u8` graph id (via
+/// `QuadStore::lftj_graph_id`) before delegating.
+///
+/// Every method here is defaulted to "not supported"/"unknown", so any
+/// `Dataset` implementor can opt out entirely with an empty
+/// `impl DatasetLftjSource for MyDataset {}` block. Only [`StoreDataset`]
+/// wrapping an LFTJ-capable `QuadStore` (i.e. Ring-backed/CLTJ stores)
+/// currently overrides these to enable the accelerated join path.
+pub trait DatasetLftjSource: Send + Sync {
     /// Returns `true` if this dataset supports Leapfrog Triejoin acceleration.
     ///
     /// When `false`, the SPARQL evaluator uses the nested-loop path.
@@ -150,7 +154,7 @@ pub trait Dataset: Send + Sync {
     }
 
     /// Returns `true` if this backend provides meaningful (non-`u64::MAX`)
-    /// estimates for [`lftj_estimate_count`][Dataset::lftj_estimate_count].
+    /// estimates for [`lftj_estimate_count`][DatasetLftjSource::lftj_estimate_count].
     ///
     /// Non-CLTJ backends (MemoryStore, InMemoryDataset) should return `false`
     /// so `lftj_step` skips the VEO heap-allocation + sort entirely.
@@ -228,8 +232,22 @@ pub trait Dataset: Send + Sync {
     ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
         None
     }
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
+// ── Dataset trait ─────────────────────────────────────────────────────────────
+
+/// The storage-agnostic interface the SPARQL evaluator uses.
+///
+/// Every storage backend is accessed through this trait; the evaluator never
+/// knows whether it is talking to a `Vec`, a hypertrie, or a remote endpoint.
+pub trait Dataset: Send + Sync + DatasetLftjSource {
+    // ── Core query interface ──────────────────────────────────────────────────
+
+    /// Iterate lazily over all quads matching the given pattern.
+    ///
+    /// Pattern terms set to [`PatternTerm::Variable`] match any value.
+    /// The [`GraphSelector`] controls which graph(s) are searched.
+    fn find_quads<'a>(&'a self, pattern: &QuadPattern) -> Result<QuadIter<'a>>;
 
     /// Fast existence check for a fully-bound quad.
     ///
@@ -304,6 +322,8 @@ impl InMemoryDataset {
     }
 }
 
+impl DatasetLftjSource for InMemoryDataset {}
+
 impl Dataset for InMemoryDataset {
     fn find_quads<'a>(&'a self, pattern: &QuadPattern) -> Result<QuadIter<'a>> {
         let pat = pattern.clone();
@@ -374,7 +394,7 @@ fn to_term(pt: &PatternTerm) -> Option<Term> {
     }
 }
 
-impl<S: QuadStore + 'static> Dataset for StoreDataset<S> {
+impl<S: QuadStore + 'static> DatasetLftjSource for StoreDataset<S> {
     // ── LFTJ delegates to the underlying QuadStore ────────────────────────────
 
     fn supports_lftj(&self) -> bool {
@@ -448,9 +468,9 @@ impl<S: QuadStore + 'static> Dataset for StoreDataset<S> {
         };
         self.store.lftj_real_count(s, p, o, target_field, graph_id)
     }
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
-
+impl<S: QuadStore + 'static> Dataset for StoreDataset<S> {
     fn find_quads<'a>(&'a self, pattern: &QuadPattern) -> Result<QuadIter<'a>> {
         // Use to_term for subject so Term::Triple patterns are passed through
         // to the store (which now accepts Option<&Term> for subject).

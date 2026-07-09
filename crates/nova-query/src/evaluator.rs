@@ -15,7 +15,10 @@
 //! # Implementation notes
 //!
 //! All `GraphPattern` arms are implemented, including property paths.
-//! `Service` returns an error (federated queries not supported).
+//! `Service` dispatches to a configurable [`crate::service::ServiceHandler`]
+//! (see [`crate::options::QueryOptions::with_service_handler`]); without one
+//! configured, a non-`SILENT` `SERVICE` clause errors and a `SILENT` one
+//! evaluates to zero solutions.
 //! Expression evaluation uses `Option<Term>` — `None` represents a SPARQL
 //! type error (the filter/expression silently fails).
 
@@ -625,11 +628,21 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 aggregates,
             } => self.eval_group(inner, variables, aggregates, active_graph),
 
-            GP::Service { silent, .. } => {
-                if *silent {
-                    Ok(vec![])
-                } else {
-                    Err(anyhow::anyhow!("SERVICE (federated queries) not supported"))
+            GP::Service {
+                name,
+                inner,
+                silent,
+            } => {
+                let result = self.eval_service(name, inner);
+                match result {
+                    Ok(solutions) => Ok(solutions),
+                    Err(e) => {
+                        if *silent {
+                            Ok(vec![])
+                        } else {
+                            Err(e)
+                        }
+                    }
                 }
             }
 
@@ -640,6 +653,36 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 object,
             } => self.eval_path(subject, path, object, active_graph),
         }
+    }
+
+    // =========================================================================
+    // SERVICE (SPARQL 1.1 Federated Query)
+    // =========================================================================
+
+    /// Dispatch a `SERVICE <name> { inner }` clause to the configured
+    /// [`crate::service::ServiceHandler`] (if any). Returns an error if no
+    /// handler is configured (`self.options.service_handler.is_none()`) or
+    /// `name` is a variable (unsupported — SPARQL 1.1 Federated Query's
+    /// "variable service name" form requires a prior binding source, which
+    /// this evaluator does not yet implement); the caller (`eval_pattern`'s
+    /// `GP::Service` arm) turns that error into zero solutions when the
+    /// clause was written with `SILENT`.
+    fn eval_service(&self, name: &NamedNodePattern, inner: &GP) -> Result<Solutions> {
+        let handler = self.options.service_handler.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "SERVICE (federated queries) not supported: no ServiceHandler configured \
+                 (see QueryOptions::with_service_handler)"
+            )
+        })?;
+        let service_name = match name {
+            NamedNodePattern::NamedNode(n) => n,
+            NamedNodePattern::Variable(_) => {
+                return Err(anyhow::anyhow!(
+                    "SERVICE with a variable service name is not supported"
+                ));
+            }
+        };
+        handler.handle(service_name, inner, self.base_iri.borrow().as_deref())
     }
 
     // =========================================================================
@@ -4029,6 +4072,127 @@ mod tests {
                 sols[0].get(&Variable::new_unchecked("s")),
                 Some(&iri("http://ex/s1"))
             );
+        }
+    }
+
+    // ── SERVICE (ServiceHandler extension point) ────────────────────────
+
+    mod service_dispatch {
+        use super::*;
+        use crate::options::QueryOptions;
+        use crate::service::ServiceHandler;
+        use spargebra::algebra::GraphPattern;
+        use std::sync::Arc;
+
+        /// A mock handler that always returns one fixed solution binding
+        /// `?x` to `"mocked"`, regardless of `service_name`/`pattern`.
+        struct FixedHandler;
+        impl ServiceHandler for FixedHandler {
+            fn handle(
+                &self,
+                _service_name: &NamedNode,
+                _pattern: &GraphPattern,
+                _base_iri: Option<&str>,
+            ) -> anyhow::Result<Solutions> {
+                let mut sol = Solution::new();
+                sol.insert(Variable::new_unchecked("x"), lit("mocked"));
+                Ok(vec![sol])
+            }
+        }
+
+        /// A mock handler that always fails -- used to exercise both the
+        /// hard-error (non-SILENT) and zero-solutions (SILENT) paths.
+        struct FailingHandler;
+        impl ServiceHandler for FailingHandler {
+            fn handle(
+                &self,
+                _service_name: &NamedNode,
+                _pattern: &GraphPattern,
+                _base_iri: Option<&str>,
+            ) -> anyhow::Result<Solutions> {
+                Err(anyhow::anyhow!("mock service failure"))
+            }
+        }
+
+        #[test]
+        fn no_handler_configured_errors_without_silent() {
+            let d = InMemoryDataset::new();
+            let ev = Evaluator::new(&d); // default QueryOptions: no service_handler
+            let q = SparqlParser::new()
+                .parse_query("SELECT ?x WHERE { SERVICE <http://example.org/sparql> { ?s ?p ?x } }")
+                .unwrap();
+            assert!(ev.evaluate(&q).is_err());
+        }
+
+        #[test]
+        fn no_handler_configured_silent_yields_empty() {
+            let d = InMemoryDataset::new();
+            let ev = Evaluator::new(&d); // default QueryOptions: no service_handler
+            let q = SparqlParser::new()
+                .parse_query(
+                    "SELECT ?x WHERE { SERVICE SILENT <http://example.org/sparql> { ?s ?p ?x } }",
+                )
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert!(sols.is_empty());
+        }
+
+        #[test]
+        fn configured_handler_dispatches_and_returns_its_solutions() {
+            let d = InMemoryDataset::new();
+            let options = QueryOptions::new().with_service_handler(Arc::new(FixedHandler));
+            let ev = Evaluator::with_options(&d, options);
+            let q = SparqlParser::new()
+                .parse_query("SELECT ?x WHERE { SERVICE <http://example.org/sparql> { ?s ?p ?x } }")
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert_eq!(sols.len(), 1);
+            assert_eq!(
+                sols[0].get(&Variable::new_unchecked("x")),
+                Some(&lit("mocked"))
+            );
+        }
+
+        #[test]
+        fn failing_handler_errors_without_silent() {
+            let d = InMemoryDataset::new();
+            let options = QueryOptions::new().with_service_handler(Arc::new(FailingHandler));
+            let ev = Evaluator::with_options(&d, options);
+            let q = SparqlParser::new()
+                .parse_query("SELECT ?x WHERE { SERVICE <http://example.org/sparql> { ?s ?p ?x } }")
+                .unwrap();
+            assert!(ev.evaluate(&q).is_err());
+        }
+
+        #[test]
+        fn failing_handler_silent_yields_empty() {
+            let d = InMemoryDataset::new();
+            let options = QueryOptions::new().with_service_handler(Arc::new(FailingHandler));
+            let ev = Evaluator::with_options(&d, options);
+            let q = SparqlParser::new()
+                .parse_query(
+                    "SELECT ?x WHERE { SERVICE SILENT <http://example.org/sparql> { ?s ?p ?x } }",
+                )
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert!(sols.is_empty());
+        }
+
+        #[test]
+        fn variable_service_name_is_unsupported() {
+            let d = InMemoryDataset::new();
+            let options = QueryOptions::new().with_service_handler(Arc::new(FixedHandler));
+            let ev = Evaluator::with_options(&d, options);
+            let q = SparqlParser::new()
+                .parse_query("SELECT ?x WHERE { SERVICE ?svc { ?s ?p ?x } }")
+                .unwrap();
+            assert!(ev.evaluate(&q).is_err());
         }
     }
 }

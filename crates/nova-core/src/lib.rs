@@ -19,7 +19,7 @@ pub use oxrdf::{
     BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable,
 };
 use std::sync::Arc;
-pub use store::QuadStore;
+pub use store::{LftjSource, QuadOp, QuadStore, QuadStoreExt};
 pub use text_search::{TextMatch, TextSearch};
 pub use trie::{EmptyTrieIter, TrieIterator};
 

@@ -6,6 +6,7 @@
 //! join evaluation, property-path BFS) via [`CancellationToken::check`].
 //! [`QueryOptions`] bundles this together with an optional result-row cap.
 
+use crate::service::ServiceHandler;
 use oxigraph_nova_core::TextSearch;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,6 +101,12 @@ pub struct QueryOptions {
     /// `text:contains` calls then evaluate as unbound rather than
     /// performing a search.
     pub text_search: Option<Arc<dyn TextSearch>>,
+    /// Optional handler for SPARQL 1.1 Federated Query `SERVICE` clauses
+    /// (see [`crate::service::ServiceHandler`]). `None` (the default) means
+    /// `SERVICE` is unsupported: a non-`SILENT` `SERVICE` clause errors,
+    /// and a `SILENT` one evaluates to zero solutions — unchanged from the
+    /// evaluator's behavior before this field existed.
+    pub service_handler: Option<Arc<dyn ServiceHandler>>,
 }
 
 impl QueryOptions {
@@ -121,6 +128,14 @@ impl QueryOptions {
     /// `text:contains` extension-function dispatch in the evaluator.
     pub fn with_text_search(mut self, ts: Arc<dyn TextSearch>) -> Self {
         self.text_search = Some(ts);
+        self
+    }
+
+    /// Attach a [`ServiceHandler`], enabling SPARQL 1.1 Federated Query
+    /// `SERVICE` clause evaluation. Without this, a non-`SILENT` `SERVICE`
+    /// clause errors and a `SILENT` one evaluates to zero solutions.
+    pub fn with_service_handler(mut self, handler: Arc<dyn ServiceHandler>) -> Self {
+        self.service_handler = Some(handler);
         self
     }
 

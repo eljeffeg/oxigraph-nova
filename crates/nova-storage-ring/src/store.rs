@@ -67,8 +67,8 @@ use crate::louds::LoudsMemBreakdown;
 use crate::ring::{GraphRing, GraphRingHandle, RingBuilder, SortOrder};
 use crate::snapshot::StoreSnapshot;
 use oxigraph_nova_core::{
-    Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, NamedNode, Oxigraph, Quad,
-    QuadStore, StoredQuad, Subject, Term, TermId,
+    Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, LftjSource, NamedNode, Oxigraph,
+    Quad, QuadOp, QuadStore, StoredQuad, Subject, Term, TermId,
 };
 #[cfg(feature = "fulltext")]
 use oxigraph_nova_fulltext::FulltextIndex;
@@ -1308,27 +1308,15 @@ fn decode_stored_quad(
     })
 }
 
-// ── QuadStore impl ────────────────────────────────────────────────────────────
+// ── LftjSource impl ───────────────────────────────────────────────────────────
+//
+// Ring/CLTJ-backed acceleration for the LFTJ/WCOJ join evaluator (see
+// `oxigraph_nova_core::LftjSource`'s doc comment for why this lives in its
+// own supertrait rather than being folded directly into `QuadStore`).
 
-impl QuadStore for RingStore {
-    // ── LFTJ capability ───────────────────────────────────────────────────────
-
+impl LftjSource for RingStore {
     fn supports_lftj(&self) -> bool {
         true
-    }
-
-    // ── Observability ─────────────────────────────────────────────────────────
-
-    fn delta_len(&self) -> Option<usize> {
-        Some(RingStore::delta_len(self))
-    }
-
-    fn compaction_count(&self) -> Option<u64> {
-        Some(compaction_count())
-    }
-
-    fn compaction_duration_seconds_total(&self) -> Option<f64> {
-        Some(compaction_duration_seconds_total())
     }
 
     fn supports_veo_estimates(&self) -> bool {
@@ -1396,6 +1384,24 @@ impl QuadStore for RingStore {
             Ok(inner) => !inner.delta.is_empty(),
             Err(_) => false,
         }
+    }
+}
+
+// ── QuadStore impl ────────────────────────────────────────────────────────────
+
+impl QuadStore for RingStore {
+    // ── Observability ─────────────────────────────────────────────────────────
+
+    fn delta_len(&self) -> Option<usize> {
+        Some(RingStore::delta_len(self))
+    }
+
+    fn compaction_count(&self) -> Option<u64> {
+        Some(compaction_count())
+    }
+
+    fn compaction_duration_seconds_total(&self) -> Option<f64> {
+        Some(compaction_duration_seconds_total())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1673,7 +1679,7 @@ impl QuadStore for RingStore {
     /// doc comment) — is logged to the WAL *before* any of them are applied
     /// to in-memory state, exactly mirroring the single-quad `insert()`'s
     /// "log intent durably BEFORE applying" discipline, just batched.
-    fn extend(&self, quads: impl IntoIterator<Item = Quad>) -> Result<usize, Oxigraph> {
+    fn extend_boxed(&self, quads: Box<dyn Iterator<Item = Quad> + '_>) -> Result<usize, Oxigraph> {
         let quads: Vec<Quad> = quads.into_iter().collect();
         if quads.is_empty() {
             return Ok(0);
@@ -1701,6 +1707,45 @@ impl QuadStore for RingStore {
         inner.maybe_auto_compact()?;
         Ok(count)
     }
+
+    fn apply_batch(&self, ops: &[QuadOp]) -> Result<(usize, usize), Oxigraph> {
+        if ops.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+
+        let records: Vec<WalRecord> = ops
+            .iter()
+            .map(|op| match op {
+                QuadOp::Insert(q) => WalRecord::InsertQuad(q.clone()),
+                QuadOp::Remove(q) => WalRecord::RemoveQuad(q.clone()),
+            })
+            .collect();
+        inner.wal_append_batch(records.iter())?;
+
+        let mut inserted = 0usize;
+        let mut removed = 0usize;
+        for op in ops {
+            match op {
+                QuadOp::Insert(q) => {
+                    if inner.apply_insert(q)? {
+                        inserted += 1;
+                    }
+                }
+                QuadOp::Remove(q) => {
+                    if inner.apply_remove(q)? {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        inner.maybe_auto_compact()?;
+        Ok((inserted, removed))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1708,7 +1753,7 @@ impl QuadStore for RingStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxigraph_nova_core::{Literal, NamedNode};
+    use oxigraph_nova_core::{Literal, NamedNode, QuadStoreExt};
 
     #[cfg(feature = "fulltext")]
     mod fulltext_tests {
@@ -2527,6 +2572,49 @@ mod tests {
     }
 
     #[test]
+    fn apply_batch_mixed_insert_remove_single_lock() {
+        let dir = temp_dir("apply_batch");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = RingStore::open(&dir).unwrap();
+        let q1 = make_quad("http://ex/s1", "http://ex/p", "v", dg());
+        store.insert(&q1).unwrap();
+        assert_eq!(store.len().unwrap(), 1);
+
+        let q2 = make_quad("http://ex/s2", "http://ex/p", "v", dg());
+        let q3 = make_quad("http://ex/s3", "http://ex/p", "v", dg());
+        let ops = vec![
+            QuadOp::Remove(q1.clone()),
+            QuadOp::Insert(q2.clone()),
+            QuadOp::Insert(q3.clone()),
+        ];
+        let (inserted, removed) = store.apply_batch(&ops).unwrap();
+        assert_eq!(inserted, 2);
+        assert_eq!(removed, 1);
+
+        assert!(!store.contains(&q1).unwrap());
+        assert!(store.contains(&q2).unwrap());
+        assert!(store.contains(&q3).unwrap());
+        assert_eq!(store.len().unwrap(), 2);
+
+        drop(store);
+        let store2 = RingStore::open(&dir).unwrap();
+        assert!(!store2.contains(&q1).unwrap());
+        assert!(store2.contains(&q2).unwrap());
+        assert!(store2.contains(&q3).unwrap());
+        assert_eq!(store2.len().unwrap(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_batch_empty_is_noop() {
+        let store = RingStore::new();
+        store.apply_batch(&[]).unwrap();
+        assert_eq!(store.len().unwrap(), 0);
+    }
+
+    #[test]
     fn extend_torn_batch_tail_replays_none_of_the_batch() {
         // A batch's records are each independently framed, so a torn write
         // mid-batch behaves exactly like any other torn write: replay stops
@@ -2572,6 +2660,72 @@ mod tests {
             store.len().unwrap(),
             1,
             "torn batch tail must not partially apply — only the pre-existing record survives"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_batch_torn_batch_tail_replays_none_of_the_batch() {
+        // Same shape as `extend_torn_batch_tail_replays_none_of_the_batch`,
+        // but exercises `apply_batch`'s *mixed* insert/remove path instead of
+        // `extend`'s all-insert path — `apply_batch` writes its `WalRecord`s
+        // via a separate `wal_append_batch` call (see `RingStore`'s
+        // `impl QuadStore::apply_batch` override), so it's worth confirming
+        // independently that a torn tail after a mixed batch is handled the
+        // same way: replay stops at the first bad frame, and since every
+        // record in this batch is torn, none of it is recovered — only
+        // pre-existing state (including the quad the batch was supposed to
+        // remove) survives.
+        let dir = temp_dir("apply_batch_torn");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let q_before = make_quad("http://ex/before", "http://ex/p", "v", dg());
+        let q_to_remove = make_quad("http://ex/toremove", "http://ex/p", "v", dg());
+        {
+            let store = RingStore::open(&dir).unwrap();
+            store.insert(&q_before).unwrap();
+            store.insert(&q_to_remove).unwrap();
+        }
+
+        let before_len = std::fs::metadata(RingStore::wal_path(&dir)).unwrap().len();
+
+        {
+            let store = RingStore::open(&dir).unwrap();
+            let ops = vec![
+                QuadOp::Remove(q_to_remove.clone()),
+                QuadOp::Insert(make_quad("http://ex/batch0", "http://ex/p", "v", dg())),
+                QuadOp::Insert(make_quad("http://ex/batch1", "http://ex/p", "v", dg())),
+            ];
+            let (inserted, removed) = store.apply_batch(&ops).unwrap();
+            assert_eq!(inserted, 2);
+            assert_eq!(removed, 1);
+        }
+
+        let full_len = std::fs::metadata(RingStore::wal_path(&dir)).unwrap().len();
+        assert!(full_len > before_len);
+
+        // Truncate everything the batch wrote, minus a few bytes, so the
+        // batch's tail is torn but the pre-existing records are untouched.
+        {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(RingStore::wal_path(&dir))
+                .unwrap();
+            file.set_len(before_len + 5).unwrap();
+        }
+
+        let store = RingStore::open(&dir).unwrap();
+        assert!(store.contains(&q_before).unwrap());
+        assert!(
+            store.contains(&q_to_remove).unwrap(),
+            "torn batch tail must not partially apply — the batch's REMOVE must not have taken \
+             effect since replay never reached it"
+        );
+        assert_eq!(
+            store.len().unwrap(),
+            2,
+            "torn batch tail must not partially apply — only the two pre-existing records survive"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

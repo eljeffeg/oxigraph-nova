@@ -721,6 +721,7 @@ fn eval_bgp_lftj_multi_graph<D: Dataset>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::DatasetLftjSource;
     use oxigraph_nova_core::{Term, TrieIterator};
 
     // ── Stub dataset for unit-testing LFTJ logic ──────────────────────────────
@@ -756,13 +757,7 @@ mod tests {
     use anyhow::Result;
     use oxigraph_nova_core::GraphName;
 
-    impl Dataset for StubDataset {
-        fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
-            Ok(Box::new(std::iter::empty()))
-        }
-        fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
-            Ok(Box::new(std::iter::empty()))
-        }
+    impl DatasetLftjSource for StubDataset {
         fn supports_lftj(&self) -> bool {
             true
         }
@@ -805,6 +800,15 @@ mod tests {
         // lftj_estimate_count and lftj_real_count both use their default
         // (u64::MAX / None) — VEO sort is stable for equal estimates, so
         // first-appearance order is preserved in tests.
+    }
+
+    impl Dataset for StubDataset {
+        fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+            Ok(Box::new(std::iter::empty()))
+        }
     }
 
     struct VecTrieIter {
@@ -917,15 +921,7 @@ mod tests {
     #[test]
     fn veo_sort_prefers_smaller_real_subtree_size() {
         struct RemainingCountDataset;
-        impl Dataset for RemainingCountDataset {
-            fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
-                Ok(Box::new(std::iter::empty()))
-            }
-            fn named_graphs<'a>(
-                &'a self,
-            ) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
-                Ok(Box::new(std::iter::empty()))
-            }
+        impl DatasetLftjSource for RemainingCountDataset {
             fn supports_lftj(&self) -> bool {
                 true
             }
@@ -949,6 +945,16 @@ mod tests {
                 // target_field 0 (var 0's S field) → large remaining count.
                 // target_field 2 (var 1's O field) → small remaining count.
                 if target_field == 0 { Some(10) } else { Some(2) }
+            }
+        }
+        impl Dataset for RemainingCountDataset {
+            fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
+                Ok(Box::new(std::iter::empty()))
+            }
+            fn named_graphs<'a>(
+                &'a self,
+            ) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+                Ok(Box::new(std::iter::empty()))
             }
         }
 

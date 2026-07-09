@@ -1030,13 +1030,7 @@ mod tests {
         }
     }
 
-    impl Dataset for PathStub {
-        fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
-            Ok(Box::new(std::iter::empty()))
-        }
-        fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
-            Ok(Box::new(std::iter::empty()))
-        }
+    impl crate::dataset::DatasetLftjSource for PathStub {
         fn supports_lftj(&self) -> bool {
             true
         }
@@ -1080,6 +1074,15 @@ mod tests {
             vals.sort_unstable();
             vals.dedup();
             Some(Box::new(VecIter { vals, pos: 0 }))
+        }
+    }
+
+    impl Dataset for PathStub {
+        fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+            Ok(Box::new(std::iter::empty()))
         }
     }
 

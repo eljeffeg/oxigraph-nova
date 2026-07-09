@@ -4,7 +4,9 @@
 //! W3C conformance test suite (datasets are small). Replace with
 //! `oxigraph-nova-storage-hypertrie` for production workloads.
 
-use oxigraph_nova_core::{GraphName, NamedNode, Oxigraph, Quad, QuadStore, StoredQuad, Term};
+use oxigraph_nova_core::{
+    GraphName, LftjSource, NamedNode, Oxigraph, Quad, QuadStore, StoredQuad, Term,
+};
 use std::collections::HashSet;
 use std::sync::RwLock;
 
@@ -30,6 +32,8 @@ impl Default for MemoryStore {
         Self::new()
     }
 }
+
+impl LftjSource for MemoryStore {}
 
 impl QuadStore for MemoryStore {
     fn insert(&self, quad: &Quad) -> Result<bool, Oxigraph> {
@@ -143,6 +147,12 @@ impl QuadStore for MemoryStore {
         }
         Ok(())
     }
+
+    // No `apply_batch` override: `MemoryStore` has no WAL and its
+    // `RwLock<Vec<Quad>>` is already cheap to (re-)acquire per call, so
+    // there is no single-lock-acquisition/single-fsync win to be had from
+    // batching — it deliberately relies on `QuadStore::apply_batch`'s
+    // default (loop over `insert`/`remove`) rather than duplicating it here.
 }
 
 #[cfg(test)]
