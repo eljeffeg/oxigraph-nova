@@ -140,6 +140,18 @@ impl PatternSpec {
         is_jv(&self.s) || is_jv(&self.p) || is_jv(&self.o)
     }
 
+    /// Is every field of this pattern a constant (zero join variables)?
+    ///
+    /// A fully-ground pattern is never `is_active_for_var` for *any* variable,
+    /// so `lftj_step`'s leapfrog recursion never opens a scan for it. Callers
+    /// must independently verify existence for any fully-ground pattern (see
+    /// `build_spec`) before treating the overall BGP as satisfied.
+    fn is_fully_ground(&self) -> bool {
+        matches!(self.s, FieldSpec::Const(_))
+            && matches!(self.p, FieldSpec::Const(_))
+            && matches!(self.o, FieldSpec::Const(_))
+    }
+
     /// Resolve this pattern's fields for a scan targeting `var_idx`.
     ///
     /// `bindings[i] = Some(val)` for bound variables; `None` for unbound.
@@ -285,6 +297,44 @@ fn classify_nn_field<D: Dataset>(
     }
 }
 
+/// Convert a fully-classified (`Const`-only) `TermPattern` back to a concrete
+/// `Term`. Only ever called after `classify_term_field` has already
+/// classified the same field as `Ok(FieldSpec::Const(_))`, so `Variable`,
+/// `BlankNode` and `Triple` (which produce `JoinVar`/`Err`, never `Const`)
+/// cannot occur here.
+fn ground_term_pattern(tp: &TermPattern) -> oxigraph_nova_core::Term {
+    match tp {
+        TermPattern::NamedNode(n) => oxigraph_nova_core::Term::NamedNode(n.clone()),
+        TermPattern::Literal(l) => oxigraph_nova_core::Term::Literal(l.clone()),
+        TermPattern::Variable(_) | TermPattern::BlankNode(_) | TermPattern::Triple(_) => {
+            unreachable!("ground_term_pattern called on a non-constant field")
+        }
+    }
+}
+
+/// Same as [`ground_term_pattern`] for the predicate position.
+fn ground_nn_pattern(nn: &NamedNodePattern) -> oxigraph_nova_core::Term {
+    match nn {
+        NamedNodePattern::NamedNode(n) => oxigraph_nova_core::Term::NamedNode(n.clone()),
+        NamedNodePattern::Variable(_) => {
+            unreachable!("ground_nn_pattern called on a non-constant field")
+        }
+    }
+}
+
+/// Resolve a `GraphSelector` to a concrete `GraphName` for
+/// `Dataset::contains_quad`. Only `Default`/`Named` selectors reach
+/// `build_spec` (`AnyNamed`/`Union` are handled by `eval_bgp_lftj_multi_graph`
+/// before `build_spec` is ever called per-graph, and `UnionOf` triggers an
+/// immediate nested-loop fallback) — `None` here is defensive only.
+fn graph_name_for_selector(graph: &GraphSelector) -> Option<GraphName> {
+    match graph {
+        GraphSelector::Default => Some(GraphName::DefaultGraph),
+        GraphSelector::Named(g) => Some(g.clone()),
+        GraphSelector::AnyNamed | GraphSelector::Union | GraphSelector::UnionOf(_) => None,
+    }
+}
+
 fn build_spec<D: Dataset>(
     tp: &TriplePattern,
     join_vars: &[Variable],
@@ -311,7 +361,35 @@ fn build_spec<D: Dataset>(
         Err(false) => return SpecResult::Fallback,
     };
 
-    SpecResult::Ok(PatternSpec { s, p, o })
+    let spec = PatternSpec { s, p, o };
+
+    // ── Fully-ground pattern: verify existence directly ─────────────────────
+    //
+    // A pattern with zero variables (all of s/p/o are `Const`) is never
+    // `is_active_for_var` for *any* join variable, so `lftj_step`'s leapfrog
+    // recursion never opens a scan for it -- the pattern would otherwise
+    // silently contribute nothing and the BGP would be treated as trivially
+    // satisfied by `lftj_step`'s base case. Each field being individually
+    // interned (checked above via `lftj_intern_term`) only means the *term*
+    // exists in the dictionary -- NOT that this exact (s, p, o) triple was
+    // ever asserted together. Verify that directly, once, via the
+    // always-correct `Dataset::contains_quad` existence check (same
+    // nested-loop-backed path used elsewhere in the evaluator).
+    if spec.is_fully_ground() {
+        let Some(graph_name) = graph_name_for_selector(graph) else {
+            return SpecResult::Fallback;
+        };
+        let s_term = ground_term_pattern(&tp.subject);
+        let p_term = ground_nn_pattern(&tp.predicate);
+        let o_term = ground_term_pattern(&tp.object);
+        match dataset.contains_quad(&s_term, &p_term, &o_term, &graph_name) {
+            Ok(true) => {}
+            Ok(false) => return SpecResult::EmptyResult,
+            Err(_) => return SpecResult::Fallback,
+        }
+    }
+
+    SpecResult::Ok(spec)
 }
 
 // ── Adaptive VEO sort ─────────────────────────────────────────────────────────
@@ -982,6 +1060,108 @@ mod tests {
             order,
             vec![1, 0],
             "VEO must prefer var 1 (real subtree size 2) over var 0 (real subtree size 10)"
+        );
+    }
+
+    /// Regression test: a fully-ground triple pattern (a BGP
+    /// with zero join variables -- every field a constant) must be verified
+    /// against the store, not unconditionally treated as satisfied.
+    #[test]
+    fn fully_ground_pattern_checks_existence_not_just_term_interning() {
+        /// A dataset whose constants are all individually "internable" (as
+        /// long as they appear in `KNOWN_TERMS`), but whose `contains_quad`
+        /// only returns `true` for one specific asserted triple -- this
+        /// isolates whether `eval_bgp_lftj` actually checks existence for a
+        /// fully-ground pattern, or merely checks that each term individually
+        /// exists somewhere in the dictionary.
+        struct ExistenceCheckDataset;
+
+        const KNOWN_TERMS: &[&str] = &[
+            "http://ex/a",
+            "http://ex/p",
+            "http://ex/q",
+            "http://ex/o1",
+            "http://ex/o2",
+        ];
+
+        fn term_id(uri: &str) -> Option<u64> {
+            KNOWN_TERMS
+                .iter()
+                .position(|t| *t == uri)
+                .map(|i| i as u64 + 1)
+        }
+
+        impl DatasetLftjSource for ExistenceCheckDataset {
+            fn supports_lftj(&self) -> bool {
+                true
+            }
+            fn lftj_has_delta(&self) -> bool {
+                false
+            }
+            fn lftj_intern_term(&self, term: &Term, _: &GraphSelector) -> Option<u64> {
+                if let Term::NamedNode(n) = term {
+                    term_id(n.as_str())
+                } else {
+                    None
+                }
+            }
+            fn lftj_decode_term(&self, _id: u64) -> Option<Term> {
+                None
+            }
+        }
+
+        impl Dataset for ExistenceCheckDataset {
+            fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
+                Ok(Box::new(std::iter::empty()))
+            }
+            fn named_graphs<'a>(
+                &'a self,
+            ) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+                Ok(Box::new(std::iter::empty()))
+            }
+            // Only `<http://ex/a> <http://ex/p> <http://ex/o1>` is actually
+            // asserted -- every other combination of KNOWN_TERMS is not,
+            // even though each individual term is internable.
+            fn contains_quad(&self, s: &Term, p: &Term, o: &Term, g: &GraphName) -> Result<bool> {
+                if !matches!(g, GraphName::DefaultGraph) {
+                    return Ok(false);
+                }
+                let is = |t: &Term, uri: &str| matches!(t, Term::NamedNode(n) if n.as_str() == uri);
+                Ok(is(s, "http://ex/a") && is(p, "http://ex/p") && is(o, "http://ex/o1"))
+            }
+        }
+
+        let ds = ExistenceCheckDataset;
+
+        let pattern = |o: &str| TriplePattern {
+            subject: TermPattern::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(
+                "http://ex/a",
+            )),
+            predicate: NamedNodePattern::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(
+                "http://ex/p",
+            )),
+            object: TermPattern::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(o)),
+        };
+
+        // The asserted triple: must be found (one solution).
+        let asserted = eval_bgp_lftj(&ds, &[pattern("http://ex/o1")], &GraphSelector::Default)
+            .expect("LFTJ should handle a fully-ground pattern, not fall back")
+            .expect("no error expected");
+        assert_eq!(
+            asserted.len(),
+            1,
+            "the asserted fully-ground triple must yield exactly one solution"
+        );
+
+        // Same subject/predicate, but a *different* (also-internable) object
+        // that was never asserted together with them -- must be empty, not a
+        // spurious match.
+        let not_asserted = eval_bgp_lftj(&ds, &[pattern("http://ex/o2")], &GraphSelector::Default)
+            .expect("LFTJ should handle a fully-ground pattern, not fall back")
+            .expect("no error expected");
+        assert!(
+            not_asserted.is_empty(),
+            "a fully-ground triple that was never asserted must yield zero solutions"
         );
     }
 }
