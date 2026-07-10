@@ -1,10 +1,11 @@
 # Architecture
 
-This document maps the crate layout and the **trait seams** that let a
-downstream project extend or replace pieces of oxigraph-nova without forking
-it. If you're building on top of this project — a custom storage backend, a
-custom SPARQL function, a federated `SERVICE` handler, or embedding the HTTP
-server into a larger application — start here.
+This document maps the crate layout, the succinct storage engine's internal
+design (CompactLTJ Ring + Leapfrog Triejoin), and the **trait seams** that
+let a downstream project extend or replace pieces of oxigraph-nova without
+forking it. If you're building on top of this project — a custom storage
+backend, a custom SPARQL function, a federated `SERVICE` handler, or
+embedding the HTTP server into a larger application — start here.
 
 ## Crate layout
 
@@ -14,6 +15,7 @@ nova-core              (vocabulary + trait definitions; no storage/query logic)
   │     ├── nova-storage-memory  (MemoryStore: simple reference QuadStore impl)
   │     └── nova-storage-ring    (RingStore: LOUDS/CLTJ QuadStore impl, WAL + delta + compaction)
   ├── nova-fulltext         (Tantivy-backed TextSearch impl)
+  ├── nova-reasoning        (LftjFixpointEngine: OWL 2 RL forward-chaining reasoner)
   └── nova-query            (Dataset trait, SPARQL evaluator, LFTJ/WCOJ join engine,
                               extension registry, SERVICE federation)
         └── nova-server      (axum HTTP SPARQL 1.1 Protocol server, generic over QuadStore)
@@ -32,6 +34,111 @@ This layering is what makes each seam below reusable: a downstream crate can
 depend on just `nova-core` + `nova-query` and supply its own storage/service
 implementations without touching (or forking) `nova-storage-ring` or
 `nova-server` at all.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   oxigraph-nova-server                       │
+│             SPARQL 1.2 HTTP endpoint (axum)                  │
+│             /sparql GET/POST · /update POST                  │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+┌───────────────────────────▼──────────────────────────────────┐
+│                   oxigraph-nova-query                        │
+│    spargebra (parse) → sparopt (normalize) → evaluator       │
+│    Dataset trait · Leapfrog Triejoin · ExtensionRegistry     │
+└───────────────────────────┬──────────────────────────────────┘
+                            │  QuadStore / Dataset traits
+           ┌────────────────┴────────────────┐
+           │                                 │
+┌──────────▼──────────────┐   ┌──────────────▼──────────────────┐
+│ oxigraph-nova-storage-  │   │  oxigraph-nova-storage-ring     │
+│        memory           │   │  CompactLTJ LOUDS tries         │
+│  Vec + linear scan      │   │  + BTreeMap<u128> LSM delta     │
+│  testing / dev          │   │  + Leapfrog Triejoin            │
+│  (no persistence)       │   │  + WAL/MANIFEST persistence     │
+└─────────────────────────┘   └──────────────┬──────────────────┘
+           │                                 │
+           │                   ┌─────────────▼───────────────────┐
+           │                   │ oxigraph-nova-storage-common    │
+           │                   │ WAL + MANIFEST + mmap'd ε-serde │
+           │                   │ dictionary/snapshot persistence │
+           │                   │ (backend-agnostic, reusable)    │
+           │                   └─────────────┬───────────────────┘
+           └─────────────────┬───────────────┘
+                             │
+┌────────────────────────────▼──────────────────────────────────┐
+│                      oxigraph-nova-core                       │
+│    re-exports oxrdf types · QuadStore / TrieIterator traits   │
+│    Dictionary (TermId / GraphId) · error types                │
+└───────────────────────────────────────────────────────────────┘
+```
+
+| Crate | Purpose |
+|---|---|
+| `oxigraph-nova-core` | RDF types (re-exports `oxrdf`), `QuadStore` trait, `TrieIterator` trait, `Dictionary` (40-bit `TermId`, 8-bit `GraphId`), error types |
+| `oxigraph-nova-query` | SPARQL 1.2 evaluator, `Dataset` trait, Leapfrog Triejoin (`lftj.rs`), `ExtensionRegistry` |
+| `oxigraph-nova-storage-memory` | In-memory backend — `Vec`-based linear scan; testing and development |
+| `oxigraph-nova-storage-common` | Backend-agnostic WAL + MANIFEST + dictionary-persistence machinery, reusable by any `QuadStore` that wants crash-safe durability |
+| `oxigraph-nova-storage-ring` | CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + `BTreeMap<u128>` LSM delta + Leapfrog Triejoin; live-write, WAL-backed persistent storage engine with mmap'd ε-serde snapshot loading |
+| `oxigraph-nova-fulltext` | Tantivy-backed full-text index — opt-in via the `fulltext` cargo feature on `oxigraph-nova-storage-ring`; indexed incrementally on the compaction cycle |
+| `oxigraph-nova-reasoning` | OWL 2 RL forward-chaining reasoner — LFTJ-native semi-naive fixpoint driver (`LftjFixpointEngine`), `ReasoningDataset` in-memory overlay decorator, opt-in via `--reasoning` on the server |
+| `oxigraph-nova-server` | SPARQL 1.2 HTTP endpoint (`axum`), SPARQL Query/Update, Graph Store Protocol |
+| `oxigraph-nova-w3c-harness` | W3C SPARQL conformance test runner — fetches and caches real W3C manifests (test-only; not published) |
+| `oxigraph-nova-bench` | Criterion benchmarks comparing Ring+LFTJ vs in-memory and vs. other RDF stores (not published) |
+
+## Storage engine: the Ring
+
+The main algorithmic contribution is `oxigraph-nova-storage-ring`'s compact
+storage engine, which replaces the simple in-memory backend with a succinct
+structure from recent research:
+
+**CompactLTJ** (Arroyuelo, Navarro, Gómez-Brandón et al., "CompactLTJ: Space
+and Time Efficient Leapfrog Triejoin on Graph Databases", VLDB Journal 2025)
+— six explicit height-3 LOUDS tries (one per triple ordering: SPO, POS, OSP,
+OPS, PSO, SOP). Each trie stores one bit per trie edge in a `T` bitvector
+(Rank9 + SelectAdapt for O(1) `select1`) and ⌈log₂ U⌉ bits per label in an
+`L` array (`sux::BitFieldVec`). Navigation is O(1) per step — simultaneously
+the most space-efficient *and* the fastest known design for worst-case
+optimal joins on RDF.
+
+**Leapfrog Triejoin** (Veldhuizen, ICDT 2014) — worst-case optimal join (AGM
+bound). Requires only a `seek`-capable sorted-order iterator. The LOUDS trie
+interface satisfies that contract directly, which is why the two algorithms
+compose naturally.
+
+```rust
+/// A depth-first iterator over one level of an ordered ID trie.
+/// Implemented by both the compact Ring index and the BTreeMap live-write delta.
+pub trait TrieIterator: Send {
+    fn key(&self) -> u64;
+    fn seek(&mut self, target: u64);
+    fn open(&mut self) -> Box<dyn TrieIterator>;
+    fn at_end(&self) -> bool;
+}
+```
+
+**The live-write delta** — a `BTreeMap<u128, bool>` where each key packs a
+complete named-graph quad as a single 128-bit integer:
+
+```
+(graph_id as u128) << 120 | (subject_id as u128) << 80 | (pred_id as u128) << 40 | object_id
+```
+
+8 + 40 + 40 + 40 = 128 bits exactly. Inserts and deletes land here in
+O(log n). When the delta crosses a threshold, the store rebuilds the Ring
+over the merged dataset and atomically swaps it in. Queries during the merge
+read both layers — no read downtime.
+
+**Term dictionary** — all internal computation runs over **40-bit integer
+IDs** (`TermId`), not cloned `Term` objects. The 40-bit ceiling (~1.1
+trillion distinct terms) comfortably exceeds Wikidata at current scale
+(~200M distinct terms). Named graphs get a separate 8-bit `GraphId` (256
+total graphs).
+
+**RDF 1.2 / quoted triples** — a quoted triple (`<< s p o >>`) is assigned
+its own `TermId` from the flat ID space, with a parallel side table mapping
+`TermId → [s_id, p_id, o_id]`. The index and delta are completely
+unaffected — they index flat 40-bit IDs regardless.
 
 ## Extension seams
 

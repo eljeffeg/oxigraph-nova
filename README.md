@@ -41,150 +41,31 @@ Oxigraph Nova does **not** re-implement RDF parsing, SPARQL parsing, result seri
 | [`sux`](https://crates.io/crates/sux) | Sebastiano Vigna | Rank9 + SelectAdapt bitvectors and `BitFieldVec` — the LOUDS trie substrate |
 | [`epserde`](https://crates.io/crates/epserde) | Sebastiano Vigna | ε-copy serialization — mmap'd, near-zero-copy load of the Ring and dictionary snapshots |
 | [`tantivy`](https://crates.io/crates/tantivy) | community | Full-text search engine |
-| [`reasonable`](https://github.com/gtfierro/reasonable) | Gabe Fierro | OWL 2 RL Reasoner (planned — not yet a workspace dependency) |
 
 
 All `rdf-12` / `sparql-12` feature flags are enabled across the parsing stack from day one, giving full RDF-star / quoted-triple support throughout.
 
 ---
 
-## What is new here
-
-### Storage is a trait, not a type
-
-```rust
-// Simplified for illustration — the real trait (crates/nova-core/src/store.rs)
-// also carries a family of default `lftj_*` / `supports_*` methods that let a
-// backend opt into Leapfrog Triejoin acceleration and cardinality estimation;
-// backends that don't implement them (e.g. the in-memory store) simply fall
-// back to the default nested-loop-friendly behavior.
-pub trait QuadStore: Send + Sync {
-    fn insert(&self, quad: &Quad) -> Result<bool, Oxigraph>;
-    fn remove(&self, quad: &Quad) -> Result<bool, Oxigraph>;
-    fn quads_for_pattern(
-        &self,
-        subject:    Option<&Term>,
-        predicate:  Option<&NamedNode>,
-        object:     Option<&Term>,
-        graph_name: Option<&GraphName>,
-    ) -> Result<Box<dyn Iterator<Item = Result<StoredQuad, Oxigraph>> + '_>, Oxigraph>;
-    fn len(&self) -> Result<usize, Oxigraph>;
-    fn contains(&self, quad: &Quad) -> Result<bool, Oxigraph>;
-}
-```
-
-Any backend — in-memory, compact trie + delta, sled, RocksDB — implements this. The query evaluator only ever calls `quads_for_pattern`; it has no knowledge of what is underneath.
-
-### The evaluator is decoupled from storage via a `Dataset` trait
-
-A `StoreDataset` adapter bridges any `QuadStore` into the evaluator. The evaluator only sees the `Dataset` abstraction:
-
-```rust
-// Simplified for illustration — the real trait (crates/nova-query/src/dataset.rs)
-// operates over a richer QuadPattern/GraphSelector pair (so it can express
-// GRAPH ?g, FROM/FROM NAMED, and graph unions precisely) and mirrors
-// QuadStore's optional lftj_*/supports_* capability methods.
-pub trait Dataset: Send + Sync {
-    fn find_quads<'a>(&'a self, pattern: &QuadPattern) -> Result<QuadIter<'a>>;
-    fn contains_quad(&self, s: &Term, p: &Term, o: &Term, g: &GraphName) -> Result<bool>;
-    fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>>;
-}
-```
-
-These two traits are the architectural seam that makes the compact storage engine possible without touching the evaluator.
-
-
-### The Ring index: CompactLTJ LOUDS tries + Leapfrog Triejoin
-
-The main algorithmic contribution is the compact storage engine, which replaces the simple in-memory backend with a succinct structure from recent research:
-
-**CompactLTJ** (Arroyuelo, Navarro, Gómez-Brandón et al., "CompactLTJ: Space and Time Efficient Leapfrog Triejoin on Graph Databases", VLDB Journal 2025) — six explicit height-3 LOUDS tries (one per triple ordering: SPO, POS, OSP, OPS, PSO, SOP). Each trie stores one bit per trie edge in a `T` bitvector (Rank9 + SelectAdapt for O(1) `select1`) and ⌈log₂ U⌉ bits per label in an `L` array (`sux::BitFieldVec`). Navigation is O(1) per step — simultaneously the most space-efficient *and* the fastest known design for worst-case optimal joins on RDF.
-
-**Leapfrog Triejoin** (Veldhuizen, ICDT 2014) — worst-case optimal join (AGM bound). Requires only a `seek`-capable sorted-order iterator. The LOUDS trie interface satisfies that contract directly, which is why the two algorithms compose naturally.
-
-```rust
-/// A depth-first iterator over one level of an ordered ID trie.
-/// Implemented by both the compact Ring index and the BTreeMap live-write delta.
-pub trait TrieIterator: Send {
-    fn key(&self) -> u64;
-    fn seek(&mut self, target: u64);
-    fn open(&mut self) -> Box<dyn TrieIterator>;
-    fn at_end(&self) -> bool;
-}
-```
-
-**The live-write delta** — a `BTreeMap<u128, bool>` where each key packs a complete named-graph quad as a single 128-bit integer:
-
-```
-(graph_id as u128) << 120 | (subject_id as u128) << 80 | (pred_id as u128) << 40 | object_id
-```
-
-8 + 40 + 40 + 40 = 128 bits exactly. Inserts and deletes land here in O(log n). When the delta crosses a threshold, the store rebuilds the Ring over the merged dataset and atomically swaps it in. Queries during the merge read both layers — no read downtime.
-
-**Term dictionary** — all internal computation runs over **40-bit integer IDs** (`TermId`), not cloned `Term` objects. The 40-bit ceiling (~1.1 trillion distinct terms) comfortably exceeds Wikidata at current scale (~200M distinct terms). Named graphs get a separate 8-bit `GraphId` (256 total graphs).
-
-**RDF 1.2 / quoted triples** — a quoted triple (`<< s p o >>`) is assigned its own `TermId` from the flat ID space, with a parallel side table mapping `TermId → [s_id, p_id, o_id]`. The index and delta are completely unaffected — they index flat 40-bit IDs regardless.
-
----
-
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                   oxigraph-nova-server                       │
-│             SPARQL 1.2 HTTP endpoint (axum)                  │
-│             /sparql GET/POST · /update POST                  │
-└───────────────────────────┬──────────────────────────────────┘
-                            │
-┌───────────────────────────▼──────────────────────────────────┐
-│                   oxigraph-nova-query                        │
-│    spargebra (parse) → sparopt (normalize) → evaluator       │
-│    Dataset trait · Leapfrog Triejoin · ExtensionRegistry     │
-└───────────────────────────┬──────────────────────────────────┘
-                            │  QuadStore / Dataset traits
-           ┌────────────────┴────────────────┐
-           │                                 │
-┌──────────▼──────────────┐   ┌──────────────▼──────────────────┐
-│ oxigraph-nova-storage-  │   │  oxigraph-nova-storage-ring     │
-│        memory           │   │  CompactLTJ LOUDS tries         │
-│  Vec + linear scan      │   │  + BTreeMap<u128> LSM delta     │
-│  testing / dev          │   │  + Leapfrog Triejoin            │
-│  (no persistence)       │   │  + WAL/MANIFEST persistence     │
-└─────────────────────────┘   └──────────────┬──────────────────┘
-           │                                 │
-           │                   ┌─────────────▼───────────────────┐
-           │                   │ oxigraph-nova-storage-common    │
-           │                   │ WAL + MANIFEST + mmap'd ε-serde │
-           │                   │ dictionary/snapshot persistence │
-           │                   │ (backend-agnostic, reusable)    │
-           │                   └─────────────┬───────────────────┘
-           └─────────────────┬───────────────┘
-                             │
-┌────────────────────────────▼──────────────────────────────────┐
-│                      oxigraph-nova-core                       │
-│    re-exports oxrdf types · QuadStore / TrieIterator traits   │
-│    Dictionary (TermId / GraphId) · error types                │
-└───────────────────────────────────────────────────────────────┘
-```
+Nova separates the storage engine from the SPARQL evaluator behind two small
+traits, `QuadStore` and `Dataset` — the only seam the query engine depends
+on. The default storage engine (`oxigraph-nova-storage-ring`) implements
+those traits on top of **the Ring**: six succinct CompactLTJ LOUDS tries (one
+per triple ordering) combined with **Leapfrog Triejoin** for worst-case
+optimal joins, plus a `BTreeMap`-backed LSM delta so live writes never block
+reads.
 
-### Crates
-
-| Crate | Purpose |
-|---|---|
-| `oxigraph-nova-core` | RDF types (re-exports `oxrdf`), `QuadStore` trait, `TrieIterator` trait, `Dictionary` (40-bit `TermId`, 8-bit `GraphId`), error types |
-| `oxigraph-nova-query` | SPARQL 1.2 evaluator, `Dataset` trait, Leapfrog Triejoin (`lftj.rs`), `ExtensionRegistry` |
-| `oxigraph-nova-storage-memory` | In-memory backend — `Vec`-based linear scan; testing and development |
-| `oxigraph-nova-storage-common` | Backend-agnostic WAL + MANIFEST + dictionary-persistence machinery, reusable by any `QuadStore` that wants crash-safe durability |
-| `oxigraph-nova-storage-ring` | CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + `BTreeMap<u128>` LSM delta + Leapfrog Triejoin; live-write, WAL-backed persistent storage engine with mmap'd ε-serde snapshot loading |
-| `oxigraph-nova-fulltext` | Tantivy-backed full-text index — opt-in via the `fulltext` cargo feature on `oxigraph-nova-storage-ring`; indexed incrementally on the compaction cycle |
-| `oxigraph-nova-server` | SPARQL 1.2 HTTP endpoint (`axum`), SPARQL Query/Update, Graph Store Protocol |
-| `oxigraph-nova-w3c-harness` | W3C SPARQL conformance test runner — fetches and caches real W3C manifests (test-only; not published) |
-| `oxigraph-nova-bench` | Criterion benchmarks comparing Ring+LFTJ vs in-memory and vs. other RDF stores (not published) |
-
+The full crate layout, the CompactLTJ/Leapfrog-Triejoin design in depth, and
+the extension seams for building on top of Nova (`QuadStore`, `Dataset`,
+`TextSearch`, `ServiceHandler`, custom SPARQL functions, embedding the HTTP
+server) are documented in **[`ARCHITECTURE.md`](./ARCHITECTURE.md)**.
 
 ---
 
 ## Full-text search (opt-in)
+
 
 An optional Tantivy-backed full-text index sits alongside the Ring, gated
 behind a `fulltext` cargo feature on `oxigraph-nova-storage-ring` so the
@@ -234,7 +115,70 @@ See `crates/nova-fulltext/src/lib.rs` for the Tantivy schema and
 `crates/nova-storage-ring/src/fulltext.rs` for the compaction-time indexing
 glue.
 
----
+
+## OWL 2 RL reasoning (opt-in)
+
+`oxigraph-nova-reasoning` adds forward-chaining OWL 2 RL inference as an **opt-in `Dataset` decorator** — zero changes to the evaluator or storage layer. Enable it server-wide with a single flag:
+
+```sh
+cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
+    --file dataset.nt \
+    --file ontology.ttl --graph http://example.org/ontology \
+    --reasoning --bind 0.0.0.0:3030
+```
+
+Every `/sparql` query is then evaluated over an in-memory `ReasoningDataset` overlay instead of the raw store:
+
+```rust
+/// Wraps any Dataset, transparently merging base facts with an in-memory
+/// materialized OWL 2 RL closure. The evaluator only ever sees Dataset — it
+/// never knows reasoning happened.
+pub struct ReasoningDataset<D: Dataset> {
+    inner:    D,
+    inferred: Vec<(Term, Term, Term)>, // in-memory overlay; never written back into the store
+}
+impl<D: Dataset> Dataset for ReasoningDataset<D> { … }
+```
+
+Rule coverage spans `rdfs:subClassOf`/`subPropertyOf` transitivity, `rdf:type`
+propagation, property domain/range/hierarchy propagation, generic
+`owl:TransitiveProperty`/`SymmetricProperty`, `owl:equivalentClass`/
+`equivalentProperty`, and `owl:inverseOf` — cross-checked against
+[`reasonable`](https://github.com/gtfierro/reasonable), an independent OWL 2
+RL reasoner, via differential testing. Not yet covered: `owl:sameAs` and the
+OWL 2 RL consistency-checking rules.
+
+**HTTP surface:**
+
+
+```sh
+# Query with reasoning enabled — sees both asserted and inferred facts
+curl -X POST http://localhost:3030/sparql \
+    -H 'Content-Type: application/sparql-query' \
+    -H 'Accept: application/sparql-results+json' \
+    --data 'ASK { <http://ex/fido> a <http://ex/Animal> }'
+
+# Diagnostics for the current reasoning overlay (404 if --reasoning wasn't passed)
+curl http://localhost:3030/reasoning/diagnostics
+# → {"inferred_len": 3, "diagnostics": []}
+
+# The SPARQL Service Description also reflects reasoning status
+curl http://localhost:3030/
+# → sd:defaultEntailmentRegime is http://www.w3.org/ns/entailment/OWL-RL
+#   (vs. .../Simple when --reasoning is not passed)
+```
+
+**Example:**
+```sparql
+-- 1. Load your OWL ontology into any named graph (or the default graph)
+INSERT DATA { GRAPH <http://example.org/ontology> { <Ex:Dog> rdfs:subClassOf <Ex:Animal> . } }
+
+-- 2. Query against a server started with --reasoning
+SELECT ?animal WHERE { ?animal a <Ex:Animal> }
+-- → returns both explicit Ex:Animal instances and inferred ones (dogs, etc.)
+```
+
+See `crates/nova-reasoning/src/lib.rs`'s module doc comment for the crate's internal architecture (`SortedVecTrie`, `AtomSource`/`CombinedSource`, `fixpoint::closure_over_store`), and `crates/nova-server/tests/reasoning_http.rs` for end-to-end HTTP examples.
 
 ## Design trade-offs vs. QLever
 
@@ -247,7 +191,7 @@ QLever (C++) is a high-performance RDF store optimized for bulk-loaded static da
 | Cyclic joins | Merge-join based | LFTJ: worst-case optimal over Ring `TrieIterator`s |
 | Live writes | SPARQL UPDATE via offline diff/merge | O(log n) per write into `BTreeMap` delta; Ring rebuild with no read downtime |
 | Full-text + SPARQL | Integrated | Tantivy-backed, opt-in (`--fulltext`), incrementally indexed on the compaction cycle |
-| Reasoning | None | OWL 2 RL reasoning via `reasonable` (planned) |
+| Reasoning | None | OWL 2 RL reasoning, opt-in (`--reasoning`), LFTJ-native semi-naive fixpoint engine |
 | Memory footprint | Six sorted compressed arrays | Single compact Ring (tens of bytes/triple at benchmark scale) |
 | Persistence | On-disk from the start | Optional: in-memory by default, or a crash-safe WAL + MANIFEST + mmap'd ε-serde snapshot store (`--location <dir>`) with near-zero-copy load of both the Ring index and the term dictionary |
 
@@ -261,37 +205,6 @@ Nova runs in two modes. The default is a purely in-process, heap-resident store 
 Oxigraph Nova targets full conformance with the W3C SPARQL 1.1 and (Working Draft) SPARQL 1.2 test suites, run against the live, up-to-date W3C test manifests rather than a fixed snapshot — see `tests/w3c/` to run the harness yourself. RDF 1.2 features (quoted triples, `TRIPLE()`, base-direction literals) are supported end-to-end since Nova enables the `rdf-12`/`sparql-12` feature flags across the whole parsing stack from day one.
 
 Because Nova reuses the Oxigraph project's own parsing crates (`spargebra`, `oxrdf`, etc. — see the table above), any gap in those crates shows up here too.
-
----
-
-## Planned: OWL 2 RL reasoning via `reasonable`
-
-The planned reasoning layer adds forward-chaining OWL 2 RL inference as an **opt-in `Dataset` decorator** — zero changes to the evaluator or storage layer:
-
-```rust
-/// Wraps any Dataset, transparently merging base facts with an in-memory
-/// materialized OWL 2 RL closure. The evaluator only ever sees Dataset — it
-/// never knows reasoning happened.
-pub struct ReasoningDataset<D: Dataset> {
-    base:     Arc<D>,
-    inferred: Vec<Quad>, // in-memory overlay; never written back into the store
-}
-impl<D: Dataset> Dataset for ReasoningDataset<D> { … }
-```
-
-**Engine:** a native LFTJ-driven forward-chaining engine (`oxigraph-nova-reasoning`), reusing the same Leapfrog Triejoin machinery the query evaluator uses for joins, plus a pluggable `ReasoningEngine` trait so an adapter over an external reasoner (e.g. [`reasonable`](https://github.com/gtfierro/reasonable)) could be swapped in later. Current rule coverage includes `rdfs:subClassOf`/`subPropertyOf` transitivity, `rdf:type` propagation, property domain/range, generic `owl:TransitiveProperty`/`SymmetricProperty`, `owl:equivalentClass`/`equivalentProperty`, and `owl:inverseOf` — see `crates/nova-reasoning/src/engine.rs` for the authoritative, up-to-date list.
-
-**Materialization policy:** the default path computes the OWL 2 RL closure **in memory** and never persists it — there is no reserved `GraphId` for ontology input or inferred output; any named graph works identically as far as reasoning is concerned, since the whole dataset (default graph plus every named graph) is reasoned over as one merged scope. A future, opt-in materializing engine could instead write its output into an ordinary named graph chosen by the deployment, recomputed on the same cycle that rebuilds the Ring — but that is not the shipped default. The reasoner is **never on the per-write hot path** — write throughput is unaffected.
-
-**Workflow:**
-```sparql
--- 1. Load your OWL ontology into any named graph (or the default graph)
-INSERT DATA { GRAPH <http://example.org/ontology> { <Ex:Dog> rdfs:subClassOf <Ex:Animal> . } }
-
--- 2. Query with reasoning enabled (server flag or ?reasoning=true)
-SELECT ?animal WHERE { ?animal a <Ex:Animal> }
--- → returns both explicit Ex:Animal instances and inferred ones (dogs, etc.)
-```
 
 
 ---
@@ -497,8 +410,6 @@ of (or in addition to) a persistent volume.
 
 ## Design papers
 
-
-
 The compact storage and join algorithms are described in published research. Listed in reading order:
 
 1. **CompactLTJ** — "[CompactLTJ: Space and Time Efficient Leapfrog Triejoin on Graph Databases](https://dl.acm.org/doi/10.1145/3661304.3661898)" (VLDB Journal 2025), Arroyuelo, Navarro, Gómez-Brandón et al. The compact trie storage engine implemented here.
@@ -511,11 +422,6 @@ Context / prior art (read, not implemented):
 5. **Tentris / Hypertrie** — "[Tentris — A Tensor-Based Triple Store](https://dl.acm.org/doi/10.1007/978-3-030-62419-4_4)" (ISWC 2020). Prior WCOJ state of the art; higher memory, C++ only.
 6. **HoneyComb** — "[HoneyComb: A Parallel Worst-Case Optimal Join](https://dl.acm.org/doi/10.1145/3725307)" (ACM PODS 2025). Future parallelism strategy if LFTJ becomes CPU-bound at Wikidata scale.
 
----
-
-## License
-
-MIT
 
 ## Oxigraph Sponsors
 
@@ -528,3 +434,8 @@ MIT
 * [Albin Larsson](https://byabbe.se/) who is building [GovDirectory](https://www.govdirectory.org/), a directory of public agencies based on Wikidata.
 
 And [others](https://github.com/sponsors/Tpt). Many thanks to them!
+
+## License
+
+MIT
+
