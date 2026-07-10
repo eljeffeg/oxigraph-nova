@@ -118,7 +118,12 @@ glue.
 
 ## OWL 2 RL reasoning (opt-in)
 
-`oxigraph-nova-reasoning` adds forward-chaining OWL 2 RL inference as an **opt-in `Dataset` decorator** — zero changes to the evaluator or storage layer. Enable it server-wide with a single flag:
+`oxigraph-nova-reasoning` adds OWL 2 RL inference — computed bottom-up to a
+fixpoint via a semi-naive Datalog-style evaluation (a specific, efficient
+strategy for the general forward-chaining approach: apply rules to known
+facts to derive new ones, repeat until nothing changes) — as an **opt-in
+`Dataset` decorator** — zero changes to the evaluator or storage layer.
+Enable it server-wide with a single flag:
 
 ```sh
 cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
@@ -127,18 +132,10 @@ cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
     --reasoning --bind 0.0.0.0:3030
 ```
 
-Every `/sparql` query is then evaluated over an in-memory `ReasoningDataset` overlay instead of the raw store:
-
-```rust
-/// Wraps any Dataset, transparently merging base facts with an in-memory
-/// materialized OWL 2 RL closure. The evaluator only ever sees Dataset — it
-/// never knows reasoning happened.
-pub struct ReasoningDataset<D: Dataset> {
-    inner:    D,
-    inferred: Vec<(Term, Term, Term)>, // in-memory overlay; never written back into the store
-}
-impl<D: Dataset> Dataset for ReasoningDataset<D> { … }
-```
+Every `/sparql` query is then evaluated over an in-memory `ReasoningDataset`
+overlay instead of the raw store — see
+**[`ARCHITECTURE.md`](./ARCHITECTURE.md#3-dataset--datasetlftjsource--the-evaluators-storage-seam)**
+for how this decorator is built on the `Dataset` trait.
 
 Rule coverage spans `rdfs:subClassOf`/`subPropertyOf` transitivity, `rdf:type`
 propagation, property domain/range/hierarchy propagation, generic
@@ -149,7 +146,6 @@ RL reasoner, via differential testing. Not yet covered: `owl:sameAs` and the
 OWL 2 RL consistency-checking rules.
 
 **HTTP surface:**
-
 
 ```sh
 # Query with reasoning enabled — sees both asserted and inferred facts

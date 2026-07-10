@@ -270,6 +270,35 @@ writing a full storage backend — see `InMemoryDataset` for a from-scratch
 example, or `StoreDataset<S>` for the "adapt an existing `QuadStore`"
 pattern.
 
+`oxigraph-nova-reasoning`'s `ReasoningDataset<D>` (opt-in OWL 2 RL support,
+see the README's "OWL 2 RL reasoning" section) is a third pattern built on
+this same seam — a **decorator** that wraps an existing `Dataset` rather than
+adapting a `QuadStore` or implementing one from scratch:
+
+```rust
+/// Wraps any Dataset, transparently merging base facts with an in-memory
+/// materialized OWL 2 RL closure. The evaluator only ever sees Dataset — it
+/// never knows reasoning happened.
+pub struct ReasoningDataset<D: Dataset> {
+    inner: D,
+    inferred: Vec<(Term, Term, Term)>, // in-memory overlay; never written back into the store
+    diagnostics: Vec<Diagnostic>,
+}
+impl<D: Dataset> Dataset for ReasoningDataset<D> { … }
+```
+
+`find_quads` over `GraphSelector::Default`/`Union` transparently unions the
+wrapped dataset's matches with the inferred overlay; `GraphSelector::Named`
+queries are untouched, since nothing is ever persisted into a named graph.
+LFTJ acceleration is intentionally disabled on the wrapped view
+(`supports_lftj() == false`), so the evaluator always falls back to its
+nested-loop path against `find_quads` — which is what correctly unions the
+overlay in. The overlay itself is computed by a pluggable `ReasoningEngine`
+trait; the default `LftjFixpointEngine` computes it via a **semi-naive
+Datalog-style fixpoint** (see "Storage engine: the Ring" above — same
+`TrieIterator`/Leapfrog Triejoin machinery the query evaluator uses for
+joins, reused rather than duplicated by a from-scratch triple-scan reasoner).
+
 ### 4. `TextSearch` — full-text search backend seam
 
 Defined in `nova-core/src/text_search.rs`. Backs the `text:query`/
