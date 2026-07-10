@@ -16,6 +16,12 @@ fulltext = ["oxigraph-nova-storage-ring/fulltext"]
 # `SERVICE` clause handler (`oxigraph_nova_query::HttpServiceHandler`) —
 # see `Server::new`'s doc comment.
 http-client = ["oxigraph-nova-query/http-client"]
+# Opt-in GeoSPARQL extension functions (geof:distance, sf:intersects, etc.),
+# forwarded straight through to `oxigraph-nova-query`'s own `geosparql`
+# feature. Advertised in the SPARQL Service Description document.
+geosparql = ["oxigraph-nova-query/geosparql", "dep:spargeo"]
+
+
 
 
 [dependencies]
@@ -39,6 +45,11 @@ tracing        = { workspace = true }
 tracing-subscriber = { workspace = true }
 mimalloc         = { version = "0.1.52", features = ["extended"] }
 libmimalloc-sys  = { version = "0.1.49", features = ["extended"] }
+# Opt-in via the `geosparql` feature: only needed to enumerate
+# `GEOSPARQL_EXTENSION_FUNCTIONS`'s IRIs for the SPARQL Service Description
+# (`sd:extensionFunction` triples) — see `service_description.rs`.
+spargeo          = { workspace = true, optional = true }
+
 
 
 

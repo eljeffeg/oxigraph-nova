@@ -1715,6 +1715,9 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                     // didn't apply) — it re-runs the search per row and
                     // checks whether `arg(0)`'s TermId is among the hits.
                     self.eval_text_scalar(arg(0).as_ref(), str_val(1).as_deref(), mode)
+                } else if let Some(term_fn) = geosparql_function_local(nn) {
+                    let call_args: Vec<Term> = ev.iter().cloned().collect::<Option<Vec<_>>>()?;
+                    term_fn(&call_args)
                 } else {
                     eval_xsd_cast(nn.as_str(), arg(0).as_ref())
                 }
@@ -3336,6 +3339,36 @@ fn jd_to_ymd(jd: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
+// ── GeoSPARQL extension functions (`geof:distance`, `sf:intersects`, …) ───────
+//
+// Opt-in via the `geosparql` cargo feature, which pulls in `spargeo` — a
+// partial GeoSPARQL 1.1 implementation exposing 43 `geof:`/`sf:`/`eh:`/
+// `rcc8:` functions (distance/area/length/centroid/convexHull/envelope, the
+// Simple Features / Egenhofer / RCC8 topological relation families, and
+// WKT/GeoJSON literal conversion) as plain `fn(&[Term]) -> Option<Term>`
+// pairs keyed by function IRI. Parsed by `spargebra` the same way as the
+// full-text extension functions above: `Function::Custom(NamedNode)`.
+// Dispatched only from `eval_fn`'s `Function::Custom` arm — GeoSPARQL
+// functions are pure (no pushdown/index-assisted evaluation is attempted).
+#[cfg(feature = "geosparql")]
+fn geosparql_function_local(nn: &NamedNode) -> Option<fn(&[Term]) -> Option<Term>> {
+    use std::sync::LazyLock;
+    static TABLE: LazyLock<HashMap<NamedNode, fn(&[Term]) -> Option<Term>>> = LazyLock::new(|| {
+        spargeo::GEOSPARQL_EXTENSION_FUNCTIONS
+            .iter()
+            .map(|(name, f)| (name.into_owned(), *f))
+            .collect()
+    });
+    TABLE.get(nn).copied()
+}
+
+/// No-op stand-in used when the `geosparql` cargo feature is disabled, so
+/// the `eval_fn` call site above needs no `#[cfg(...)]` of its own.
+#[cfg(not(feature = "geosparql"))]
+fn geosparql_function_local(_nn: &NamedNode) -> Option<fn(&[Term]) -> Option<Term>> {
+    None
+}
+
 // ── XSD cast functions ────────────────────────────────────────────────────────
 
 /// Dispatch XSD cast function calls (`xsd:integer(?x)`, `xsd:boolean(?x)`, …).
@@ -4193,6 +4226,195 @@ mod tests {
                 .parse_query("SELECT ?x WHERE { SERVICE ?svc { ?s ?p ?x } }")
                 .unwrap();
             assert!(ev.evaluate(&q).is_err());
+        }
+    }
+
+    // ── GeoSPARQL (geof:distance, sf:intersects, geof:area, …) ──────────
+
+    #[cfg(feature = "geosparql")]
+    mod geosparql_dispatch {
+        use super::*;
+
+        const GEO: &str = "http://www.opengis.net/ont/geosparql#";
+        const GEOF: &str = "http://www.opengis.net/def/function/geosparql/";
+        const UOM: &str = "http://www.opengis.net/def/uom/OGC/1.0/";
+
+        fn wkt(s: &str) -> Term {
+            Term::Literal(Literal::new_typed_literal(
+                s,
+                NamedNode::new_unchecked(&format!("{GEO}wktLiteral")),
+            ))
+        }
+
+        fn make_geo_dataset() -> InMemoryDataset {
+            let mut d = InMemoryDataset::new();
+            d.add_default(
+                iri("http://ex/origin"),
+                iri("http://ex/geom"),
+                wkt("POINT(0 0)"),
+            );
+            d.add_default(
+                iri("http://ex/one_degree_north"),
+                iri("http://ex/geom"),
+                wkt("POINT(0 1)"),
+            );
+            d
+        }
+
+        fn as_f64(t: &Term) -> f64 {
+            let Term::Literal(l) = t else {
+                panic!("expected a literal, got {t:?}")
+            };
+            l.value().parse().unwrap()
+        }
+
+        fn as_bool(t: &Term) -> bool {
+            let Term::Literal(l) = t else {
+                panic!("expected a literal, got {t:?}")
+            };
+            l.value() == "true"
+        }
+
+        #[test]
+        fn distance_between_bound_points_dispatches_through_bgp() {
+            let d = make_geo_dataset();
+            let ev = Evaluator::new(&d);
+            let q = SparqlParser::new()
+                .parse_query(&format!(
+                    r#"PREFIX geof: <{GEOF}>
+                       PREFIX uom: <{UOM}>
+                       SELECT ?d WHERE {{
+                           <http://ex/origin> <http://ex/geom> ?ga .
+                           <http://ex/one_degree_north> <http://ex/geom> ?gb .
+                           BIND(geof:distance(?ga, ?gb, uom:metre) AS ?d)
+                       }}"#
+                ))
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert_eq!(sols.len(), 1);
+            let d = as_f64(sols[0].get(&Variable::new_unchecked("d")).unwrap());
+            // ~111.2 km per degree of latitude via Haversine.
+            assert!((109_000.0..113_000.0).contains(&d), "got {d}");
+        }
+
+        #[test]
+        fn distance_between_identical_points_is_zero() {
+            let d = InMemoryDataset::new();
+            let ev = Evaluator::new(&d);
+            let q = SparqlParser::new()
+                .parse_query(&format!(
+                    r#"PREFIX geof: <{GEOF}>
+                       PREFIX geo: <{GEO}>
+                       PREFIX uom: <{UOM}>
+                       SELECT ?d WHERE {{
+                           BIND(geof:distance("POINT(3 4)"^^geo:wktLiteral, "POINT(3 4)"^^geo:wktLiteral, uom:metre) AS ?d)
+                       }}"#
+                ))
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert_eq!(sols.len(), 1);
+            let d = as_f64(sols[0].get(&Variable::new_unchecked("d")).unwrap());
+            assert_eq!(d, 0.0);
+        }
+
+        #[test]
+        fn sf_intersects_true_for_overlapping_polygons() {
+            let d = InMemoryDataset::new();
+            let ev = Evaluator::new(&d);
+            let q = SparqlParser::new()
+                .parse_query(&format!(
+                    r#"PREFIX geof: <{GEOF}>
+                       PREFIX geo: <{GEO}>
+                       SELECT ?b WHERE {{
+                           BIND(geof:sfIntersects(
+                               "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))"^^geo:wktLiteral,
+                               "POLYGON((2 2, 6 2, 6 6, 2 6, 2 2))"^^geo:wktLiteral
+                           ) AS ?b)
+                       }}"#
+                ))
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert_eq!(sols.len(), 1);
+            assert!(as_bool(sols[0].get(&Variable::new_unchecked("b")).unwrap()));
+        }
+
+        #[test]
+        fn sf_intersects_false_for_disjoint_polygons() {
+            let d = InMemoryDataset::new();
+            let ev = Evaluator::new(&d);
+            let q = SparqlParser::new()
+                .parse_query(&format!(
+                    r#"PREFIX geof: <{GEOF}>
+                       PREFIX geo: <{GEO}>
+                       SELECT ?b WHERE {{
+                           BIND(geof:sfIntersects(
+                               "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))"^^geo:wktLiteral,
+                               "POLYGON((100 100, 101 100, 101 101, 100 101, 100 100))"^^geo:wktLiteral
+                           ) AS ?b)
+                       }}"#
+                ))
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert_eq!(sols.len(), 1);
+            assert!(!as_bool(
+                sols[0].get(&Variable::new_unchecked("b")).unwrap()
+            ));
+        }
+
+        #[test]
+        fn area_of_a_polygon_is_positive() {
+            let d = InMemoryDataset::new();
+            let ev = Evaluator::new(&d);
+            let q = SparqlParser::new()
+                .parse_query(&format!(
+                    r#"PREFIX geof: <{GEOF}>
+                       PREFIX geo: <{GEO}>
+                       PREFIX uom: <{UOM}>
+                       SELECT ?a WHERE {{
+                           BIND(geof:area(
+                               "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))"^^geo:wktLiteral,
+                               uom:square_metre
+                           ) AS ?a)
+                       }}"#
+                ))
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert_eq!(sols.len(), 1);
+            let a = as_f64(sols[0].get(&Variable::new_unchecked("a")).unwrap());
+            assert!(a > 0.0, "got {a}");
+        }
+
+        #[test]
+        fn unrecognized_geosparql_function_iri_yields_unbound() {
+            // Not one of the 43 registered GeoSPARQL function IRIs: falls
+            // through to `eval_xsd_cast`, which also doesn't recognize this
+            // IRI (wrong namespace) and returns `None` -- BIND leaves the
+            // variable unbound rather than erroring.
+            let d = InMemoryDataset::new();
+            let ev = Evaluator::new(&d);
+            let q = SparqlParser::new()
+                .parse_query(&format!(
+                    r#"PREFIX geof: <{GEOF}>
+                       SELECT ?x WHERE {{
+                           BIND(geof:notAFunction("x") AS ?x)
+                       }}"#
+                ))
+                .unwrap();
+            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+                panic!()
+            };
+            assert_eq!(sols.len(), 1);
+            assert!(sols[0].get(&Variable::new_unchecked("x")).is_none());
         }
     }
 }

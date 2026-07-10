@@ -14,6 +14,10 @@ fulltext = ["oxigraph-nova-server/fulltext", "oxigraph-nova-storage-ring/fulltex
 # `http-client` feature: unblocks SPARQL 1.1 Update's `LOAD <iri>` and gives
 # the server a default, real HTTP-backed `SERVICE` clause handler.
 http-client = ["oxigraph-nova-server/http-client"]
+# Opt-in GeoSPARQL extension functions, forwarded through to nova-server's
+# own `geosparql` feature.
+geosparql = ["oxigraph-nova-server/geosparql"]
+
 
 
 [dependencies]

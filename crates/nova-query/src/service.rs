@@ -121,7 +121,6 @@ impl std::fmt::Debug for HttpServiceHandler {
     }
 }
 
-
 #[cfg(feature = "http-client")]
 impl Default for HttpServiceHandler {
     fn default() -> Self {
@@ -178,10 +177,7 @@ mod http_client {
         let base_iri = base_iri
             .map(|iri| {
                 oxiri::Iri::parse(iri.to_owned()).map_err(|e| {
-                    anyhow!(
-                        "SERVICE <{}>: invalid base IRI: {e}",
-                        service_name.as_str()
-                    )
+                    anyhow!("SERVICE <{}>: invalid base IRI: {e}", service_name.as_str())
                 })
             })
             .transpose()?;
@@ -201,18 +197,10 @@ mod http_client {
                 "application/sparql-query",
             )
             .body(query_text)
-            .map_err(|e| {
-                anyhow!(
-                    "SERVICE <{}>: invalid request: {e}",
-                    service_name.as_str()
-                )
-            })?;
-        let response = client.request(request).map_err(|e| {
-            anyhow!(
-                "SERVICE <{}>: request failed: {e}",
-                service_name.as_str()
-            )
-        })?;
+            .map_err(|e| anyhow!("SERVICE <{}>: invalid request: {e}", service_name.as_str()))?;
+        let response = client
+            .request(request)
+            .map_err(|e| anyhow!("SERVICE <{}>: request failed: {e}", service_name.as_str()))?;
         if !response.status().is_success() {
             return Err(anyhow!(
                 "SERVICE <{}>: server returned HTTP {}",

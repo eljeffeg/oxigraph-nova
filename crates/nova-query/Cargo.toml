@@ -29,10 +29,17 @@ oxhttp        = { workspace = true, optional = true }
 oxrdfio       = { workspace = true, optional = true }
 sparesults    = { workspace = true, optional = true }
 
+# Opt-in via the `geosparql` feature: GeoSPARQL 1.1 extension functions
+# (geof:distance, sf:intersects, etc.) — see `crate::evaluator`'s
+# `geosparql_function_local`.
+spargeo       = { workspace = true, optional = true }
+
 [features]
 default = ["sparopt"]
 sparopt = ["dep:sparopt"]
 http-client = ["dep:oxhttp", "dep:oxrdfio", "dep:sparesults"]
+geosparql = ["dep:spargeo"]
+
 
 [dev-dependencies]
 oxigraph-nova-storage-memory = { path = "../nova-storage-memory" }

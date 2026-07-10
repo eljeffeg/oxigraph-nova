@@ -181,7 +181,56 @@ SELECT ?animal WHERE { ?animal a <Ex:Animal> }
 
 See `crates/nova-reasoning/src/lib.rs`'s module doc comment for the crate's internal architecture (`SortedVecTrie`, `AtomSource`/`CombinedSource`, `fixpoint::closure_over_store`), and `crates/nova-server/tests/reasoning_http.rs` for end-to-end HTTP examples.
 
+## GeoSPARQL support (opt-in)
+
+[`spargeo`](https://crates.io/crates/spargeo) — the GeoSPARQL function
+library from Oxigraph's own crate ecosystem — is wired in behind an opt-in
+`geosparql` cargo feature on `oxigraph-nova-query` (forwarded through
+`oxigraph-nova-server` and the `oxigraph` CLI's own `geosparql` features),
+so the dependency is zero-cost until explicitly enabled. Unlike `--fulltext`
+or `--reasoning`, there is no runtime flag to pass — GeoSPARQL functions are
+pure and stateless, so enabling the cargo feature at build time is the only
+step required:
+
+```sh
+# Server binary built with GeoSPARQL support:
+cargo run -p oxigraph-nova-server --release --features geosparql --bin nova_serve -- \
+    --file dataset.nt --bind 0.0.0.0:3030
+
+# Or via the `oxigraph` CLI's `serve` subcommand:
+cargo run --release --bin oxigraph --features geosparql -- \
+    serve --file dataset.nt --bind 0.0.0.0:3030
+```
+
+Once enabled, all 43 GeoSPARQL extension functions become available under
+their standard function-IRI namespace, and WKT literals are typed with the
+standard `geo:wktLiteral` datatype:
+
+```sparql
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+SELECT ?a ?b (geof:distance(?a, ?b, <http://www.opengis.net/def/uom/OGC/1.0/metre>) AS ?d) WHERE {
+    ?a a <http://example.org/Point> ; <http://example.org/wkt> ?wktA .
+    ?b a <http://example.org/Point> ; <http://example.org/wkt> ?wktB .
+    FILTER(geof:sfIntersects(?wktA, ?wktB))
+}
+```
+
+Distance/area functions (`geof:distance`, `geof:area`, ...), geometry
+construction and conversion (`geof:convexHull`, `geof:envelope`, WKT↔GeoJSON),
+and the Simple Features / Egenhofer / RCC8 topological relation families
+(`sf:intersects`, `eh:contains`, `rcc8:dc`, etc.) are all dispatched the same
+way as any other SPARQL extension function — no spatial index accelerates
+the candidate set beforehand, so filtering happens after the enclosing basic
+graph pattern has otherwise been evaluated.
+
+See `crates/nova-query/src/evaluator.rs`'s `geosparql_function_local` for the
+function-dispatch table, and `crates/nova-server/src/service_description.rs`
+for how enabled functions are advertised via `sd:extensionFunction` in the
+SPARQL Service Description.
+
 ## Design trade-offs vs. QLever
+
 
 QLever (C++) is a high-performance RDF store optimized for bulk-loaded static datasets. It uses six sorted compressed integer arrays and merge joins — an excellent approach for read-heavy analytical workloads over large, stable graphs. The table below shows how the two stores differ across a few dimensions; each row reflects a deliberate design choice, not a deficiency in either system.
 

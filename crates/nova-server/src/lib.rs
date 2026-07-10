@@ -234,7 +234,6 @@ fn default_service_handler() -> Option<Arc<dyn ServiceHandler>> {
 
 // ── Application state ─────────────────────────────────────────────────────────
 
-
 /// Shared server state.  Holds only an `Arc` to the backing store so axum can
 /// cheaply clone it for every request without requiring `S: Clone`.
 pub struct AppState<S: QuadStore + 'static> {
@@ -342,7 +341,6 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             reasoning: None,
         }
     }
-
 
     /// Enforce a wall-clock timeout on `/sparql` query evaluation. Queries
     /// running longer than `timeout` are cancelled cooperatively (via
@@ -610,7 +608,9 @@ async fn service_description_get<S: QuadStore + 'static>(
         &endpoint_url,
         state.text_search.is_some(),
         state.reasoning.is_some(),
+        service_description::GEOSPARQL_COMPILED_IN,
     );
+
     serialize_triples(&graph, accept_header(&headers))
 }
 

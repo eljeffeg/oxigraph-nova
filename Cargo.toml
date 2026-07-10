@@ -94,6 +94,16 @@ rand = "0.9"   # SPARQL RAND() built-in
 # depends on tantivy.
 tantivy = "0.26"
 
+# ── GeoSPARQL functions ─────────────────────────────────────────────────────
+# Opt-in via nova-query's `geosparql` cargo feature. Pins the exact oxrdf
+# version (=0.3.3) this workspace already uses, so no vendoring is needed.
+# Exposes `GEOSPARQL_EXTENSION_FUNCTIONS`, a const array of 43
+# `(NamedNodeRef, fn(&[Term]) -> Option<Term>)` pairs covering distance/area/
+# length/centroid/convexHull/envelope, the sf:/eh:/rcc8: topological relation
+# families, and WKT/GeoJSON literal conversion.
+spargeo = "0.5.5"
+
+
 # ── Testing utilities ───────────────────────────────────────────────────────
 pretty_assertions = "1.4"
 

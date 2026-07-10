@@ -155,6 +155,13 @@ const RDF_FORMAT_IRIS: [&str; 6] = [
 /// `nova-query`'s public API).
 const TEXT_FN_NS: &str = "http://oxigraph-nova.dev/fn/text#";
 
+/// True when the binary was built with the `geosparql` cargo feature — used
+/// as the default `geosparql_enabled` value at `generate_service_description_graph`'s
+/// only call site. GeoSPARQL functions are pure/stateless and always
+/// registered whenever the feature is compiled in (no `--geosparql` runtime
+/// flag exists), so this is a compile-time constant rather than server state.
+pub const GEOSPARQL_COMPILED_IN: bool = cfg!(feature = "geosparql");
+
 /// Build the `sd:Service` description graph for this endpoint.
 ///
 /// `endpoint_url` is an absolute IRI naming the primary query endpoint
@@ -169,10 +176,17 @@ const TEXT_FN_NS: &str = "http://oxigraph-nova.dev/fn/text#";
 /// `http://www.w3.org/ns/entailment/OWL-RL` instead of `.../Simple` — set
 /// from whether the server was constructed with `Server::with_reasoning`
 /// (i.e. `--reasoning` was passed).
+///
+/// `geosparql_enabled`: when `true`, advertises all 43 GeoSPARQL functions
+/// (`geof:distance`, `sf:intersects`, etc.) as `sd:extensionFunction`s — set
+/// from [`GEOSPARQL_COMPILED_IN`] (a compile-time constant; unlike
+/// `fulltext`/`reasoning`, GeoSPARQL functions are pure and need no runtime
+/// `--geosparql` flag or server-side state).
 pub fn generate_service_description_graph(
     endpoint_url: &str,
     fulltext_enabled: bool,
     reasoning_enabled: bool,
+    geosparql_enabled: bool,
 ) -> Vec<Triple> {
     let root = NamedOrBlankNode::BlankNode(BlankNode::default());
     let mut graph = Vec::new();
@@ -277,6 +291,19 @@ pub fn generate_service_description_graph(
             ));
         }
     }
+
+    #[cfg(feature = "geosparql")]
+    if geosparql_enabled {
+        for (name, _) in spargeo::GEOSPARQL_EXTENSION_FUNCTIONS {
+            graph.push(Triple::new(
+                root.clone(),
+                sd::extension_function(),
+                name.into_owned(),
+            ));
+        }
+    }
+    #[cfg(not(feature = "geosparql"))]
+    let _ = geosparql_enabled;
 
     graph
 }
