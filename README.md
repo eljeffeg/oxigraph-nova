@@ -140,10 +140,15 @@ for how this decorator is built on the `Dataset` trait.
 Rule coverage spans `rdfs:subClassOf`/`subPropertyOf` transitivity, `rdf:type`
 propagation, property domain/range/hierarchy propagation, generic
 `owl:TransitiveProperty`/`SymmetricProperty`, `owl:equivalentClass`/
-`equivalentProperty`, and `owl:inverseOf` — cross-checked against
+`equivalentProperty`, `owl:inverseOf`, and `owl:sameAs` — cross-checked against
 [`reasonable`](https://github.com/gtfierro/reasonable), an independent OWL 2
-RL reasoner, via differential testing. Not yet covered: `owl:sameAs` and the
-OWL 2 RL consistency-checking rules.
+RL reasoner, via differential testing. OWL 2 RL consistency-checking is also
+covered: disjoint-class, asymmetric-property, irreflexive-property, and
+`owl:sameAs`/`owl:differentFrom` clashes are reported as violations via the
+diagnostics endpoint below. Not yet covered: general XSD datatype-value-space
+clash detection (e.g. two differently-formatted literals that are provably
+equal or provably distinct typed values).
+
 
 **HTTP surface:**
 

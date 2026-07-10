@@ -51,6 +51,11 @@ axum         = { version = "0.8",   features = ["json"] }
 tower        = "0.5"
 tower-http   = { version = "0.7",   features = ["cors", "trace"] }
 
+# Outbound HTTP client used by SPARQL 1.1 Update LOAD and the SERVICE clause
+# (crates/nova-query, gated behind its opt-in `http-client` feature).
+# rustls-ring-native avoids a system OpenSSL dependency for portability.
+oxhttp = { version = "0.3", features = ["rustls-ring-native"] }
+
 
 # ── Serialization ───────────────────────────────────────────────────────────
 serde      = { version = "1", features = ["derive"] }

@@ -22,12 +22,20 @@ regex         = { workspace = true }   # SPARQL REGEX() / REPLACE() built-ins
 uuid          = { workspace = true }   # SPARQL UUID() / STRUUID() built-ins
 rand          = { workspace = true }   # SPARQL RAND() built-in
 
+# Opt-in via the `http-client` feature: fetch client for LOAD and the
+# built-in SERVICE handler. oxrdfio parses LOAD's fetched RDF; sparesults
+# parses SERVICE's SPARQL-results response.
+oxhttp        = { workspace = true, optional = true }
+oxrdfio       = { workspace = true, optional = true }
+sparesults    = { workspace = true, optional = true }
+
 [features]
 default = ["sparopt"]
 sparopt = ["dep:sparopt"]
+http-client = ["dep:oxhttp", "dep:oxrdfio", "dep:sparesults"]
 
 [dev-dependencies]
 oxigraph-nova-storage-memory = { path = "../nova-storage-memory" }
 oxigraph-nova-storage-ring = { path = "../nova-storage-ring", features = ["fulltext"] }
 pretty_assertions = { workspace = true }
-
+oxhttp = { workspace = true }

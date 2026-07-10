@@ -10,6 +10,11 @@ repository.workspace = true
 # Opt-in Tantivy full-text search, forwarded through to nova-server/
 # nova-storage-ring's own `fulltext` feature.
 fulltext = ["oxigraph-nova-server/fulltext", "oxigraph-nova-storage-ring/fulltext"]
+# Opt-in outbound HTTP client, forwarded through to nova-server's own
+# `http-client` feature: unblocks SPARQL 1.1 Update's `LOAD <iri>` and gives
+# the server a default, real HTTP-backed `SERVICE` clause handler.
+http-client = ["oxigraph-nova-server/http-client"]
+
 
 [dependencies]
 oxigraph-nova-core         = { path = "../nova-core" }

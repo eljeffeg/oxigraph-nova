@@ -218,7 +218,22 @@ static QUERY_TIMEOUTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static QUERY_RESULT_LIMIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static QUERY_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Default [`ServiceHandler`] for a freshly-constructed [`Server`]: with the
+/// `http-client` feature enabled, a real HTTP-backed
+/// `oxigraph_nova_query::HttpServiceHandler`; without it, `None` (`SERVICE`
+/// clauses are unsupported until [`Server::with_service_handler`] is called).
+#[cfg(feature = "http-client")]
+fn default_service_handler() -> Option<Arc<dyn ServiceHandler>> {
+    Some(Arc::new(oxigraph_nova_query::HttpServiceHandler::new()))
+}
+
+#[cfg(not(feature = "http-client"))]
+fn default_service_handler() -> Option<Arc<dyn ServiceHandler>> {
+    None
+}
+
 // ── Application state ─────────────────────────────────────────────────────────
+
 
 /// Shared server state.  Holds only an `Arc` to the backing store so axum can
 /// cheaply clone it for every request without requiring `S: Clone`.
@@ -307,6 +322,15 @@ pub struct Server<S: QuadStore + 'static> {
 }
 
 impl<S: QuadStore + Send + Sync + 'static> Server<S> {
+    /// Construct a new server around `store`.
+    ///
+    /// When this crate is built with the `http-client` feature, `SERVICE`
+    /// clauses are supported out of the box: `service_handler` defaults to
+    /// an `oxigraph_nova_query::HttpServiceHandler`, a real HTTP-backed
+    /// implementation that issues SPARQL 1.1 Protocol requests to the
+    /// service's IRI (see its docs). Without that feature (the default),
+    /// `service_handler` starts `None` and `SERVICE` is unsupported — call
+    /// [`Self::with_service_handler`] to override either way.
     pub fn new(store: Arc<S>) -> Self {
         Self {
             store,
@@ -314,10 +338,11 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             max_results: None,
             max_parallel_queries: None,
             text_search: None,
-            service_handler: None,
+            service_handler: default_service_handler(),
             reasoning: None,
         }
     }
+
 
     /// Enforce a wall-clock timeout on `/sparql` query evaluation. Queries
     /// running longer than `timeout` are cancelled cooperatively (via
@@ -607,7 +632,7 @@ async fn service_description_get<S: QuadStore + 'static>(
 ///   ]
 /// }
 /// ```
-
+///
 /// **Blocking.** Building/rebuilding the overlay runs on a
 /// `spawn_blocking` thread, matching `execute_sparql_query`'s handling of
 /// the same call (see `ReasoningState::current`'s doc comment).

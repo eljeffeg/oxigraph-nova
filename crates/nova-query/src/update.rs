@@ -38,11 +38,14 @@
 //!
 //! # LOAD
 //!
-//! `LOAD <iri>` requires fetching remote RDF data over HTTP; `nova-server`
-//! has no HTTP client dependency wired up (out of scope for the primary
-//! BSBM-compatibility motivation, which only exercises `INSERT DATA` /
-//! `DELETE WHERE`). Non-`SILENT` `LOAD` therefore returns an error;
-//! `LOAD SILENT` succeeds as a no-op. Bulk data loading is available instead
+//! `LOAD <iri> [INTO GRAPH <g>]` fetches the remote IRI over HTTP (content
+//! negotiation via an `Accept` header listing every RDF format `oxrdfio`
+//! understands), resolves the response's `Content-Type` to an
+//! [`oxrdfio::RdfFormat`] (falling back to the IRI's own extension, then to
+//! Turtle), parses it into quads tagged with the destination graph, and
+//! inserts them. This requires this crate's opt-in `http-client` feature
+//! (see [`do_load`]); without it, `LOAD` always errors (`LOAD SILENT` still
+//! succeeds as a no-op either way). Bulk data loading is also available
 //! through the SPARQL 1.1 Graph Store HTTP Protocol (`PUT`/`POST /store`).
 
 use crate::dataset::StoreDataset;
@@ -92,19 +95,8 @@ fn execute_operation<S: QuadStore + 'static>(
         GraphUpdateOperation::Load {
             silent,
             source,
-            destination: _,
-        } => {
-            if *silent {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "LOAD <{}> is not supported by this server (no HTTP fetch client is wired \
-                     up); use the Graph Store HTTP Protocol (PUT/POST /store) to upload data \
-                     instead, or use LOAD SILENT to ignore this error",
-                    source.as_str()
-                ))
-            }
-        }
+            destination,
+        } => do_load(store, source, destination).or_else(|e| if *silent { Ok(()) } else { Err(e) }),
         GraphUpdateOperation::Clear { silent, graph } => {
             clear_graph_target(store, graph).or_else(|e| if *silent { Ok(()) } else { Err(e) })
         }
@@ -130,6 +122,105 @@ fn spargebra_graph_name_to_oxrdf(g: &spargebra::term::GraphName) -> GraphName {
         spargebra::term::GraphName::NamedNode(n) => GraphName::NamedNode(n.clone()),
         spargebra::term::GraphName::DefaultGraph => GraphName::DefaultGraph,
     }
+}
+
+/// `LOAD <source> [INTO GRAPH <destination>]`: fetch, parse, and insert.
+///
+/// Real HTTP-backed implementation, only compiled with the `http-client`
+/// feature. GET `source` with an `Accept` header listing every RDF media
+/// type `oxrdfio` understands (so a well-behaved server can return whatever
+/// format it prefers to serialize), resolve the response's `Content-Type` to
+/// an [`oxrdfio::RdfFormat`] — falling back to the source IRI's own file
+/// extension, then to Turtle if neither resolves — parse the body into
+/// quads tagged with `destination` as their (default) graph, and insert them
+/// as one batch.
+#[cfg(feature = "http-client")]
+fn do_load<S: QuadStore + 'static>(
+    store: &Arc<S>,
+    source: &NamedNode,
+    destination: &spargebra::term::GraphName,
+) -> Result<()> {
+    use oxrdfio::{RdfFormat, RdfParser};
+
+    const ACCEPT: &str = "text/turtle, application/n-triples, application/n-quads, \
+                           application/trig, application/rdf+xml, application/ld+json, \
+                           text/n3;q=0.9, */*;q=0.1";
+
+    let request = oxhttp::model::Request::builder()
+        .method(oxhttp::model::Method::GET)
+        .uri(source.as_str())
+        .header(oxhttp::model::header::ACCEPT, ACCEPT)
+        .body(())
+        .map_err(|e| anyhow!("LOAD <{}>: invalid request: {e}", source.as_str()))?;
+    let response = oxhttp::Client::new()
+        .with_redirection_limit(5)
+        .request(request)
+        .map_err(|e| anyhow!("LOAD <{}>: fetch failed: {e}", source.as_str()))?;
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "LOAD <{}>: server returned HTTP {}",
+            source.as_str(),
+            response.status()
+        ));
+    }
+    let content_type = response
+        .headers()
+        .get(oxhttp::model::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = response.into_body().to_vec().map_err(|e| {
+        anyhow!(
+            "LOAD <{}>: error reading response body: {e}",
+            source.as_str()
+        )
+    })?;
+
+    let format = content_type
+        .as_deref()
+        .and_then(RdfFormat::from_media_type)
+        .or_else(|| {
+            // Isolate the last path segment (ignoring any query string/
+            // fragment) before looking for a file extension, so a dot in the
+            // authority (e.g. `example.com`) is never mistaken for one: for
+            // `http://example.com/data.ttl` this yields `data.ttl` -> `ttl`,
+            // and for `http://example.com/data` (no path extension at all)
+            // this correctly yields `None` rather than spuriously matching
+            // `com/data`.
+            source
+                .as_str()
+                .rsplit(['?', '#'])
+                .next_back()
+                .and_then(|path_and_beyond| path_and_beyond.rsplit('/').next())
+                .and_then(|last_segment| last_segment.rsplit('.').next())
+                .and_then(RdfFormat::from_extension)
+        })
+        .unwrap_or(RdfFormat::Turtle);
+
+    let destination_graph = spargebra_graph_name_to_oxrdf(destination);
+    let quads = RdfParser::from_format(format)
+        .with_default_graph(destination_graph)
+        .for_reader(body.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow!("LOAD <{}>: RDF parse error: {e}", source.as_str()))?;
+    store.extend(quads).map_err(|e| anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Stub compiled when the `http-client` feature is disabled: `LOAD` always
+/// errors (its caller still lets `LOAD SILENT` swallow this and succeed as a
+/// no-op).
+#[cfg(not(feature = "http-client"))]
+fn do_load<S: QuadStore + 'static>(
+    _store: &Arc<S>,
+    source: &NamedNode,
+    _destination: &spargebra::term::GraphName,
+) -> Result<()> {
+    Err(anyhow!(
+        "LOAD <{}> is not supported by this build (compiled without the `http-client` feature); \
+         use the Graph Store HTTP Protocol (PUT/POST /store) to upload data instead, or use \
+         LOAD SILENT to ignore this error",
+        source.as_str()
+    ))
 }
 
 fn insert_data<S: QuadStore>(store: &Arc<S>, data: &[spargebra::term::Quad]) -> Result<()> {
@@ -642,6 +733,10 @@ mod tests {
         assert!(execute_update(&store, &update).is_ok());
     }
 
+    // Without the `http-client` feature, `LOAD` always fails (no fetch
+    // client compiled in) — verify the unreachable-network-free stub
+    // behavior directly rather than depending on `example.com` being up.
+    #[cfg(not(feature = "http-client"))]
     #[test]
     fn load_without_silent_errors() {
         let store = Arc::new(MemoryStore::new());
@@ -649,10 +744,145 @@ mod tests {
         assert!(execute_update(&store, &update).is_err());
     }
 
+    #[cfg(not(feature = "http-client"))]
     #[test]
     fn load_silent_ok() {
         let store = Arc::new(MemoryStore::new());
         let update = parse("LOAD SILENT <http://example.com/data.ttl>");
         assert!(execute_update(&store, &update).is_ok());
+    }
+
+    // With the `http-client` feature, exercise the real fetch+parse+insert
+    // path against a local `oxhttp::Server` fixture instead of the network.
+    #[cfg(feature = "http-client")]
+    mod http_client_tests {
+        use super::*;
+        use oxhttp::Server;
+        use oxhttp::model::header::CONTENT_TYPE;
+        use oxhttp::model::{Body, Response, StatusCode};
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        fn spawn_fixture(
+            port: u16,
+            content_type: &'static str,
+            body: &'static str,
+        ) -> oxhttp::ListeningServer {
+            let server = Server::new(move |_request| {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, content_type)
+                    .body(Body::from(body))
+                    .unwrap()
+            })
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .spawn()
+            .unwrap();
+            sleep(Duration::from_millis(100)); // let the listener thread start
+            server
+        }
+
+        /// Like [`spawn_fixture`], but the response carries **no**
+        /// `Content-Type` header at all, forcing `do_load` to fall back to
+        /// resolving the RDF format from `source`'s own URL path extension.
+        fn spawn_fixture_no_content_type(port: u16, body: &'static str) -> oxhttp::ListeningServer {
+            let server = Server::new(move |_request| {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(body))
+                    .unwrap()
+            })
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .spawn()
+            .unwrap();
+            sleep(Duration::from_millis(100));
+            server
+        }
+
+        #[test]
+        fn load_fetches_parses_and_inserts() {
+            let _fixture = spawn_fixture(
+                18781,
+                "text/turtle",
+                r#"<http://ex/alice> <http://ex/name> "Alice" ."#,
+            );
+            let store = Arc::new(MemoryStore::new());
+            let update = parse("LOAD <http://127.0.0.1:18781/data.ttl>");
+            execute_update(&store, &update).unwrap();
+            assert!(
+                store
+                    .contains(&CoreQuad::new(
+                        iri("http://ex/alice"),
+                        iri("http://ex/name"),
+                        Term::Literal(Literal::new_simple_literal("Alice")),
+                        OxGraphName::DefaultGraph,
+                    ))
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn load_into_graph_tags_destination() {
+            let _fixture = spawn_fixture(
+                18782,
+                "text/turtle",
+                r#"<http://ex/bob> <http://ex/name> "Bob" ."#,
+            );
+            let store = Arc::new(MemoryStore::new());
+            let update = parse("LOAD <http://127.0.0.1:18782/data.ttl> INTO GRAPH <http://ex/g>");
+            execute_update(&store, &update).unwrap();
+            assert!(
+                store
+                    .contains(&CoreQuad::new(
+                        iri("http://ex/bob"),
+                        iri("http://ex/name"),
+                        Term::Literal(Literal::new_simple_literal("Bob")),
+                        OxGraphName::NamedNode(iri("http://ex/g")),
+                    ))
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn load_falls_back_to_url_extension_when_no_content_type() {
+            // No `Content-Type` header at all, and the URL path's own
+            // extension (`.ttl`) must be used to resolve the RDF format —
+            // this also exercises that the fallback correctly ignores the
+            // dot in `127.0.0.1`'s port-bearing authority and only looks at
+            // the last path segment.
+            let _fixture = spawn_fixture_no_content_type(
+                18784,
+                r#"<http://ex/carol> <http://ex/name> "Carol" ."#,
+            );
+            let store = Arc::new(MemoryStore::new());
+            let update = parse("LOAD <http://127.0.0.1:18784/path/data.ttl>");
+            execute_update(&store, &update).unwrap();
+            assert!(
+                store
+                    .contains(&CoreQuad::new(
+                        iri("http://ex/carol"),
+                        iri("http://ex/name"),
+                        Term::Literal(Literal::new_simple_literal("Carol")),
+                        OxGraphName::DefaultGraph,
+                    ))
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn load_unreachable_without_silent_errors() {
+            let store = Arc::new(MemoryStore::new());
+            // Port 18783 has no fixture bound to it.
+            let update = parse("LOAD <http://127.0.0.1:18783/data.ttl>");
+            assert!(execute_update(&store, &update).is_err());
+        }
+
+        #[test]
+        fn load_unreachable_silent_ok() {
+            let store = Arc::new(MemoryStore::new());
+            let update = parse("LOAD SILENT <http://127.0.0.1:18783/data.ttl>");
+            assert!(execute_update(&store, &update).is_ok());
+        }
     }
 }
