@@ -20,14 +20,16 @@ pub mod fixpoint;
 pub mod join;
 pub mod reasoning_dataset;
 pub mod rule;
+pub mod same_as;
 pub mod sorted_vec_trie;
 pub mod store_source;
 
-pub use engine::{Diagnostic, LftjFixpointEngine, ReasoningEngine};
+pub use engine::{Diagnostic, LftjFixpointEngine, ReasoningEngine, Severity};
 pub use join::{
     Atom, AtomField, AtomSource, CombinedSource, NullSource, SliceSource, leapfrog_join,
 };
 pub use reasoning_dataset::ReasoningDataset;
 pub use rule::{Rule, RuleAtom, RuleSet};
+pub use same_as::SameAsTracker;
 pub use sorted_vec_trie::SortedVecTrie;
 pub use store_source::StoreAtomSource;

@@ -40,12 +40,39 @@
 //!   reasonable follow-up once this decorator's basic correctness is
 //!   proven out, not required for the initial hook point.
 
+//! ## `owl:sameAs` query-time canonicalization
+//!
+//! [`ReasoningDataset::wrap`] also captures a frozen
+//! [`SameAsTracker`](crate::same_as::SameAsTracker) (built once, via
+//! [`ReasoningEngine::same_as_tracker`]) and applies it in `find_quads`.
+//!
+//! Since nothing is ever rewritten in the inner store (no materialization —
+//! see the module doc comment above), a fact might be physically stored
+//! under *any* member of a `owl:sameAs` equivalence class — e.g. `alice
+//! owl:sameAs bob` plus `alice knows carol` stored under `alice`, while a
+//! query asks about `bob`. So "canonicalization" here is implemented as a
+//! **fan-out**: every bound subject/object term in the incoming pattern is
+//! widened to the full list of its `owl:sameAs` equivalence-class members
+//! (via [`ReasoningDataset::candidate_patterns`]), and the inner
+//! dataset/inferred overlay is queried once per resulting concrete pattern,
+//! unioning the results together (deduped). Symmetrically, every matched
+//! subject/object term that came from a position the original query left
+//! as a variable is expanded back out to its equivalence class before being
+//! yielded (via [`ReasoningDataset::expand_match`]) — together implementing
+//! `eq-sym`/`eq-trans`/`eq-rep-s`/`eq-rep-o` as a query-time rewrite rather
+//! than a materialized closure (see `crate::same_as`'s module doc comment
+//! for the full rationale). This is skipped entirely (fast path, zero
+//! overhead) whenever the tracker is empty — the overwhelmingly common case
+//! of a dataset with no `owl:sameAs` triples at all.
+
 use crate::engine::{Diagnostic, ReasoningEngine};
+use crate::same_as::SameAsTracker;
 use anyhow::Result;
 use oxigraph_nova_core::{GraphName, Term};
 use oxigraph_nova_query::{
-    Dataset, DatasetLftjSource, GraphSelector, QuadIter, QuadMatch, QuadPattern,
+    Dataset, DatasetLftjSource, GraphSelector, PatternTerm, QuadIter, QuadMatch, QuadPattern,
 };
+use std::collections::HashSet;
 
 /// Wraps a base [`Dataset`] `D` with an in-memory closure computed once (at
 /// construction) by a [`ReasoningEngine`]. See the module doc comment for
@@ -54,6 +81,12 @@ pub struct ReasoningDataset<D: Dataset> {
     inner: D,
     inferred: Vec<(Term, Term, Term)>,
     diagnostics: Vec<Diagnostic>,
+    /// Frozen union-find over `owl:sameAs` pairs — see [`SameAsTracker`]'s
+    /// module doc comment for the query-time canonicalize/expand design
+    /// applied in [`ReasoningDataset::find_quads`]. Empty (the common case)
+    /// whenever the wrapped engine has no `owl:sameAs` support, or the
+    /// dataset simply has no `owl:sameAs` triples.
+    same_as: SameAsTracker,
 }
 
 impl<D: Dataset> ReasoningDataset<D> {
@@ -73,10 +106,12 @@ impl<D: Dataset> ReasoningDataset<D> {
                 )
             })
             .collect();
+        let same_as = engine.same_as_tracker(&inner)?;
         Ok(Self {
             inner,
             inferred,
             diagnostics,
+            same_as,
         })
     }
 
@@ -96,6 +131,12 @@ impl<D: Dataset> ReasoningDataset<D> {
         self.inferred.len()
     }
 
+    /// The frozen `owl:sameAs` union-find this overlay canonicalizes/expands
+    /// against — see the module doc comment.
+    pub fn same_as_tracker(&self) -> &SameAsTracker {
+        &self.same_as
+    }
+
     fn inferred_matches<'a>(
         &'a self,
         pattern: &QuadPattern,
@@ -108,16 +149,16 @@ impl<D: Dataset> ReasoningDataset<D> {
             }
 
             let s_ok = match &pattern.subject {
-                oxigraph_nova_query::PatternTerm::Variable => true,
-                oxigraph_nova_query::PatternTerm::Bound(v) => v == s,
+                PatternTerm::Variable => true,
+                PatternTerm::Bound(v) => v == s,
             };
             let p_ok = match &pattern.predicate {
-                oxigraph_nova_query::PatternTerm::Variable => true,
-                oxigraph_nova_query::PatternTerm::Bound(v) => v == p,
+                PatternTerm::Variable => true,
+                PatternTerm::Bound(v) => v == p,
             };
             let o_ok = match &pattern.object {
-                oxigraph_nova_query::PatternTerm::Variable => true,
-                oxigraph_nova_query::PatternTerm::Bound(v) => v == o,
+                PatternTerm::Variable => true,
+                PatternTerm::Bound(v) => v == o,
             };
             if s_ok && p_ok && o_ok {
                 Some(QuadMatch {
@@ -131,6 +172,96 @@ impl<D: Dataset> ReasoningDataset<D> {
             }
         })
     }
+
+    /// Widen a pattern's bound subject/object terms to *every* member of
+    /// their `owl:sameAs` equivalence class — the "before lookup" half of
+    /// query-time canonicalization (see module doc comment).
+    ///
+    /// Note this is a fan-out to every class member, **not** a substitution
+    /// with a single canonical representative: the inner dataset is never
+    /// rewritten (nothing is materialized — see this module's doc
+    /// comment), so it may hold the fact under *any* member of the class
+    /// (e.g. stored as `alice knows carol` while the query asks about
+    /// `bob`, `alice`'s `owl:sameAs` partner) — only trying the
+    /// union-find's arbitrarily-chosen root term would miss such a fact
+    /// whenever the root isn't the literal term the store happens to use.
+    /// The predicate position is left untouched (see [`SameAsTracker`]'s
+    /// module doc comment on why `eq-rep-p` is not implemented). Returns
+    /// `vec![pattern.clone()]` whenever `self.same_as.is_empty()`.
+    fn candidate_patterns(&self, pattern: &QuadPattern) -> Vec<QuadPattern> {
+        if self.same_as.is_empty() {
+            return vec![pattern.clone()];
+        }
+        let subjects: Vec<PatternTerm> = match &pattern.subject {
+            PatternTerm::Bound(t) => self
+                .same_as
+                .class_members(t)
+                .into_iter()
+                .map(PatternTerm::Bound)
+                .collect(),
+            PatternTerm::Variable => vec![PatternTerm::Variable],
+        };
+        let objects: Vec<PatternTerm> = match &pattern.object {
+            PatternTerm::Bound(t) => self
+                .same_as
+                .class_members(t)
+                .into_iter()
+                .map(PatternTerm::Bound)
+                .collect(),
+            PatternTerm::Variable => vec![PatternTerm::Variable],
+        };
+        let mut out = Vec::with_capacity(subjects.len() * objects.len());
+        for s in &subjects {
+            for o in &objects {
+                out.push(QuadPattern {
+                    subject: s.clone(),
+                    predicate: pattern.predicate.clone(),
+                    object: o.clone(),
+                    graph: pattern.graph.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Expand `m`'s subject/object back out to every member of its
+    /// `owl:sameAs` equivalence class — the "after lookup" half of
+    /// query-time canonicalization (see module doc comment). Yields exactly
+    /// `[m]` (unchanged) whenever `self.same_as.is_empty()`. When a
+    /// position was originally *bound* in `pattern` (rather than a free
+    /// variable), that position is not expanded — expansion only widens
+    /// positions the query left as variables, matching the Fluree design
+    /// note's "expand only when returning results [for variables]" shape;
+    /// a bound position was already fanned out over going in (see
+    /// `candidate_patterns`), and the original request explicitly asked
+    /// for that one term, not its whole class.
+    fn expand_match(&self, pattern: &QuadPattern, m: QuadMatch) -> Vec<QuadMatch> {
+        if self.same_as.is_empty() {
+            return vec![m];
+        }
+        let subjects = if matches!(pattern.subject, PatternTerm::Variable) {
+            self.same_as.class_members(&m.subject)
+        } else {
+            vec![m.subject.clone()]
+        };
+        let objects = if matches!(pattern.object, PatternTerm::Variable) {
+            self.same_as.class_members(&m.object)
+        } else {
+            vec![m.object.clone()]
+        };
+        let mut out = Vec::with_capacity(subjects.len() * objects.len());
+        for s in &subjects {
+            for o in &objects {
+                out.push(QuadMatch {
+                    subject: s.clone(),
+                    predicate: m.predicate.clone(),
+                    object: o.clone(),
+                    graph_name: m.graph_name.clone(),
+                });
+            }
+        }
+        out
+    }
 }
 
 /// LFTJ acceleration is deliberately turned off on the wrapped view — see
@@ -140,9 +271,40 @@ impl<D: Dataset> DatasetLftjSource for ReasoningDataset<D> {}
 
 impl<D: Dataset> Dataset for ReasoningDataset<D> {
     fn find_quads<'a>(&'a self, pattern: &QuadPattern) -> Result<QuadIter<'a>> {
-        let base = self.inner.find_quads(pattern)?;
-        let overlay = self.inferred_matches(pattern).map(Ok);
-        Ok(Box::new(base.chain(overlay)))
+        if self.same_as.is_empty() {
+            let base = self.inner.find_quads(pattern)?;
+            let overlay = self.inferred_matches(pattern).map(Ok);
+            return Ok(Box::new(base.chain(overlay)));
+        }
+
+        // `owl:sameAs` canonicalization is active: fan the pattern's bound
+        // S/O terms out to every member of their equivalence class (since
+        // the inner store is never rewritten — see `candidate_patterns`'s
+        // doc comment), look each candidate pattern up against both the
+        // inner dataset and the inferred overlay, then expand each match's
+        // variable-position S/O terms back out to the full class, and dedup
+        // (multiple candidate patterns, and/or the inner dataset plus the
+        // inferred overlay, can easily yield the exact same expanded
+        // QuadMatch more than once).
+        let mut seen: HashSet<QuadMatchKey> = HashSet::new();
+        let mut expanded: Vec<Result<QuadMatch>> = Vec::new();
+        for candidate in self.candidate_patterns(pattern) {
+            let base = self.inner.find_quads(&candidate)?;
+            let overlay = self.inferred_matches(&candidate).map(Ok);
+            for m in base.chain(overlay) {
+                match m {
+                    Ok(m) => {
+                        for e in self.expand_match(pattern, m) {
+                            if seen.insert(QuadMatchKey::from(&e)) {
+                                expanded.push(Ok(e));
+                            }
+                        }
+                    }
+                    Err(e) => expanded.push(Err(e)),
+                }
+            }
+        }
+        Ok(Box::new(expanded.into_iter()))
     }
 
     fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
@@ -152,12 +314,30 @@ impl<D: Dataset> Dataset for ReasoningDataset<D> {
     }
 }
 
+/// Hashable/comparable dedup key for a [`QuadMatch`] — `QuadMatch` itself
+/// derives `PartialEq` but not `Hash`/`Eq`, so a small local key tuple is
+/// used instead — used only by the `owl:sameAs`-expansion dedup pass in
+/// `find_quads` above.
+#[derive(PartialEq, Eq, Hash)]
+struct QuadMatchKey(String, String, String, String);
+
+impl From<&QuadMatch> for QuadMatchKey {
+    fn from(m: &QuadMatch) -> Self {
+        Self(
+            m.subject.to_string(),
+            m.predicate.to_string(),
+            m.object.to_string(),
+            format!("{:?}", m.graph_name),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::LftjFixpointEngine;
     use oxigraph_nova_core::{GraphName as CoreGraphName, NamedNode, Quad, QuadStore};
-    use oxigraph_nova_query::{PatternTerm, StoreDataset};
+    use oxigraph_nova_query::StoreDataset;
     use oxigraph_nova_storage_ring::RingStore;
     use std::sync::Arc;
 
@@ -171,6 +351,10 @@ mod tests {
 
     fn rdfs_sub_class_of() -> NamedNode {
         nn("http://www.w3.org/2000/01/rdf-schema#subClassOf")
+    }
+
+    fn owl_same_as() -> NamedNode {
+        nn("http://www.w3.org/2002/07/owl#sameAs")
     }
 
     fn build_store() -> RingStore {
@@ -264,5 +448,95 @@ mod tests {
         let engine = LftjFixpointEngine::new();
         let reasoning = ReasoningDataset::wrap(dataset, &engine).unwrap();
         assert!(!reasoning.supports_lftj());
+    }
+
+    /// `owl:sameAs` end-to-end: `alice owl:sameAs bob`, `alice knows carol`
+    /// asserted as a base fact. Querying `?x knows carol` (subject
+    /// unbound) must return **both** `alice` and `bob` (expansion);
+    /// querying `bob knows ?y` (subject bound to the *other* member of the
+    /// class) must still find the fact stored under `alice` (fan-out
+    /// before lookup).
+    #[test]
+    fn same_as_canonicalizes_and_expands_across_equivalence_class() {
+        let store = RingStore::new();
+        let g = CoreGraphName::DefaultGraph;
+        let knows = nn("http://ex/knows");
+        store
+            .insert(&Quad::new(
+                nn("http://ex/alice"),
+                owl_same_as(),
+                Term::NamedNode(nn("http://ex/bob")),
+                g.clone(),
+            ))
+            .unwrap();
+        store
+            .insert(&Quad::new(
+                nn("http://ex/alice"),
+                knows.clone(),
+                Term::NamedNode(nn("http://ex/carol")),
+                g,
+            ))
+            .unwrap();
+        store.compact().unwrap();
+
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let reasoning = ReasoningDataset::wrap(dataset, &engine).unwrap();
+        assert!(
+            !reasoning.same_as_tracker().is_empty(),
+            "sanity: sameAs tracker must be populated"
+        );
+
+        // Expansion: ?x knows carol -> {alice, bob}.
+        let pattern = QuadPattern::default_graph(
+            PatternTerm::Variable,
+            PatternTerm::Bound(Term::NamedNode(knows.clone())),
+            PatternTerm::Bound(Term::NamedNode(nn("http://ex/carol"))),
+        );
+        let mut subjects: Vec<String> = reasoning
+            .find_quads(&pattern)
+            .unwrap()
+            .map(|m| m.unwrap().subject.to_string())
+            .collect();
+        subjects.sort();
+        subjects.dedup();
+        assert_eq!(
+            subjects,
+            vec![
+                "<http://ex/alice>".to_string(),
+                "<http://ex/bob>".to_string()
+            ],
+            "querying by carol must expand the subject to both alice and bob"
+        );
+
+        // Fan-out: bob knows ?y must still find carol (the fact is stored
+        // under alice, bob's sameAs partner).
+        let pattern2 = QuadPattern::default_graph(
+            PatternTerm::Bound(Term::NamedNode(nn("http://ex/bob"))),
+            PatternTerm::Bound(Term::NamedNode(knows)),
+            PatternTerm::Variable,
+        );
+        let objects: Vec<String> = reasoning
+            .find_quads(&pattern2)
+            .unwrap()
+            .map(|m| m.unwrap().object.to_string())
+            .collect();
+        assert_eq!(
+            objects,
+            vec!["<http://ex/carol>".to_string()],
+            "querying bob (alice's sameAs partner) must still find the carol fact"
+        );
+    }
+
+    /// When there are no `owl:sameAs` triples at all, `same_as_tracker()`
+    /// must be empty and ordinary queries must behave exactly as before
+    /// (no expansion, no dedup pass) — the fast path.
+    #[test]
+    fn no_same_as_triples_yields_empty_tracker_and_unexpanded_results() {
+        let store = build_store();
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let reasoning = ReasoningDataset::wrap(dataset, &engine).unwrap();
+        assert!(reasoning.same_as_tracker().is_empty());
     }
 }

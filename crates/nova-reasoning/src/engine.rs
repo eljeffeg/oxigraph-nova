@@ -53,11 +53,28 @@
 //!   - `owl:inverseOf` (`prp-inv1`/`prp-inv2`, via
 //!     [`crate::rule::Rule::inverse_forward`]/[`crate::rule::Rule::inverse_backward`]).
 //!
-//! It does not yet cover `owl:sameAs` (symmetry/transitivity alone would be
-//! misleading without the `eq-rep-*` replacement rules that rewrite every
-//! triple through a `sameAs` link) or any OWL 2 RL consistency-checking
-//! rules (`cax-dw`, `prp-asyp`, ...).
+//!   - `owl:sameAs` — via [`ReasoningEngine::same_as_tracker`]/
+//!     [`crate::same_as::SameAsTracker`], **not** a materialized `eq-rep-*`
+//!     closure: [`LftjFixpointEngine::same_as_tracker`] scans every
+//!     `owl:sameAs` pair and builds a frozen union-find, which
+//!     [`ReasoningDataset`](crate::ReasoningDataset) uses to canonicalize
+//!     query terms and expand results back out at query time — see
+//!     [`crate::same_as`]'s module doc comment for the full rationale.
+//!   - OWL 2 RL consistency-checking rules `prp-asyp`/`prp-irp`/`cax-dw`
+//!     (asymmetric/irreflexive property violations, disjoint-class
+//!     violations) plus `eq-diff` (an `owl:sameAs` pair also asserted
+//!     `owl:differentFrom`) — reported as [`Diagnostic::violation`]s via
+//!     [`check_consistency`] and `infer`'s `eq-diff` check, never as derived
+//!     triples (these are existential, one-shot checks, not recursive
+//!     derivations, so they run directly over the closure/dataset rather
+//!     than through [`crate::rule::RuleSet`]/[`crate::fixpoint`]).
 //!
+//! Arbitrary datatype-value clashes (e.g. two literals asserted `owl:sameAs`
+//! whose XSD values are provably distinct) are not covered — this would
+//! require a general XSD value-space comparison, which is out of scope for
+//! this increment; the `eq-diff` check above covers the far more common
+//! explicit-`owl:differentFrom`-vs-`owl:sameAs` clash.
+
 //! ## Head-only constants and synthetic TermIds
 //!
 //! A rule's head can reference a predicate/class that is a compile-time
@@ -82,8 +99,9 @@
 //! that id, never a real store row (which by construction never contains
 //! an id from the reserved synthetic range).
 
-use crate::join::{AtomSource, UnionTrieIter};
+use crate::join::{Atom, AtomField, AtomSource, SliceSource, UnionTrieIter, leapfrog_join};
 use crate::rule::{Rule, RuleSet};
+use crate::same_as::SameAsTracker;
 use anyhow::Result;
 use oxigraph_nova_core::{
     EmptyTrieIter, GraphName, NamedNode, NamedOrBlankNode, Quad, Term, TrieIterator,
@@ -91,25 +109,59 @@ use oxigraph_nova_core::{
 use oxigraph_nova_query::{Dataset, GraphSelector, PatternTerm, QuadPattern};
 use std::collections::HashMap;
 
+/// Distinguishes a merely-informational [`Diagnostic`] (e.g. "skipped a
+/// malformed declaration triple") from an actual OWL 2 RL consistency
+/// violation (e.g. `prp-asyp`/`prp-irp`/`cax-dw` firing) — see
+/// [`Diagnostic::violation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// Purely informational — never indicates the dataset is inconsistent.
+    Info,
+    /// An OWL 2 RL consistency-checking rule matched: the dataset is
+    /// inconsistent per this diagnostic's rule.
+    Violation,
+}
+
 /// One diagnostic emitted by a [`ReasoningEngine`] — e.g. a skipped
-/// declaration triple, or a derived row that failed to decode back into a
-/// `Quad`.
+/// declaration triple, a derived row that failed to decode back into a
+/// `Quad`, or (see [`Diagnostic::violation`]) an OWL 2 RL consistency-rule
+/// match.
 ///
-/// Materialization never *aborts* on a diagnostic — these are purely
-/// informational, surfaced to callers via
+/// Materialization never *aborts* on a diagnostic — even a
+/// [`Severity::Violation`] is purely reported, never treated as a hard
+/// error — surfaced to callers via
 /// [`ReasoningDataset::diagnostics`](crate::ReasoningDataset::diagnostics).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub rule: String,
     pub message: String,
+    pub severity: Severity,
 }
 
 impl Diagnostic {
+    /// An informational diagnostic (the common case prior to consistency
+    /// checking) — see [`Severity::Info`].
     pub fn new(rule: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             rule: rule.into(),
             message: message.into(),
+            severity: Severity::Info,
         }
+    }
+
+    /// An OWL 2 RL consistency-rule violation — see [`Severity::Violation`].
+    pub fn violation(rule: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            rule: rule.into(),
+            message: message.into(),
+            severity: Severity::Violation,
+        }
+    }
+
+    /// `true` if this diagnostic reports an actual inconsistency
+    /// ([`Severity::Violation`]) rather than an informational note.
+    pub fn is_violation(&self) -> bool {
+        self.severity == Severity::Violation
     }
 }
 
@@ -126,6 +178,19 @@ pub trait ReasoningEngine: Send + Sync {
     /// Compute every quad entailed by `dataset` that is not already one of
     /// its base facts, plus any diagnostics produced along the way.
     fn infer(&self, dataset: &dyn Dataset) -> Result<(Vec<Quad>, Vec<Diagnostic>)>;
+
+    /// Build a frozen union-find over `dataset`'s `owl:sameAs` pairs — see
+    /// [`crate::same_as`]'s module doc comment for the query-time
+    /// canonicalization design this supports.
+    ///
+    /// Default: no `owl:sameAs` support at all (an empty tracker, under
+    /// which every term canonicalizes to itself) — a `ReasoningEngine`
+    /// implementor that has nothing to say about `owl:sameAs` need not
+    /// override this.
+    fn same_as_tracker(&self, dataset: &dyn Dataset) -> Result<SameAsTracker> {
+        let _ = dataset;
+        Ok(SameAsTracker::empty())
+    }
 }
 
 /// An [`AtomSource`] adapter over a [`Dataset`]'s LFTJ capability methods,
@@ -204,6 +269,26 @@ fn owl_equivalent_property() -> NamedNode {
 
 fn owl_inverse_of() -> NamedNode {
     NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#inverseOf")
+}
+
+fn owl_same_as() -> NamedNode {
+    NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
+}
+
+fn owl_different_from() -> NamedNode {
+    NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#differentFrom")
+}
+
+fn owl_asymmetric_property() -> NamedNode {
+    NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#AsymmetricProperty")
+}
+
+fn owl_irreflexive_property() -> NamedNode {
+    NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#IrreflexiveProperty")
+}
+
+fn owl_disjoint_with() -> NamedNode {
+    NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#disjointWith")
 }
 
 /// Lower bound of the synthetic-TermId range — see this module's doc
@@ -296,7 +381,182 @@ impl LftjFixpointEngine {
     }
 }
 
+/// Collect every `owl:sameAs` pair from `dataset` (RDF-merge of every
+/// graph, via `GraphSelector::Union`) and build a [`SameAsTracker`] from
+/// them. Shared helper for [`ReasoningEngine::same_as_tracker`]'s
+/// `LftjFixpointEngine` override — factored out so it can be called
+/// regardless of `supports_lftj()` (unlike `infer`, `owl:sameAs` tracking
+/// needs nothing beyond ordinary [`Dataset::find_quads`] — see
+/// `crate::same_as`'s module doc comment).
+fn build_same_as_tracker(dataset: &dyn Dataset) -> Result<SameAsTracker> {
+    let pattern = QuadPattern {
+        subject: PatternTerm::Variable,
+        predicate: PatternTerm::Bound(Term::NamedNode(owl_same_as())),
+        object: PatternTerm::Variable,
+        graph: GraphSelector::Union,
+    };
+    let mut pairs = Vec::new();
+    for m in dataset.find_quads(&pattern)? {
+        let m = m?;
+        pairs.push((m.subject, m.object));
+    }
+    Ok(SameAsTracker::build(pairs))
+}
+
+/// Run the OWL 2 RL consistency-checking rules this engine covers —
+/// `prp-asyp`, `prp-irp`, `cax-dw` — against `dataset`'s base facts plus
+/// `closure` (this `infer()` call's already-computed inferred rows,
+/// TermId-keyed), returning one [`Diagnostic::violation`] per match.
+///
+/// These are existential, one-shot checks (find *any* witness), not
+/// recursive derivations, so they run directly via [`leapfrog_join`] over
+/// [`Atom`]s pointed at a [`SliceSource`] wrapping `closure` — no
+/// `RuleSet`/[`crate::fixpoint`] involved, matching this module's doc
+/// comment. `resolver` must already have every predicate/class this
+/// function references resolved (see `same_as_tracker`'s and `infer`'s
+/// callers) — `check_consistency` itself only ever calls
+/// `resolver.decode`, never `resolver.resolve`, so it cannot mint new
+/// synthetic ids partway through.
+fn check_consistency(
+    resolver: &TermResolver,
+    closure_rows: &[[u64; 3]],
+    asymmetric_property_id: u64,
+    irreflexive_property_id: u64,
+    disjoint_with_id: u64,
+    rdf_type_id: u64,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let src = SliceSource::new(closure_rows);
+
+    // `prp-asyp`: ?p rdf:type owl:AsymmetricProperty ∧ ?x ?p ?y ∧ ?y ?p ?x.
+    //
+    // The join naturally matches both (x=a, y=b) and its swap (x=b, y=a)
+    // for the same underlying violation (the two body atoms are
+    // themselves symmetric in x/y) — dedup on the unordered pair via a
+    // `seen` set (min/max of the two TermIds) so each violating pair is
+    // reported exactly once.
+    {
+        let atoms = vec![
+            Atom {
+                s: AtomField::Var(0), // ?p
+                p: AtomField::Const(rdf_type_id),
+                o: AtomField::Const(asymmetric_property_id),
+                source: &src,
+            },
+            Atom {
+                s: AtomField::Var(1), // ?x
+                p: AtomField::Var(0),
+                o: AtomField::Var(2), // ?y
+                source: &src,
+            },
+            Atom {
+                s: AtomField::Var(2),
+                p: AtomField::Var(0),
+                o: AtomField::Var(1),
+                source: &src,
+            },
+        ];
+        let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+        for binding in leapfrog_join(&atoms, 3) {
+            let key = (binding[1].min(binding[2]), binding[1].max(binding[2]));
+            if !seen.insert(key) {
+                continue;
+            }
+            let p = resolver.decode(binding[0]);
+            let x = resolver.decode(binding[1]);
+            let y = resolver.decode(binding[2]);
+            diagnostics.push(Diagnostic::violation(
+                "prp-asyp",
+                format!(
+                    "asymmetric property violation: {p:?} relates {x:?} to {y:?} and {y:?} to {x:?}"
+                ),
+            ));
+        }
+    }
+
+    // `prp-irp`: ?p rdf:type owl:IrreflexiveProperty ∧ ?x ?p ?x.
+    //
+    // The join engine's variable-binding order resolves an atom's fields
+    // via the *first* matching position only (see `Atom::resolve_for_var`)
+    // — so a single atom with the same variable in both the `s` and `o`
+    // position (e.g. `Var(1) ?p Var(1)`) does not actually constrain those
+    // two occurrences to be equal while the scan for that variable is
+    // still in flight (the second occurrence is treated as still
+    // unbound). To get a correctly-enforced self-loop check, use two
+    // distinct variables for the edge atom's endpoints and filter for
+    // equality on the materialized bindings instead.
+    {
+        let atoms = vec![
+            Atom {
+                s: AtomField::Var(0), // ?p
+                p: AtomField::Const(rdf_type_id),
+                o: AtomField::Const(irreflexive_property_id),
+                source: &src,
+            },
+            Atom {
+                s: AtomField::Var(1), // ?x
+                p: AtomField::Var(0),
+                o: AtomField::Var(2), // ?y
+                source: &src,
+            },
+        ];
+        for binding in leapfrog_join(&atoms, 3) {
+            if binding[1] != binding[2] {
+                continue;
+            }
+            let p = resolver.decode(binding[0]);
+            let x = resolver.decode(binding[1]);
+            diagnostics.push(Diagnostic::violation(
+                "prp-irp",
+                format!("irreflexive property violation: {p:?} relates {x:?} to itself"),
+            ));
+        }
+    }
+
+    // `cax-dw`: ?c1 owl:disjointWith ?c2 ∧ ?x rdf:type ?c1 ∧ ?x rdf:type ?c2.
+    {
+        let atoms = vec![
+            Atom {
+                s: AtomField::Var(0), // ?c1
+                p: AtomField::Const(disjoint_with_id),
+                o: AtomField::Var(1), // ?c2
+                source: &src,
+            },
+            Atom {
+                s: AtomField::Var(2), // ?x
+                p: AtomField::Const(rdf_type_id),
+                o: AtomField::Var(0),
+                source: &src,
+            },
+            Atom {
+                s: AtomField::Var(2),
+                p: AtomField::Const(rdf_type_id),
+                o: AtomField::Var(1),
+                source: &src,
+            },
+        ];
+        for binding in leapfrog_join(&atoms, 3) {
+            let c1 = resolver.decode(binding[0]);
+            let c2 = resolver.decode(binding[1]);
+            let x = resolver.decode(binding[2]);
+            diagnostics.push(Diagnostic::violation(
+                "cax-dw",
+                format!(
+                    "disjoint-class violation: {x:?} is rdf:type both {c1:?} and {c2:?}, \
+                     which are declared owl:disjointWith each other"
+                ),
+            ));
+        }
+    }
+
+    diagnostics
+}
+
 impl ReasoningEngine for LftjFixpointEngine {
+    fn same_as_tracker(&self, dataset: &dyn Dataset) -> Result<SameAsTracker> {
+        build_same_as_tracker(dataset)
+    }
+
     fn infer(&self, dataset: &dyn Dataset) -> Result<(Vec<Quad>, Vec<Diagnostic>)> {
         // Reason over the RDF merge of every graph in the dataset (no
         // dedicated TBox/ontology graph is reserved; see
@@ -347,6 +607,10 @@ impl ReasoningEngine for LftjFixpointEngine {
         let equivalent_class_id = resolver.resolve(&Term::NamedNode(owl_equivalent_class()));
         let equivalent_property_id = resolver.resolve(&Term::NamedNode(owl_equivalent_property()));
         let inverse_of_id = resolver.resolve(&Term::NamedNode(owl_inverse_of()));
+        let asymmetric_property_id = resolver.resolve(&Term::NamedNode(owl_asymmetric_property()));
+        let irreflexive_property_id =
+            resolver.resolve(&Term::NamedNode(owl_irreflexive_property()));
+        let disjoint_with_id = resolver.resolve(&Term::NamedNode(owl_disjoint_with()));
 
         let rules = vec![
             Rule::transitive(sub_class_of_id),
@@ -381,6 +645,7 @@ impl ReasoningEngine for LftjFixpointEngine {
             owl_equivalent_class(),
             owl_equivalent_property(),
             owl_inverse_of(),
+            owl_disjoint_with(),
         ] {
             let pattern = QuadPattern {
                 subject: PatternTerm::Variable,
@@ -405,9 +670,21 @@ impl ReasoningEngine for LftjFixpointEngine {
         // that property as its predicate, which is what
         // `Rule::transitive_property`/`Rule::symmetric_property` actually
         // need in `Delta` to bootstrap their own closure.
+        //
+        // `owl:AsymmetricProperty`/`owl:IrreflexiveProperty` are included
+        // here too, purely for seeding purposes: unlike `prp-trp`/
+        // `prp-symp`, neither is an inference rule — they're consistency
+        // checks handled entirely by `check_consistency` below — but that
+        // function only ever reads from `closure_rows`
+        // (`seed` ∪ rule-derived rows), so the edges of a property declared
+        // with either class must still land in `seed` or `check_consistency`
+        // has no rows to match against. No `Rule` is added to `rules` for
+        // either class.
         for (decl_class, rule_name) in [
             (owl_transitive_property(), "prp-trp"),
             (owl_symmetric_property(), "prp-symp"),
+            (owl_asymmetric_property(), "prp-asyp"),
+            (owl_irreflexive_property(), "prp-irp"),
         ] {
             let pattern = QuadPattern {
                 subject: PatternTerm::Variable,
@@ -447,7 +724,39 @@ impl ReasoningEngine for LftjFixpointEngine {
         let source = DatasetAtomSource { dataset, graphs };
         let closure = crate::fixpoint::closure_over_store(&rule_set, &source, &seed);
 
+        diagnostics.extend(check_consistency(
+            &resolver,
+            &closure,
+            asymmetric_property_id,
+            irreflexive_property_id,
+            disjoint_with_id,
+            rdf_type_id,
+        ));
+
+        let same_as = build_same_as_tracker(dataset)?;
+        if !same_as.is_empty() {
+            let diff_pattern = QuadPattern {
+                subject: PatternTerm::Variable,
+                predicate: PatternTerm::Bound(Term::NamedNode(owl_different_from())),
+                object: PatternTerm::Variable,
+                graph: GraphSelector::Union,
+            };
+            for m in dataset.find_quads(&diff_pattern)? {
+                let m = m?;
+                if same_as.canonicalize(&m.subject) == same_as.canonicalize(&m.object) {
+                    diagnostics.push(Diagnostic::violation(
+                        "eq-diff",
+                        format!(
+                            "{:?} and {:?} are owl:sameAs-equivalent but also asserted owl:differentFrom each other",
+                            m.subject, m.object
+                        ),
+                    ));
+                }
+            }
+        }
+
         let seed_set: std::collections::HashSet<[u64; 3]> = seed.iter().copied().collect();
+
         let mut inferred: Vec<Quad> = Vec::new();
         for row in closure {
             if seed_set.contains(&row) {
@@ -982,5 +1291,254 @@ mod tests {
             diagnostics.iter().any(|d| d.rule == "prp-trp"),
             "expected a prp-trp diagnostic for the non-IRI declaration subject, got: {diagnostics:?}"
         );
+    }
+
+    /// `prp-asyp`: `hates rdf:type owl:AsymmetricProperty`, plus both
+    /// `alice hates bob` and `bob hates alice` asserted, must produce a
+    /// [`Diagnostic::violation`] with rule `"prp-asyp"`.
+    #[test]
+    fn detects_asymmetric_property_violation() {
+        let store = RingStore::new();
+        let g = CoreGraphName::DefaultGraph;
+        let insert = |s: NamedNode, p: NamedNode, o: Term| {
+            store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
+        };
+        let hates = nn("http://ex/hates");
+        insert(
+            hates.clone(),
+            rdf_type(),
+            Term::NamedNode(owl_asymmetric_property()),
+        );
+        insert(
+            nn("http://ex/alice"),
+            hates.clone(),
+            Term::NamedNode(nn("http://ex/bob")),
+        );
+        insert(
+            nn("http://ex/bob"),
+            hates,
+            Term::NamedNode(nn("http://ex/alice")),
+        );
+        store.compact().unwrap();
+
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let (_inferred, diagnostics) = engine.infer(&dataset).unwrap();
+        let violations: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.rule == "prp-asyp")
+            .collect();
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly one prp-asyp violation, got: {diagnostics:?}"
+        );
+        assert!(violations[0].is_violation());
+    }
+
+    /// A dataset that respects an `owl:AsymmetricProperty` declaration
+    /// (only one direction asserted) must produce no `prp-asyp` diagnostic.
+    #[test]
+    fn no_asymmetric_property_violation_when_only_one_direction_asserted() {
+        let store = RingStore::new();
+        let g = CoreGraphName::DefaultGraph;
+        let insert = |s: NamedNode, p: NamedNode, o: Term| {
+            store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
+        };
+        let hates = nn("http://ex/hates");
+        insert(
+            hates.clone(),
+            rdf_type(),
+            Term::NamedNode(owl_asymmetric_property()),
+        );
+        insert(
+            nn("http://ex/alice"),
+            hates,
+            Term::NamedNode(nn("http://ex/bob")),
+        );
+        store.compact().unwrap();
+
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let (_inferred, diagnostics) = engine.infer(&dataset).unwrap();
+        assert!(!diagnostics.iter().any(|d| d.rule == "prp-asyp"));
+    }
+
+    /// `prp-irp`: `marriedTo rdf:type owl:IrreflexiveProperty`, plus
+    /// `alice marriedTo alice`, must produce a [`Diagnostic::violation`]
+    /// with rule `"prp-irp"`.
+    #[test]
+    fn detects_irreflexive_property_violation() {
+        let store = RingStore::new();
+        let g = CoreGraphName::DefaultGraph;
+        let insert = |s: NamedNode, p: NamedNode, o: Term| {
+            store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
+        };
+        let married_to = nn("http://ex/marriedTo");
+        insert(
+            married_to.clone(),
+            rdf_type(),
+            Term::NamedNode(owl_irreflexive_property()),
+        );
+        insert(
+            nn("http://ex/alice"),
+            married_to,
+            Term::NamedNode(nn("http://ex/alice")),
+        );
+        store.compact().unwrap();
+
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let (_inferred, diagnostics) = engine.infer(&dataset).unwrap();
+        let violations: Vec<_> = diagnostics.iter().filter(|d| d.rule == "prp-irp").collect();
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly one prp-irp violation, got: {diagnostics:?}"
+        );
+        assert!(violations[0].is_violation());
+    }
+
+    /// A dataset that never relates an `owl:IrreflexiveProperty` to itself
+    /// must produce no `prp-irp` diagnostic.
+    #[test]
+    fn no_irreflexive_property_violation_when_no_self_relation() {
+        let store = RingStore::new();
+        let g = CoreGraphName::DefaultGraph;
+        let insert = |s: NamedNode, p: NamedNode, o: Term| {
+            store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
+        };
+        let married_to = nn("http://ex/marriedTo");
+        insert(
+            married_to.clone(),
+            rdf_type(),
+            Term::NamedNode(owl_irreflexive_property()),
+        );
+        insert(
+            nn("http://ex/alice"),
+            married_to,
+            Term::NamedNode(nn("http://ex/bob")),
+        );
+        store.compact().unwrap();
+
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let (_inferred, diagnostics) = engine.infer(&dataset).unwrap();
+        assert!(!diagnostics.iter().any(|d| d.rule == "prp-irp"));
+    }
+
+    /// `cax-dw`: `Cat owl:disjointWith Dog`, plus `felix rdf:type Cat` and
+    /// `felix rdf:type Dog`, must produce a [`Diagnostic::violation`] with
+    /// rule `"cax-dw"`.
+    #[test]
+    fn detects_disjoint_class_violation() {
+        let store = RingStore::new();
+        let g = CoreGraphName::DefaultGraph;
+        let insert = |s: NamedNode, p: NamedNode, o: Term| {
+            store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
+        };
+        let cat = nn("http://ex/Cat");
+        let dog = nn("http://ex/Dog");
+        insert(
+            cat.clone(),
+            owl_disjoint_with(),
+            Term::NamedNode(dog.clone()),
+        );
+        insert(nn("http://ex/felix"), rdf_type(), Term::NamedNode(cat));
+        insert(nn("http://ex/felix"), rdf_type(), Term::NamedNode(dog));
+        store.compact().unwrap();
+
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let (_inferred, diagnostics) = engine.infer(&dataset).unwrap();
+        let violations: Vec<_> = diagnostics.iter().filter(|d| d.rule == "cax-dw").collect();
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly one cax-dw violation, got: {diagnostics:?}"
+        );
+        assert!(violations[0].is_violation());
+    }
+
+    /// A dataset where an individual is only `rdf:type` one of two
+    /// disjoint classes must produce no `cax-dw` diagnostic.
+    #[test]
+    fn no_disjoint_class_violation_when_only_one_class_asserted() {
+        let store = RingStore::new();
+        let g = CoreGraphName::DefaultGraph;
+        let insert = |s: NamedNode, p: NamedNode, o: Term| {
+            store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
+        };
+        let cat = nn("http://ex/Cat");
+        let dog = nn("http://ex/Dog");
+        insert(cat.clone(), owl_disjoint_with(), Term::NamedNode(dog));
+        insert(nn("http://ex/felix"), rdf_type(), Term::NamedNode(cat));
+        store.compact().unwrap();
+
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let (_inferred, diagnostics) = engine.infer(&dataset).unwrap();
+        assert!(!diagnostics.iter().any(|d| d.rule == "cax-dw"));
+    }
+
+    /// `eq-diff`: `alice owl:sameAs bob` plus `alice owl:differentFrom bob`
+    /// must produce a [`Diagnostic::violation`] with rule `"eq-diff"`.
+    #[test]
+    fn detects_same_as_different_from_clash() {
+        let store = RingStore::new();
+        let g = CoreGraphName::DefaultGraph;
+        let insert = |s: NamedNode, p: NamedNode, o: Term| {
+            store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
+        };
+        insert(
+            nn("http://ex/alice"),
+            owl_same_as(),
+            Term::NamedNode(nn("http://ex/bob")),
+        );
+        insert(
+            nn("http://ex/alice"),
+            owl_different_from(),
+            Term::NamedNode(nn("http://ex/bob")),
+        );
+        store.compact().unwrap();
+
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let (_inferred, diagnostics) = engine.infer(&dataset).unwrap();
+        let violations: Vec<_> = diagnostics.iter().filter(|d| d.rule == "eq-diff").collect();
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly one eq-diff violation, got: {diagnostics:?}"
+        );
+        assert!(violations[0].is_violation());
+    }
+
+    /// A dataset with `owl:sameAs`/`owl:differentFrom` asserted between
+    /// terms that are *not* in the same equivalence class must produce no
+    /// `eq-diff` diagnostic.
+    #[test]
+    fn no_same_as_different_from_clash_when_unrelated() {
+        let store = RingStore::new();
+        let g = CoreGraphName::DefaultGraph;
+        let insert = |s: NamedNode, p: NamedNode, o: Term| {
+            store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
+        };
+        insert(
+            nn("http://ex/alice"),
+            owl_same_as(),
+            Term::NamedNode(nn("http://ex/bob")),
+        );
+        insert(
+            nn("http://ex/carol"),
+            owl_different_from(),
+            Term::NamedNode(nn("http://ex/dave")),
+        );
+        store.compact().unwrap();
+
+        let dataset = StoreDataset::new(Arc::new(store));
+        let engine = LftjFixpointEngine::new();
+        let (_inferred, diagnostics) = engine.infer(&dataset).unwrap();
+        assert!(!diagnostics.iter().any(|d| d.rule == "eq-diff"));
     }
 }

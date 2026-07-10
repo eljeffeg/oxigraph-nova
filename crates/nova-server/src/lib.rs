@@ -601,12 +601,13 @@ async fn service_description_get<S: QuadStore + 'static>(
 ///   "enabled": true,
 ///   "inferred_len": 1234,
 ///   "diagnostics": [
-///     {"rule": "decode", "message": "..."},
+///     {"rule": "decode", "message": "...", "severity": "info"},
+///     {"rule": "prp-asyp", "message": "...", "severity": "violation"},
 ///     ...
 ///   ]
 /// }
 /// ```
-///
+
 /// **Blocking.** Building/rebuilding the overlay runs on a
 /// `spawn_blocking` thread, matching `execute_sparql_query`'s handling of
 /// the same call (see `ReasoningState::current`'s doc comment).
@@ -643,6 +644,7 @@ async fn reasoning_diagnostics_get<S: QuadStore + 'static>(
                     serde_json::json!({
                         "rule": d.rule,
                         "message": d.message,
+                        "severity": if d.is_violation() { "violation" } else { "info" },
                     })
                 })
                 .collect();
