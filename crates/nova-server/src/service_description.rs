@@ -164,9 +164,15 @@ const TEXT_FN_NS: &str = "http://oxigraph-nova.dev/fn/text#";
 /// as `sd:extensionFunction`s — set from whether the server was constructed
 /// with `Server::with_text_search` (i.e. `--fulltext` was passed and the
 /// binary was built with the `fulltext` cargo feature).
+///
+/// `reasoning_enabled`: when `true`, `sd:defaultEntailmentRegime` advertises
+/// `http://www.w3.org/ns/entailment/OWL-RL` instead of `.../Simple` — set
+/// from whether the server was constructed with `Server::with_reasoning`
+/// (i.e. `--reasoning` was passed).
 pub fn generate_service_description_graph(
     endpoint_url: &str,
     fulltext_enabled: bool,
+    reasoning_enabled: bool,
 ) -> Vec<Triple> {
     let root = NamedOrBlankNode::BlankNode(BlankNode::default());
     let mut graph = Vec::new();
@@ -251,10 +257,15 @@ pub fn generate_service_description_graph(
     // Dataset construction detail (SPARQL spec, not a `sd:feature`).
     graph.push(Triple::new(root.clone(), sd::feature(), sd::empty_graphs()));
 
+    let entailment_regime = if reasoning_enabled {
+        "http://www.w3.org/ns/entailment/OWL-RL"
+    } else {
+        "http://www.w3.org/ns/entailment/Simple"
+    };
     graph.push(Triple::new(
         root.clone(),
         sd::default_entailment_regime(),
-        NamedNode::new_unchecked("http://www.w3.org/ns/entailment/Simple"),
+        NamedNode::new_unchecked(entailment_regime),
     ));
 
     if fulltext_enabled {

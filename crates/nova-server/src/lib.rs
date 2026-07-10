@@ -86,6 +86,7 @@
 //! semantics", for the storage-level explanation), demonstrated directly by
 //! `crates/nova-server/tests/isolation.rs`'s two integration tests.
 
+mod reasoning_state;
 mod service_description;
 
 /// mimalloc purge tuning (bulk-load/compaction transient-memory fix).
@@ -186,8 +187,10 @@ use oxigraph_nova_query::{
     CancellationToken, EvalLimitError, Evaluator, QueryOptions, QueryResult, ServiceHandler,
     Solutions, StoreDataset, clear_graph, execute_update,
 };
+use oxigraph_nova_reasoning::ReasoningEngine;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
 use oxrdfio::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
+use reasoning_state::ReasoningState;
 use serde::Deserialize;
 use service_description::generate_service_description_graph;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
@@ -247,6 +250,13 @@ pub struct AppState<S: QuadStore + 'static> {
     /// `QueryOptions` so `SERVICE` clauses can be dispatched (see
     /// `oxigraph_nova_query::options::QueryOptions::service_handler`).
     pub service_handler: Option<Arc<dyn ServiceHandler>>,
+    /// Opt-in OWL 2 RL reasoning overlay cache, if configured via
+    /// `Server::with_reasoning` / `--reasoning`. When present, `/sparql`
+    /// evaluates every query over the cached
+    /// `oxigraph_nova_reasoning::ReasoningDataset` overlay (rebuilt lazily
+    /// when the store's compaction generation advances — see
+    /// `reasoning_state`'s module doc comment) instead of the raw store.
+    pub reasoning: Option<Arc<ReasoningState<S>>>,
 }
 
 /// Manual `Clone` impl — `Arc<S>` is always `Clone` regardless of whether `S`
@@ -261,6 +271,7 @@ impl<S: QuadStore + 'static> Clone for AppState<S> {
             max_parallel_queries: self.max_parallel_queries,
             text_search: self.text_search.clone(),
             service_handler: self.service_handler.clone(),
+            reasoning: self.reasoning.clone(),
         }
     }
 }
@@ -292,6 +303,7 @@ pub struct Server<S: QuadStore + 'static> {
     max_parallel_queries: Option<usize>,
     text_search: Option<Arc<dyn TextSearch>>,
     service_handler: Option<Arc<dyn ServiceHandler>>,
+    reasoning: Option<Arc<ReasoningState<S>>>,
 }
 
 impl<S: QuadStore + Send + Sync + 'static> Server<S> {
@@ -303,6 +315,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             max_parallel_queries: None,
             text_search: None,
             service_handler: None,
+            reasoning: None,
         }
     }
 
@@ -355,6 +368,18 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
         self
     }
 
+    /// Enable OWL 2 RL reasoning: every `/sparql` query is evaluated over an
+    /// in-memory [`oxigraph_nova_reasoning::ReasoningDataset`] overlay built
+    /// by `engine`, rebuilt lazily whenever the store's compaction
+    /// generation advances (see [`reasoning_state::ReasoningState`]'s module
+    /// doc comment for the full staleness policy). Also exposes `GET
+    /// /reasoning/diagnostics` and advertises the OWL-RL entailment regime
+    /// on the SPARQL Service Description (`GET /`).
+    pub fn with_reasoning(mut self, engine: Arc<dyn ReasoningEngine>) -> Self {
+        self.reasoning = Some(Arc::new(ReasoningState::new(engine)));
+        self
+    }
+
     /// Build the axum `Router`.
     ///
     /// Returns a router that can be used directly in integration tests via
@@ -370,7 +395,9 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             max_parallel_queries: self.max_parallel_queries,
             text_search: self.text_search,
             service_handler: self.service_handler,
+            reasoning: self.reasoning,
         };
+
         Router::new()
             .route("/sparql", get(sparql_get::<S>).post(sparql_post::<S>))
             // `/query` is an alias matching upstream Oxigraph's endpoint
@@ -394,6 +421,13 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             // delta size, compaction count/duration, query counters, LFTJ
             // vs nested-loop fallback rate — see `metrics_get`'s doc comment).
             .route("/metrics", get(metrics_get::<S>))
+            // OWL 2 RL reasoning diagnostics (only meaningful when
+            // `Server::with_reasoning` was configured — see
+            // `reasoning_diagnostics_get`'s doc comment).
+            .route(
+                "/reasoning/diagnostics",
+                get(reasoning_diagnostics_get::<S>),
+            )
 
             // Permissive CORS so browser-based SPARQL clients (e.g. YASGUI,
             // or any web app served from a different origin/port) can query
@@ -547,8 +581,84 @@ async fn service_description_get<S: QuadStore + 'static>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
     let endpoint_url = format!("http://{host}/sparql");
-    let graph = generate_service_description_graph(&endpoint_url, state.text_search.is_some());
+    let graph = generate_service_description_graph(
+        &endpoint_url,
+        state.text_search.is_some(),
+        state.reasoning.is_some(),
+    );
     serialize_triples(&graph, accept_header(&headers))
+}
+
+/// `GET /reasoning/diagnostics` — OWL 2 RL reasoning overlay diagnostics.
+///
+/// Returns `404 Not Found` if `Server::with_reasoning` was never configured
+/// (there is no overlay to report on). Otherwise, returns the current
+/// (possibly lazily-rebuilt — see [`reasoning_state::ReasoningState`]'s
+/// module doc comment) overlay's diagnostics as JSON:
+///
+/// ```json
+/// {
+///   "enabled": true,
+///   "inferred_len": 1234,
+///   "diagnostics": [
+///     {"rule": "decode", "message": "..."},
+///     ...
+///   ]
+/// }
+/// ```
+///
+/// **Blocking.** Building/rebuilding the overlay runs on a
+/// `spawn_blocking` thread, matching `execute_sparql_query`'s handling of
+/// the same call (see `ReasoningState::current`'s doc comment).
+async fn reasoning_diagnostics_get<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+) -> Response {
+    let Some(rs) = state.reasoning.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "Reasoning is not enabled on this server (see --reasoning)",
+        )
+            .into_response();
+    };
+
+    let store = Arc::clone(&state.store);
+    let result = tokio::task::spawn_blocking(move || rs.current(&store)).await;
+
+    match result {
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("internal error: {join_err}"),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build reasoning overlay: {e}"),
+        )
+            .into_response(),
+        Ok(Ok(overlay)) => {
+            let diagnostics: Vec<serde_json::Value> = overlay
+                .diagnostics()
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "rule": d.rule,
+                        "message": d.message,
+                    })
+                })
+                .collect();
+            let body = serde_json::json!({
+                "enabled": true,
+                "inferred_len": overlay.inferred_len(),
+                "diagnostics": diagnostics,
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// `GET /metrics` — Prometheus text-exposition-format observability endpoint.
@@ -1052,11 +1162,18 @@ async fn execute_sparql_query<S: QuadStore + 'static>(
     }
 
     let store = Arc::clone(&state.store);
+    let reasoning = state.reasoning.clone();
     let query_for_eval = query.clone();
     let mut join = tokio::task::spawn_blocking(move || {
-        let dataset = StoreDataset::new(store);
-        let evaluator = Evaluator::with_options(&dataset, options);
-        evaluator.evaluate(&query_for_eval)
+        if let Some(rs) = reasoning {
+            let overlay = rs.current(&store)?;
+            let evaluator = Evaluator::with_options(&*overlay, options);
+            evaluator.evaluate(&query_for_eval)
+        } else {
+            let dataset = StoreDataset::new(store);
+            let evaluator = Evaluator::with_options(&dataset, options);
+            evaluator.evaluate(&query_for_eval)
+        }
     });
 
     // 3. Evaluate, racing against the configured timeout (if any).

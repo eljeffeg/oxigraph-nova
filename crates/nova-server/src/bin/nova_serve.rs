@@ -1,6 +1,6 @@
 //! Standalone Nova SPARQL server binary backed by `RingStore` (Ring + LFTJ).
 //!
-//! Loads an N-Triples file into memory, builds the Ring index (via
+//! Loads an RDF file into memory, builds the Ring index (via
 //! `compact()`), then serves the SPARQL 1.1 HTTP Protocol on the given
 //! address. Used for external comparative benchmarking against Oxigraph and
 //! QLever — see `benches/external/`.
@@ -21,12 +21,25 @@
 //! cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
 //!     --location /tmp/oxigraph-nova-bench/data \
 //!     --file /tmp/oxigraph-nova-bench/dataset.nt --bind 0.0.0.0:3030
+//!
+//! # Load a TBox into its own named graph and enable OWL 2 RL reasoning
+//! # (QLever-style --graph flag; no dedicated --ontology flag — just load
+//! # the ontology file into whatever graph you like):
+//! cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
+//!     --file dataset.nt \
+//!     --file ontology.ttl --graph http://example.org/ontology \
+//!     --reasoning --bind 0.0.0.0:3030
 //! ```
 //!
 //! `--location`/`-l`, `--bind`/`-b`, and `--file`/`-f` are named identically
 //! to upstream Oxigraph's own `oxigraph serve --location <path> --bind <addr>`
 //! and `oxigraph load --file <file>` flags, so a script or muscle memory
 //! built around either binary carries over unchanged.
+//!
+//! `--file` may be given more than once (each occurrence loads one more
+//! file); `--graph` applies to the single `--file` that immediately follows
+//! it and only to plain-triple formats (see `resolve_format`'s doc comment
+//! for format detection and `--graph`'s interaction with dataset formats).
 //!
 //! Storage model note: without `--location`, `RingStore` is always fully
 //! in-process heap memory — there is no disk persistence at all, so the
@@ -38,7 +51,8 @@
 //! `RingStore::open` for details of the overall persistent-storage design.
 
 use mimalloc::MiMalloc;
-use oxigraph_nova_core::{GraphName, Quad};
+use oxigraph_nova_core::{GraphName, NamedNode, Quad};
+use oxigraph_nova_reasoning::{LftjFixpointEngine, ReasoningEngine};
 use oxigraph_nova_server::Server;
 use oxigraph_nova_storage_ring::{RingStore, SyncPolicy};
 use oxrdfio::{RdfFormat, RdfParser};
@@ -69,9 +83,36 @@ static GLOBAL: MiMalloc = MiMalloc;
 // a 500K-entity/12.5M-triple in-memory dataset).
 use oxigraph_nova_server::mimalloc_tuning;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Resolve an RDF format from a file's extension, mirroring
+/// `oxigraph-cli`'s `nova-cli/src/load.rs::resolve_format` (kept as a small
+/// standalone copy here rather than a shared dependency, since `nova-cli`
+/// is a separate binary crate and this is the only bit of it `nova_serve`
+/// needs).
+fn resolve_format(path: &Path) -> RdfFormat {
+    let name = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| panic!("cannot guess RDF format from file extension of {}; expected one of: nt, ttl, rdf, nq, trig, jsonld", path.display()));
+
+    RdfFormat::from_extension(&name)
+        .or_else(|| RdfFormat::from_media_type(&name))
+        .unwrap_or_else(|| {
+            panic!(
+                "unrecognized RDF format {name:?}; expected one of: nt, ttl, rdf, nq, trig, jsonld"
+            )
+        })
+}
+
+/// One `--file [--graph <iri>]` entry from the command line.
+struct FileLoad {
+    path: PathBuf,
+    graph: Option<GraphName>,
+}
 
 #[tokio::main]
 async fn main() {
@@ -81,7 +122,7 @@ async fn main() {
 
     tracing_subscriber::fmt::init();
 
-    let mut file: Option<PathBuf> = None;
+    let mut files: Vec<FileLoad> = Vec::new();
 
     let mut location: Option<PathBuf> = None;
     let mut bind: String = "0.0.0.0:3030".to_string();
@@ -92,6 +133,7 @@ async fn main() {
     let mut max_parallel_queries: Option<usize> = None;
     #[cfg_attr(not(feature = "fulltext"), allow(unused_mut))]
     let mut fulltext = false;
+    let mut reasoning = false;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -99,7 +141,20 @@ async fn main() {
         match args[i].as_str() {
             "--file" | "-f" => {
                 i += 1;
-                file = Some(PathBuf::from(&args[i]));
+                files.push(FileLoad {
+                    path: PathBuf::from(&args[i]),
+                    graph: None,
+                });
+            }
+            "--graph" => {
+                i += 1;
+                let iri = &args[i];
+                let last = files
+                    .last_mut()
+                    .unwrap_or_else(|| panic!("--graph must follow the --file it applies to"));
+                let node = NamedNode::new(iri)
+                    .unwrap_or_else(|e| panic!("--graph {iri:?} is not a valid IRI: {e}"));
+                last.graph = Some(GraphName::NamedNode(node));
             }
             "--location" | "-l" => {
                 i += 1;
@@ -147,13 +202,27 @@ async fn main() {
             "--fulltext" => {
                 fulltext = true;
             }
+            "--reasoning" => {
+                reasoning = true;
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: nova_serve [--file <dataset.nt>] [--location <dir>] [--bind 0.0.0.0:3030] \
-                     [--compact-threshold <n>] [--sync-interval-ms <n>]\n\
+                    "Usage: nova_serve [--file <dataset> [--graph <iri>]]... [--location <dir>] \
+                     [--bind 0.0.0.0:3030] [--compact-threshold <n>] [--sync-interval-ms <n>] \
+                     [--reasoning] [--fulltext]\n\
                      \n\
-                     --file <file> (matching `oxigraph load --file`): bulk-load an\n\
-                     N-Triples dataset. Short form: -f.\n\
+                     --file <file> (matching `oxigraph load --file`): bulk-load an RDF file.\n\
+                     May be given more than once; each occurrence loads one more file. RDF\n\
+                     format is auto-detected from the file extension (.nt, .ttl, .rdf, .nq,\n\
+                     .trig, .jsonld, ...). Short form: -f.\n\
+                     \n\
+                     --graph <iri>: target named graph for the *immediately preceding*\n\
+                     --file (QLever-style). Ignored (with a warning) for dataset formats\n\
+                     (N-Quads/TriG/JSON-LD), since those carry their own per-quad graph.\n\
+                     Omit --graph to load into the default graph. There is no dedicated\n\
+                     --ontology flag: load a TBox into its own graph with e.g.\n\
+                     `--file ontology.ttl --graph http://example.org/ontology`.\n\
+                     \n\
                      --location <dir> (matching `oxigraph serve --location`): persistent\n\
                      WAL-backed RingStore rooted at <dir>. Short form: -l.\n\
                      --bind <addr> (matching `oxigraph serve --bind`), default 0.0.0.0:3030.\n\
@@ -189,6 +258,13 @@ async fn main() {
                      evaluations running concurrently; a request arriving while <n>\n\
                      evaluations are in flight is rejected immediately with 503 Service\n\
                      Unavailable. Unset by default (unbounded).\n\
+                     \n\
+                     --reasoning: enable OWL 2 RL reasoning (`oxigraph_nova_reasoning::\n\
+                     LftjFixpointEngine`). Every `/sparql` query is evaluated over an\n\
+                     in-memory closure computed over the union of all graphs, rebuilt\n\
+                     lazily whenever the store's data changes. Also exposes `GET\n\
+                     /reasoning/diagnostics` and advertises the OWL-RL entailment regime\n\
+                     on the SPARQL Service Description (`GET /`).\n\
                      \n\
                      --fulltext: enable Tantivy-backed full-text search\n\
                      (`text:query`/`text:contains` SPARQL extension functions), indexed\n\
@@ -238,34 +314,54 @@ async fn main() {
     // in-memory store, or a fresh/empty --location directory with no prior
     // WAL history). If a persistent store already has data recovered from
     // its WAL, --file is ignored — the WAL is the source of truth.
-    if let Some(file) = &file {
+    if !files.is_empty() {
         if store.triple_count() > 0 {
             eprintln!(
                 "[nova_serve] Store already has {} triples (from --location); ignoring --file.",
                 store.triple_count()
             );
         } else {
-            eprintln!("[nova_serve] Loading {} ...", file.display());
-            let t0 = Instant::now();
-            let f = File::open(file).expect("failed to open dataset file");
-            let reader = BufReader::new(f);
+            // First pass: parse every --file into one combined `Vec<Quad>`
+            // (each targeting its own resolved graph), then bulk-load them
+            // all in a single `bulk_load()` call/compaction.
+            let mut all_quads: Vec<Quad> = Vec::new();
+            for fl in &files {
+                let fmt = resolve_format(&fl.path);
+                if fmt.supports_datasets() && fl.graph.is_some() {
+                    eprintln!(
+                        "[nova_serve] warning: --graph is ignored for dataset formats \
+                         (N-Quads/TriG/JSON-LD) — {}'s own per-quad graph is used instead.",
+                        fl.path.display()
+                    );
+                }
+                let target_graph = fl.graph.clone().unwrap_or(GraphName::DefaultGraph);
 
-            let mut parsed: usize = 0;
-            let quads = RdfParser::from_format(RdfFormat::NTriples)
-                .for_reader(reader)
-                .map(|result| {
-                    let quad = result.expect("N-Triples parse error");
-                    parsed += 1;
-                    if parsed.is_multiple_of(200_000) {
-                        eprintln!("[nova_serve]   ... {parsed} triples parsed");
-                    }
-                    Quad::new(
-                        quad.subject,
-                        quad.predicate,
-                        quad.object,
-                        GraphName::DefaultGraph,
-                    )
-                });
+                eprintln!("[nova_serve] Loading {} ...", fl.path.display());
+                let t0 = Instant::now();
+                let f = File::open(&fl.path).expect("failed to open dataset file");
+                let reader = BufReader::new(f);
+
+                let mut parsed: usize = 0;
+                let quads: Vec<Quad> = RdfParser::from_format(fmt)
+                    .with_default_graph(target_graph)
+                    .for_reader(reader)
+                    .map(|result| {
+                        let quad =
+                            result.unwrap_or_else(|e| panic!("{} parse error: {e}", fmt.name()));
+                        parsed += 1;
+                        if parsed.is_multiple_of(200_000) {
+                            eprintln!("[nova_serve]   ... {parsed} triples parsed");
+                        }
+                        quad
+                    })
+                    .collect();
+                eprintln!(
+                    "[nova_serve]   ... parsed {} in {:.2}s.",
+                    quads.len(),
+                    t0.elapsed().as_secs_f64()
+                );
+                all_quads.extend(quads);
+            }
 
             // `bulk_load()` bypasses both the delta `BTreeMap` *and* the WAL
             // entirely: it builds the Ring directly in memory, then commits
@@ -283,7 +379,10 @@ async fn main() {
             // leaves the fully-loaded snapshot committed — no partial
             // states), so there is no reason to prefer the fsync-per-write
             // path for an initial bulk load, persistent or not.
-            let count = store.bulk_load(quads).expect("bulk_load failed");
+            let t0 = Instant::now();
+            let count = store
+                .bulk_load(all_quads.into_iter())
+                .expect("bulk_load failed");
             eprintln!(
                 "[nova_serve] Loaded + compacted {count} triples in {:.2}s.",
                 t0.elapsed().as_secs_f64()
@@ -296,7 +395,7 @@ async fn main() {
             mimalloc_tuning::mimalloc_collect_now();
         }
     } else if location.is_none() {
-        panic!("either --file <dataset.nt> or --location <dir> is required");
+        panic!("either --file <dataset> or --location <dir> is required");
     }
 
     eprintln!("[nova_serve] Ring triple_count={}", store.triple_count());
@@ -395,6 +494,11 @@ async fn main() {
     }
     if let Some(ts) = text_search {
         server = server.with_text_search(ts);
+    }
+    if reasoning {
+        eprintln!("[nova_serve] Enabling OWL 2 RL reasoning (LftjFixpointEngine) ...");
+        let engine: Arc<dyn ReasoningEngine> = Arc::new(LftjFixpointEngine::new());
+        server = server.with_reasoning(engine);
     }
     server.run(&bind).await.expect("server failed");
 }

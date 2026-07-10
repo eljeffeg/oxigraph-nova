@@ -121,17 +121,7 @@ pub trait TrieIterator: Send {
 
 8 + 40 + 40 + 40 = 128 bits exactly. Inserts and deletes land here in O(log n). When the delta crosses a threshold, the store rebuilds the Ring over the merged dataset and atomically swaps it in. Queries during the merge read both layers — no read downtime.
 
-**Term dictionary** — all internal computation runs over **40-bit integer IDs** (`TermId`), not cloned `Term` objects. The 40-bit ceiling (~1.1 trillion distinct terms) comfortably exceeds Wikidata at current scale (~200M distinct terms). Named graphs get a separate 8-bit `GraphId`. Several `GraphId` values are reserved for system use:
-
-| `GraphId` | Meaning |
-|---|---|
-| `0` | Default graph (always present; SPARQL default) |
-| `1` | Ontology graph — TBox (OWL class/property definitions loaded by the user) |
-| `2–253` | User named graphs |
-| `254` | Reserved (future system use) |
-| `255` | Inference graph — materialized OWL 2 RL entailment closure (planned) |
-
-The ontology graph (`GraphId(1)`) is the input to the planned OWL 2 RL reasoner. Load OWL axioms here via a standard named-graph INSERT; the reasoner reads from it and writes results to `GraphId(255)`.
+**Term dictionary** — all internal computation runs over **40-bit integer IDs** (`TermId`), not cloned `Term` objects. The 40-bit ceiling (~1.1 trillion distinct terms) comfortably exceeds Wikidata at current scale (~200M distinct terms). Named graphs get a separate 8-bit `GraphId` (256 total graphs).
 
 **RDF 1.2 / quoted triples** — a quoted triple (`<< s p o >>`) is assigned its own `TermId` from the flat ID space, with a parallel side table mapping `TermId → [s_id, p_id, o_id]`. The index and delta are completely unaffected — they index flat 40-bit IDs regardless.
 
@@ -279,28 +269,30 @@ Because Nova reuses the Oxigraph project's own parsing crates (`spargebra`, `oxr
 The planned reasoning layer adds forward-chaining OWL 2 RL inference as an **opt-in `Dataset` decorator** — zero changes to the evaluator or storage layer:
 
 ```rust
-/// Wraps any Dataset, transparently merging base facts with the materialized
-/// OWL 2 RL closure. The evaluator only ever sees Dataset — it never knows reasoning happened.
+/// Wraps any Dataset, transparently merging base facts with an in-memory
+/// materialized OWL 2 RL closure. The evaluator only ever sees Dataset — it
+/// never knows reasoning happened.
 pub struct ReasoningDataset<D: Dataset> {
     base:     Arc<D>,
-    inferred: Arc<dyn QuadStore>,  // holds the materialized closure in GraphId(255)
+    inferred: Vec<Quad>, // in-memory overlay; never written back into the store
 }
 impl<D: Dataset> Dataset for ReasoningDataset<D> { … }
 ```
 
-**Engine:** [`reasonable`](https://github.com/gtfierro/reasonable) — pure-Rust OWL 2 RL reasoner. OWL 2 RL covers `rdfs:subClassOf` transitivity, `owl:sameAs`, property chains, inverse/symmetric/transitive properties, domain/range, and more — the pragmatic decidable profile. Neither QLever nor Tentris reasons; this is a genuine differentiator.
+**Engine:** a native LFTJ-driven forward-chaining engine (`oxigraph-nova-reasoning`), reusing the same Leapfrog Triejoin machinery the query evaluator uses for joins, plus a pluggable `ReasoningEngine` trait so an adapter over an external reasoner (e.g. [`reasonable`](https://github.com/gtfierro/reasonable)) could be swapped in later. Current rule coverage includes `rdfs:subClassOf`/`subPropertyOf` transitivity, `rdf:type` propagation, property domain/range, generic `owl:TransitiveProperty`/`SymmetricProperty`, `owl:equivalentClass`/`equivalentProperty`, and `owl:inverseOf` — see `crates/nova-reasoning/src/engine.rs` for the authoritative, up-to-date list.
 
-**Materialization policy:** the OWL 2 RL closure is recomputed as part of the same merge cycle that rebuilds the Ring, running `reasonable` over the ontology (`GraphId(1)`) plus base facts and writing inferred triples into the inference graph (`GraphId(255)`). Between merges, the live delta is treated as un-inferred — sound but incomplete; full inference catches up at the next merge. The reasoner is **never on the per-write hot path** — write throughput is unaffected.
+**Materialization policy:** the default path computes the OWL 2 RL closure **in memory** and never persists it — there is no reserved `GraphId` for ontology input or inferred output; any named graph works identically as far as reasoning is concerned, since the whole dataset (default graph plus every named graph) is reasoned over as one merged scope. A future, opt-in materializing engine could instead write its output into an ordinary named graph chosen by the deployment, recomputed on the same cycle that rebuilds the Ring — but that is not the shipped default. The reasoner is **never on the per-write hot path** — write throughput is unaffected.
 
 **Workflow:**
 ```sparql
--- 1. Load your OWL ontology into the reserved ontology graph
-INSERT DATA { GRAPH <oxigraph-nova:ontology> { <Ex:Dog> rdfs:subClassOf <Ex:Animal> . } }
+-- 1. Load your OWL ontology into any named graph (or the default graph)
+INSERT DATA { GRAPH <http://example.org/ontology> { <Ex:Dog> rdfs:subClassOf <Ex:Animal> . } }
 
 -- 2. Query with reasoning enabled (server flag or ?reasoning=true)
 SELECT ?animal WHERE { ?animal a <Ex:Animal> }
 -- → returns both explicit Ex:Animal instances and inferred ones (dogs, etc.)
 ```
+
 
 ---
 

@@ -8,10 +8,22 @@ repository.workspace = true
 
 [dependencies]
 oxigraph-nova-core = { path = "../nova-core" }
+# `engine`/`reasoning_dataset` operate at the `Dataset` seam (not raw
+# `QuadStore`) so `ReasoningDataset<D: Dataset>` can wrap any SPARQL-facing
+# dataset, mirroring `oxigraph-nova-query`'s own `StoreDataset` adapter.
+oxigraph-nova-query = { path = "../nova-query" }
+anyhow = { workspace = true }
 
 [dev-dependencies]
-# Only the integration spike test (tests/transitivity_spike.rs) needs a real
-# storage backend + oxrdf term constructors — the library itself has no
-# dependency on any concrete QuadStore, only on TermIds (`u64`).
+# Only integration/unit tests need a real storage backend + oxrdf term
+# constructors — the fixpoint/join/rule core has no dependency on any
+# concrete QuadStore, only on TermIds (`u64`).
 oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
 oxrdf = { workspace = true }
+# Differential-testing oracle: an independent, mature OWL 2 RL reasoner
+# (datafrog-based) used only in tests, to cross-check `LftjFixpointEngine`'s
+# output against a from-scratch implementation of the same rules. Never a
+# dependency of any production (non-test) code in this crate.
+reasonable = { workspace = true }
+
+

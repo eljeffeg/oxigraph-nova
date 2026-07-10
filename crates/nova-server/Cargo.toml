@@ -15,6 +15,7 @@ fulltext = ["oxigraph-nova-storage-ring/fulltext"]
 oxigraph-nova-core         = { path = "../nova-core" }
 oxigraph-nova-query        = { path = "../nova-query" }
 oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
+oxigraph-nova-reasoning    = { path = "../nova-reasoning" }
 oxrdf          = { workspace = true }
 oxrdfio        = { workspace = true }
 spargebra      = { workspace = true }
@@ -25,11 +26,13 @@ tokio-stream   = { workspace = true }
 axum           = { workspace = true }
 tower-http     = { workspace = true }
 serde          = { workspace = true }
+serde_json     = { workspace = true }
 anyhow         = { workspace = true }
 tracing        = { workspace = true }
 tracing-subscriber = { workspace = true }
 mimalloc         = { version = "0.1.52", features = ["extended"] }
 libmimalloc-sys  = { version = "0.1.49", features = ["extended"] }
+
 
 
 [[bin]]
@@ -39,8 +42,8 @@ path = "src/bin/nova_serve.rs"
 [dev-dependencies]
 oxigraph-nova-storage-memory = { path = "../nova-storage-memory" }
 tower             = { workspace = true }   # Router::oneshot for integration tests
-serde_json        = { workspace = true }
 pretty_assertions = { workspace = true }
+
 tokio             = { workspace = true }
 ureq              = "3"    # blocking HTTP client for the crash-recovery integration
                              # test (tests/crash_recovery.rs) — spawns and talks to a

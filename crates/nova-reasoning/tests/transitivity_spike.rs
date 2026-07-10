@@ -2,7 +2,9 @@
 //!
 //! This is the integration test that de-risks the whole
 //! `SortedVecTrie` + heterogeneous-source `leapfrog_join` + semi-naive
-//! `transitive_closure` combination against Nova's actual storage backend,
+//! `transitive_closure` combination against Nova's actual storage backend
+//! (note this test predates and is independent of the project's current
+//! default reasoning path, `oxigraph_nova_reasoning::ReasoningDataset`),
 //! not just synthetic `[u64; 3]` fixtures (see the unit tests in
 //! `fixpoint.rs`/`join.rs`/`sorted_vec_trie.rs` for those).
 //!
@@ -20,16 +22,15 @@
 //!
 //! ## Simplification vs. the production design
 //!
-//! `GraphId(255)` (`oxigraph_nova_core::GRAPH_INFERENCE`) is reserved for
-//! the OWL 2 RL inference closure, but `Dictionary::intern_graph` currently
-//! only assigns graph IDs sequentially from its `next_graph_id` counter —
-//! there is not yet a public API to force a `GraphName` to bind to a
-//! *specific* reserved `GraphId`. Wiring that up is separate storage-layer
-//! follow-up work (tracked in `CLAUDE.md`'s Phase 3 section), orthogonal to
-//! what this spike is testing (the fixpoint/join machinery). This test
-//! therefore writes the closure into an ordinary dedicated named graph
-//! (`urn:nova:inference-spike`) rather than literally `GraphId(255)` — the
-//! insert/compact mechanics are identical either way.
+//! There is no reserved `GraphId` for OWL 2 RL inference output — per the
+//! project's current design (see
+//! `oxigraph_nova_reasoning::ReasoningDataset`), the default reasoning path
+//! is an in-memory overlay that never writes derived quads back into the
+//! store at all. This test predates that design and simply writes its
+//! derived closure into an ordinary dedicated named graph
+//! (`urn:nova:inference-spike`), assigned whatever `GraphId`
+//! `Dictionary::intern_graph` happens to hand out — the insert/compact
+//! mechanics being exercised here don't depend on which id that is.
 
 use oxigraph_nova_core::{GraphName, LftjSource, NamedNode, Quad, QuadStore, Term};
 use oxigraph_nova_reasoning::fixpoint::transitive_closure;
@@ -98,12 +99,8 @@ fn subclassof_transitivity_end_to_end_over_ringstore() {
         id_of("F"),
     );
 
-    let base_triples: Vec<[u64; 3]> = vec![
-        [a, sc_id, b],
-        [b, sc_id, c],
-        [c, sc_id, d],
-        [e, sc_id, f],
-    ];
+    let base_triples: Vec<[u64; 3]> =
+        vec![[a, sc_id, b], [b, sc_id, c], [c, sc_id, d], [e, sc_id, f]];
 
     // ── Run the semi-naive fixpoint ──────────────────────────────────────
     let rule = Rule::transitive(sc_id);

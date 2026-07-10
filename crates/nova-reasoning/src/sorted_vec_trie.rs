@@ -21,7 +21,7 @@
 //! one ordering (e.g. SPO) implements it directly: `seek()` is a
 //! `partition_point` binary search over the sorted slice, matching the
 //! SIMD-friendly access pattern the LOUDS backend's own vocab arrays are
-//! deliberately kept as (`&[u64]`, see CLAUDE.md Hard-Won Lesson #1).
+//! deliberately kept as (`&[u64]`).
 //!
 //! This lets a fixpoint round's `lftj_step` recursion mix atom sources
 //! freely: some triple-pattern atoms scan the stable, large LOUDS tries
@@ -171,9 +171,7 @@ pub fn join_scan(
     let bound = [s, p, o];
     let mut vals: Vec<u64> = rows
         .iter()
-        .filter(|row| {
-            (0..3).all(|i| i == target_field || bound[i].is_none_or(|v| v == row[i]))
-        })
+        .filter(|row| (0..3).all(|i| i == target_field || bound[i].is_none_or(|v| v == row[i])))
         .map(|row| row[target_field])
         .collect();
     vals.sort_unstable();
@@ -185,7 +183,6 @@ pub fn join_scan(
 }
 
 impl TrieIterator for SortedVecTrie {
-
     fn key(&self) -> u64 {
         self.val_at(self.range.0 + self.pos)
     }

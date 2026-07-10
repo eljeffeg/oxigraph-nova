@@ -100,6 +100,17 @@ pretty_assertions = "1.4"
 # crate, and not a replacement for Nova's own LFTJ-based evaluator.
 spareval = { version = "0.2.6", features = ["sparql-12"] }
 
+# `reasonable` is a mature, independently-implemented OWL 2 RL reasoner
+# (datafrog-based). Used only as a differential-testing oracle by
+# nova-reasoning's tests — cross-checking `LftjFixpointEngine`'s semi-naive
+# LFTJ fixpoint output against an independent implementation of the same
+# OWL 2 RL rules, never a dependency of any production crate. The `rdf-12`
+# feature must be enabled here because this workspace's `oxrdf` is built
+# with `rdf-12` on, which adds a `Term::Triple` variant that `reasonable`
+# must have a (feature-gated) match arm for to compile against.
+reasonable = { version = "0.4.4", features = ["rdf-12"] }
+
+
 
 [profile.release]
 opt-level      = 3

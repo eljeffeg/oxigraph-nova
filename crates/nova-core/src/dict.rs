@@ -20,10 +20,14 @@
 //! | `GraphId` | Meaning |
 //! |---|---|
 //! | `0` | Default graph (always present) |
-//! | `1` | Ontology graph — TBox input for reasoner |
-//! | `2–254` | User named graphs |
-//! | `255` | Inference graph — OWL 2 RL closure written by the reasoner |
+//! | `1–255` | User named graphs (assigned sequentially on first use) |
 //!
+//! There is no reserved graph for ontology input or reasoner output —
+//! anything that needs an internal named graph (e.g.
+//! `oxigraph_nova_reasoning`) simply interns whatever `GraphName` it likes
+//! through the normal path; it does not matter which `GraphId` ends up
+//! assigned to it.
+
 //! ## Two-tier storage (Front-Coding compression)
 //!
 //! `Dictionary` is a two-tier structure:
@@ -55,10 +59,10 @@
 //! delta tier — always stays heap-resident: both are small and bounded by
 //! design, so there is no benefit to mapping them.
 //!
-//! `get_term`'s old `-> Option<&Term>` signature could not survive this
-//! (a borrowed reference cannot be produced for content that isn't
-//! resident) — it has been removed in favor of `get_term_arc` (which was
-//! already the primary hot-path accessor for exactly this reason).
+//! A borrowed `&Term` reference cannot be produced for content that isn't
+//! resident, so term lookup is exposed only via `get_term_arc` (returning
+//! an owned `Arc<Term>`), which is also the primary hot-path accessor for
+//! exactly this reason.
 
 use crate::Oxigraph;
 use crate::dict_compact::{
@@ -123,18 +127,16 @@ impl TermId {
 
 /// An 8-bit named-graph identifier.
 ///
-/// The default graph is `GraphId(0)`; user named graphs occupy `2..=254`.
-/// `1` is reserved for the ontology TBox; `255` is reserved for the OWL 2 RL
-/// inference closure written by the reasoner.
+/// The default graph is `GraphId(0)`; user named graphs occupy `1..=255`,
+/// assigned sequentially on first use. There is no other reservation —
+/// anything that needs an internal named graph (an ontology graph, a
+/// reasoner's inference overlay, etc.) simply interns whatever `GraphName`
+/// it likes through the normal path.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct GraphId(pub u8);
 
 /// Default graph (SPARQL default, always present).
 pub const GRAPH_DEFAULT: GraphId = GraphId(0);
-/// Ontology graph — loads OWL TBox axioms for reasoning.
-pub const GRAPH_ONTOLOGY: GraphId = GraphId(1);
-/// Inference graph — written by the OWL 2 RL materializing reasoner.
-pub const GRAPH_INFERENCE: GraphId = GraphId(255);
 
 impl GraphId {
     /// The raw 8-bit value.
@@ -196,7 +198,13 @@ pub struct Dictionary {
     graph_to_id: HashMap<GraphName, GraphId>,
     /// Reverse: `GraphId.as_u8()` → `GraphName`
     id_to_graph: HashMap<u8, GraphName>,
-    /// Next available user GraphId (range `2..=254`; `0/1/255` are reserved).
+    /// Next available user GraphId, range `1..=255`. `0` doubles as an
+    /// "exhausted" sentinel: since `0` is permanently reserved for the
+    /// default graph, it can never legitimately be the *next available*
+    /// user id, so [`Dictionary::intern_graph`] reuses it to mean "every
+    /// one of the 255 user slots has been assigned" (reached via
+    /// `255u8.checked_add(1)` wrapping to this sentinel rather than
+    /// panicking on overflow).
     next_graph_id: u8,
 
     // ── Quoted-triple side table (RDF 1.2 / RDF-star) ──────────────────────
@@ -225,12 +233,13 @@ impl Dictionary {
             )),
             graph_to_id: HashMap::new(),
             id_to_graph: HashMap::new(),
-            next_graph_id: 2, // 0=default, 1=ontology — both reserved
+            next_graph_id: 1, // 0 is reserved for the default graph
 
             triple_terms: HashMap::new(),
             triple_index: HashMap::new(),
         };
         // Pre-register the default graph so GraphId(0) is always valid.
+
         d.graph_to_id.insert(GraphName::DefaultGraph, GRAPH_DEFAULT);
         d.id_to_graph.insert(0, GraphName::DefaultGraph);
         d
@@ -448,8 +457,16 @@ impl Dictionary {
     /// Get or assign a `GraphId` for the given `GraphName`.
     ///
     /// `GraphName::DefaultGraph` always maps to `GRAPH_DEFAULT` (`GraphId(0)`).
-    /// User named graphs are assigned IDs in `2..=254`; returning
-    /// `Err(GraphSpaceExhausted)` when all 253 slots are consumed.
+    /// User named graphs are assigned IDs sequentially from `1..=255`
+    /// (all 255 slots usable — no reservation beyond `GraphId(0)`),
+    /// returning `Err(GraphSpaceExhausted)` once every slot is consumed.
+    ///
+    /// `next_graph_id` doubles as its own "exhausted" sentinel (see that
+    /// field's doc comment): assigning `GraphId(255)` advances
+    /// `next_graph_id` via `checked_add(1)`, which is `None` exactly when
+    /// the just-assigned id was `255` — `unwrap_or(0)` turns that into the
+    /// sentinel value `0`, which can never collide with a real "next
+    /// available" id (since `0` is always the default graph's own id).
     pub fn intern_graph(&mut self, graph: &GraphName) -> Result<GraphId, Oxigraph> {
         if let Some(&id) = self.graph_to_id.get(graph) {
             return Ok(id);
@@ -460,11 +477,11 @@ impl Dictionary {
             self.id_to_graph.insert(0, graph.clone());
             return Ok(GRAPH_DEFAULT);
         }
-        if self.next_graph_id > 254 {
+        if self.next_graph_id == 0 {
             return Err(Oxigraph::GraphSpaceExhausted);
         }
         let id = GraphId(self.next_graph_id);
-        self.next_graph_id += 1;
+        self.next_graph_id = self.next_graph_id.checked_add(1).unwrap_or(0);
         self.graph_to_id.insert(graph.clone(), id);
         self.id_to_graph.insert(id.as_u8(), graph.clone());
         Ok(id)
@@ -485,7 +502,8 @@ impl Dictionary {
         self.id_to_graph.iter().map(|(&raw, g)| (GraphId(raw), g))
     }
 
-    /// The next available user `GraphId` (range `2..=254`).
+    /// The next available user `GraphId` (range `1..=255`; `0` means the
+    /// range is exhausted — see `next_graph_id`'s field doc comment).
     pub fn next_graph_id_raw(&self) -> u8 {
         self.next_graph_id
     }
@@ -643,7 +661,7 @@ impl Dictionary {
         Ok(d)
     }
 
-    // ── mmap-based persistence (Phase 4: dictionary residency) ─────────────
+    // ── mmap-based persistence (dictionary residency) ──────────────────────
 
     /// Build an ε-serde-serializable [`DictSnapshot`] of this dictionary's
     /// current state.

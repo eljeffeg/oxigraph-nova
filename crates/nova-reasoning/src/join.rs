@@ -79,6 +79,130 @@ impl AtomSource for SliceSource<'_> {
     }
 }
 
+/// An [`AtomSource`] that always yields an empty (already-exhausted) scan —
+/// a placeholder "no EDB" base source, useful when a fixpoint run has no
+/// separate store-backed relation (e.g. pure in-memory unit tests where the
+/// base facts are already folded into `Total` directly).
+pub struct NullSource;
+
+impl AtomSource for NullSource {
+    fn scan(
+        &self,
+        _s: Option<u64>,
+        _p: Option<u64>,
+        _o: Option<u64>,
+        _target_field: usize,
+    ) -> Box<dyn TrieIterator> {
+        Box::new(oxigraph_nova_core::EmptyTrieIter)
+    }
+}
+
+/// An [`AtomSource`] that transparently unions two other sources — e.g. the
+/// stable, LOUDS-backed base facts (EDB, via
+/// [`crate::store_source::StoreAtomSource`]) with the in-memory closure
+/// derived so far (IDB, via [`SliceSource`]) — without copying either side
+/// into a combined `Vec` first.
+///
+/// This is what lets a semi-naive fixpoint round's "Total" atoms scan the
+/// real store directly every round rather than re-materializing the base
+/// relation into memory on every iteration: `primary` is queried once per
+/// scan call exactly like any other `AtomSource`, and [`UnionTrieIter`]
+/// merges its results with `secondary`'s on the fly, key by key.
+pub struct CombinedSource<'a> {
+    pub primary: &'a dyn AtomSource,
+    pub secondary: &'a dyn AtomSource,
+}
+
+impl AtomSource for CombinedSource<'_> {
+    fn scan(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+    ) -> Box<dyn TrieIterator> {
+        let a = self.primary.scan(s, p, o, target_field);
+        let b = self.secondary.scan(s, p, o, target_field);
+        UnionTrieIter::new(a, b)
+    }
+}
+
+/// A [`TrieIterator`] that merges two other `TrieIterator`s into one sorted,
+/// deduplicated key stream — the trie-level equivalent of a merge-union of
+/// two sorted iterators, recursing through `open()` at every depth.
+///
+/// Both `a` and `b` are ordinary `TrieIterator`s (backend-agnostic — one may
+/// be LOUDS-backed, the other a [`SortedVecTrie`](crate::SortedVecTrie)); the
+/// union is computed purely through the trait's `key`/`seek`/`open`/`at_end`
+/// contract, so it composes with any backend without either side knowing
+/// about the other.
+pub struct UnionTrieIter {
+    a: Box<dyn TrieIterator>,
+    b: Box<dyn TrieIterator>,
+}
+
+impl UnionTrieIter {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(a: Box<dyn TrieIterator>, b: Box<dyn TrieIterator>) -> Box<dyn TrieIterator> {
+        Box::new(Self { a, b })
+    }
+}
+
+impl TrieIterator for UnionTrieIter {
+    fn key(&self) -> u64 {
+        match (self.a.at_end(), self.b.at_end()) {
+            (true, true) => 0, // precondition violated by caller; harmless default
+            (true, false) => self.b.key(),
+            (false, true) => self.a.key(),
+            (false, false) => self.a.key().min(self.b.key()),
+        }
+    }
+
+    fn seek(&mut self, target: u64) {
+        if !self.a.at_end() {
+            self.a.seek(target);
+        }
+        if !self.b.at_end() {
+            self.b.seek(target);
+        }
+    }
+
+    fn advance(&mut self) {
+        if self.at_end() {
+            return;
+        }
+        let next = self.key().saturating_add(1);
+        self.seek(next);
+    }
+
+    fn open(&self) -> Box<dyn TrieIterator> {
+        if self.at_end() {
+            return Box::new(oxigraph_nova_core::EmptyTrieIter);
+        }
+        let cur = self.key();
+        let a_matches = !self.a.at_end() && self.a.key() == cur;
+        let b_matches = !self.b.at_end() && self.b.key() == cur;
+        match (a_matches, b_matches) {
+            (true, true) => UnionTrieIter::new(self.a.open(), self.b.open()),
+            (true, false) => self.a.open(),
+            (false, true) => self.b.open(),
+            (false, false) => unreachable!("open() called with neither side at the current key"),
+        }
+    }
+
+    fn at_end(&self) -> bool {
+        self.a.at_end() && self.b.at_end()
+    }
+
+    fn remaining_count(&self) -> u64 {
+        // A precise merged count would require deduplicating overlapping
+        // keys between `a` and `b`, which isn't worth the O(n) cost here —
+        // callers (VEO cardinality estimation) already treat u64::MAX as
+        // "unknown, fall back to stable ordering".
+        u64::MAX
+    }
+}
+
 /// One fully-classified rule-body atom: its three fields, plus which
 /// [`AtomSource`] answers scans for it.
 ///
@@ -297,5 +421,54 @@ mod tests {
         ];
         let results = leapfrog_join(&atoms, 3);
         assert!(results.is_empty());
+    }
+
+    /// `CombinedSource` over two disjoint relations must behave like a
+    /// single relation containing the union of both.
+    #[test]
+    fn combined_source_unions_disjoint_relations() {
+        let a: Vec<[u64; 3]> = vec![[1, 100, 2]];
+        let b: Vec<[u64; 3]> = vec![[2, 100, 3]];
+        let src_a = SliceSource::new(&a);
+        let src_b = SliceSource::new(&b);
+        let combined = CombinedSource {
+            primary: &src_a,
+            secondary: &src_b,
+        };
+        let atoms = vec![
+            Atom {
+                s: AtomField::Var(0),
+                p: AtomField::Const(100),
+                o: AtomField::Var(1),
+                source: &combined,
+            },
+            Atom {
+                s: AtomField::Var(1),
+                p: AtomField::Const(100),
+                o: AtomField::Var(2),
+                source: &combined,
+            },
+        ];
+        let mut results = leapfrog_join(&atoms, 3);
+        results.sort();
+        assert_eq!(results, vec![vec![1, 2, 3]]);
+    }
+
+    /// `CombinedSource` must deduplicate a row present in *both* underlying
+    /// sources (e.g. a fact that is both a base fact and was re-derived).
+    #[test]
+    fn combined_source_dedups_overlapping_rows() {
+        let a: Vec<[u64; 3]> = vec![[1, 100, 2]];
+        let b: Vec<[u64; 3]> = vec![[1, 100, 2]]; // same row in both sides
+        let src_a = SliceSource::new(&a);
+        let src_b = SliceSource::new(&b);
+        let combined = CombinedSource {
+            primary: &src_a,
+            secondary: &src_b,
+        };
+        let mut scan = combined.scan(Some(1), Some(100), None, 2);
+        assert_eq!(scan.key(), 2);
+        scan.advance();
+        assert!(scan.at_end(), "duplicate row must yield exactly one key");
     }
 }
