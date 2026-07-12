@@ -26,25 +26,38 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Bulk-load a file directly into a persistent store
+    /// Bulk-load one or more files (or stdin) directly into a persistent
+    /// store
     ///
-    /// Bypasses the HTTP Graph Store Protocol entirely — reads the file,
-    /// parses it, and calls `RingStore::bulk_load` directly, which is much
-    /// faster than sending it through `nova-server`'s `/store` endpoint for
-    /// very large datasets.
+    /// Bypasses the HTTP Graph Store Protocol entirely — reads the
+    /// file(s), parses them, and calls `RingStore::bulk_load` directly,
+    /// which is much faster than sending it through `nova-server`'s
+    /// `/store` endpoint for very large datasets. Multiple `--file`s are
+    /// parsed in parallel (one thread per file) and merged into a single
+    /// bulk-load pass; parsing itself is streamed incrementally into the
+    /// store rather than materializing the whole dataset in memory first.
     Load {
         /// Directory in which Nova data is persisted
         #[arg(short, long, value_hint = ValueHint::DirPath)]
         location: PathBuf,
-        /// File to load
-        #[arg(short, long, value_hint = ValueHint::FilePath)]
-        file: PathBuf,
-        /// The format of the file to load
+        /// File(s) to load
+        ///
+        /// May be given multiple times (`--file a.ttl --file b.nt`) or as a
+        /// single space-separated flag (`--file a.ttl b.nt`) to load several
+        /// files in one bulk-load pass (parsed in parallel, merged into a
+        /// single store build — much cheaper than one `load` invocation per
+        /// file). If omitted entirely, data is read from stdin instead, in
+        /// which case `--format` must be given explicitly (there's no file
+        /// extension to guess it from).
+        #[arg(short, long, num_args = 0.., value_hint = ValueHint::FilePath)]
+        file: Vec<PathBuf>,
+        /// The format of the file(s) to load
         ///
         /// Accepts either an extension (`nt`, `ttl`, `nq`, `trig`, `rdf`,
         /// `jsonld`) or a MIME type (e.g. `application/n-triples`).
         ///
-        /// By default, the format is guessed from the file's extension.
+        /// By default, the format is guessed from each file's extension;
+        /// required when reading from stdin (no `--file` given).
         #[arg(long)]
         format: Option<String>,
         /// Name of the graph to load the data into
@@ -57,6 +70,14 @@ pub enum Command {
         /// (with a warning) for those.
         #[arg(long, value_hint = ValueHint::Url)]
         graph: Option<String>,
+        /// Base IRI used to resolve relative IRIs in the loaded file(s)
+        ///
+        /// Only meaningful for formats that can contain relative IRIs
+        /// (Turtle, TriG, RDF/XML, JSON-LD) — ignored otherwise (N-Triples/
+        /// N-Quads have no relative IRIs). When loading multiple files, the
+        /// same base IRI is applied to each.
+        #[arg(long, value_hint = ValueHint::Url)]
+        base: Option<String>,
     },
     /// Create a database backup into a target directory
     ///

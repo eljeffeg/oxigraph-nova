@@ -6,8 +6,11 @@
 //! the same binary name (`oxigraph`) so scripts/muscle memory written
 //! against upstream `oxigraph-cli` work unchanged. Nine subcommands total:
 //!
-//! - `oxigraph load --location <dir> --file <path> [--format F] [--graph G]`
-//!   — bulk-load directly into a persistent store, without going through HTTP.
+//! - `oxigraph load --location <dir> [--file <path>]... [--format F] \
+//!   [--graph G] [--base IRI]` — bulk-load directly into a persistent
+//!   store, without going through HTTP. Accepts multiple `--file`s (parsed
+//!   in parallel, merged into a single bulk-load pass) or, if `--file` is
+//!   omitted entirely, reads from stdin (`--format` then required).
 //! - `oxigraph backup --location <dir> --destination <dir>` — mirrors
 //!   `oxigraph backup` 1:1 (see `RingStore::backup`).
 //! - `oxigraph query --location <dir> (--query Q | --query-file F) ...` —
@@ -70,7 +73,14 @@ fn main() -> anyhow::Result<()> {
             file,
             format,
             graph,
-        } => run_load(&location, &file, format.as_deref(), graph.as_deref()),
+            base,
+        } => run_load(
+            &location,
+            &file,
+            format.as_deref(),
+            graph.as_deref(),
+            base.as_deref(),
+        ),
         Command::Backup {
             location,
             destination,
@@ -176,9 +186,10 @@ fn parse_graph_name(graph: Option<&str>) -> anyhow::Result<Option<GraphName>> {
 
 fn run_load(
     location: &std::path::Path,
-    file: &std::path::Path,
+    files: &[std::path::PathBuf],
     format: Option<&str>,
     graph: Option<&str>,
+    base: Option<&str>,
 ) -> anyhow::Result<()> {
     let graph_name = parse_graph_name(graph)?;
 
@@ -188,13 +199,16 @@ fn run_load(
     );
     let store = RingStore::open(location)?;
 
-    println!("[oxigraph load] Parsing {} ...", file.display());
+    match files {
+        [] => println!("[oxigraph load] Reading from stdin ..."),
+        [single] => println!("[oxigraph load] Parsing {} ...", single.display()),
+        multiple => println!(
+            "[oxigraph load] Parsing {} files in parallel ...",
+            multiple.len()
+        ),
+    }
     let t0 = Instant::now();
-    let quads = load::parse_file(file, format, graph_name.as_ref())?;
-    let parsed = quads.len();
-
-    println!("[oxigraph load] Bulk-loading {parsed} quads ...");
-    let count = store.bulk_load(quads)?;
+    let count = load::load_sources_into_store(&store, files, format, graph_name.as_ref(), base)?;
     // See `oxigraph_nova_server::mimalloc_tuning::mimalloc_collect_now`'s doc
     // comment: force an eager purge pass right after the build's transient
     // scratch-buffer allocation burst.
@@ -695,8 +709,13 @@ async fn run_serve(
         } else {
             println!("[oxigraph serve] Loading {} ...", file.display());
             let t0 = Instant::now();
-            let quads = load::parse_file(file, None, None)?;
-            let count = store.bulk_load(quads)?;
+            let count = load::load_sources_into_store(
+                &store,
+                std::slice::from_ref(file),
+                None,
+                None,
+                None,
+            )?;
             // See `oxigraph_nova_server::mimalloc_tuning::mimalloc_collect_now`'s
             // doc comment.
             mimalloc_tuning::mimalloc_collect_now();

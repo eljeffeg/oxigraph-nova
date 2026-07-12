@@ -119,6 +119,212 @@ fn load_fixture() -> TempDir {
 }
 
 #[test]
+fn load_multiple_files_merges_into_single_bulk_load() {
+    let dir = TempDir::new("multi_file_load");
+    let a = dir.path().join("a.ttl");
+    let b = dir.path().join("b.ttl");
+    std::fs::write(
+        &a,
+        "@prefix ex: <http://ex/> .\nex:alice ex:knows ex:bob .\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &b,
+        "@prefix ex: <http://ex/> .\nex:bob ex:knows ex:carol .\nex:carol ex:knows ex:dave .\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        a.to_str().unwrap(),
+        "--file",
+        b.to_str().unwrap(),
+    ]);
+    assert_success(&out, "load (multi-file)");
+    assert!(
+        stdout_str(&out).contains("3 triples"),
+        "expected combined 3 triples across both files, got: {}",
+        stdout_str(&out)
+    );
+
+    let out = run(&[
+        "query",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--query",
+        "SELECT ?o WHERE { <http://ex/carol> <http://ex/knows> ?o }",
+    ]);
+    assert_success(&out, "query (post multi-file load)");
+    assert!(
+        stdout_str(&out).contains("http://ex/dave"),
+        "body: {}",
+        stdout_str(&out)
+    );
+}
+
+#[test]
+fn load_multiple_files_space_separated_single_flag() {
+    // Same as `load_multiple_files_merges_into_single_bulk_load`, but using
+    // clap's `num_args = 0..` space-separated syntax
+    // (`--file a.ttl b.ttl`) in a single flag occurrence, rather than
+    // repeating `--file` for each path — verifies parity with upstream
+    // `oxigraph-cli`'s `--file` flag, which supports both forms.
+    let dir = TempDir::new("multi_file_load_space_sep");
+    let a = dir.path().join("a.ttl");
+    let b = dir.path().join("b.ttl");
+    std::fs::write(
+        &a,
+        "@prefix ex: <http://ex/> .\nex:alice ex:knows ex:bob .\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &b,
+        "@prefix ex: <http://ex/> .\nex:bob ex:knows ex:carol .\nex:carol ex:knows ex:dave .\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+    ]);
+    assert_success(&out, "load (multi-file, space-separated)");
+    assert!(
+        stdout_str(&out).contains("3 triples"),
+        "expected combined 3 triples across both files, got: {}",
+        stdout_str(&out)
+    );
+
+    let out = run(&[
+        "query",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--query",
+        "SELECT ?o WHERE { <http://ex/carol> <http://ex/knows> ?o }",
+    ]);
+    assert_success(&out, "query (post space-separated multi-file load)");
+    assert!(
+        stdout_str(&out).contains("http://ex/dave"),
+        "body: {}",
+        stdout_str(&out)
+    );
+}
+
+#[test]
+fn load_from_stdin_requires_format() {
+    let dir = TempDir::new("stdin_load_no_format");
+
+    let out = run_stdin(
+        &["load", "--location", dir.path().to_str().unwrap()],
+        TURTLE_FIXTURE,
+    );
+
+    assert!(
+        !out.status.success(),
+        "expected load with no --file/--format to fail"
+    );
+    assert!(
+        stderr_str(&out).contains("--format"),
+        "expected error to mention --format, got: {}",
+        stderr_str(&out)
+    );
+}
+
+#[test]
+fn load_from_stdin_with_format_succeeds() {
+    let dir = TempDir::new("stdin_load");
+
+    let out = run_stdin(
+        &[
+            "load",
+            "--location",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "ttl",
+        ],
+        TURTLE_FIXTURE,
+    );
+    assert_success(&out, "load (stdin)");
+    assert!(
+        stdout_str(&out).contains("3 triples"),
+        "expected 3 triples from stdin fixture, got: {}",
+        stdout_str(&out)
+    );
+}
+
+#[test]
+fn load_with_base_resolves_relative_iris() {
+    let dir = TempDir::new("base_load");
+    let ttl_path = dir.path().join("relative.ttl");
+    // A relative IRI subject/object, resolved against --base.
+    std::fs::write(
+        &ttl_path,
+        "<rel-subject> <http://ex/knows> <rel-object> .\n",
+    )
+    .unwrap();
+
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        ttl_path.to_str().unwrap(),
+        "--base",
+        "http://ex/base/",
+    ]);
+    assert_success(&out, "load --base");
+    assert!(
+        stdout_str(&out).contains("1 triples"),
+        "{}",
+        stdout_str(&out)
+    );
+
+    let out = run(&[
+        "query",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--query",
+        "ASK { <http://ex/base/rel-subject> <http://ex/knows> <http://ex/base/rel-object> }",
+    ]);
+    assert_success(&out, "query (post --base load)");
+    assert!(
+        stdout_str(&out).contains("true"),
+        "expected relative IRIs resolved against --base, body: {}",
+        stdout_str(&out)
+    );
+}
+
+#[test]
+fn load_parse_error_propagates_nonzero_exit() {
+    let dir = TempDir::new("parse_error_load");
+    let bad_path = dir.path().join("bad.ttl");
+    std::fs::write(&bad_path, "this is not valid turtle @@@ !!!\n").unwrap();
+
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        bad_path.to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success(),
+        "expected load of malformed Turtle to fail"
+    );
+    assert!(
+        stderr_str(&out).to_lowercase().contains("parse"),
+        "expected error message to mention parsing, got: {}",
+        stderr_str(&out)
+    );
+}
+
+#[test]
 fn load_then_query_select_json() {
     let dir = load_fixture();
 
