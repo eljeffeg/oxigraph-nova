@@ -89,6 +89,14 @@ use std::time::Instant;
 /// auto-compact (no `data_dir` to persist to).
 const DEFAULT_AUTO_COMPACT_THRESHOLD: usize = 1_000_000;
 
+/// How many quads `RingStore::bulk_load_with_progress` interns between each
+/// `on_progress` callback invocation. Matches the order of magnitude of
+/// upstream Oxigraph's own `BulkLoader` progress cadence — frequent enough
+/// to give a caller a meaningful sense of throughput on a large load,
+/// infrequent enough that the callback itself never becomes a measurable
+/// fraction of the load's cost.
+const PROGRESS_REPORT_INTERVAL: usize = 1_000_000;
+
 // ── Compaction metrics (process-wide) ──────────────────────────────────────────
 //
 // Global counters tracking how many times `compact_locked` has run (manual
@@ -1057,6 +1065,34 @@ impl RingStore {
     /// same as `compact()` — so a bulk-loaded dataset is never left
     /// WAL-only/un-snapshotted.
     pub fn bulk_load(&self, quads: impl IntoIterator<Item = Quad>) -> Result<usize, Oxigraph> {
+        self.bulk_load_with_progress(quads, None)
+    }
+
+    /// Same as [`RingStore::bulk_load`], additionally invoking `on_progress`
+    /// (if given) periodically with the number of quads interned so far —
+    /// mirroring upstream Oxigraph's `BulkLoader::on_progress` callback,
+    /// which reports progress against the same "quads consumed from the
+    /// input iterator" unit.
+    ///
+    /// The callback fires every [`PROGRESS_REPORT_INTERVAL`] quads (not on
+    /// every single one — for a large load that would dominate the cost of
+    /// the loop itself), plus once more at the very end if the final batch
+    /// didn't land exactly on the interval boundary, so the caller always
+    /// sees a final call reporting the true total.
+    ///
+    /// It fires **only** for the interning phase, not for the subsequent
+    /// per-graph LOUDS build / dictionary compaction / snapshot commit that
+    /// happens after every quad has been consumed — those phases have no
+    /// natural "N of M" unit to report against, exactly as with upstream
+    /// Oxigraph's own callback (which is similarly silent during its
+    /// post-load index build). It also fires while the store's internal
+    /// lock is held, so a slow callback will stall the load; keep it cheap
+    /// (e.g. logging or updating an atomic counter another thread reads).
+    pub fn bulk_load_with_progress(
+        &self,
+        quads: impl IntoIterator<Item = Quad>,
+        mut on_progress: Option<&mut dyn FnMut(u64)>,
+    ) -> Result<usize, Oxigraph> {
         let mut inner = self
             .inner
             .lock()
@@ -1085,6 +1121,22 @@ impl RingStore {
                 inner.named_graph_ids.insert(g_id);
             }
             count += 1;
+
+            if let Some(cb) = on_progress.as_deref_mut()
+                && count.is_multiple_of(PROGRESS_REPORT_INTERVAL)
+            {
+                cb(count as u64);
+            }
+        }
+
+        // Final call so the caller always sees the true total reported at
+        // least once, even if `count` didn't land on the interval boundary
+        // (including the `count == 0`/empty-input case, matching upstream
+        // Oxigraph's "always calls at least once" behavior).
+        if let Some(cb) = on_progress
+            && !count.is_multiple_of(PROGRESS_REPORT_INTERVAL)
+        {
+            cb(count as u64);
         }
 
         let new_graphs = build_graphs_from_triples(per_graph);

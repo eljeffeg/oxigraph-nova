@@ -426,6 +426,7 @@ impl Store {
     pub fn bulk_loader(&self) -> BulkLoader {
         BulkLoader {
             store: Arc::clone(&self.store),
+            on_progress: None,
         }
     }
 
@@ -481,15 +482,33 @@ fn stored_subject(sq: &StoredQuad) -> Option<NamedOrBlankNode> {
 /// [`Store::bulk_loader`].
 pub struct BulkLoader {
     store: Arc<RingStore>,
+    on_progress: Option<Box<dyn FnMut(u64)>>,
 }
 
 impl BulkLoader {
+    /// Register a callback invoked periodically during [`BulkLoader::load`]
+    /// with the number of quads consumed from the input so far — mirrors
+    /// upstream Oxigraph's `BulkLoader::on_progress`. See
+    /// `RingStore::bulk_load_with_progress`'s doc comment for the exact
+    /// reporting cadence and the "keep it cheap" caveat (the callback runs
+    /// while the store's internal lock is held).
+    #[must_use]
+    pub fn on_progress(mut self, callback: impl FnMut(u64) + 'static) -> Self {
+        self.on_progress = Some(Box::new(callback));
+        self
+    }
+
     /// Bulk-insert `quads` directly into the compacted index, bypassing the
     /// per-write delta buffer. Returns the number of quads loaded. Intended
     /// for initial dataset loads where every quad is known to be fresh —
     /// see `RingStore::bulk_load`'s doc comment for the full rationale.
-    pub fn load(&self, quads: impl IntoIterator<Item = Quad>) -> anyhow::Result<usize> {
-        self.store.bulk_load(quads).map_err(storage_err)
+    pub fn load(mut self, quads: impl IntoIterator<Item = Quad>) -> anyhow::Result<usize> {
+        let store = Arc::clone(&self.store);
+        let result = match &mut self.on_progress {
+            Some(cb) => store.bulk_load_with_progress(quads, Some(cb.as_mut())),
+            None => store.bulk_load_with_progress(quads, None),
+        };
+        result.map_err(storage_err)
     }
 }
 
@@ -628,6 +647,34 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(store.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn bulk_loader_on_progress_reports_final_count() {
+        use std::sync::Mutex;
+
+        let store = Store::new();
+        let calls: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = Arc::clone(&calls);
+
+        let quads = vec![
+            quad("http://ex/s0", "http://ex/p", "zero"),
+            quad("http://ex/s1", "http://ex/p", "one"),
+            quad("http://ex/s2", "http://ex/p", "two"),
+        ];
+
+        let count = store
+            .bulk_loader()
+            .on_progress(move |n| calls_clone.lock().unwrap().push(n))
+            .load(quads)
+            .unwrap();
+
+        assert_eq!(count, 3);
+        // `PROGRESS_REPORT_INTERVAL` is far larger than 3, so the periodic
+        // branch never fires — only the "final call" branch should, exactly
+        // once, reporting the true total.
+        let recorded = calls.lock().unwrap();
+        assert_eq!(*recorded, vec![3]);
     }
 
     #[test]
