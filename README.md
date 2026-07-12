@@ -304,8 +304,9 @@ See [`benches/external/README.md`](./benches/external/README.md) for the full me
 ## Command-line interface (`oxigraph`)
 
 Building the workspace also produces a standalone `oxigraph` binary
-(`crates/nova-cli`, package `oxigraph-nova-cli`) that mirrors a subset of
-upstream `oxigraph-cli`'s subcommands — `load`, `backup`, and `serve` —
+(`crates/nova-cli`, package `oxigraph-nova-cli`) that matches upstream
+`oxigraph-cli`'s full 9-subcommand surface — `load`, `backup`, `query`,
+`update`, `dump`, `convert`, `optimize`, `serve`, and `serve-read-only` —
 against Nova's own `RingStore`, under the same binary name so scripts/muscle
 memory carry over:
 
@@ -317,7 +318,13 @@ cargo build --release --bin oxigraph
 |---|---|
 | `oxigraph load --location <dir> --file <path> [--format <fmt>] [--graph <iri>]` | Bulk-load a file directly into a persistent store, bypassing HTTP entirely (much faster than the Graph Store Protocol for large datasets) |
 | `oxigraph backup --location <dir> --destination <dir>` | Create a crash-safe, independent copy of a persistent store's WAL + MANIFEST + snapshot |
+| `oxigraph query --location <dir> (--query <q> \| --query-file <f>) [--results-file <f>] [--results-format <fmt>]` | Run a SPARQL query against a persistent store, offline (no HTTP) — results format-negotiated the same way as `/sparql` |
+| `oxigraph update --location <dir> (--update <u> \| --update-file <f>)` | Run a SPARQL update against a persistent store, offline (no HTTP) |
+| `oxigraph dump --location <dir> [--file <f>] [--format <fmt>] [--graph <iri>]` | Serialize a store's logical RDF content out to a file, optionally restricted to one graph |
+| `oxigraph convert [--from-file <f>] [--from-format <fmt>] [--to-file <f>] [--to-format <fmt>]` | Stream-convert one RDF file to another format, with no store involved at all — supports stdin/stdout |
+| `oxigraph optimize --location <dir>` | Force storage compaction on demand (`RingStore::compact()`) |
 | `oxigraph serve [--location <dir>] [--file <path>] [--bind <addr>]` | Start the same SPARQL 1.2 HTTP server described below, as a subcommand instead of a separate binary |
+| `oxigraph serve-read-only --location <dir> [--bind <addr>]` | Same as `serve`, but every write (`/update`, `PUT`/`POST`/`DELETE /store`) is rejected at the HTTP layer with `403 Forbidden` |
 
 ```sh
 # Bulk-load a dataset directly into a persistent store
@@ -326,15 +333,45 @@ cargo run --release --bin oxigraph -- load --location ./data --file dataset.nt
 # Back up a store's on-disk data into an independent directory
 cargo run --release --bin oxigraph -- backup --location ./data --destination ./backup
 
+# Run a SPARQL query offline, writing SPARQL-results JSON to stdout
+cargo run --release --bin oxigraph -- query --location ./data \
+    --query 'SELECT * WHERE { ?s ?p ?o } LIMIT 10'
+
+# Run a SPARQL update offline
+cargo run --release --bin oxigraph -- update --location ./data \
+    --update 'INSERT DATA { <http://ex/s> <http://ex/p> "v" }'
+
+# Dump one named graph as Turtle
+cargo run --release --bin oxigraph -- dump --location ./data \
+    --graph http://ex/g1 --format ttl --file g1.ttl
+
+# Convert a file between RDF formats with no store at all (also supports stdin/stdout)
+cargo run --release --bin oxigraph -- convert \
+    --from-file data.nt --from-format nt --to-file data.ttl --to-format ttl
+
+# Force compaction on demand
+cargo run --release --bin oxigraph -- optimize --location ./data
+
 # Serve a persistent store over HTTP (equivalent to nova_serve --location ./data)
 cargo run --release --bin oxigraph -- serve --location ./data --bind 0.0.0.0:3030
+
+# Serve the same store read-only — writes get 403 Forbidden
+cargo run --release --bin oxigraph -- serve-read-only --location ./data --bind 0.0.0.0:3031
 ```
 
 Run `oxigraph <subcommand> --help` for the full flag reference for each
-subcommand. `oxigraph serve` is a thin wrapper around the exact same server
-logic as the standalone `nova_serve` binary documented next — everything in
-the following section (endpoints, protocols, formats) applies equally to
-`oxigraph serve`.
+subcommand. `oxigraph serve`/`serve-read-only` are thin wrappers around the
+exact same server logic as the standalone `nova_serve` binary documented
+next — everything in the following section (endpoints, protocols, formats)
+applies equally to `oxigraph serve`. `serve-read-only`'s write-gate is
+HTTP-layer only, not storage-level concurrent-multi-process read isolation —
+see `oxigraph serve-read-only --help` for the exact caveat.
+
+A handful of upstream `oxigraph-cli` flags aren't implemented yet (server-wide
+`--union-default-graph`, `--lenient` parsing, `load` stdin/multi-file input,
+query `--explain`/`--stats`) — see `CLAUDE.md`'s "What's Next" for tracked
+follow-ups; none of them block the subcommands above.
+
 
 ---
 

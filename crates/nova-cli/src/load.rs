@@ -24,17 +24,27 @@ use std::path::Path;
 /// guess from `path`'s extension — mirroring `oxigraph-cli`'s
 /// `rdf_format_from_name`/`rdf_format_from_path` behaviour.
 fn resolve_format(format: Option<&str>, path: &Path) -> Result<RdfFormat> {
+    resolve_format_opt(format, Some(path))
+}
+
+/// Like [`resolve_format`], but `path` is optional — used by `oxigraph dump`
+/// (stdout output, no `--file`) and `oxigraph convert` (stdin/stdout,
+/// `--from-file`/`--to-file` optional). When `path` is `None`, `format` must
+/// be given explicitly (there's no extension to guess from).
+pub(crate) fn resolve_format_opt(format: Option<&str>, path: Option<&Path>) -> Result<RdfFormat> {
     let name = match format {
         Some(f) => f.to_string(),
         None => path
-            .extension()
+            .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)
-            .with_context(|| {
-                format!(
+            .with_context(|| match path {
+                Some(p) => format!(
                     "cannot guess RDF format from file extension of {}; pass --format explicitly",
-                    path.display()
-                )
+                    p.display()
+                ),
+                None => "no file given to guess an RDF format from; pass --format explicitly"
+                    .to_string(),
             })?,
     };
 

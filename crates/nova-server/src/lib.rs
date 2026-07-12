@@ -271,6 +271,13 @@ pub struct AppState<S: QuadStore + 'static> {
     /// when the store's compaction generation advances — see
     /// `reasoning_state`'s module doc comment) instead of the raw store.
     pub reasoning: Option<Arc<ReasoningState<S>>>,
+    /// If `true`, every write-capable handler (`/update`, and `PUT`/`POST`/
+    /// `DELETE` on `/store`) rejects the request immediately with `403
+    /// Forbidden` instead of executing it. Configured via
+    /// `Server::read_only` / `oxigraph serve-read-only`. See that method's
+    /// doc comment for the important caveat about what this does and does
+    /// not guarantee.
+    pub read_only: bool,
 }
 
 /// Manual `Clone` impl — `Arc<S>` is always `Clone` regardless of whether `S`
@@ -286,6 +293,7 @@ impl<S: QuadStore + 'static> Clone for AppState<S> {
             text_search: self.text_search.clone(),
             service_handler: self.service_handler.clone(),
             reasoning: self.reasoning.clone(),
+            read_only: self.read_only,
         }
     }
 }
@@ -318,6 +326,7 @@ pub struct Server<S: QuadStore + 'static> {
     text_search: Option<Arc<dyn TextSearch>>,
     service_handler: Option<Arc<dyn ServiceHandler>>,
     reasoning: Option<Arc<ReasoningState<S>>>,
+    read_only: bool,
 }
 
 impl<S: QuadStore + Send + Sync + 'static> Server<S> {
@@ -339,6 +348,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             text_search: None,
             service_handler: default_service_handler(),
             reasoning: None,
+            read_only: false,
         }
     }
 
@@ -403,6 +413,24 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
         self
     }
 
+    /// Make this server read-only: every write-capable handler (`/update`,
+    /// and `PUT`/`POST`/`DELETE` on `/store`) rejects the request
+    /// immediately with `403 Forbidden` instead of executing it.
+    ///
+    /// **Important caveat**: this only guarantees that *this server
+    /// process* will never write to the store — it is an HTTP-layer gate,
+    /// not a storage-level guarantee. `RingStore` still uses a
+    /// single-`Mutex<RingStoreInner>`, single-writer WAL design (see
+    /// `oxigraph_nova_storage_ring::store`'s module doc, "Isolation
+    /// semantics"); this flag does **not** by itself make it safe to run
+    /// this server concurrently against a `--location` directory that
+    /// another process is actively writing to. Used by `oxigraph
+    /// serve-read-only`.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     /// Build the axum `Router`.
     ///
     /// Returns a router that can be used directly in integration tests via
@@ -419,6 +447,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             text_search: self.text_search,
             service_handler: self.service_handler,
             reasoning: self.reasoning,
+            read_only: self.read_only,
         };
 
         Router::new()
@@ -547,6 +576,9 @@ async fn sparql_update<S: QuadStore + 'static>(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    if state.read_only {
+        return (StatusCode::FORBIDDEN, "This server is read-only").into_response();
+    }
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "Empty request body").into_response();
     }
@@ -1013,6 +1045,9 @@ async fn store_put<S: QuadStore + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if state.read_only {
+        return (StatusCode::FORBIDDEN, "This server is read-only").into_response();
+    }
     let graph = match resolve_target_graph(&params) {
         Ok(g) => g,
         Err(resp) => return *resp,
@@ -1053,6 +1088,9 @@ async fn store_post<S: QuadStore + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if state.read_only {
+        return (StatusCode::FORBIDDEN, "This server is read-only").into_response();
+    }
     let graph = match resolve_target_graph(&params) {
         Ok(g) => g,
         Err(resp) => return *resp,
@@ -1087,6 +1125,9 @@ async fn store_delete<S: QuadStore + 'static>(
     State(state): State<AppState<S>>,
     AxumQuery(params): AxumQuery<GraphStoreParams>,
 ) -> Response {
+    if state.read_only {
+        return (StatusCode::FORBIDDEN, "This server is read-only").into_response();
+    }
     let graph = match resolve_target_graph(&params) {
         Ok(g) => g,
         Err(resp) => return *resp,

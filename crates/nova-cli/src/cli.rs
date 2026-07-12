@@ -3,17 +3,22 @@
 //! Subcommand/flag names deliberately mirror upstream `oxigraph-cli`
 //! (see `./research/oxigraph/cli/src/cli.rs`) wherever Nova's feature surface
 //! overlaps — this binary is even named `oxigraph`, so scripts/muscle
-//! memory written against one carry over to the other. Nova currently
-//! ships a smaller subset (`load`, `backup`, `serve`) than
-//! `oxigraph-cli`'s nine subcommands.
+//! memory written against one carry over to the other. Nova ships 9
+//! subcommands: `load`, `backup`, `serve`, `query`, `update`, `dump`,
+//! `convert`, `optimize`, `serve-read-only` — matching upstream's full
+//! subcommand surface (some flags are trimmed relative to upstream where
+//! Nova doesn't yet implement the corresponding capability — e.g. no
+//! `--explain`/`--stats`/`--union-default-graph`/`--lenient`/stdin input for
+//! `query`/`update`.
 
 use clap::{Parser, Subcommand, ValueHint};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(about, version, name = "oxigraph")]
-/// Oxigraph Nova offline CLI tooling: bulk-load, backup, and serve a
-/// persistent `RingStore` without going through HTTP.
+/// Oxigraph Nova offline CLI tooling: bulk-load, backup, query, update,
+/// dump, convert, optimize, and serve a persistent `RingStore` without
+/// necessarily going through HTTP.
 pub struct Args {
     #[command(subcommand)]
     pub command: Command,
@@ -64,6 +69,183 @@ pub enum Command {
         /// Directory in which the backup will be written
         #[arg(short, long, value_hint = ValueHint::DirPath)]
         destination: PathBuf,
+    },
+    /// Run a SPARQL query against a persistent store, offline (no HTTP)
+    ///
+    /// Results are format-negotiated the same way as `nova-server`'s
+    /// `/sparql` endpoint, just driven by `--results-format` (or the
+    /// extension of `--results-file`) instead of an `Accept` header.
+    Query {
+        /// Directory in which Nova data is persisted
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        location: PathBuf,
+        /// The SPARQL query to execute, given directly on the command line
+        ///
+        /// Exactly one of `--query` / `--query-file` is required.
+        #[arg(short, long, conflicts_with = "query_file")]
+        query: Option<String>,
+        /// Read the SPARQL query from a file instead of the command line
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "query")]
+        query_file: Option<PathBuf>,
+        /// Write results to this file instead of stdout
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        results_file: Option<PathBuf>,
+        /// The format results should be written in
+        ///
+        /// For SELECT/ASK queries, one of: `json`, `xml`, `csv`, `tsv`
+        /// (default: `json`, or guessed from `--results-file`'s extension).
+        /// For CONSTRUCT/DESCRIBE queries, an RDF format extension or MIME
+        /// type (default: `nt`, or guessed from `--results-file`'s
+        /// extension).
+        #[arg(long)]
+        results_format: Option<String>,
+    },
+    /// Run a SPARQL update against a persistent store, offline (no HTTP)
+    Update {
+        /// Directory in which Nova data is persisted
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        location: PathBuf,
+        /// The SPARQL update to execute, given directly on the command line
+        ///
+        /// Exactly one of `--update` / `--update-file` is required.
+        #[arg(short, long, conflicts_with = "update_file")]
+        update: Option<String>,
+        /// Read the SPARQL update from a file instead of the command line
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "update")]
+        update_file: Option<PathBuf>,
+    },
+    /// Dump the contents of a store out to an RDF file
+    ///
+    /// Distinct from `backup`, which copies the whole binary store
+    /// directory: `dump` serializes the store's *logical RDF content* to a
+    /// chosen RDF format (Turtle/N-Quads/etc.), optionally restricted to one
+    /// graph via `--graph`.
+    Dump {
+        /// Directory in which Nova data is persisted
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        location: PathBuf,
+        /// File to write the dump to (defaults to stdout)
+        #[arg(short, long, value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+        /// The format to serialize into
+        ///
+        /// Accepts either an extension (`nt`, `ttl`, `nq`, `trig`, `rdf`,
+        /// `jsonld`) or a MIME type. Required if `--file` is not given
+        /// (stdout output needs an explicit format) or if `--file`'s
+        /// extension can't be guessed.
+        #[arg(long)]
+        format: Option<String>,
+        /// Only dump this named graph's triples
+        ///
+        /// If not given, every graph (default + named) is dumped, which
+        /// requires `--format` to be a dataset format (N-Quads/TriG/
+        /// JSON-LD) — a plain triple format needs `--graph` to pick one
+        /// graph to serialize.
+        #[arg(long, value_hint = ValueHint::Url)]
+        graph: Option<String>,
+    },
+    /// Stream-convert one RDF file to another format, without a store at all
+    ///
+    /// A pure `oxrdfio` pipe — reads `--from-file` (or stdin), reparses/
+    /// reserializes term-by-term, and writes `--to-file` (or stdout). Useful
+    /// as a cheap standalone format converter, independent of any Nova
+    /// store.
+    Convert {
+        /// File to convert from (defaults to stdin)
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        from_file: Option<PathBuf>,
+        /// The format to convert from
+        ///
+        /// Required if `--from-file` is not given, or its extension can't
+        /// be guessed.
+        #[arg(long)]
+        from_format: Option<String>,
+        /// File to convert to (defaults to stdout)
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        to_file: Option<PathBuf>,
+        /// The format to convert to
+        ///
+        /// Required if `--to-file` is not given, or its extension can't be
+        /// guessed.
+        #[arg(long)]
+        to_format: Option<String>,
+        /// Only keep quads from this named graph (remapped to the default
+        /// graph in the output)
+        #[arg(long, value_hint = ValueHint::Url, conflicts_with = "from_default_graph")]
+        from_graph: Option<String>,
+        /// Only keep quads that are already in the default graph
+        #[arg(long, conflicts_with = "from_graph")]
+        from_default_graph: bool,
+        /// Remap the (post-filter) default graph to this named graph in the
+        /// output
+        ///
+        /// Only quads that are in the default graph *after* the
+        /// `--from-graph`/`--from-default-graph` filter above has run are
+        /// remapped — i.e. either quads that were already in the default
+        /// graph (when no `--from-*` filter was given), or quads that
+        /// `--from-graph`/`--from-default-graph` just selected and remapped
+        /// there. This is **not** "remap every quad regardless of graph" —
+        /// quads left in a named graph after the `--from-*` filter (e.g.
+        /// when no filter is given and the input has multiple named graphs)
+        /// pass through unchanged.
+        #[arg(long, value_hint = ValueHint::Url)]
+        to_graph: Option<String>,
+    },
+    /// Force storage compaction on a persistent store
+    ///
+    /// Nova already compacts automatically once the write-buffer delta
+    /// crosses a size threshold (see `--compact-threshold` on `serve`); this
+    /// subcommand lets an operator force it on demand (e.g. after a large
+    /// batch of deletes, or before taking a `backup`).
+    Optimize {
+        /// Directory in which Nova data is persisted
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        location: PathBuf,
+    },
+    /// Start the Nova SPARQL 1.2 HTTP server, opened read-only
+    ///
+    /// Rejects every write (`/update`, and `PUT`/`POST`/`DELETE` on
+    /// `/store`) at the HTTP layer with `403 Forbidden`, so this server
+    /// process can never mutate `--location`. **This is not the same as
+    /// storage-level concurrent-multi-process read isolation** —
+    /// `RingStore` still uses a single-writer WAL design (see
+    /// `oxigraph_nova_storage_ring::store`'s module doc, "Isolation
+    /// semantics"); running this against a `--location` directory that
+    /// another process is concurrently writing to is not guaranteed safe.
+    /// This flag only guarantees that *this* process won't write.
+    ServeReadOnly {
+        /// Directory in which Nova data is persisted (required — unlike
+        /// `serve`, there is no in-memory read-only mode)
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        location: PathBuf,
+        /// Host and port to listen on
+        #[arg(short, long, default_value = "0.0.0.0:3030", value_hint = ValueHint::Hostname)]
+        bind: String,
+        /// Abort a `/sparql` query that runs longer than this many seconds,
+        /// returning 504 Gateway Timeout. Unset by default (no timeout).
+        #[arg(long)]
+        query_timeout_s: Option<u64>,
+        /// Cap the number of result rows/triples a single `/sparql` query
+        /// may produce; exceeding it returns 413 Payload Too Large. Unset
+        /// by default (no cap).
+        #[arg(long)]
+        max_results: Option<usize>,
+        /// Bound the number of `/sparql` query evaluations running
+        /// concurrently; a request arriving while this many evaluations are
+        /// already in flight is rejected immediately with 503 Service
+        /// Unavailable. Unset by default (unbounded).
+        #[arg(long)]
+        max_parallel_queries: Option<usize>,
+        /// Enable Tantivy-backed full-text search (`text:query`/
+        /// `text:contains` SPARQL extension functions), indexed
+        /// incrementally on the store's compaction cycle.
+        ///
+        /// Requires this binary to have been built with the `fulltext`
+        /// cargo feature (`cargo run -p oxigraph-nova-cli --features
+        /// fulltext`); passing this flag without that feature enabled is a
+        /// hard error at startup.
+        #[arg(long)]
+        fulltext: bool,
     },
     /// Start the Nova SPARQL 1.2 HTTP server
     ///
