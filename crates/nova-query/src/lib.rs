@@ -13,7 +13,7 @@ pub use dataset::{
     Dataset, DatasetLftjSource, GraphSelector, InMemoryDataset, PatternTerm, QuadIter, QuadMatch,
     QuadPattern, StoreDataset,
 };
-pub use evaluator::{Evaluator, QueryResult};
+pub use evaluator::{Evaluator, QueryResult, SolutionStream, TripleStream};
 pub use extensions::{
     AggregateState, CustomAggregate, CustomFunction, CustomOperator, ExtensionRegistry,
     TermFunction, Value, ValueType,
@@ -26,4 +26,3 @@ pub use service::HttpServiceHandler;
 pub use service::ServiceHandler;
 pub use solution::{Solution, Solutions, SparqlVariable};
 pub use update::{clear_graph, execute_update};
-

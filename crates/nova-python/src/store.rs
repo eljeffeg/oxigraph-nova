@@ -105,7 +105,6 @@ impl PyStore {
         })
     }
 
-
     /// Adds a set of quads to this store without keeping them all into memory.
     ///
     /// :param quads: the quads to add.
@@ -267,7 +266,10 @@ impl PyStore {
 
         if base_iri.is_none() && prefixes.is_none() {
             let (results, vars) = py
-                .detach(|| self.inner.query_with_variables(query, QueryOptions::default()))
+                .detach(|| {
+                    self.inner
+                        .query_with_variables(query, QueryOptions::default())
+                })
                 .map_err(map_anyhow_error)?;
             return query_results_to_python(py, results, vars);
         }
@@ -296,9 +298,12 @@ impl PyStore {
         // This custom base_iri/prefixes path is the less common one; the fast path
         // above (no custom parser options) still releases the GIL.
         let result = evaluator.evaluate(&parsed).map_err(map_anyhow_error)?;
-        query_results_to_python(py, result.into(), vars)
+        query_results_to_python(
+            py,
+            oxigraph_nova_store::collect_query_result(result).map_err(map_anyhow_error)?,
+            vars,
+        )
     }
-
 
     /// Executes a `SPARQL 1.1 update <https://www.w3.org/TR/sparql11-update/>`_.
     ///
@@ -404,9 +409,10 @@ impl PyStore {
         py.detach(|| {
             if let Some(input) = input {
                 match input {
-                    PyReadableInput::Bytes(bytes) => self
-                        .inner
-                        .load(&*bytes as &[u8], format, base_iri, to_graph.as_ref()),
+                    PyReadableInput::Bytes(bytes) => {
+                        self.inner
+                            .load(&*bytes as &[u8], format, base_iri, to_graph.as_ref())
+                    }
                     PyReadableInput::String(str) => {
                         self.inner
                             .load(str.as_bytes(), format, base_iri, to_graph.as_ref())
@@ -537,7 +543,6 @@ impl PyStore {
             .contains_named_graph(&graph_name)
             .map_err(map_anyhow_error)
     }
-
 
     /// Adds a named graph to the store.
     ///
@@ -755,7 +760,3 @@ pub fn map_anyhow_error(e: anyhow::Error) -> PyErr {
     }
     PyRuntimeError::new_err(e.to_string())
 }
-
-
-
-

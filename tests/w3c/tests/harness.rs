@@ -1115,11 +1115,25 @@ fn solutions_to_rows(sols: &[Solution], vars: &[Variable]) -> Vec<BTreeMap<Strin
 /// Purely diagnostic — never affects PASS/FAIL, only prints a warning to
 /// stderr on disagreement. Gated by `OXIGRAPH_W3C_SPAREVAL_ORACLE=1` at the
 /// call site in `run_test`.
+/// Nova's evaluator now returns `QueryResult::Solutions`/`Triples` variants
+/// carrying a lazy, single-consumption `Send` iterator rather than a
+/// materialized `Vec` (see `nova-query`'s `evaluator` module doc comment).
+/// `run_test` needs to consume the evaluated result twice — once for the
+/// optional `run_spareval_oracle` diagnostic, once for the real PASS/FAIL
+/// comparison — so it collects the `QueryResult` into this owned, plain-data
+/// shape exactly once, immediately after `evaluate()` returns, before either
+/// consumption point.
+enum CollectedResult {
+    Boolean(bool),
+    Solutions(Vec<Solution>),
+    Triples(Vec<Triple>),
+}
+
 fn run_spareval_oracle(
     test_name: &str,
     quads: &[Quad],
     query: &spargebra::Query,
-    nova_result: &QueryResult,
+    nova_result: &CollectedResult,
 ) {
     // oxrdf::Dataset has a blanket `spareval::QueryableDataset` impl (for
     // `&Dataset`), so mirroring the same quads already loaded into Nova's
@@ -1136,8 +1150,8 @@ fn run_spareval_oracle(
     };
 
     let matches = match (nova_result, spareval_result) {
-        (QueryResult::Boolean(got), SparevalResults::Boolean(exp)) => *got == exp,
-        (QueryResult::Solutions(sols), SparevalResults::Solutions(sol_iter)) => {
+        (CollectedResult::Boolean(got), SparevalResults::Boolean(exp)) => *got == exp,
+        (CollectedResult::Solutions(sols), SparevalResults::Solutions(sol_iter)) => {
             let vars = sol_iter.variables().to_vec();
             let mut exp_rows = Vec::new();
             for sol in sol_iter {
@@ -1157,7 +1171,7 @@ fn run_spareval_oracle(
             let got_rows = solutions_to_rows(sols, &vars);
             facts_isomorphic(&rows_to_facts(&got_rows), &rows_to_facts(&exp_rows))
         }
-        (QueryResult::Triples(ts), SparevalResults::Graph(triple_iter)) => {
+        (CollectedResult::Triples(ts), SparevalResults::Graph(triple_iter)) => {
             let mut exp = Vec::new();
             for t in triple_iter {
                 let t = match t {
@@ -1303,20 +1317,35 @@ fn run_test<S: TestStore + 'static>(tc: &TestCase) -> Result<bool> {
             let ds = StoreDataset::new(Arc::clone(&store));
             let result = Evaluator::new(&ds).evaluate(&query)?;
 
+            // Collect the (lazily-streamed) result into an owned, plain-data
+            // shape exactly once, immediately after evaluation — it's about
+            // to be consumed twice below (the oracle diagnostic, then the
+            // real PASS/FAIL comparison), and a `QueryResult::Solutions`/
+            // `Triples`'s stream can only be iterated once. See
+            // `CollectedResult`'s doc comment.
+            let collected = match result {
+                QueryResult::Boolean(b) => CollectedResult::Boolean(b),
+                s @ QueryResult::Solutions { .. } => {
+                    let (_, sols) = s.into_solutions_vec()?;
+                    CollectedResult::Solutions(sols)
+                }
+                t @ QueryResult::Triples(_) => CollectedResult::Triples(t.into_triples_vec()?),
+            };
+
             // Optional differential-testing oracle: cross-check Nova's own
             // result against spareval (Oxigraph's independent nested-loop/
             // hash-join evaluator) on the exact same quads/query. Purely
             // diagnostic — never affects the PASS/FAIL verdict below.
             if std::env::var("OXIGRAPH_W3C_SPAREVAL_ORACLE").is_ok() {
-                run_spareval_oracle(&tc.name, &all_quads, &query, &result);
+                run_spareval_oracle(&tc.name, &all_quads, &query, &collected);
             }
 
             // Compare — blank-node-bearing results are compared via a true
             // isomorphism check (Weisfeiler-Lehman refinement + verified
             // bijection search), not a lossy label collapse.
-            Ok(match (&result, expected) {
-                (QueryResult::Boolean(got), Expected::Boolean(exp)) => *got == exp,
-                (QueryResult::Solutions(sols), Expected::Solutions(exp_rows)) => {
+            Ok(match (&collected, expected) {
+                (CollectedResult::Boolean(got), Expected::Boolean(exp)) => *got == exp,
+                (CollectedResult::Solutions(sols), Expected::Solutions(exp_rows)) => {
                     let vars = projected_vars(&query);
                     let got_rows = solutions_to_rows(sols, &vars);
                     let ok = facts_isomorphic(&rows_to_facts(&got_rows), &rows_to_facts(&exp_rows));
@@ -1327,7 +1356,7 @@ fn run_test<S: TestStore + 'static>(tc: &TestCase) -> Result<bool> {
                     ok
                 }
 
-                (QueryResult::Triples(ts), Expected::Triples(exp)) => {
+                (CollectedResult::Triples(ts), Expected::Triples(exp)) => {
                     let got = dedup_triples(ts.iter().map(triple_to_repr).collect());
                     let ok = facts_isomorphic(&triples_to_facts(&got), &triples_to_facts(&exp));
                     if !ok && std::env::var("OXIGRAPH_W3C_DEBUG").is_ok() {

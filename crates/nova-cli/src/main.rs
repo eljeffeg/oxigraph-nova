@@ -349,12 +349,13 @@ fn run_query(
             let fmt = resolve_results_format(results_format, results_file)?;
             QueryResultsSerializer::from_format(fmt).serialize_boolean_to_writer(&mut out, b)?;
         }
-        QueryResult::Solutions(solutions) => {
+        QueryResult::Solutions { stream, .. } => {
             let fmt = resolve_results_format(results_format, results_file)?;
             let variables = query_select_vars(&parsed);
             let mut ser = QueryResultsSerializer::from_format(fmt)
                 .serialize_solutions_to_writer(&mut out, variables.clone())?;
-            for sol in &solutions {
+            for sol in stream {
+                let sol = sol?;
                 ser.serialize(
                     variables
                         .iter()
@@ -363,11 +364,12 @@ fn run_query(
             }
             ser.finish()?;
         }
-        QueryResult::Triples(triples) => {
+        QueryResult::Triples(stream) => {
             let fmt = resolve_triples_format(results_format, results_file)?;
             let mut ser = RdfSerializer::from_format(fmt).for_writer(&mut out);
-            for t in &triples {
-                ser.serialize_triple(t)?;
+            for t in stream {
+                let t = t?;
+                ser.serialize_triple(&t)?;
             }
             ser.finish()?;
         }

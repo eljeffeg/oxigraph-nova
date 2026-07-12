@@ -56,7 +56,6 @@ use spargebra::SparqlParser;
 use std::path::Path;
 use std::sync::Arc;
 
-
 /// Convert a storage-layer [`oxigraph_nova_core::Oxigraph`] error into an
 /// `anyhow::Error` — the error type used throughout this facade (matching
 /// `oxigraph_nova_query`'s own convention, so `?` composes cleanly between
@@ -79,13 +78,22 @@ pub enum QueryResults {
     Graph(Vec<oxrdf::Triple>),
 }
 
-impl From<QueryResult> for QueryResults {
-    fn from(result: QueryResult) -> Self {
-        match result {
-            QueryResult::Solutions(solutions) => QueryResults::Solutions(solutions),
-            QueryResult::Boolean(b) => QueryResults::Boolean(b),
-            QueryResult::Triples(triples) => QueryResults::Graph(triples),
+/// Fallibly convert a [`QueryResult`] (whose `Solutions`/`Triples` variants
+/// now carry a lazy, `Send` iterator rather than a materialized `Vec` — see
+/// `nova-query`'s `evaluator` module doc comment) into this facade's
+/// eager [`QueryResults`], collecting the underlying stream. `QueryResult`
+/// is a foreign type (defined in `oxigraph_nova_query`), so this is a free
+/// function rather than a `From`/`TryFrom` impl's trait method — either
+/// works equally well here, but a plain function avoids any ambiguity with
+/// a hypothetical future `TryFrom<QueryResult>` impl.
+pub fn collect_query_result(result: QueryResult) -> anyhow::Result<QueryResults> {
+    match result {
+        s @ QueryResult::Solutions { .. } => {
+            let (_, solutions) = s.into_solutions_vec()?;
+            Ok(QueryResults::Solutions(solutions))
         }
+        QueryResult::Boolean(b) => Ok(QueryResults::Boolean(b)),
+        t @ QueryResult::Triples(_) => Ok(QueryResults::Graph(t.into_triples_vec()?)),
     }
 }
 
@@ -162,11 +170,11 @@ impl Store {
         if let Some(rs) = &self.reasoning {
             let overlay = rs.current(&self.store)?;
             let evaluator = Evaluator::with_options(&*overlay, options);
-            Ok(evaluator.evaluate(&parsed)?.into())
+            collect_query_result(evaluator.evaluate(&parsed)?)
         } else {
             let dataset = StoreDataset::new(Arc::clone(&self.store));
             let evaluator = Evaluator::with_options(&dataset, options);
-            Ok(evaluator.evaluate(&parsed)?.into())
+            collect_query_result(evaluator.evaluate(&parsed)?)
         }
     }
 
@@ -190,11 +198,11 @@ impl Store {
         let results = if let Some(rs) = &self.reasoning {
             let overlay = rs.current(&self.store)?;
             let evaluator = Evaluator::with_options(&*overlay, options);
-            evaluator.evaluate(&parsed)?.into()
+            collect_query_result(evaluator.evaluate(&parsed)?)?
         } else {
             let dataset = StoreDataset::new(Arc::clone(&self.store));
             let evaluator = Evaluator::with_options(&dataset, options);
-            evaluator.evaluate(&parsed)?.into()
+            collect_query_result(evaluator.evaluate(&parsed)?)?
         };
         Ok((results, vars))
     }
@@ -235,7 +243,6 @@ impl Store {
         let (inserted, _removed) = self.store.apply_batch(&ops).map_err(storage_err)?;
         Ok(inserted)
     }
-
 
     /// Remove a quad. Returns `true` if it was present and removed.
     pub fn remove(&self, quad: &Quad) -> anyhow::Result<bool> {
@@ -314,7 +321,6 @@ impl Store {
         }
         Ok(false)
     }
-
 
     // ── I/O ──────────────────────────────────────────────────────────────
 
@@ -718,7 +724,11 @@ mod tests {
     #[test]
     fn contains_named_graph_default_graph_always_true() {
         let store = Store::new();
-        assert!(store.contains_named_graph(&GraphName::DefaultGraph).unwrap());
+        assert!(
+            store
+                .contains_named_graph(&GraphName::DefaultGraph)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -743,7 +753,6 @@ mod tests {
                 .unwrap()
         );
     }
-
 
     // ── Optional: reasoning ───────────────────────────────────────────────
 

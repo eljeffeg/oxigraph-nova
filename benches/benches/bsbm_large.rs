@@ -306,9 +306,9 @@ fn count_solutions<D: Dataset>(dataset: &D, sparql: &str) -> usize {
     let q = SparqlParser::new().parse_query(sparql).unwrap();
     let ev = Evaluator::new(dataset);
     match ev.evaluate(&q).unwrap() {
-        QueryResult::Solutions(sols) => sols.len(),
+        QueryResult::Solutions { stream, .. } => stream.count(),
         QueryResult::Boolean(b) => b as usize,
-        QueryResult::Triples(ts) => ts.len(),
+        QueryResult::Triples(stream) => stream.count(),
     }
 }
 

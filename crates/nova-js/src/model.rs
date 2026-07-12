@@ -42,7 +42,6 @@ pub fn from_literal(factory: &DataFactory, value: &Literal) -> JsValue {
         } else {
             factory.typed_literal(value.value(), from_named_node(factory, &datatype.into()))
         }
-
     }
 }
 

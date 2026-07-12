@@ -66,7 +66,6 @@ mod tests {
         assert_eq!(vars, vec!["o", "s"]);
     }
 
-
     #[test]
     fn ask_query_has_no_projection() {
         let query = SparqlParser::new().parse_query("ASK { ?s ?p ?o }").unwrap();
@@ -82,5 +81,4 @@ mod tests {
         let vars: Vec<&str> = projected.iter().map(|v| v.as_str()).collect();
         assert_eq!(vars, vec!["s"]);
     }
-
 }

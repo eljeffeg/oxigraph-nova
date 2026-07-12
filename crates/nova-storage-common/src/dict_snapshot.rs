@@ -62,7 +62,6 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "mmap")]
 use std::sync::Arc;
 
-
 fn tmp_sibling(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".tmp");
@@ -133,7 +132,6 @@ pub fn load_mmap_from_file(_path: &Path) -> Result<Dictionary, Oxigraph> {
         "disk-backed persistence requires the \"mmap\" cargo feature, which is disabled in this build".into(),
     ))
 }
-
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

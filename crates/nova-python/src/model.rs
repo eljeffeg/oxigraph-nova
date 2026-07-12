@@ -362,12 +362,12 @@ impl PyLiteral {
     ) -> PyResult<Self> {
         if let Some(language) = language {
             if let Some(direction) = direction {
-                if let Some(datatype) = datatype {
-                    if datatype.value() != rdf::DIR_LANG_STRING.as_str() {
-                        return Err(PyValueError::new_err(
-                            "The literals with a language tag and a base direction must use the rdf:dirLangString datatype",
-                        ));
-                    }
+                if let Some(datatype) = datatype
+                    && datatype.value() != rdf::DIR_LANG_STRING.as_str()
+                {
+                    return Err(PyValueError::new_err(
+                        "The literals with a language tag and a base direction must use the rdf:dirLangString datatype",
+                    ));
                 }
                 return Ok(Literal::new_directional_language_tagged_literal(
                     value.extract::<OxStringInput>()?,
@@ -377,12 +377,12 @@ impl PyLiteral {
                 .map_err(|e| PyValueError::new_err(e.to_string()))?
                 .into());
             }
-            if let Some(datatype) = datatype {
-                if datatype.value() != rdf::LANG_STRING.as_str() {
-                    return Err(PyValueError::new_err(
-                        "The literals with a language tag must use the rdf:langString datatype",
-                    ));
-                }
+            if let Some(datatype) = datatype
+                && datatype.value() != rdf::LANG_STRING.as_str()
+            {
+                return Err(PyValueError::new_err(
+                    "The literals with a language tag must use the rdf:langString datatype",
+                ));
             }
             return Ok(Literal::new_language_tagged_literal(
                 value.extract::<OxStringInput>()?,
@@ -491,7 +491,10 @@ impl PyLiteral {
                 kwargs.set_item("direction", PyBaseDirection::from(direction))?;
             }
         } else if self.inner.datatype() != xsd::STRING {
-            kwargs.set_item("datatype", PyNamedNode::from(self.inner.datatype().into_owned()))?;
+            kwargs.set_item(
+                "datatype",
+                PyNamedNode::from(self.inner.datatype().into_owned()),
+            )?;
         }
         Ok(((self.value(),), kwargs))
     }

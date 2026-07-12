@@ -184,9 +184,8 @@ use axum::routing::{get, post};
 use oxigraph_nova_core::{QuadStore, TextSearch};
 use oxigraph_nova_query::{
     CancellationToken, EvalLimitError, Evaluator, QueryOptions, QueryResult, ServiceHandler,
-    Solutions, StoreDataset, clear_graph, execute_update, projected_variables,
+    Solutions, StoreDataset, clear_graph, execute_update,
 };
-
 use oxigraph_nova_reasoning::{ReasoningEngine, ReasoningState};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
 use oxrdfio::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
@@ -1291,12 +1290,32 @@ async fn execute_sparql_query<S: QuadStore + 'static>(
             }
         },
         Ok(Ok(QueryResult::Boolean(b))) => serialize_boolean(b, accept),
-        Ok(Ok(QueryResult::Solutions(solutions))) => {
-            let vars = projected_variables(&query);
-            serialize_solutions(&vars, solutions, accept)
-        }
+        Ok(Ok(qr @ QueryResult::Solutions { .. })) => match qr.into_solutions_vec() {
+            Ok((vars_arc, solutions)) => {
+                let vars: Vec<Variable> = vars_arc.to_vec();
+                serialize_solutions(&vars, solutions, accept)
+            }
+            Err(e) => {
+                QUERY_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("error collecting results: {e}"),
+                )
+                    .into_response()
+            }
+        },
 
-        Ok(Ok(QueryResult::Triples(triples))) => serialize_triples(&triples, accept),
+        Ok(Ok(QueryResult::Triples(stream))) => match stream.collect::<anyhow::Result<Vec<_>>>() {
+            Ok(triples) => serialize_triples(&triples, accept),
+            Err(e) => {
+                QUERY_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("error collecting results: {e}"),
+                )
+                    .into_response()
+            }
+        },
     }
 }
 
@@ -1522,7 +1541,6 @@ fn accept_header(headers: &HeaderMap) -> &str {
 }
 
 // ── Form URL-decoding ─────────────────────────────────────────────────────────
-
 
 /// Extract a named parameter from an `application/x-www-form-urlencoded` body.
 fn form_param(body: &str, key: &str) -> Option<String> {

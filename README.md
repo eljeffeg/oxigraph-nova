@@ -369,8 +369,7 @@ see `oxigraph serve-read-only --help` for the exact caveat.
 
 A handful of upstream `oxigraph-cli` flags aren't implemented yet (server-wide
 `--union-default-graph`, `--lenient` parsing, `load` stdin/multi-file input,
-query `--explain`/`--stats`) — see `CLAUDE.md`'s "What's Next" for tracked
-follow-ups; none of them block the subcommands above.
+query `--explain`/`--stats`).
 
 
 ---

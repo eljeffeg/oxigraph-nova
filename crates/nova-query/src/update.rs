@@ -49,7 +49,7 @@
 //! through the SPARQL 1.1 Graph Store HTTP Protocol (`PUT`/`POST /store`).
 
 use crate::dataset::StoreDataset;
-use crate::evaluator::{Evaluator, QueryResult};
+use crate::evaluator::Evaluator;
 use crate::solution::Solution;
 use anyhow::{Result, anyhow};
 use oxigraph_nova_core::{QuadOp, QuadStore, QuadStoreExt};
@@ -289,10 +289,9 @@ fn delete_insert<S: QuadStore + 'static>(
         pattern: pattern.clone(),
         base_iri: None,
     };
-    let solutions = match Evaluator::new(&dataset).evaluate(&synthetic)? {
-        QueryResult::Solutions(s) => s,
-        _ => unreachable!("Query::Select always evaluates to QueryResult::Solutions"),
-    };
+    let (_, solutions) = Evaluator::new(&dataset)
+        .evaluate(&synthetic)?
+        .into_solutions_vec()?;
 
     // Collect every row's deletes-then-inserts into a single ops batch and
     // apply it in one `apply_batch` call, instead of issuing one `remove`/

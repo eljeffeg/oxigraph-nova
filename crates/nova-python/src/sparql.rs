@@ -1,6 +1,8 @@
 use crate::io::*;
 use crate::model::*;
+use oxigraph_nova_store::QueryResults;
 use oxrdf::{Term, Triple, Variable};
+use oxrdfio::RdfSerializer;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PySyntaxError, PyValueError};
 use pyo3::prelude::*;
@@ -10,13 +12,10 @@ use sparesults::{
     QuerySolution, ReaderQueryResultsParserOutput, ReaderSolutionsParser,
 };
 use spargebra::SparqlSyntaxError;
-use oxigraph_nova_store::QueryResults;
-use oxrdfio::RdfSerializer;
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::vec::IntoIter;
-
 
 /// Converts a Nova [`QueryResults`] into the Python object matching its query form:
 /// an iterator of [`PyQuerySolution`] for `SELECT`, a [`PyQueryBoolean`] for `ASK`,
@@ -33,10 +32,8 @@ pub fn query_results_to_python<'py>(
             let rows = solutions
                 .into_iter()
                 .map(|solution| {
-                    let values: Vec<Option<Term>> = variables
-                        .iter()
-                        .map(|v| solution.get(v).cloned())
-                        .collect();
+                    let values: Vec<Option<Term>> =
+                        variables.iter().map(|v| solution.get(v).cloned()).collect();
                     QuerySolution::from((variables.clone(), values))
                 })
                 .collect::<Vec<_>>()
@@ -175,7 +172,7 @@ enum PyQuerySolutionsVariant {
         variables: Vec<Variable>,
     },
     Reader {
-        iter: ReaderSolutionsParser<PyReadable>,
+        iter: Box<ReaderSolutionsParser<PyReadable>>,
         file_path: Option<PathBuf>,
     },
 }
@@ -463,7 +460,7 @@ pub fn parse_query_results(
     match results {
         ReaderQueryResultsParserOutput::Solutions(iter) => PyQuerySolutions {
             inner: PyQuerySolutionsVariant::Reader {
-                iter,
+                iter: Box::new(iter),
                 file_path: path,
             },
         }

@@ -502,7 +502,6 @@ impl RingStoreInner {
         result
     }
 
-
     /// Add/remove literal-object documents for every entry currently in
     /// `self.delta` (an insert or a tombstone), using the `quad_key` term
     /// for tombstone deletes. No-op (including no error) if fulltext isn't

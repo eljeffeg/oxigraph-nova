@@ -23,6 +23,7 @@
 //! type error (the filter/expression silently fails).
 
 use crate::dataset::{Dataset, GraphSelector, PatternTerm, QuadPattern};
+use crate::select_vars::projected_variables;
 use crate::solution::{Solution, Solutions};
 use anyhow::Result;
 use oxiri::{Iri, IriRef};
@@ -40,6 +41,7 @@ use spargebra::algebra::{
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// Short label for a query's top-level kind, used as a `tracing` span field
 /// in `Evaluator::evaluate` (`SELECT` / `ASK` / `CONSTRUCT` / `DESCRIBE`).
@@ -370,10 +372,39 @@ impl Numeric {
 // ── Public result type ────────────────────────────────────────────────────────
 
 /// The result of evaluating a SPARQL query.
+pub type SolutionStream = Box<dyn Iterator<Item = Result<Solution>> + Send>;
+pub type TripleStream = Box<dyn Iterator<Item = Result<oxrdf::Triple>> + Send>;
+
 pub enum QueryResult {
-    Solutions(Solutions),
+    Solutions {
+        vars: Arc<[Variable]>,
+        stream: SolutionStream,
+    },
     Boolean(bool),
-    Triples(Vec<oxrdf::Triple>),
+    Triples(TripleStream),
+}
+
+impl QueryResult {
+    pub fn into_solutions_vec(self) -> Result<(Arc<[Variable]>, Vec<Solution>)> {
+        match self {
+            QueryResult::Solutions { vars, stream } => {
+                let sols = stream.collect::<Result<Vec<_>>>()?;
+                Ok((vars, sols))
+            }
+            _ => Err(anyhow::anyhow!(
+                "into_solutions_vec() called on a non-Solutions QueryResult"
+            )),
+        }
+    }
+
+    pub fn into_triples_vec(self) -> Result<Vec<oxrdf::Triple>> {
+        match self {
+            QueryResult::Triples(stream) => stream.collect::<Result<Vec<_>>>(),
+            _ => Err(anyhow::anyhow!(
+                "into_triples_vec() called on a non-Triples QueryResult"
+            )),
+        }
+    }
 }
 
 // ── Evaluator ────────────────────────────────────────────────────────────────
@@ -428,7 +459,9 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 let active_graph = dataset_clause_selector(query.dataset());
                 let pattern = optimize_pattern(pattern);
                 let solutions = self.eval_pattern(&pattern, &active_graph)?;
-                Ok(QueryResult::Solutions(solutions))
+                let vars: Arc<[Variable]> = projected_variables(query).into();
+                let stream: SolutionStream = Box::new(solutions.into_iter().map(Ok));
+                Ok(QueryResult::Solutions { vars, stream })
             }
             Query::Ask { pattern, .. } => {
                 let active_graph = dataset_clause_selector(query.dataset());
@@ -461,7 +494,8 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 }
                 triples.sort_by_key(|t| t.to_string());
                 triples.dedup_by_key(|t| t.to_string());
-                Ok(QueryResult::Triples(triples))
+                let stream: TripleStream = Box::new(triples.into_iter().map(Ok));
+                Ok(QueryResult::Triples(stream))
             }
 
             Query::Describe { .. } => Err(anyhow::anyhow!("DESCRIBE evaluation not implemented")),
@@ -3325,7 +3359,6 @@ fn current_datetime_string() -> String {
     unix_secs_to_datetime(secs)
 }
 
-
 /// Convert Unix epoch seconds to an ISO-8601 UTC dateTime string.
 fn unix_secs_to_datetime(secs: i64) -> String {
     let days = secs / 86400;
@@ -3633,9 +3666,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 4);
     }
 
@@ -3672,9 +3706,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query(r#"SELECT ?s WHERE { ?s <http://ex/name> ?n FILTER(?n = "Alice") }"#)
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 1);
         assert_eq!(
             sols[0].get(&Variable::new_unchecked("s")),
@@ -3696,9 +3731,10 @@ mod tests {
                 }"#,
             )
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 3);
         let carol_sol = sols
             .iter()
@@ -3721,9 +3757,10 @@ mod tests {
                 }"#,
             )
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 2);
     }
 
@@ -3735,9 +3772,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query("SELECT DISTINCT ?s WHERE { ?s <http://ex/name> ?n }")
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 2);
     }
 
@@ -3748,9 +3786,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o } ORDER BY ?s LIMIT 2 OFFSET 1")
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 2);
     }
 
@@ -3761,9 +3800,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query("SELECT (COUNT(?s) AS ?cnt) WHERE { ?s <http://ex/name> ?n }")
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 1);
         let cnt = sols[0].get(&Variable::new_unchecked("cnt")).unwrap();
         assert_eq!(cnt, &make_integer_literal(2));
@@ -3782,9 +3822,10 @@ mod tests {
                 }"#,
             )
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 1);
     }
 
@@ -3801,9 +3842,10 @@ mod tests {
                 }"#,
             )
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 2);
         for sol in &sols {
             let upper = sol.get(&Variable::new_unchecked("upper")).unwrap();
@@ -3821,9 +3863,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query(r#"SELECT (MD5("abc") AS ?h) WHERE {}"#)
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 1);
         let h = sols[0].get(&Variable::new_unchecked("h")).unwrap();
         assert_eq!(h.to_string(), "\"900150983cd24fb0d6963f7d28e17f72\"");
@@ -3838,9 +3881,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/a> <http://ex/p>+ ?x }")
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         let mut got: Vec<String> = sols
             .iter()
             .map(|s| s.get(&Variable::new_unchecked("x")).unwrap().to_string())
@@ -3858,9 +3902,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/a> <http://ex/p>* ?x }")
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         let mut got: Vec<String> = sols
             .iter()
             .map(|s| s.get(&Variable::new_unchecked("x")).unwrap().to_string())
@@ -3878,9 +3923,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/b> ^<http://ex/p> ?x }")
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 1);
         assert_eq!(
             sols[0].get(&Variable::new_unchecked("x")),
@@ -3897,9 +3943,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/a> <http://ex/p>|<http://ex/q> ?x }")
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         let mut got: Vec<String> = sols
             .iter()
             .map(|s| s.get(&Variable::new_unchecked("x")).unwrap().to_string())
@@ -3919,9 +3966,10 @@ mod tests {
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/a> <http://ex/p>/<http://ex/q> ?x }")
             .unwrap();
-        let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+        let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
+        let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(sols.len(), 1);
         assert_eq!(
             sols[0].get(&Variable::new_unchecked("x")),
@@ -3978,9 +4026,10 @@ mod tests {
                        }"#,
                 )
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(sols.len(), 1);
             assert_eq!(
                 sols[0].get(&Variable::new_unchecked("s")),
@@ -4004,9 +4053,10 @@ mod tests {
                        }"#,
                 )
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert!(sols.is_empty());
         }
 
@@ -4027,9 +4077,10 @@ mod tests {
                        }"#,
                 )
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert!(sols.is_empty());
         }
 
@@ -4081,9 +4132,10 @@ mod tests {
                        }"#,
                 )
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert!(
                 sols.is_empty(),
                 "rows with ?o incompatibly rebound as a predicate must be dropped, got: {sols:?}"
@@ -4110,9 +4162,10 @@ mod tests {
                        }"#,
                 )
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(sols.len(), 1);
             assert_eq!(
                 sols[0].get(&Variable::new_unchecked("s")),
@@ -4179,9 +4232,10 @@ mod tests {
                     "SELECT ?x WHERE { SERVICE SILENT <http://example.org/sparql> { ?s ?p ?x } }",
                 )
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert!(sols.is_empty());
         }
 
@@ -4193,9 +4247,10 @@ mod tests {
             let q = SparqlParser::new()
                 .parse_query("SELECT ?x WHERE { SERVICE <http://example.org/sparql> { ?s ?p ?x } }")
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(sols.len(), 1);
             assert_eq!(
                 sols[0].get(&Variable::new_unchecked("x")),
@@ -4224,9 +4279,10 @@ mod tests {
                     "SELECT ?x WHERE { SERVICE SILENT <http://example.org/sparql> { ?s ?p ?x } }",
                 )
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert!(sols.is_empty());
         }
 
@@ -4255,7 +4311,7 @@ mod tests {
         fn wkt(s: &str) -> Term {
             Term::Literal(Literal::new_typed_literal(
                 s,
-                NamedNode::new_unchecked(&format!("{GEO}wktLiteral")),
+                NamedNode::new_unchecked(format!("{GEO}wktLiteral")),
             ))
         }
 
@@ -4303,9 +4359,10 @@ mod tests {
                        }}"#
                 ))
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(sols.len(), 1);
             let d = as_f64(sols[0].get(&Variable::new_unchecked("d")).unwrap());
             // ~111.2 km per degree of latitude via Haversine.
@@ -4326,9 +4383,10 @@ mod tests {
                        }}"#
                 ))
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(sols.len(), 1);
             let d = as_f64(sols[0].get(&Variable::new_unchecked("d")).unwrap());
             assert_eq!(d, 0.0);
@@ -4350,9 +4408,10 @@ mod tests {
                        }}"#
                 ))
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(sols.len(), 1);
             assert!(as_bool(sols[0].get(&Variable::new_unchecked("b")).unwrap()));
         }
@@ -4373,9 +4432,10 @@ mod tests {
                        }}"#
                 ))
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(sols.len(), 1);
             assert!(!as_bool(
                 sols[0].get(&Variable::new_unchecked("b")).unwrap()
@@ -4399,9 +4459,10 @@ mod tests {
                        }}"#
                 ))
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(sols.len(), 1);
             let a = as_f64(sols[0].get(&Variable::new_unchecked("a")).unwrap());
             assert!(a > 0.0, "got {a}");
@@ -4423,9 +4484,10 @@ mod tests {
                        }}"#
                 ))
                 .unwrap();
-            let QueryResult::Solutions(sols) = ev.evaluate(&q).unwrap() else {
+            let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
                 panic!()
             };
+            let sols: Vec<_> = stream.collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(sols.len(), 1);
             assert!(sols[0].get(&Variable::new_unchecked("x")).is_none());
         }

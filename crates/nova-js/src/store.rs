@@ -5,10 +5,11 @@ use crate::reflect::*;
 use crate::utils::{to_option, to_option_ref};
 use js_sys::{Array, Map, try_iter};
 use oxigraph_nova_core::QuadStore;
-use oxigraph_nova_query::{Evaluator, QueryOptions, StoreDataset, execute_update, projected_variables};
+use oxigraph_nova_query::{
+    Evaluator, QueryOptions, StoreDataset, execute_update, projected_variables,
+};
 use oxigraph_nova_store::{QueryResults, Store};
 use oxrdf::{NamedOrBlankNode, Quad, Term};
-
 use oxrdfio::{RdfParser, RdfSerializer};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use spargebra::SparqlParser;
@@ -29,11 +30,11 @@ impl JsStore {
             store: Store::new(),
             data_factory: default_data_factory(),
         };
-        if let Some(quads) = to_option_ref(quads) {
-            if let Some(quads) = try_iter(quads)? {
-                for quad in quads {
-                    store.add(&quad?)?;
-                }
+        if let Some(quads) = to_option_ref(quads)
+            && let Some(quads) = try_iter(quads)?
+        {
+            for quad in quads {
+                store.add(&quad?)?;
             }
         }
         Ok(store)
@@ -115,27 +116,30 @@ impl JsStore {
         let mut named_graphs = None;
         if let Some(options) = to_option_ref(options) {
             base_iri = convert_base_iri(&reflect_get(options, &BASE_IRI)?)?;
-            default_graph = if let Some(default_graph) = to_option(reflect_get(options, &DEFAULT_GRAPH)?) {
-                Some(if let Some(iter) = try_iter(&default_graph)? {
-                    iter.map(|term| to_graph_name(&term?))
-                        .collect::<Result<Vec<_>, _>>()?
+            default_graph =
+                if let Some(default_graph) = to_option(reflect_get(options, &DEFAULT_GRAPH)?) {
+                    Some(if let Some(iter) = try_iter(&default_graph)? {
+                        iter.map(|term| to_graph_name(&term?))
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        vec![to_graph_name(&default_graph)?]
+                    })
                 } else {
-                    vec![to_graph_name(&default_graph)?]
-                })
-            } else {
-                None
-            };
-            named_graphs = if let Some(named_graphs) = to_option(reflect_get(options, &NAMED_GRAPHS)?) {
-                Some(
-                    try_iter(&named_graphs)?
-                        .ok_or_else(|| format_err!("named_graphs option must be iterable"))?
-                        .map(|term| to_named_or_blank_node(&term?))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
-            } else {
-                None
-            };
-            use_default_graph_as_union = reflect_get(options, &USED_DEFAULT_GRAPH_AS_UNION)?.is_truthy();
+                    None
+                };
+            named_graphs =
+                if let Some(named_graphs) = to_option(reflect_get(options, &NAMED_GRAPHS)?) {
+                    Some(
+                        try_iter(&named_graphs)?
+                            .ok_or_else(|| format_err!("named_graphs option must be iterable"))?
+                            .map(|term| to_named_or_blank_node(&term?))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )
+                } else {
+                    None
+                };
+            use_default_graph_as_union =
+                reflect_get(options, &USED_DEFAULT_GRAPH_AS_UNION)?.is_truthy();
             if let Some(js_results_format) = to_option(reflect_get(options, &RESULTS_FORMAT)?) {
                 results_format = Some(
                     js_results_format
@@ -162,7 +166,10 @@ impl JsStore {
             let dataset = StoreDataset::new(self.store.inner());
             let evaluator = Evaluator::with_options(&dataset, QueryOptions::default());
             let result = evaluator.evaluate(&parsed).map_err(map_anyhow_error)?;
-            (QueryResults::from(result), vars)
+            (
+                oxigraph_nova_store::collect_query_result(result).map_err(map_anyhow_error)?,
+                vars,
+            )
         } else {
             self.store
                 .query_with_variables(query, QueryOptions::default())
@@ -172,9 +179,10 @@ impl JsStore {
         Ok(match results {
             QueryResults::Solutions(solutions) => {
                 if let Some(results_format) = results_format {
-                    let mut serializer = QueryResultsSerializer::from_format(query_results_format(&results_format)?)
-                        .serialize_solutions_to_writer(Vec::new(), vars.clone())
-                        .map_err(JsError::from)?;
+                    let mut serializer =
+                        QueryResultsSerializer::from_format(query_results_format(&results_format)?)
+                            .serialize_solutions_to_writer(Vec::new(), vars.clone())
+                            .map_err(JsError::from)?;
                     for solution in &solutions {
                         serializer
                             .serialize(vars.iter().filter_map(|v| solution.get(v).map(|t| (v, t))))
@@ -189,7 +197,10 @@ impl JsStore {
                     for solution in &solutions {
                         let result = Map::new();
                         for (variable, value) in solution.iter() {
-                            result.set(&variable.as_str().into(), &from_term(&self.data_factory, value));
+                            result.set(
+                                &variable.as_str().into(),
+                                &from_term(&self.data_factory, value),
+                            );
                         }
                         results.push(&result.into());
                     }
@@ -198,7 +209,8 @@ impl JsStore {
             }
             QueryResults::Graph(triples) => {
                 if let Some(results_format) = results_format {
-                    let mut serializer = RdfSerializer::from_format(rdf_format(&results_format)?).for_writer(Vec::new());
+                    let mut serializer = RdfSerializer::from_format(rdf_format(&results_format)?)
+                        .for_writer(Vec::new());
                     for triple in &triples {
                         serializer.serialize_triple(triple).map_err(JsError::from)?;
                     }
@@ -218,9 +230,11 @@ impl JsStore {
                 if let Some(results_format) = results_format {
                     JsValue::from_str(
                         &String::from_utf8(
-                            QueryResultsSerializer::from_format(query_results_format(&results_format)?)
-                                .serialize_boolean_to_writer(Vec::new(), b)
-                                .map_err(JsError::from)?,
+                            QueryResultsSerializer::from_format(query_results_format(
+                                &results_format,
+                            )?)
+                            .serialize_boolean_to_writer(Vec::new(), b)
+                            .map_err(JsError::from)?,
                         )
                         .map_err(JsError::from)?,
                     )
@@ -315,7 +329,9 @@ impl JsStore {
         } else {
             let inner = self.store.inner();
             for quad in &quads {
-                inner.insert(quad).map_err(|e| map_anyhow_error(anyhow::anyhow!("{e}")))?;
+                inner
+                    .insert(quad)
+                    .map_err(|e| map_anyhow_error(anyhow::anyhow!("{e}")))?;
             }
         }
         Ok(())
@@ -348,11 +364,19 @@ impl JsStore {
 
 fn query_results_format(format: &str) -> Result<QueryResultsFormat, JsValue> {
     if format.contains('/') {
-        QueryResultsFormat::from_media_type(format)
-            .ok_or_else(|| format_err!("Not supported SPARQL query results format media type: {}", format))
+        QueryResultsFormat::from_media_type(format).ok_or_else(|| {
+            format_err!(
+                "Not supported SPARQL query results format media type: {}",
+                format
+            )
+        })
     } else {
-        QueryResultsFormat::from_extension(format)
-            .ok_or_else(|| format_err!("Not supported SPARQL query results format extension: {}", format))
+        QueryResultsFormat::from_extension(format).ok_or_else(|| {
+            format_err!(
+                "Not supported SPARQL query results format extension: {}",
+                format
+            )
+        })
     }
 }
 

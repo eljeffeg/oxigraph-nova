@@ -151,9 +151,9 @@ fn run_query<D: Dataset>(ds: &D, name: &str, sparql: &str, iters: usize, count_a
             );
         }
         n_results = match result {
-            QueryResult::Solutions(s) => s.len(),
+            QueryResult::Solutions { stream, .. } => stream.count(),
             QueryResult::Boolean(b) => b as usize,
-            QueryResult::Triples(t) => t.len(),
+            QueryResult::Triples(stream) => stream.count(),
         };
         times.push(elapsed.as_secs_f64() * 1000.0);
     }
@@ -259,9 +259,9 @@ fn main() {
             let ev = Evaluator::new(&ds);
             let result = ev.evaluate(&q).unwrap();
             let rows = match result {
-                QueryResult::Solutions(s) => s.len(),
+                QueryResult::Solutions { stream, .. } => stream.count(),
                 QueryResult::Boolean(b) => b as usize,
-                QueryResult::Triples(t) => t.len(),
+                QueryResult::Triples(stream) => stream.count(),
             };
             let _ = rows;
 

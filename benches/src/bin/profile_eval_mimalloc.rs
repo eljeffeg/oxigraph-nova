@@ -79,9 +79,9 @@ fn main() {
         let ev = Evaluator::new(&ds);
         let result = ev.evaluate(&q).unwrap();
         let rows = match result {
-            QueryResult::Solutions(s) => s.len(),
+            QueryResult::Solutions { stream, .. } => stream.count(),
             QueryResult::Boolean(b) => b as usize,
-            QueryResult::Triples(t) => t.len(),
+            QueryResult::Triples(stream) => stream.count(),
         };
         let rss_kb = std::process::Command::new("ps")
             .args(["-o", "rss=", "-p", &pid.to_string()])
