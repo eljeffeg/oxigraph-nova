@@ -52,11 +52,16 @@
 //! `nova.snapshot.<gen>` (see `nova-storage-ring`'s `snapshot.rs` module
 //! docs).
 
+#[cfg(feature = "mmap")]
 use epserde::deser::{Deserialize, Flags};
 use epserde::ser::Serialize;
-use oxigraph_nova_core::{DictSnapshot, Dictionary, Oxigraph};
+#[cfg(feature = "mmap")]
+use oxigraph_nova_core::DictSnapshot;
+use oxigraph_nova_core::{Dictionary, Oxigraph};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "mmap")]
 use std::sync::Arc;
+
 
 fn tmp_sibling(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
@@ -101,6 +106,14 @@ pub fn write_and_load_mmap(dict: &Dictionary, path: &Path) -> Result<Dictionary,
 /// is zero-copy mapped from the moment it's loaded, not just after the next
 /// `compact()`) and by [`write_and_load_mmap`] (right after writing a fresh
 /// snapshot generation during `commit_compaction`).
+///
+/// Requires the `mmap` cargo feature (default-on; disabled for the wasm32
+/// build, see this crate's `Cargo.toml`). Disk-backed persistence
+/// (`RingStore::open`) is unavailable without it — see the `not(feature =
+/// "mmap")` fallback below, which returns an error rather than failing to
+/// compile, since wasm32 builds never call this path at runtime (in-memory
+/// `RingStore::new()` only).
+#[cfg(feature = "mmap")]
 pub fn load_mmap_from_file(path: &Path) -> Result<Dictionary, Oxigraph> {
     if !path.exists() {
         return Ok(Dictionary::new());
@@ -111,6 +124,16 @@ pub fn load_mmap_from_file(path: &Path) -> Result<Dictionary, Oxigraph> {
     });
     Dictionary::from_mapped(mem)
 }
+
+/// `mmap`-disabled fallback (see the gated definition above): disk-backed
+/// dictionary persistence is unavailable in this build.
+#[cfg(not(feature = "mmap"))]
+pub fn load_mmap_from_file(_path: &Path) -> Result<Dictionary, Oxigraph> {
+    Err(Oxigraph::Storage(
+        "disk-backed persistence requires the \"mmap\" cargo feature, which is disabled in this build".into(),
+    ))
+}
+
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

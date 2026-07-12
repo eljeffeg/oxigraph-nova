@@ -19,6 +19,7 @@ pub mod engine;
 pub mod fixpoint;
 pub mod join;
 pub mod reasoning_dataset;
+pub mod reasoning_state;
 pub mod rule;
 pub mod same_as;
 pub mod sorted_vec_trie;
@@ -29,6 +30,7 @@ pub use join::{
     Atom, AtomField, AtomSource, CombinedSource, NullSource, SliceSource, leapfrog_join,
 };
 pub use reasoning_dataset::ReasoningDataset;
+pub use reasoning_state::ReasoningState;
 pub use rule::{Rule, RuleAtom, RuleSet};
 pub use same_as::SameAsTracker;
 pub use sorted_vec_trie::SortedVecTrie;

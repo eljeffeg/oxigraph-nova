@@ -1,0 +1,45 @@
+[package]
+name        = "oxigraph-nova-store"
+description = "Monolithic Store facade over RingStore + the SPARQL evaluator — an oxigraph::store::Store-shaped embedding API for Rust callers and language bindings"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+default = ["mmap"]
+# Opt-in Tantivy full-text search, forwarded through to
+# nova-storage-ring's own `fulltext` feature. See `Store::enable_fulltext`/
+# `Store::text_search`.
+fulltext = ["oxigraph-nova-storage-ring/fulltext"]
+
+# Opt-in outbound HTTP client, forwarded through to nova-query's own
+# `http-client` feature: unblocks SPARQL 1.1 Update's `LOAD <iri>` and
+# makes `oxigraph_nova_query::HttpServiceHandler` available for callers to
+# attach via `QueryOptions::with_service_handler`.
+http-client = ["oxigraph-nova-query/http-client"]
+# Opt-in GeoSPARQL 1.1 extension functions (geof:distance, sf:intersects,
+# etc.), forwarded through to nova-query's own `geosparql` feature. Dispatch
+# is automatic once compiled in — no new `Store` API is needed.
+geosparql = ["oxigraph-nova-query/geosparql"]
+# Forwards to `oxigraph-nova-core`'s `mmap` feature (see its doc comment):
+# mmap-based zero-copy disk persistence, requiring `mmap-rs` (no wasm32
+# support). Default-on for native builds; `oxigraph-nova-js`'s wasm32 build
+# disables it (`default-features = false` on this crate's dependency edge).
+mmap = ["oxigraph-nova-core/mmap", "oxigraph-nova-storage-ring/mmap", "oxigraph-nova-query/mmap", "oxigraph-nova-reasoning/mmap"]
+
+[dependencies]
+oxigraph-nova-core         = { path = "../nova-core", default-features = false }
+oxigraph-nova-storage-ring = { path = "../nova-storage-ring", default-features = false }
+oxigraph-nova-query        = { path = "../nova-query", default-features = false }
+oxigraph-nova-reasoning    = { path = "../nova-reasoning", default-features = false }
+
+oxrdf      = { workspace = true }
+oxrdfio    = { workspace = true }
+spargebra  = { workspace = true }
+sparesults = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

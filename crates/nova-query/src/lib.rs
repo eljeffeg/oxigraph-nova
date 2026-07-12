@@ -4,6 +4,7 @@ pub mod extensions;
 pub mod lftj;
 pub mod options;
 pub mod path;
+pub mod select_vars;
 pub mod service;
 pub mod solution;
 pub mod update;
@@ -19,8 +20,10 @@ pub use extensions::{
 };
 pub use lftj::{lftj_fallback_total, lftj_used_total};
 pub use options::{CancellationToken, EvalLimitError, QueryOptions};
+pub use select_vars::projected_variables;
 #[cfg(feature = "http-client")]
 pub use service::HttpServiceHandler;
 pub use service::ServiceHandler;
 pub use solution::{Solution, Solutions, SparqlVariable};
 pub use update::{clear_graph, execute_update};
+

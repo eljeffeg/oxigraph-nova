@@ -451,6 +451,12 @@ impl<B, L, S, V: AsRef<[u64]>> GraphRing<LoudsTrie<B, L, S>, V> {
 impl GraphRing<BorrowedLouds, VocabRepr> {
     /// Reconstruct a navigable, zero-copy `GraphRing<BorrowedLouds, VocabRepr>`
     /// from a `load_mmap`'d [`RingSnapshot`] view.
+    ///
+    /// Only constructed on the `mmap`-enabled path (see `MappedGraphRing::new`,
+    /// the sole caller); on builds with `mmap` disabled (e.g. the wasm32
+    /// `oxigraph-nova-js` target, which is in-memory-only), this function is
+    /// never called, hence the `cfg_attr`-gated `allow(dead_code)` below.
+    #[cfg_attr(not(feature = "mmap"), allow(dead_code))]
     pub(crate) fn from_mapped(
         view: &epserde::deser::DeserType<RingSnapshot>,
     ) -> GraphRing<BorrowedLouds, VocabRepr> {
@@ -577,6 +583,12 @@ impl MappedGraphRing {
     /// `mem` must be the same `Arc` (or a clone of it) that the caller keeps
     /// alive for the lifetime of the whole store's mmap'd generation — see
     /// this struct's SAFETY contract above.
+    ///
+    /// Only constructed on the `mmap`-enabled path (see `GraphRingHandle::Mapped`,
+    /// its sole caller); on builds with `mmap` disabled (e.g. the wasm32
+    /// `oxigraph-nova-js` target, which is in-memory-only), this function is
+    /// never called, hence the `cfg_attr`-gated `allow(dead_code)` below.
+    #[cfg_attr(not(feature = "mmap"), allow(dead_code))]
     pub(crate) fn new(
         mem: Arc<epserde::deser::MemCase<crate::snapshot::StoreSnapshot>>,
         ring_index: usize,
@@ -608,6 +620,12 @@ impl MappedGraphRing {
 /// object or dynamic dispatch overhead beyond the match itself.
 pub(crate) enum GraphRingHandle {
     Owned(Arc<GraphRing>),
+    /// Only constructed when the `mmap` cargo feature is enabled (see
+    /// `RingStore::open`/`commit_compaction`'s persistent branch); on builds
+    /// with `mmap` disabled (e.g. the wasm32 `oxigraph-nova-js` target, which
+    /// is in-memory-only), this variant is never constructed, hence the
+    /// `cfg_attr`-gated `allow(dead_code)` below.
+    #[cfg_attr(not(feature = "mmap"), allow(dead_code))]
     Mapped(Arc<MappedGraphRing>),
 }
 

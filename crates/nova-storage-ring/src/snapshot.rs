@@ -58,9 +58,13 @@
 //! (`path: None`) is also unaffected, since `round_trip_and_maybe_save`'s
 //! file-writing branch is skipped entirely when `path` is `None`.
 
-use crate::ring::{GraphRing, GraphRingHandle, MappedGraphRing, RingSnapshot};
+#[cfg(feature = "mmap")]
+use crate::ring::MappedGraphRing;
+use crate::ring::{GraphRing, GraphRingHandle, RingSnapshot};
 use epserde::Epserde;
-use epserde::deser::{Deserialize, Flags};
+use epserde::deser::Deserialize;
+#[cfg(feature = "mmap")]
+use epserde::deser::Flags;
 use epserde::ser::Serialize;
 use oxigraph_nova_core::{GraphId, Oxigraph};
 use std::collections::HashMap;
@@ -191,6 +195,14 @@ impl StoreSnapshot {
     /// are zero-copy mapped from the moment they're loaded, not just after
     /// the next `compact()`) and by [`Self::write_and_load_mmap`] (right
     /// after writing a fresh snapshot generation during `commit_compaction`).
+    ///
+    /// Requires the `mmap` cargo feature (default-on; disabled for the
+    /// wasm32 build, see this crate's `Cargo.toml`). Disk-backed persistence
+    /// (`RingStore::open`) is unavailable without it — see the `not(feature
+    /// = "mmap")` fallback below, which returns an error rather than failing
+    /// to compile, since wasm32 builds never call this path at runtime
+    /// (in-memory `RingStore::new()` only).
+    #[cfg(feature = "mmap")]
     pub(crate) fn load_mmap_from_file(
         path: &Path,
     ) -> Result<HashMap<GraphId, GraphRingHandle>, Oxigraph> {
@@ -208,6 +220,17 @@ impl StoreSnapshot {
             out.insert(GraphId(g), GraphRingHandle::Mapped(Arc::new(mapped)));
         }
         Ok(out)
+    }
+
+    /// `mmap`-disabled fallback (see the gated definition above): disk-backed
+    /// snapshot persistence is unavailable in this build.
+    #[cfg(not(feature = "mmap"))]
+    pub(crate) fn load_mmap_from_file(
+        _path: &Path,
+    ) -> Result<HashMap<GraphId, GraphRingHandle>, Oxigraph> {
+        Err(Oxigraph::Storage(
+            "disk-backed persistence requires the \"mmap\" cargo feature, which is disabled in this build".into(),
+        ))
     }
 
     /// Consume `graphs`, serializing it once, atomically writing the bytes

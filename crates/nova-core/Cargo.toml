@@ -6,14 +6,25 @@ edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
+[features]
+default = ["mmap"]
+# mmap-based zero-copy loading of the compacted Front-Coded dictionary tier
+# (`Dictionary::from_mapped`, ε-serde's `load_mmap`). Requires `mmap-rs`,
+# which has no WebAssembly support. Disabled (via `default-features = false`
+# on this crate's dependency edge) for the wasm32 build
+# (`oxigraph-nova-js`), which is in-memory-only and never touches
+# mmap-backed persistence at runtime.
+mmap = ["epserde/mmap", "sux/mmap"]
+
 [dependencies]
 oxrdf        = { workspace = true }
 anyhow       = { workspace = true }
 thiserror    = { workspace = true }
-sux          = { version = "0.14", features = ["epserde", "mmap"] } # BitFieldVec-based id2rank/rank2id permutation arrays (PFC dictionary)
+sux          = { version = "0.14", default-features = false, features = ["epserde"] } # BitFieldVec-based id2rank/rank2id permutation arrays (PFC dictionary)
 value-traits = "0.2.0"  # SliceByValue::index_value for safe BitFieldVec reads
 lru          = "0.18.1"   # TermId-keyed decode cache for compacted-tier terms (PFC dictionary)
-epserde      = { version = "0.12.5", features = ["derive", "mmap", "std"] } # mmap residency for CompactedTier's Front-Coded buffer
+epserde      = { version = "0.12.5", default-features = false, features = ["derive", "std"] } # mmap residency for CompactedTier's Front-Coded buffer; see `mmap` feature above
+
 
 
 

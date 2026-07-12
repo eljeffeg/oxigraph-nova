@@ -6,13 +6,20 @@ edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
+[features]
+default = ["mmap"]
+# Forwards to `oxigraph-nova-core`'s `mmap` feature (see its doc comment).
+# This crate itself has no mmap-specific code.
+mmap = ["oxigraph-nova-core/mmap"]
+
 [dependencies]
-oxigraph-nova-core = { path = "../nova-core" }
+oxigraph-nova-core = { path = "../nova-core", default-features = false }
 # `engine`/`reasoning_dataset` operate at the `Dataset` seam (not raw
 # `QuadStore`) so `ReasoningDataset<D: Dataset>` can wrap any SPARQL-facing
 # dataset, mirroring `oxigraph-nova-query`'s own `StoreDataset` adapter.
-oxigraph-nova-query = { path = "../nova-query" }
+oxigraph-nova-query = { path = "../nova-query", default-features = false }
 anyhow = { workspace = true }
+
 
 [dev-dependencies]
 # Only integration/unit tests need a real storage backend + oxrdf term

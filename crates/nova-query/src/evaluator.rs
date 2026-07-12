@@ -3304,6 +3304,12 @@ fn tz_str_to_duration(tz: &str) -> String {
 }
 
 /// Return a minimal UTC dateTime string for the current moment.
+///
+/// `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown` (no OS
+/// clock is available there) — use the `Date.now()` ECMAScript API via
+/// `js_sys` instead on that target, matching how upstream oxigraph-js's
+/// `oxsdatatypes` handles this (see `research/oxigraph/lib/oxsdatatypes/src/date_time.rs`).
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn current_datetime_string() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -3312,6 +3318,13 @@ fn current_datetime_string() -> String {
         .as_secs() as i64;
     unix_secs_to_datetime(secs)
 }
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn current_datetime_string() -> String {
+    let secs = (js_sys::Date::now() / 1000.) as i64;
+    unix_secs_to_datetime(secs)
+}
+
 
 /// Convert Unix epoch seconds to an ISO-8601 UTC dateTime string.
 fn unix_secs_to_datetime(secs: i64) -> String {

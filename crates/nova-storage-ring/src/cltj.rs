@@ -96,6 +96,13 @@ pub(crate) enum VocabRepr {
     /// Borrowed vocab slice, zero-copy from a `load_mmap`'d snapshot file.
     /// See the type-level doc comment above for the lifetime-extension
     /// safety argument.
+    ///
+    /// Only constructed when the `mmap` cargo feature is enabled (see
+    /// `GraphRing::from_mapped` in `ring.rs`); on builds with `mmap`
+    /// disabled (e.g. the wasm32 `oxigraph-nova-js` target, which is
+    /// in-memory-only), this variant is never constructed, hence the
+    /// `cfg_attr`-gated `allow(dead_code)` below.
+    #[cfg_attr(not(feature = "mmap"), allow(dead_code))]
     Mapped(&'static [u64]),
 }
 

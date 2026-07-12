@@ -86,7 +86,6 @@
 //! semantics", for the storage-level explanation), demonstrated directly by
 //! `crates/nova-server/tests/isolation.rs`'s two integration tests.
 
-mod reasoning_state;
 mod service_description;
 
 /// mimalloc purge tuning (bulk-load/compaction transient-memory fix).
@@ -185,17 +184,16 @@ use axum::routing::{get, post};
 use oxigraph_nova_core::{QuadStore, TextSearch};
 use oxigraph_nova_query::{
     CancellationToken, EvalLimitError, Evaluator, QueryOptions, QueryResult, ServiceHandler,
-    Solutions, StoreDataset, clear_graph, execute_update,
+    Solutions, StoreDataset, clear_graph, execute_update, projected_variables,
 };
-use oxigraph_nova_reasoning::ReasoningEngine;
+
+use oxigraph_nova_reasoning::{ReasoningEngine, ReasoningState};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
 use oxrdfio::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
-use reasoning_state::ReasoningState;
 use serde::Deserialize;
 use service_description::generate_service_description_graph;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
-use spargebra::algebra::GraphPattern;
-use spargebra::{Query, SparqlParser};
+use spargebra::SparqlParser;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::Arc;
@@ -1294,9 +1292,10 @@ async fn execute_sparql_query<S: QuadStore + 'static>(
         },
         Ok(Ok(QueryResult::Boolean(b))) => serialize_boolean(b, accept),
         Ok(Ok(QueryResult::Solutions(solutions))) => {
-            let vars = query_select_vars(&query);
+            let vars = projected_variables(&query);
             serialize_solutions(&vars, solutions, accept)
         }
+
         Ok(Ok(QueryResult::Triples(triples))) => serialize_triples(&triples, accept),
     }
 }
@@ -1522,32 +1521,8 @@ fn accept_header(headers: &HeaderMap) -> &str {
         .unwrap_or("")
 }
 
-// ── SPARQL algebra helpers ────────────────────────────────────────────────────
-
-/// Extract the ordered SELECT variable list from the outermost `Project` node.
-///
-/// spargebra resolves `SELECT *` to an explicit `Project` with all WHERE-clause
-/// variables during parsing, so this is always populated for valid SELECT queries.
-fn query_select_vars(query: &Query) -> Vec<Variable> {
-    if let Query::Select { pattern, .. } = query {
-        extract_project_vars(pattern)
-    } else {
-        vec![]
-    }
-}
-
-fn extract_project_vars(pattern: &GraphPattern) -> Vec<Variable> {
-    match pattern {
-        GraphPattern::Project { variables, .. } => variables.clone(),
-        GraphPattern::Distinct { inner } => extract_project_vars(inner),
-        GraphPattern::Reduced { inner } => extract_project_vars(inner),
-        GraphPattern::OrderBy { inner, .. } => extract_project_vars(inner),
-        GraphPattern::Slice { inner, .. } => extract_project_vars(inner),
-        _ => vec![],
-    }
-}
-
 // ── Form URL-decoding ─────────────────────────────────────────────────────────
+
 
 /// Extract a named parameter from an `application/x-www-form-urlencoded` body.
 fn form_param(body: &str, key: &str) -> Option<String> {

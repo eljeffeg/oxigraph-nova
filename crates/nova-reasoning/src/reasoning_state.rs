@@ -1,17 +1,16 @@
-//! [`ReasoningState`] — server-level cache for the OWL 2 RL reasoning
-//! overlay ([`oxigraph_nova_reasoning::ReasoningDataset`]), computed lazily
-//! and rebuilt only when the backing store's compaction generation has
-//! advanced since the last build.
+//! [`ReasoningState`] — a cache for the OWL 2 RL reasoning overlay
+//! ([`ReasoningDataset`]), computed lazily and rebuilt only when the
+//! backing store's compaction generation has advanced since the last
+//! build.
 //!
 //! ## Why a cache at all
 //!
 //! `ReasoningDataset::wrap` runs a [`ReasoningEngine::infer`] pass eagerly,
 //! at construction time — and that pass is O(closure), potentially far
 //! above normal query latency (`reasonable` takes ~19s to materialize a
-//! ~15K-triple TBox). Re-wrapping on every `/sparql` request would make
-//! every single query pay that cost. Instead, the overlay is built once and
-//! held; it's only rebuilt when the store's data has actually changed
-//! underneath it.
+//! ~15K-triple TBox). Re-wrapping on every request would make every single
+//! query pay that cost. Instead, the overlay is built once and held; it's
+//! only rebuilt when the store's data has actually changed underneath it.
 //!
 //! ## Staleness policy
 //!
@@ -30,23 +29,28 @@
 //! to detect staleness for them, so behavior degrades gracefully to
 //! `ReasoningDataset`'s own base "wrap once" contract (a caller who mutates
 //! such a store after enabling reasoning won't see updated inferences until
-//! the process restarts). This mirrors exactly how `RingStore::
-//! enable_fulltext`'s generation-marker staleness check works (see its doc
-//! comment) — both are "eventually consistent, recompute keyed to the
-//! compaction cycle" designs.
+//! a new `ReasoningState` is constructed). This mirrors exactly how
+//! `RingStore::enable_fulltext`'s generation-marker staleness check works
+//! (see its doc comment) — both are "eventually consistent, recompute keyed
+//! to the compaction cycle" designs.
 //!
 //! Rebuilding is **not** triggered proactively by a background task; it's
-//! checked lazily, on the next request that needs the overlay (a query, or
-//! a `GET /reasoning/diagnostics` poll) after a compaction has happened.
-//! This keeps the design simple (no extra worker thread/task to manage)
-//! at the cost of one request per compaction cycle paying the rebuild cost
-//! inline — acceptable given compactions are already an infrequent,
-//! expensive event compared to steady-state query traffic.
+//! checked lazily, on the next call that needs the overlay (a query, or a
+//! diagnostics poll) after a compaction has happened. This keeps the design
+//! simple (no extra worker thread/task to manage) at the cost of one call
+//! per compaction cycle paying the rebuild cost inline — acceptable given
+//! compactions are already an infrequent, expensive event compared to
+//! steady-state query traffic.
+//!
+//! This type lives in `nova-reasoning` (rather than e.g. `nova-server`) so
+//! any embedder of the reasoning overlay — the HTTP server, the monolithic
+//! `Store` facade, or a future language binding — shares the exact same
+//! caching/staleness policy instead of re-implementing it.
 
+use crate::{ReasoningDataset, ReasoningEngine};
 use anyhow::Result;
 use oxigraph_nova_core::QuadStore;
 use oxigraph_nova_query::StoreDataset;
-use oxigraph_nova_reasoning::{ReasoningDataset, ReasoningEngine};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -78,9 +82,9 @@ impl<S: QuadStore + 'static> ReasoningState<S> {
     /// generation has advanced since the cached overlay was built.
     ///
     /// **Blocking.** On a cache miss this calls the engine's
-    /// (potentially expensive) `infer()` — callers must invoke this from a
-    /// blocking context (`tokio::task::spawn_blocking`), never directly on
-    /// an async runtime worker thread.
+    /// (potentially expensive) `infer()` — callers on an async runtime must
+    /// invoke this from a blocking context (`tokio::task::spawn_blocking`),
+    /// never directly on an async runtime worker thread.
     pub fn current(&self, store: &Arc<S>) -> Result<Arc<ReasoningDataset<StoreDataset<S>>>> {
         let current_gen = store.compaction_count();
 
@@ -92,7 +96,7 @@ impl<S: QuadStore + 'static> ReasoningState<S> {
         }
 
         // Slow path: rebuild. Re-check after acquiring the write lock in
-        // case another concurrent request already rebuilt while we were
+        // case another concurrent caller already rebuilt while we were
         // waiting for it (avoids a redundant `infer()` pass under
         // contention).
         let mut guard = self.overlay.write().unwrap();

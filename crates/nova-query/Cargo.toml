@@ -7,7 +7,8 @@ license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-oxigraph-nova-core = { path = "../nova-core" }
+oxigraph-nova-core = { path = "../nova-core", default-features = false }
+
 oxrdf         = { workspace = true }
 spargebra     = { workspace = true }
 sparopt       = { workspace = true, optional = true }  # algebra optimizer: filter pushdown, join reordering
@@ -34,12 +35,23 @@ sparesults    = { workspace = true, optional = true }
 # `geosparql_function_local`.
 spargeo       = { workspace = true, optional = true }
 
+# `std::time::SystemTime::now()` panics on wasm32-unknown-unknown (no OS
+# clock there) — NOW() uses `js_sys::Date::now()` instead on that target
+# only (see `evaluator::current_datetime_string`).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = { workspace = true }
+
 [features]
-default = ["sparopt"]
+default = ["sparopt", "mmap"]
 sparopt = ["dep:sparopt"]
 http-client = ["dep:oxhttp", "dep:oxrdfio", "dep:sparesults"]
 geosparql = ["dep:spargeo"]
-
+# Forwards to `oxigraph-nova-core`'s `mmap` feature (see its doc comment).
+# This crate itself has no mmap-specific code — it exists purely so that
+# `oxigraph-nova-js`'s wasm32 build (which sets `default-features = false`
+# on this crate) can disable `mmap` all the way down to `nova-core` even
+# though it depends on this crate.
+mmap = ["oxigraph-nova-core/mmap"]
 
 [dev-dependencies]
 oxigraph-nova-storage-memory = { path = "../nova-storage-memory" }

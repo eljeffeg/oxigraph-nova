@@ -79,7 +79,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::time::Instant;
 
 /// Default delta-size threshold (number of live entries) that triggers an
 /// automatic inline compaction for a persistent (`RingStore::open`) store.
@@ -412,8 +414,19 @@ impl RingStoreInner {
     /// section — never re-enters the lock).
     #[tracing::instrument(name = "compact", skip_all, fields(delta_len = self.delta.len()))]
     fn compact_locked(&mut self) -> Result<(), Oxigraph> {
+        // `Instant::now()` panics on `wasm32-unknown-unknown` (no monotonic
+        // clock available there, same reason `nova_query::evaluator`'s
+        // `current_datetime_string()` cfg-gates `SystemTime::now()` — see
+        // its doc comment). This path isn't reachable from `oxigraph-nova-js`
+        // today (the wasm binding never calls `Store::optimize`/`compact`,
+        // and `bulk_load` — its `no_transaction: true` load path — never
+        // calls `compact_locked`), but skip the timing call defensively
+        // rather than leave a latent panic for the day this *is* exposed on
+        // wasm32; the compaction-count metric is still tracked either way.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let t0 = Instant::now();
         let mut per_graph: HashMap<GraphId, Vec<[u64; 3]>> = HashMap::new();
+
         for (&g_id, ring) in &self.graphs {
             per_graph.insert(g_id, ring.spo_triples());
         }
@@ -484,9 +497,11 @@ impl RingStoreInner {
         }
 
         COMPACTION_COUNT.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         COMPACTION_DURATION_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         result
     }
+
 
     /// Add/remove literal-object documents for every entry currently in
     /// `self.delta` (an insert or a tombstone), using the `quad_key` term
