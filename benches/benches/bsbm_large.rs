@@ -44,6 +44,23 @@
 //! path) are mirrored here without the FILTER/ORDER BY/LIMIT operators that BSBM
 //! queries use (not yet implemented in our evaluator).
 //!
+//! ## Parallel LFTJ scaling probes
+//!
+//! In addition to the sidecar-focused shapes above, this file hosts two
+//! benchmarks that exercise the parallel root-dispatch path in
+//! `oxigraph-nova-query::lftj` (`run_lftj_root` / chunked `par_chunks`):
+//!
+//! | Benchmark | Root domain | Purpose |
+//! |---|---|---|
+//! | `large/large_root` | ≈ 2_000 features (no class filter) | Honest multi-core scaling on a 1M-row join |
+//! | `large/skewed_paths` | power-law related graph | Residual single-level-split skew (HoneyComb §1–2) |
+//!
+//! Run just those two:
+//!
+//! ```bash
+//! cargo bench -p oxigraph-nova-bench --bench bsbm_large -- 'large/large_root|large/skewed_paths'
+//! ```
+//!
 //! ## Running
 //!
 //! ```bash
@@ -52,6 +69,9 @@
 //!
 //! # Only the sidecar-exercising benchmark (validates high-degree optimization)
 //! cargo bench -p oxigraph-nova-bench -- large/star_with_features
+//!
+//! # Parallel LFTJ scaling probes (large root domain + power-law skew)
+//! cargo bench -p oxigraph-nova-bench --bench bsbm_large -- 'large/large_root|large/skewed_paths'
 //!
 //! # Comparison: baseline (no EF) vs with EF
 //! # After implementing Elias-Fano backend, re-run and compare reports in
@@ -76,6 +96,7 @@
 //! When `BSBM_NT_FILE` is set, the BSBM data is loaded for `large/compact` and
 //! `large/ingest` benchmarks.  SPARQL query benchmarks always use synthetic data
 //! since the BSBM IRIs differ from our Wikidata-style prefixes.
+
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Subject, Term};
@@ -569,7 +590,208 @@ fn bench_large_triangle(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Benchmark 8: Degree sweep (pin EF crossover threshold) ───────────────────
+// ── Benchmark 8: Large root domain (parallel LFTJ scaling) ────────────────────
+//
+// SPARQL: SELECT ?s ?f WHERE { ?s wdt:P2 ?f }
+//
+// Exercises the parallel root-dispatch path (`run_lftj_root` / chunked
+// `par_chunks`) on a domain large enough that work-stealing has real work to
+// do. Unlike `star_class_region` / `star_with_features` (root domain ≈ 1k after
+// the class0 filter), this query has no constant filter on the subject, so
+// adaptive VEO sees:
+//
+//   - ?f (feature objects of P2): pool size N_FEATURES = 2_000
+//   - ?s (subjects with P2):      LARGE_N = 50_000
+//
+// VEO therefore picks ?f first (smaller real subtree). Root domain ≈ 2_000
+// values, each expanding to ≈ LARGE_N × FAN_OUT_FEATURES / N_FEATURES = 500
+// subjects → 1_000_000 solutions total. That is well above
+// `PARALLEL_LFTJ_ROOT_THRESHOLD` (64) and each chunk's sequential loop does
+// hundreds of microsecond-scale subtrees rather than sub-µs empty ones.
+//
+// ## Why this exists
+//
+// Phases A–C of parallel LFTJ (snapshot + per-worker decode caches + SmallVec)
+// were validated on the class-filtered star shapes, where absolute speedups
+// were large relative to the *previous parallel baseline* but the root domain
+// itself was modest. This benchmark is the honest scaling probe: if chunked
+// parallel LFTJ is paying off, `large/large_root` should show multi-core
+// utilisation on a multi-million-solution join. Compare against a sequential
+// baseline by temporarily forcing `PARALLEL_LFTJ_ROOT_THRESHOLD = usize::MAX`
+// (Criterion's own `change:` is vs. its last saved run, not a fixed reference).
+//
+// Expected: LARGE_N × FAN_OUT_FEATURES = 50_000 × 20 = 1_000_000 solutions.
+
+fn bench_large_root(c: &mut Criterion) {
+    let store = get_large_store();
+    let ds = StoreDataset::new(Arc::clone(&store));
+
+    let sparql = format!("{PREFIXES}SELECT ?s ?f WHERE {{ ?s wdt:P2 ?f }}");
+
+    let expected = LARGE_N * FAN_OUT_FEATURES; // 1_000_000
+    let actual = count_solutions(&ds, &sparql);
+    assert_eq!(actual, expected, "large_root: unexpected solution count");
+    eprintln!(
+        "[bsbm_large] large_root: {actual} solutions \
+         (root domain ≈ {N_FEATURES} features × ~{} subjects — parallel LFTJ scaling probe)",
+        LARGE_N * FAN_OUT_FEATURES / N_FEATURES
+    );
+
+    let mut group = c.benchmark_group("large/large_root");
+    group.measurement_time(Duration::from_secs(30));
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(actual as u64));
+
+    group.bench_function("ring", |b| {
+        b.iter(|| black_box(count_solutions(&ds, &sparql)))
+    });
+    group.finish();
+}
+
+// ── Benchmark 9: Skewed two-hop paths (power-law out-degree) ──────────────────
+//
+// SPARQL: SELECT ?a ?b ?c WHERE { ?a wdt:related ?b . ?b wdt:related ?c }
+//
+// HoneyComb (§1–2) shows that naively partitioning only the outermost join
+// variable is skew-prone: a few hub values dominate wall-clock time and leave
+// other workers idle. Our production path currently does a *single-level*
+// chunked root split (PJDL-style enumerate-then-dispatch) and deliberately
+// defers deeper adaptive splitting until a real skewed workload proves it
+// necessary. This benchmark *is* that workload.
+//
+// ## Dataset
+//
+// SKEW_N = 20_000 entities, each with a power-law number of `related-to`
+// outgoing edges:
+//
+//     out_degree(i) = clamp(SKEW_SCALE / (i + 1), 1, SKEW_MAX_OUT)
+//
+// Entity 0 is a hub with SKEW_MAX_OUT edges; the tail has degree 1. Total edge
+// count is ≈ SKEW_SCALE · H_{SKEW_N} (harmonic sum) — tens of thousands, cheap
+// to build. Targets are `(i + 1 + j) % SKEW_N` so the graph is a directed
+// near-cycle with hub shortcuts — no self-loops.
+//
+// ## What the query stresses
+//
+// Adaptive VEO typically iterates ?a (or ?b) first over the set of subjects
+// that have outgoing related-edges (≈ SKEW_N). Chunked parallel dispatch then
+// hands contiguous slices of that domain to rayon workers. Because out-degree
+// is power-law, early chunks (low entity ids) contain the hubs and do far more
+// second-hop expansion than late chunks. Rayon's work-stealing *within* the
+// fixed chunk set can rebalance unfinished chunks, but a single outsized hub
+// *inside* a chunk still serialises that worker — exactly the residual skew
+// HoneyComb measures. Tracking this number over time tells us when (if ever)
+// a below-root adaptive split is warranted.
+//
+// Result cardinality is data-dependent (hubs dominate); we only assert > 0
+// and report the count at startup.
+
+/// Entities in the power-law skew dataset.
+const SKEW_N: usize = 20_000;
+
+/// Scale factor for out_degree(i) ≈ SKEW_SCALE / (i + 1).
+/// Entity 0 would request SKEW_SCALE edges before the SKEW_MAX_OUT clamp.
+const SKEW_SCALE: usize = 5_000;
+
+/// Cap on any single node's out-degree (keeps hub expansion practical).
+const SKEW_MAX_OUT: usize = 2_000;
+
+#[inline]
+fn skew_out_degree(i: usize) -> usize {
+    (SKEW_SCALE / (i + 1)).clamp(1, SKEW_MAX_OUT)
+}
+
+/// Generate a directed power-law `related-to` graph over `n` entities.
+///
+/// Entity `i` emits `skew_out_degree(i)` edges to distinct targets
+/// `(i + 1 + j) % n` for `j in 0..degree`, guaranteeing no self-loop.
+fn generate_quads_skew(n: usize) -> Vec<Quad> {
+    let p_rel = NamedNode::new_unchecked(P_REL);
+    let dg = GraphName::DefaultGraph;
+    // Upper bound: every node at SKEW_MAX_OUT (actual total is much smaller).
+    let mut quads = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let subj = Subject::NamedNode(entity_iri(i));
+        let degree = skew_out_degree(i);
+        for j in 0..degree {
+            let target = (i + 1 + j) % n;
+            quads.push(Quad::new(
+                subj.clone(),
+                p_rel.clone(),
+                Term::NamedNode(entity_iri(target)),
+                dg.clone(),
+            ));
+        }
+    }
+    quads
+}
+
+static SKEW_STORE: OnceLock<Arc<RingStore>> = OnceLock::new();
+
+fn get_skew_store() -> Arc<RingStore> {
+    Arc::clone(SKEW_STORE.get_or_init(|| {
+        let mut edge_count = 0usize;
+        for i in 0..SKEW_N {
+            edge_count += skew_out_degree(i);
+        }
+        eprintln!(
+            "[bsbm_large] Building skew store: {SKEW_N} entities, \
+             {edge_count} related-to edges (power-law, max_out={SKEW_MAX_OUT}) …"
+        );
+        let quads = generate_quads_skew(SKEW_N);
+        let store = Arc::new(RingStore::new());
+        for q in &quads {
+            store.insert(q).unwrap();
+        }
+        eprintln!("[bsbm_large] Compacting skew store …");
+        store.compact().unwrap();
+        eprintln!(
+            "[bsbm_large] Skew store ready. hub_out_degree={}, \
+             tail_out_degree={}, triple_count={}",
+            skew_out_degree(0),
+            skew_out_degree(SKEW_N - 1),
+            store.triple_count()
+        );
+        store
+    }))
+}
+
+fn bench_skewed_paths(c: &mut Criterion) {
+    let store = get_skew_store();
+    let ds = StoreDataset::new(Arc::clone(&store));
+
+    // Two-hop paths (not a closing triangle): every ?a→?b edge expands into
+    // out_degree(b) continuations, so hub intermediates amplify fan-out.
+    let sparql = format!(
+        "{PREFIXES}SELECT ?a ?b ?c WHERE {{ \
+            ?a wdt:related ?b . \
+            ?b wdt:related ?c \
+        }}"
+    );
+
+    let actual = count_solutions(&ds, &sparql);
+    assert!(
+        actual > 0,
+        "skewed_paths: expected a non-empty 2-hop result on the power-law graph"
+    );
+    eprintln!(
+        "[bsbm_large] skewed_paths: {actual} solutions \
+         (power-law related graph, hub_out={})",
+        skew_out_degree(0)
+    );
+
+    let mut group = c.benchmark_group("large/skewed_paths");
+    group.measurement_time(Duration::from_secs(45));
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(actual as u64));
+
+    group.bench_function("ring", |b| {
+        b.iter(|| black_box(count_solutions(&ds, &sparql)))
+    });
+    group.finish();
+}
+
+// ── Benchmark 10: Degree sweep (pin EF crossover threshold) ──────────────────
 //
 // Measures the `feature_lookup` query at six POS-trie degree levels:
 //   16, 32, 64, 128, 256, 512 S-children per (P=has-feature, O=feature_j) node.
@@ -697,6 +919,8 @@ criterion_group!(
     bench_large_star_with_features,
     bench_large_full_star,
     bench_large_triangle,
+    bench_large_root,
+    bench_skewed_paths,
     bench_degree_sweep,
 );
 criterion_main!(benches);
