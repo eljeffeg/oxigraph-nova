@@ -67,6 +67,82 @@
 //!    d. Leapfrog-sync to find common key.
 //!    e. Bind `bindings[j*] = val`, recurse with `unbound[1..]`, advance.
 //! 4. At `unbound.is_empty()`, emit a solution from `bindings`.
+//!
+//! ## Parallel root-level dispatch
+//!
+//! References: Wu & Suciu, "HoneyComb: A Parallel Worst-Case Optimal Join"
+//! (PODS 2025, `/research/2502.06715v1.pdf`); Wei, Liu, Lin, "PJDL:
+//! Parallelizing Leapfrog Triejoin via Incremental Trie Construction and
+//! Dynamic Load Balancing" (DASFAA 2026, `/research/2026_DASFAA.pdf`).
+//!
+//! HoneyComb's own approach — hash-partitioning *every* query variable's
+//! domain and physically reorganizing each relation into per-partition
+//! contiguous arrays before joining — is deliberately not adopted here: it
+//! requires materializing per-query copies of the relations, which is
+//! incompatible with CompactLTJ's succinct, immutable, mmap'd LOUDS tries
+//! (the entire point of which is to *avoid* per-query data copies). What is
+//! adopted from both papers is the diagnosis that parallelizing only the
+//! outermost join variable is skew-prone (HoneyComb §1–2 measures a >15×
+//! task-runtime skew ratio from naively hash-partitioning just the first
+//! variable), and the PJDL-style fix: enumerate the adaptively-chosen root
+//! variable's full domain first with one sequential leapfrog pass
+//! (`lftj_enumerate_level`), then hand each domain value's *independent*
+//! subtree computation (a fresh `bindings` clone, no shared mutable state)
+//! to rayon's work-stealing pool from `eval_bgp_lftj_cancellable` once the
+//! domain is large enough (`should_parallelize_lftj_root`); below that
+//! threshold, or on wasm32 (where rayon is unavailable), the same
+//! enumerated matches are walked with a plain sequential loop, so no query
+//! pays for an extra pass. Because each root value's subtree needs no
+//! relation reorganization, this preserves CompactLTJ's space/zero-copy
+//! properties untouched — only the join *evaluation*, never the storage
+//! layout, is parallelized. A further, adaptive skew-mitigation layer
+//! (splitting *below* the root for a single outsized subtree, the way
+//! HoneyComb partitions every level) is deferred until profiling on a real
+//! skewed dataset shows this single-level split is insufficient.
+//!
+//! ### Dispatch granularity: chunked, not one-task-per-value
+//!
+//! An earlier version of this dispatch handed each enumerated root value to
+//! its own rayon task (`matches.par_iter().map(...)`). Benchmarked against
+//! `bsbm_large`'s synthetic 1.25M-triple dataset, that granularity regressed
+//! wall-clock time by 80-130% across *every* query shape (`star_class_region`,
+//! `star_with_features`, `full_star`, `triangle`) relative to the plain
+//! sequential loop, despite each shape's root domain comfortably exceeding
+//! `PARALLEL_LFTJ_ROOT_THRESHOLD`. The initial hypothesis was lock contention
+//! on `RingStore`'s internal lock (many rayon worker threads concurrently
+//! calling `lftj_join_scan`/`lftj_real_count` through a shared `Mutex`), so
+//! `RingStore` and `Dictionary`'s decode cache were migrated from `Mutex` to
+//! `RwLock` (concurrent readers no longer serialize on the same lock). This
+//! migration is real and worthwhile for concurrent-read scalability generally
+//! — but re-benchmarking after it showed **the exact same 80-130% regression
+//! magnitude**, falsifying the lock-contention hypothesis entirely.
+//!
+//! The actual root cause: for these query shapes, `matches.len()` (the
+//! enumerated root domain) is typically in the hundreds to low thousands, and
+//! each individual value's subtree recursion (`lftj_step` over `remaining`)
+//! completes in well under a microsecond. At that grain, one rayon task per
+//! value is dominated by task dispatch/steal overhead (work-stealing deque
+//! push/pop, cross-core cache-line traffic, thread wake-up) rather than by
+//! useful work. The fix actually implemented in `run_lftj_root` is **chunked
+//! dispatch**: `matches` is partitioned into `~2 * rayon::current_num_threads()`
+//! coarse-grained chunks via `par_chunks`, and each chunk runs a tight
+//! sequential loop over its slice of root values in a single rayon task. This
+//! bounds the number of dispatched tasks to a small constant regardless of
+//! domain size while still spreading work across every core.
+//!
+//! Re-benchmarked against a true sequential baseline (obtained by temporarily
+//! forcing `PARALLEL_LFTJ_ROOT_THRESHOLD = usize::MAX`, since Criterion's own
+//! `change:` percentage compares against its last saved run, not a fixed
+//! reference), chunked dispatch at the production threshold of 64 measured:
+//! `star_class_region` and `star_with_features` — no statistically
+//! significant change; `full_star` — a small ~4% regression; `triangle`
+//! (the highest join fan-out shape) — a ~13% **improvement**. This is a
+//! dramatic swing from the original one-task-per-value regression, and
+//! confirms the diagnosis: dispatch granularity, not lock contention, was
+//! the bottleneck. A further, adaptive skew-mitigation layer (splitting
+//! *below* the root for a single outsized subtree, the way HoneyComb
+//! partitions every level) remains deferred until profiling on a real
+//! skewed dataset shows this chunked single-level split is insufficient.
 
 use crate::dataset::{Dataset, GraphSelector};
 use crate::options::CancellationToken;
@@ -411,7 +487,7 @@ fn build_spec<D: Dataset>(
 /// (preserves first-appearance order).
 ///
 /// Sorting 3–6 elements is O(1) — the overhead is negligible.
-fn veo_sort<D: Dataset>(
+fn veo_sort<D: Dataset + ?Sized>(
     unbound: &[usize],
     specs: &[PatternSpec],
     bindings: &[Option<u64>],
@@ -501,7 +577,7 @@ fn leapfrog_sync(scans: &mut [Box<dyn oxigraph_nova_core::TrieIterator>]) -> Opt
 ///   recursive call and loop iteration checks it first so cancellation
 ///   propagates back up to `eval_bgp_lftj` promptly.
 #[allow(clippy::too_many_arguments)]
-fn lftj_step<D: Dataset>(
+fn lftj_step<D: Dataset + ?Sized>(
     dataset: &D,
     specs: &[PatternSpec],
     join_vars: &Arc<[Variable]>,
@@ -638,6 +714,262 @@ fn lftj_step<D: Dataset>(
     }
 }
 
+// ── Root-level enumeration (for parallel dispatch) ────────────────────────────
+
+/// Threshold on the number of distinct root-variable values below which
+/// parallel dispatch is not worth the rayon task-spawn overhead.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+const PARALLEL_LFTJ_ROOT_THRESHOLD: usize = 64;
+
+/// Should the enumerated root variable's `n` matching values be joined in
+/// parallel (one rayon task per value) rather than with a plain sequential
+/// loop?
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[inline]
+fn should_parallelize_lftj_root(n: usize) -> bool {
+    n >= PARALLEL_LFTJ_ROOT_THRESHOLD
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[inline]
+#[allow(dead_code)]
+fn should_parallelize_lftj_root(_n: usize) -> bool {
+    false
+}
+
+/// Enumerate every matching value of the adaptively-chosen next variable
+/// without recursing into child levels — a single sequential leapfrog pass
+/// over just that one variable.
+///
+/// Picks the variable exactly as `lftj_step` would (same `veo_sort` call),
+/// opens one scan per pattern active for it, and leapfrogs through all
+/// matching keys in ascending order, collecting them into a `Vec<u64>`
+/// instead of recursing on each one. This is the same amount of top-level
+/// leapfrog work `lftj_step`'s own loop would perform — the difference is
+/// only that recursion into `remaining` is deferred to the caller, which can
+/// then choose to run those per-value subtree computations sequentially or
+/// fan them out across rayon's work-stealing pool.
+///
+/// Returns `(var_idx, remaining_unbound, matches)`, or `None` when a scan
+/// could not be opened for the chosen variable (mirrors `lftj_step`'s
+/// scan-unavailable case, which yields zero rows for the whole BGP).
+fn lftj_enumerate_level<D: Dataset + ?Sized>(
+    dataset: &D,
+    specs: &[PatternSpec],
+    graph: &GraphSelector,
+    unbound: &[usize],
+    bindings: &[Option<u64>],
+) -> Option<(usize, Vec<usize>, Vec<u64>)> {
+    let veo_buf: Vec<usize>;
+    let order: &[usize] = if dataset.supports_veo_estimates() && unbound.len() > 1 {
+        veo_buf = veo_sort(unbound, specs, bindings, dataset, graph);
+        &veo_buf
+    } else {
+        unbound
+    };
+
+    let var_idx = order[0];
+    let remaining: Vec<usize> = order[1..].to_vec();
+
+    let active: Vec<&PatternSpec> = specs
+        .iter()
+        .filter(|sp| sp.is_active_for_var(var_idx))
+        .collect();
+    if active.is_empty() {
+        // Every variable in `join_vars` comes from some pattern it is active
+        // for, so this cannot arise for a well-formed BGP; handled
+        // defensively, mirroring `lftj_step`'s own defensive branch.
+        return None;
+    }
+
+    let mut scans: Vec<Box<dyn oxigraph_nova_core::TrieIterator>> =
+        Vec::with_capacity(active.len());
+    for sp in &active {
+        let (sv, pv, ov, target_field) = sp.resolve_for_var(var_idx, bindings);
+        let scan = dataset.lftj_join_scan(sv, pv, ov, target_field, graph)?;
+        scans.push(scan);
+    }
+
+    if scans.iter().any(|s| s.at_end()) {
+        return Some((var_idx, remaining, Vec::new()));
+    }
+
+    let mut matches: Vec<u64> = Vec::new();
+
+    loop {
+        match leapfrog_sync(&mut scans) {
+            None => break,
+            Some(val) => {
+                matches.push(val);
+                scans[0].advance();
+                if scans[0].at_end() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Some((var_idx, remaining, matches))
+}
+
+/// Drive the top-level join: enumerate the adaptively-chosen root
+/// variable's domain once (via [`lftj_enumerate_level`]), then either fan
+/// the per-value subtree recursions out across rayon's work-stealing pool
+/// (when the domain is large enough — [`should_parallelize_lftj_root`]) or
+/// walk them with a plain sequential loop that exactly reproduces
+/// `lftj_step`'s own top-level loop.
+///
+/// Row order is preserved either way: matches are enumerated in ascending
+/// leapfrog order and, in the parallel path, collected back in that same
+/// order (`rayon`'s `par_iter().map(...).collect()` preserves input order
+/// regardless of which thread finishes first), so parallel and sequential
+/// evaluation of the same query produce byte-identical `Solutions`.
+#[allow(clippy::too_many_arguments)]
+fn run_lftj_root<D: Dataset + ?Sized>(
+    dataset: &D,
+    specs: &[PatternSpec],
+    join_vars: &Arc<[Variable]>,
+    graph: &GraphSelector,
+    unbound: &[usize],
+    mut bindings: Vec<Option<u64>>,
+    cancellation: Option<&CancellationToken>,
+) -> (Solutions, bool) {
+    if let Some(token) = cancellation
+        && token.is_cancelled()
+    {
+        return (Vec::new(), true);
+    }
+
+    // Zero unbound variables (every pattern was fully ground and already
+    // existence-checked in `build_spec`): delegate straight to `lftj_step`,
+    // whose base case emits the single trivial solution.
+    if unbound.is_empty() {
+        let mut results: Solutions = Vec::new();
+        let mut aborted = false;
+        lftj_step(
+            dataset,
+            specs,
+            join_vars,
+            graph,
+            unbound,
+            &mut bindings,
+            &mut results,
+            cancellation,
+            &mut aborted,
+        );
+        return (results, aborted);
+    }
+
+    let Some((var_idx, remaining, matches)) =
+        lftj_enumerate_level(dataset, specs, graph, unbound, &bindings)
+    else {
+        return (Vec::new(), false);
+    };
+
+    if matches.is_empty() {
+        return (Vec::new(), false);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    if should_parallelize_lftj_root(matches.len()) {
+        use rayon::prelude::*;
+
+        // Chunked dispatch: benchmarked one-task-per-value dispatch
+        // (`matches.par_iter().map(...)`) regressed wall-clock time 80-130%
+        // across every bsbm_large query shape, even after eliminating lock
+        // contention as a possible cause (RingStore's internal lock was
+        // converted from Mutex to RwLock with no change in the regression's
+        // magnitude). Root cause: each individual value's subtree here is
+        // sub-microsecond, so with `matches.len()` in the hundreds to low
+        // thousands, one rayon task per value is dominated by task
+        // dispatch/steal overhead. Partitioning into ~2x-thread-count
+        // coarse-grained chunks (each running a tight sequential loop)
+        // bounds the task count to a small constant while still spreading
+        // work across all cores.
+        let num_threads = rayon::current_num_threads().max(1);
+        let chunk_count = (num_threads * 2).min(matches.len()).max(1);
+        let chunk_size = matches.len().div_ceil(chunk_count).max(1);
+
+        let parts: Vec<(Solutions, bool)> = matches
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                // Prefer a per-worker dataset clone with a fresh decode cache
+                // (LftjSnapshotDataset / DictDecodeSnapshot). When the backend
+                // doesn't specialize, share `&dataset` (no dyn cast — D may
+                // be `?Sized`).
+                let worker_owned = dataset.lftj_clone_for_worker();
+                let mut sub_bindings = bindings.clone();
+                let mut sub_results: Solutions = Vec::new();
+                let mut sub_aborted = false;
+                for &val in chunk {
+                    if sub_aborted {
+                        break;
+                    }
+                    sub_bindings[var_idx] = Some(val);
+                    match worker_owned.as_ref() {
+                        Some(worker) => lftj_step(
+                            worker.as_ref(),
+                            specs,
+                            join_vars,
+                            graph,
+                            &remaining,
+                            &mut sub_bindings,
+                            &mut sub_results,
+                            cancellation,
+                            &mut sub_aborted,
+                        ),
+                        None => lftj_step(
+                            dataset,
+                            specs,
+                            join_vars,
+                            graph,
+                            &remaining,
+                            &mut sub_bindings,
+                            &mut sub_results,
+                            cancellation,
+                            &mut sub_aborted,
+                        ),
+                    }
+                    sub_bindings[var_idx] = None;
+                }
+                (sub_results, sub_aborted)
+            })
+            .collect();
+
+        let mut results: Solutions = Vec::new();
+        let mut aborted = false;
+        for (sub_results, sub_aborted) in parts {
+            results.extend(sub_results);
+            aborted |= sub_aborted;
+        }
+        return (results, aborted);
+    }
+
+    // Sequential fallback (below threshold, or wasm32 where rayon is
+    // unavailable): reproduces `lftj_step`'s own top-level loop exactly.
+    let mut results: Solutions = Vec::new();
+    let mut aborted = false;
+    for &val in &matches {
+        bindings[var_idx] = Some(val);
+        lftj_step(
+            dataset,
+            specs,
+            join_vars,
+            graph,
+            &remaining,
+            &mut bindings,
+            &mut results,
+            cancellation,
+            &mut aborted,
+        );
+        bindings[var_idx] = None;
+        if aborted {
+            break;
+        }
+    }
+    (results, aborted)
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Try to evaluate a BGP using Leapfrog Triejoin with adaptive VEO.
@@ -720,22 +1052,45 @@ pub fn eval_bgp_lftj_cancellable<D: Dataset>(
     //
     // `bindings[var_idx]` = Some(val) once that variable is bound; None until then.
     // `unbound` starts as all var indices 0..k; VEO re-sorts at each depth.
-    let mut bindings: Vec<Option<u64>> = vec![None; join_vars.len()];
+    //
+    // `run_lftj_root` enumerates the adaptively-chosen root variable's
+    // domain once and, when that domain is large enough, hands each value's
+    // independent subtree to rayon's work-stealing pool — see the module
+    // doc's "Parallel root-level dispatch" section.
+    //
+    // Prefer a query-scoped lock-free snapshot when the backend provides one
+    // (RingStore via `lftj_query_snapshot`): a single store-lock acquisition
+    // freezes the Ring + dictionary state for the whole join, so parallel
+    // workers never re-enter the store lock for join_scan/decode/estimate.
+    // Pattern classification above still uses the live dataset (needs
+    // intern of constants, which is also lock-free-friendly on the snapshot
+    // but we already did it before snapshotting). Fall back to the live
+    // dataset when no snapshot is available (non-CLTJ backends, tests).
+    let bindings: Vec<Option<u64>> = vec![None; join_vars.len()];
     let unbound: Vec<usize> = (0..join_vars.len()).collect();
-    let mut results: Solutions = Vec::new();
-    let mut aborted = false;
 
-    lftj_step(
-        dataset,
-        &specs,
-        &join_vars,
-        active_graph,
-        &unbound,
-        &mut bindings,
-        &mut results,
-        cancellation,
-        &mut aborted,
-    );
+    let snapshot = dataset.lftj_query_snapshot();
+    let (results, aborted) = if let Some(ref snap) = snapshot {
+        run_lftj_root(
+            snap.as_ref(),
+            &specs,
+            &join_vars,
+            active_graph,
+            &unbound,
+            bindings,
+            cancellation,
+        )
+    } else {
+        run_lftj_root(
+            dataset,
+            &specs,
+            &join_vars,
+            active_graph,
+            &unbound,
+            bindings,
+            cancellation,
+        )
+    };
 
     if aborted {
         return Some(Err(anyhow::Error::from(
@@ -1061,6 +1416,177 @@ mod tests {
             vec![1, 0],
             "VEO must prefer var 1 (real subtree size 2) over var 0 (real subtree size 10)"
         );
+    }
+
+    /// A dataset with a large, configurable number of distinct subject ids
+    /// satisfying two patterns joined on a single variable (`?x`) — used to
+    /// exercise `run_lftj_root`'s parallel dispatch path
+    /// (`should_parallelize_lftj_root`'s threshold requires ≥64 matches).
+    ///
+    /// Both patterns are active for the same (only) join variable and target
+    /// the subject field; `lftj_join_scan` returns the full `1..=n` id range
+    /// for either pattern's (p, o) constant pair, so leapfrog intersection
+    /// yields exactly `n` matches in ascending order.
+    ///
+    /// When `cancel_on_scan` is set, every `lftj_join_scan` call cancels
+    /// `token` as a side effect — since `lftj_enumerate_level` (the single
+    /// sequential pass that opens these scans) always runs to completion
+    /// *before* `run_lftj_root` decides whether to fan out in parallel, this
+    /// deterministically cancels the token before any parallel sub-task
+    /// runs, without relying on a timing-sensitive race.
+    struct ManyRootDataset {
+        n: u64,
+        cancel_on_scan: bool,
+        token: CancellationToken,
+    }
+
+    impl DatasetLftjSource for ManyRootDataset {
+        fn supports_lftj(&self) -> bool {
+            true
+        }
+        fn lftj_has_delta(&self) -> bool {
+            false
+        }
+        fn lftj_intern_term(&self, term: &Term, _: &GraphSelector) -> Option<u64> {
+            // p1=100, o1=101, p2=200, o2=201 — anything else is not internable.
+            if let Term::NamedNode(n) = term {
+                match n.as_str() {
+                    "http://ex/p1" => Some(100),
+                    "http://ex/o1" => Some(101),
+                    "http://ex/p2" => Some(200),
+                    "http://ex/o2" => Some(201),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+            Some(Term::NamedNode(
+                oxigraph_nova_core::NamedNode::new_unchecked(format!("http://ex/s{id}")),
+            ))
+        }
+        fn lftj_join_scan(
+            &self,
+            _s: Option<u64>,
+            _p: Option<u64>,
+            _o: Option<u64>,
+            _target_field: usize,
+            _: &GraphSelector,
+        ) -> Option<Box<dyn TrieIterator>> {
+            if self.cancel_on_scan {
+                self.token.cancel();
+            }
+            let vals: Vec<u64> = (1..=self.n).collect();
+            Some(Box::new(VecTrieIter { vals, pos: 0 }))
+        }
+    }
+
+    impl Dataset for ManyRootDataset {
+        fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+    }
+
+    fn many_root_patterns() -> Vec<TriplePattern> {
+        let var_x = || TermPattern::Variable(spargebra::term::Variable::new_unchecked("x"));
+        vec![
+            TriplePattern {
+                subject: var_x(),
+                predicate: NamedNodePattern::NamedNode(
+                    oxigraph_nova_core::NamedNode::new_unchecked("http://ex/p1"),
+                ),
+                object: TermPattern::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(
+                    "http://ex/o1",
+                )),
+            },
+            TriplePattern {
+                subject: var_x(),
+                predicate: NamedNodePattern::NamedNode(
+                    oxigraph_nova_core::NamedNode::new_unchecked("http://ex/p2"),
+                ),
+                object: TermPattern::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(
+                    "http://ex/o2",
+                )),
+            },
+        ]
+    }
+
+    /// The parallel root-dispatch path (`should_parallelize_lftj_root`
+    /// returns `true` once the enumerated domain reaches
+    /// `PARALLEL_LFTJ_ROOT_THRESHOLD`) must produce exactly the same rows,
+    /// in exactly the same order, as the sequential path below that
+    /// threshold — matches are enumerated in ascending leapfrog order and
+    /// `par_iter().map(...).collect()` preserves that order regardless of
+    /// which rayon thread finishes first.
+    #[test]
+    fn parallel_root_dispatch_preserves_order_and_content() {
+        let patterns = many_root_patterns();
+
+        // Below threshold: sequential loop path.
+        let small = ManyRootDataset {
+            n: 10,
+            cancel_on_scan: false,
+            token: CancellationToken::default(),
+        };
+        let small_results = eval_bgp_lftj(&small, &patterns, &GraphSelector::Default)
+            .expect("LFTJ should handle this BGP")
+            .expect("no error expected");
+        assert_eq!(small_results.len(), 10);
+
+        // Above threshold (PARALLEL_LFTJ_ROOT_THRESHOLD == 64): parallel path.
+        let big = ManyRootDataset {
+            n: 200,
+            cancel_on_scan: false,
+            token: CancellationToken::default(),
+        };
+        assert!(should_parallelize_lftj_root(200));
+        let big_results = eval_bgp_lftj(&big, &patterns, &GraphSelector::Default)
+            .expect("LFTJ should handle this BGP")
+            .expect("no error expected");
+        assert_eq!(big_results.len(), 200);
+
+        // Row order must be ascending by subject id (1..=200), matching the
+        // sequential leapfrog enumeration order exactly.
+        let var_x = spargebra::term::Variable::new_unchecked("x");
+        for (i, sol) in big_results.iter().enumerate() {
+            let expected = Term::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(format!(
+                "http://ex/s{}",
+                i + 1
+            )));
+            assert_eq!(sol.get(&var_x), Some(&expected));
+        }
+    }
+
+    /// Cancellation observed during the single sequential enumeration pass
+    /// (before parallel fan-out ever begins) must be honoured by every
+    /// dispatched sub-task: the whole join aborts with zero rows and a
+    /// `Cancelled` error, not a partial/successful result.
+    #[test]
+    fn parallel_root_dispatch_honours_cancellation_from_all_subtasks() {
+        let patterns = many_root_patterns();
+        let token = CancellationToken::default();
+        let ds = ManyRootDataset {
+            n: 200,
+            cancel_on_scan: true,
+            token: token.clone(),
+        };
+        assert!(!token.is_cancelled());
+        let result =
+            eval_bgp_lftj_cancellable(&ds, &patterns, &GraphSelector::Default, Some(&token));
+        assert!(token.is_cancelled());
+        match result {
+            Some(Err(e)) => {
+                assert!(
+                    e.downcast_ref::<crate::options::EvalLimitError>().is_some(),
+                    "expected a Cancelled error, got: {e:?}"
+                );
+            }
+            other => panic!("expected Some(Err(Cancelled)), got {other:?}"),
+        }
     }
 
     /// Regression test: a fully-ground triple pattern (a BGP

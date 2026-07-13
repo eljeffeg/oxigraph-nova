@@ -6,7 +6,7 @@ pub mod store;
 pub mod text_search;
 pub mod trie;
 
-pub use dict::{Dictionary, GRAPH_DEFAULT, GraphId, MAX_TERM_ID, TermId};
+pub use dict::{DictDecodeSnapshot, Dictionary, GRAPH_DEFAULT, GraphId, MAX_TERM_ID, TermId};
 pub use dict_compact::DictSnapshot;
 pub use error::Oxigraph;
 // Re-export the Oxigraph RDF type system directly — no custom wrappers.
@@ -17,7 +17,7 @@ pub use oxrdf::{
     BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable,
 };
 use std::sync::Arc;
-pub use store::{LftjSource, QuadOp, QuadStore, QuadStoreExt};
+pub use store::{LftjSnapshot, LftjSource, QuadOp, QuadStore, QuadStoreExt};
 pub use text_search::{TextMatch, TextSearch};
 pub use trie::{EmptyTrieIter, TrieIterator};
 

@@ -618,6 +618,7 @@ impl MappedGraphRing {
 /// ...>` block above), so every method here is a one-line match delegating
 /// to whichever concrete `GraphRing` instantiation is present — no trait
 /// object or dynamic dispatch overhead beyond the match itself.
+#[derive(Clone)]
 pub(crate) enum GraphRingHandle {
     Owned(Arc<GraphRing>),
     /// Only constructed when the `mmap` cargo feature is enabled (see

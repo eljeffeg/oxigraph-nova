@@ -683,8 +683,17 @@ pub struct DictSnapshot<Compacted = CompactedTier> {
 /// inherent methods are already generic over the backing substrate — see the
 /// `impl<Buf, ...>` block above), so every method here is a one-line match
 /// delegating to whichever concrete instantiation is present.
+///
+/// `Owned` uses [`Arc`] (not `Box`) so a query-scoped LFTJ snapshot can
+/// cheaply `Arc::clone` the tier without deep-copying the Front-Coded
+/// buffers or blocking writers for the duration of the join. Compaction
+/// still replaces the handle wholesale under `&mut Dictionary`, so
+/// concurrent snapshot holders keep the previous generation alive until
+/// they drop — the same generation-sharing pattern as
+/// `oxigraph_nova_storage_ring`'s `GraphRingHandle::Owned(Arc<GraphRing>)`.
+#[derive(Clone)]
 pub(crate) enum CompactedTierHandle {
-    Owned(Box<CompactedTier>),
+    Owned(Arc<CompactedTier>),
     Mapped(Arc<MappedCompactedTier>),
 }
 

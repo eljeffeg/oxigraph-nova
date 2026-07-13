@@ -70,12 +70,12 @@ use crate::dict_compact::{
 };
 use epserde::deser::MemCase;
 use oxrdf::{BlankNode, GraphName, NamedNode, Term};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-/// Capacity of the `TermId`-keyed decode cache.
+/// Capacity of the `TermId`-keyed decode cache on the live dictionary and
+/// the query-scoped sequential snapshot.
 ///
 /// Measured via `profile_eval --count-allocs` on a 500K-entity/12.5M-triple
 /// dataset by sweeping this constant (8192 → 100,000 → 500,000) and
@@ -93,6 +93,17 @@ use std::sync::Arc;
 /// working-set queries' wins against keeping the cache's own footprint
 /// small relative to the compacted tier it exists to avoid re-decoding.
 const DECODE_CACHE_CAPACITY: usize = 100_000;
+
+/// Per-worker decode-cache capacity used by [`DictDecodeSnapshot::clone`].
+///
+/// The parallel LFTJ path clones the query snapshot once per rayon chunk
+/// so each worker has a private LRU (no cross-worker contention).
+/// `lru::LruCache::new` pre-allocates a `HashMap` of the full capacity, so
+/// using the live dictionary's 100_000 here would allocate
+/// ~`2 × num_threads` large empty maps per query. 8192 is large enough to
+/// absorb the hot-term working set of typical BGP subtrees while keeping
+/// the per-chunk footprint small.
+const WORKER_DECODE_CACHE_CAPACITY: usize = 8192;
 
 // ── TermId ───────────────────────────────────────────────────────────────────
 
@@ -161,8 +172,16 @@ impl GraphId {
 ///
 /// ## Thread safety
 ///
-/// `Dictionary` is `!Sync` by design — callers are expected to wrap it in a
-/// `Mutex<RingStoreInner>` (as `RingStore` does) rather than using separate locks.
+/// `Dictionary` is `Send + Sync`: every field is either immutable-after-
+/// construction (the compacted tier, which is only ever swapped wholesale
+/// under `&mut self` in `compact()`) or interior-mutability via `Mutex`
+/// (the decode cache below), never `RefCell`. This lets `RingStoreInner`
+/// (which embeds `Dictionary`) be wrapped in a `RwLock` rather than a
+/// `Mutex`, so concurrent readers (e.g. parallel LFTJ subtree scans) can
+/// call `get_term_arc`/`get_id`/etc. from multiple threads at once without
+/// serializing on a single exclusive lock. The decode cache's `Mutex` is
+/// held only for the duration of one `LruCache` get/put — far shorter and
+/// less contended than the old design's per-scan store-wide lock.
 pub struct Dictionary {
     // ── Term ↔ TermId (delta tier) ─────────────────────────────────────────
     /// Reverse: `id_to_term[id.as_u64()]` → `Term`, for terms still
@@ -187,11 +206,14 @@ pub struct Dictionary {
     /// `TermId → Arc<Term>` decode cache for compacted-tier terms.
     /// Avoids re-parsing an entire Front-Coded block on every lookup for
     /// hot terms (e.g. a repeated `rdf:type` object matched by thousands of
-    /// LFTJ rows). `RefCell`-wrapped since `get_term_arc` takes `&self` —
-    /// safe because `Dictionary` is always accessed through the single
-    /// `Mutex<RingStoreInner>` (no concurrent access to guard against).
-    /// Cleared on every `compact()` call, since ranks/block offsets shift.
-    decode_cache: RefCell<lru::LruCache<TermId, Arc<Term>>>,
+    /// LFTJ rows). `Mutex`-wrapped (not `RefCell`) since `get_term_arc`
+    /// takes `&self` and — unlike the old single-`Mutex<RingStoreInner>`
+    /// design — may now be called concurrently from multiple reader
+    /// threads under a `RwLock<RingStoreInner>` read guard. The lock is
+    /// only held for one `LruCache` get/put, not for the whole surrounding
+    /// operation. Cleared on every `compact()` call, since ranks/block
+    /// offsets shift.
+    decode_cache: Mutex<lru::LruCache<TermId, Arc<Term>>>,
 
     // ── GraphName ↔ GraphId ─────────────────────────────────────────────────
     /// Forward: `GraphName` → `GraphId`
@@ -227,8 +249,8 @@ impl Dictionary {
         let mut d = Self {
             id_to_term: Vec::new(),
             term_to_id: HashMap::new(),
-            compacted: CompactedTierHandle::Owned(Box::new(CompactedTier::empty())),
-            decode_cache: RefCell::new(lru::LruCache::new(
+            compacted: CompactedTierHandle::Owned(Arc::new(CompactedTier::empty())),
+            decode_cache: Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
             )),
             graph_to_id: HashMap::new(),
@@ -422,7 +444,7 @@ impl Dictionary {
         match self.id_to_term.get(id.as_u64() as usize) {
             Some(Some(arc)) => Some(Arc::clone(arc)),
             Some(None) => {
-                if let Some(arc) = self.decode_cache.borrow_mut().get(&id) {
+                if let Some(arc) = self.decode_cache.lock().unwrap().get(&id) {
                     return Some(Arc::clone(arc));
                 }
                 // Cache miss: Front-Coding forces decoding the *entire*
@@ -436,7 +458,7 @@ impl Dictionary {
                 // over hundreds of thousands of subjects).
                 let block = self.compacted.decode_block_for_id(id.as_u64())?;
                 let mut wanted: Option<Arc<Term>> = None;
-                let mut cache = self.decode_cache.borrow_mut();
+                let mut cache = self.decode_cache.lock().unwrap();
                 for (orig_id, result) in block {
                     if let Ok(arc) = result {
                         let tid = TermId(orig_id);
@@ -572,12 +594,12 @@ impl Dictionary {
             }
         }
 
-        self.compacted = CompactedTierHandle::Owned(Box::new(new_compacted));
+        self.compacted = CompactedTierHandle::Owned(Arc::new(new_compacted));
 
         // Ranks/block offsets shift on every compaction — any previously
         // cached decode results may point at stale offsets, so drop them
         // all rather than trying to selectively invalidate.
-        self.decode_cache.borrow_mut().clear();
+        self.decode_cache.lock().unwrap().clear();
         Ok(())
     }
 
@@ -610,8 +632,8 @@ impl Dictionary {
         let mut d = Self {
             id_to_term: Vec::with_capacity(terms.len()),
             term_to_id: HashMap::with_capacity(terms.len()),
-            compacted: CompactedTierHandle::Owned(Box::new(CompactedTier::empty())),
-            decode_cache: RefCell::new(lru::LruCache::new(
+            compacted: CompactedTierHandle::Owned(Arc::new(CompactedTier::empty())),
+            decode_cache: Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
             )),
             graph_to_id: HashMap::new(),
@@ -890,7 +912,7 @@ impl Dictionary {
             id_to_term,
             term_to_id,
             compacted,
-            decode_cache: RefCell::new(lru::LruCache::new(
+            decode_cache: Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
             )),
             graph_to_id,
@@ -955,6 +977,137 @@ impl Dictionary {
     /// Convenience wrapper for predicates.
     pub fn intern_predicate(&mut self, pred: &NamedNode) -> Result<TermId, Oxigraph> {
         self.intern(&Term::NamedNode(pred.clone()))
+    }
+
+    /// Cheaply clone the read-only state needed to decode `TermId`s without
+    /// holding a store-level lock for the duration of a query.
+    ///
+    /// Used by the parallel LFTJ path: a single `RwLock` read is taken to
+    /// build this snapshot, then every worker decodes through the snapshot
+    /// (no further store-lock acquisitions). The compacted tier is
+    /// `Arc`-shared (see [`CompactedTierHandle::Owned`]); the delta-tier
+    /// maps and graph table are each wrapped in an `Arc` so subsequent
+    /// [`DictDecodeSnapshot::clone`] calls (one per rayon chunk) are O(1)
+    /// refcount bumps rather than O(delta-tier size) deep clones.
+    ///
+    /// The returned snapshot carries its **own** decode-cache `Mutex`
+    /// (not the live dictionary's). [`Clone`] installs a **fresh empty**
+    /// worker-sized cache — the parallel LFTJ path clones once per rayon
+    /// chunk so workers never contend on a shared LRU.
+    pub fn decode_snapshot(&self) -> DictDecodeSnapshot {
+        DictDecodeSnapshot {
+            id_to_term: Arc::new(self.id_to_term.clone()),
+            term_to_id: Arc::new(self.term_to_id.clone()),
+            compacted: self.compacted.clone(),
+            graph_to_id: Arc::new(self.graph_to_id.clone()),
+            decode_cache: Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
+            )),
+        }
+    }
+}
+
+/// Query-scoped snapshot of the dictionary state needed for `TermId → Term`
+/// decoding during LFTJ evaluation.
+///
+/// Built once via [`Dictionary::decode_snapshot`] under a brief store read
+/// lock; thereafter every decode is local to this value (and its private
+/// decode cache), so parallel LFTJ workers never re-enter the store lock
+/// just to materialise a result row.
+///
+/// ## Concurrency model
+///
+/// Each snapshot owns a private `Mutex`-guarded LRU. Sharing one snapshot
+/// across rayon workers would re-introduce decode-cache contention, so
+/// [`Clone`] gives each worker a fresh empty cache while `Arc`-sharing the
+/// immutable compacted tier, delta maps, and graph table. On the sequential
+/// path a single snapshot is enough (the mutex is uncontended).
+pub struct DictDecodeSnapshot {
+    /// Delta-tier reverse map (same layout as [`Dictionary::id_to_term`]).
+    /// `Some` entries are `Arc`-shared with the live dictionary; `None`
+    /// means "decode from `compacted`". Wrapped in `Arc` so worker clones
+    /// are O(1) refcount bumps rather than O(delta) deep clones.
+    id_to_term: Arc<Vec<Option<Arc<Term>>>>,
+    /// Delta-tier forward map — `Arc`-shared keys with the live dictionary.
+    /// Wrapped in `Arc` for the same O(1) clone reason as `id_to_term`.
+    term_to_id: Arc<HashMap<Arc<Term>, TermId>>,
+    /// Compacted Front-Coded tier — `Arc`-shared with the live dictionary
+    /// (cheap `Arc::clone`, no buffer copy).
+    compacted: CompactedTierHandle,
+    /// GraphName → GraphId (small; typically ≤ 255 entries). `Arc`-shared
+    /// so worker clones stay O(1).
+    graph_to_id: Arc<HashMap<GraphName, GraphId>>,
+    /// Private per-snapshot decode cache. Owned (not `Arc`-shared) so
+    /// [`Clone`] can install a fresh empty cache per worker.
+    decode_cache: Mutex<lru::LruCache<TermId, Arc<Term>>>,
+}
+
+impl Clone for DictDecodeSnapshot {
+    fn clone(&self) -> Self {
+        // Share the compacted tier + delta/graph maps via Arc; give the
+        // clone its own empty worker-sized decode cache so parallel
+        // workers never contend and never pay for a 100k pre-sized map.
+        Self {
+            id_to_term: Arc::clone(&self.id_to_term),
+            term_to_id: Arc::clone(&self.term_to_id),
+            compacted: self.compacted.clone(),
+            graph_to_id: Arc::clone(&self.graph_to_id),
+            decode_cache: Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(WORKER_DECODE_CACHE_CAPACITY).expect("nonzero capacity"),
+            )),
+        }
+    }
+}
+
+impl DictDecodeSnapshot {
+    /// Decode `id` to an owned `Term`, using the same two-tier logic as
+    /// [`Dictionary::get_term_arc`] (delta → private cache → compacted).
+    pub fn get_term_arc(&self, id: TermId) -> Option<Arc<Term>> {
+        match self.id_to_term.get(id.as_u64() as usize) {
+            Some(Some(arc)) => Some(Arc::clone(arc)),
+            Some(None) => {
+                if let Some(arc) = self.decode_cache.lock().unwrap().get(&id) {
+                    return Some(Arc::clone(arc));
+                }
+                let block = self.compacted.decode_block_for_id(id.as_u64())?;
+                let mut wanted: Option<Arc<Term>> = None;
+                let mut cache = self.decode_cache.lock().unwrap();
+                for (orig_id, result) in block {
+                    if let Ok(arc) = result {
+                        let tid = TermId(orig_id);
+                        if tid == id {
+                            wanted = Some(Arc::clone(&arc));
+                        }
+                        cache.put(tid, arc);
+                    }
+                }
+                wanted
+            }
+            None => None,
+        }
+    }
+
+    /// Decode `id` to an owned `Term` (clones out of the `Arc` for the
+    /// LFTJ result-row path, matching [`LftjSource::lftj_decode_term`]).
+    pub fn decode_term(&self, id: u64) -> Option<Term> {
+        let tid = TermId::new(id).ok()?;
+        self.get_term_arc(tid).map(|arc| arc.as_ref().clone())
+    }
+
+    /// Look up a `TermId` without creating a new entry — same semantics as
+    /// [`Dictionary::get_id`].
+    pub fn get_id(&self, term: &Term) -> Option<TermId> {
+        if let Some(&id) = self.term_to_id.get(term) {
+            return Some(id);
+        }
+        self.compacted
+            .get_id(term)
+            .and_then(|raw| TermId::new(raw).ok())
+    }
+
+    /// Look up a `GraphId` without registering a new entry.
+    pub fn get_graph_id(&self, graph: &GraphName) -> Option<GraphId> {
+        self.graph_to_id.get(graph).copied()
     }
 }
 
@@ -1169,7 +1322,7 @@ mod tests {
             let _ = d.get_term_arc(id);
         }
         assert!(
-            !d.decode_cache.borrow().is_empty(),
+            !d.decode_cache.lock().unwrap().is_empty(),
             "cache should be warm before the second compaction"
         );
 
@@ -1181,7 +1334,7 @@ mod tests {
         }
         d.compact().unwrap();
         assert_eq!(
-            d.decode_cache.borrow().len(),
+            d.decode_cache.lock().unwrap().len(),
             0,
             "decode_cache must be cleared immediately after compact()"
         );
@@ -1217,15 +1370,72 @@ mod tests {
         for &id in &ids {
             let _ = d.get_term_arc(id);
             assert!(
-                d.decode_cache.borrow().len() <= DECODE_CACHE_CAPACITY,
+                d.decode_cache.lock().unwrap().len() <= DECODE_CACHE_CAPACITY,
                 "decode_cache must never exceed its configured capacity"
             );
         }
         assert_eq!(
-            d.decode_cache.borrow().len(),
+            d.decode_cache.lock().unwrap().len(),
             DECODE_CACHE_CAPACITY,
             "after decoding more ids than capacity, the cache should be fully (but not over-) populated"
         );
+    }
+
+    #[test]
+    fn decode_snapshot_clone_shares_maps_and_uses_worker_capacity() {
+        // Worker clones must Arc-share the delta/graph maps (so Clone is O(1)
+        // and pointer-equal) and install a fresh empty cache sized to the
+        // smaller worker capacity — not the live dictionary's 100k.
+        let mut d = Dictionary::new();
+        let ids: Vec<_> = (0..20)
+            .map(|i| {
+                d.intern(&nn(&format!("http://example.org/snap/{i}")))
+                    .unwrap()
+            })
+            .collect();
+        d.compact().unwrap();
+
+        let snap = d.decode_snapshot();
+        // Warm the sequential snapshot's full-size cache.
+        for &id in &ids {
+            let _ = snap.get_term_arc(id);
+        }
+        assert!(
+            !snap.decode_cache.lock().unwrap().is_empty(),
+            "sequential snapshot cache should be warm"
+        );
+
+        let worker = snap.clone();
+        assert!(
+            Arc::ptr_eq(&snap.id_to_term, &worker.id_to_term),
+            "worker clone must Arc-share id_to_term"
+        );
+        assert!(
+            Arc::ptr_eq(&snap.term_to_id, &worker.term_to_id),
+            "worker clone must Arc-share term_to_id"
+        );
+        assert!(
+            Arc::ptr_eq(&snap.graph_to_id, &worker.graph_to_id),
+            "worker clone must Arc-share graph_to_id"
+        );
+        assert_eq!(
+            worker.decode_cache.lock().unwrap().len(),
+            0,
+            "worker clone must start with a fresh empty cache"
+        );
+        assert_eq!(
+            worker.decode_cache.lock().unwrap().cap().get(),
+            WORKER_DECODE_CACHE_CAPACITY,
+            "worker clone must use the smaller worker capacity"
+        );
+
+        // Correctness: worker still decodes every id after the shared maps.
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(
+                worker.get_term_arc(id).as_deref(),
+                Some(&nn(&format!("http://example.org/snap/{i}"))),
+            );
+        }
     }
 
     #[test]

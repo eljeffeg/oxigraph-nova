@@ -110,7 +110,6 @@ fn xsd_nn(local: &str) -> NamedNode {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 const PARALLEL_ROW_THRESHOLD: usize = 10_000;
 
-
 /// Returns `true` if `n` independent rows/groups of work is large enough to
 /// be worth dispatching across rayon's thread pool rather than processing
 /// sequentially. Always `false` on wasm32-unknown-unknown (see module note
@@ -1122,7 +1121,6 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
 
         Ok(result)
     }
-
 
     fn eval_aggregate(
         &self,

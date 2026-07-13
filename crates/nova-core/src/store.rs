@@ -131,6 +131,57 @@ pub trait LftjSource: Send + Sync {
     fn lftj_has_delta(&self) -> bool {
         false
     }
+
+    /// Capture a query-scoped, lock-free snapshot of the LFTJ-readable state.
+    ///
+    /// When `Some`, the returned value implements the same LFTJ surface as
+    /// this store but without re-acquiring any store-level lock for each
+    /// `join_scan`/`decode`/`estimate` call — critical for the parallel
+    /// root-level LFTJ path. Returns `None` when the backend cannot (or
+    /// need not) snapshot (default; non-CLTJ stores, or when delta is
+    /// non-empty so LFTJ is gated off anyway).
+    fn lftj_query_snapshot(&self) -> Option<Box<dyn LftjSnapshot + Send + Sync>> {
+        None
+    }
+}
+
+/// Lock-free, query-scoped view of a store's LFTJ-readable state.
+///
+/// Produced by [`LftjSource::lftj_query_snapshot`]. Every method here is
+/// safe to call concurrently from multiple rayon workers with no further
+/// store-level locking.
+pub trait LftjSnapshot: Send + Sync {
+    fn decode_term(&self, id: u64) -> Option<Term>;
+    fn intern_term(&self, term: &Term) -> Option<u64>;
+    fn graph_id(&self, graph: &GraphName) -> Option<u8>;
+    fn estimate_count(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+        graph_id: u8,
+    ) -> u64;
+    fn join_scan(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+        graph_id: u8,
+    ) -> Option<Box<dyn crate::trie::TrieIterator>>;
+    fn supports_veo_estimates(&self) -> bool {
+        true
+    }
+
+    /// Cheap clone for a parallel LFTJ worker / rayon chunk.
+    ///
+    /// Implementations that own a private decode-cache `Mutex` should
+    /// return a clone with a **fresh empty** cache so workers never
+    /// contend. The default returns `None` (share the parent snapshot).
+    fn clone_for_worker(&self) -> Option<Box<dyn LftjSnapshot + Send + Sync>> {
+        None
+    }
 }
 
 /// A single write operation for batch/transactional application via

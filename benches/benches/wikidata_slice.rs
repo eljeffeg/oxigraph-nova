@@ -654,4 +654,3 @@ criterion_group!(
     bench_query_union,
 );
 criterion_main!(benches);
-

@@ -2,21 +2,39 @@
 //!
 //! ## Concurrency model
 //!
-//! A single `Mutex<RingStoreInner>` serialises all reads and writes.  This is
-//! intentionally simple — the POC goal is correctness and memory efficiency, not
-//! maximum write throughput.  The mutex is held only while working with in-memory
-//! data structures (dictionary lookups, delta writes, Ring scans), and released
-//! before returning results.  For the W3C test suite datasets (< 10 K triples each)
-//! this is completely fine.
+//! A single `RwLock<RingStoreInner>` guards all reads and writes. Every
+//! read-only operation (`quads_for_pattern`, `contains`, `len`, and —
+//! crucially — every `LftjSource` method used by the parallel Leapfrog
+//! Triejoin evaluator: `lftj_join_scan`, `lftj_estimate_count`,
+//! `lftj_intern_term`, `lftj_decode_term`, `lftj_graph_id`, `lftj_has_delta`)
+//! acquires only a `.read()` guard, so any number of threads can execute
+//! these concurrently without blocking each other — this is what lets
+//! `nova-query`'s rayon-parallel root-level LFTJ dispatch (see
+//! `nova_query::lftj::run_lftj_root`) actually scale across cores instead of
+//! serializing on a single exclusive lock. Only genuinely mutating
+//! operations (`insert`, `remove`, `compact`, `bulk_load*`, `apply_batch`,
+//! `extend_boxed`, `register_named_graph`, `enable_fulltext`,
+//! `set_sync_policy`, `set_auto_compact_threshold`) take a `.write()` guard,
+//! which — like the old single `Mutex` — excludes all other readers and
+//! writers for the duration of that one call.
 //!
-//! Automatic compaction (see `maybe_auto_compact`) runs **inline, under the
-//! same lock**, when the delta crosses `auto_compact_threshold` for a
+//! `Dictionary`'s decode cache uses an internal `Mutex` (not `RefCell`)
+//! specifically so `Dictionary`, and thus `RingStoreInner`, is `Sync` and
+//! can live inside this `RwLock` — see `oxigraph_nova_core::dict`'s module
+//! doc comment.
+//!
+//! Automatic compaction (see `maybe_auto_compact`) runs **inline, under a
+//! write guard**, when the delta crosses `auto_compact_threshold` for a
 //! persistent store. This is simple and correct but means a large delta can
 //! stall all other readers/writers for the duration of the merge + snapshot
 //! serialize + fsync. This is a known, accepted limitation for now.
 //!
 //! Production evolution path:
-//! 1. Split into `RwLock<Ring>` + `Mutex<Delta+Dict>` for concurrent reads.
+//! 1. ~~Split into `RwLock<Ring>` + `Mutex<Delta+Dict>` for concurrent
+//!    reads.~~ **Done** — see above (the whole `RingStoreInner`, including
+//!    dict/delta, is now under one `RwLock`, which already gives concurrent
+//!    readers; splitting further into separate locks is not currently
+//!    needed since reads never block on other reads).
 //! 2. Background merge thread: snapshot the delta, release the lock, rebuild
 //!    Ring, `Arc::swap`, clear delta — so compaction never blocks readers or
 //!    writers. This would replace the current inline `maybe_auto_compact`.
@@ -24,8 +42,9 @@
 //! ## Isolation semantics
 //!
 //! Every **single** `QuadStore` call (`insert`, `remove`, `contains`,
-//! `quads_for_pattern`, ...) is atomic: it acquires `Mutex<RingStoreInner>`
-//! exactly once and computes its entire result under that one critical
+//! `quads_for_pattern`, ...) is atomic: it acquires `RwLock<RingStoreInner>`
+//! exactly once (a `.write()` guard for mutating calls, `.read()` for
+//! read-only ones) and computes its entire result under that one critical
 //! section, so no other thread's write can be observed "half-applied" within
 //! one call.
 //!
@@ -54,11 +73,11 @@
 //! this gap directly, and `oxigraph_nova_query::update`'s module doc comment
 //! for the `Update`-atomicity side of the same limitation. Providing true
 //! snapshot isolation would require either an MVCC scheme or holding the
-//! single mutex for an entire multi-call operation (which would serialize
-//! all concurrent queries against the store, defeating the point of
-//! `RwLock`-style read concurrency) — out of scope for the current
-//! single-`Mutex` design; see the "Production evolution path" above for the
-//! direction a fix would take.
+//! lock for an entire multi-call operation (which would serialize all
+//! concurrent queries against the store, defeating the point of the
+//! `RwLock`-based read concurrency described above) — out of scope for now;
+//! see the "Production evolution path" above for the direction a fix would
+//! take.
 
 use crate::delta::Delta;
 #[cfg(feature = "fulltext")]
@@ -67,8 +86,8 @@ use crate::louds::LoudsMemBreakdown;
 use crate::ring::{GraphRing, GraphRingHandle, RingBuilder, SortOrder};
 use crate::snapshot::StoreSnapshot;
 use oxigraph_nova_core::{
-    Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, LftjSource, NamedNode, Oxigraph,
-    Quad, QuadOp, QuadStore, StoredQuad, Subject, Term, TermId,
+    DictDecodeSnapshot, Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, LftjSnapshot,
+    LftjSource, NamedNode, Oxigraph, Quad, QuadOp, QuadStore, StoredQuad, Subject, Term, TermId,
 };
 #[cfg(feature = "fulltext")]
 use oxigraph_nova_fulltext::FulltextIndex;
@@ -78,7 +97,7 @@ use oxigraph_nova_storage_common::wal::{self, WalRecord, WalWriter};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::Instant;
@@ -706,7 +725,7 @@ fn build_graphs_from_triples(
 /// store.compact().unwrap();
 /// ```
 pub struct RingStore {
-    inner: Mutex<RingStoreInner>,
+    inner: RwLock<RingStoreInner>,
 }
 
 impl RingStore {
@@ -715,7 +734,7 @@ impl RingStore {
     /// benchmarks, and any caller that explicitly wants an ephemeral store.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(RingStoreInner::new()),
+            inner: RwLock::new(RingStoreInner::new()),
         }
     }
 
@@ -825,7 +844,7 @@ impl RingStore {
         manifest::cleanup_orphans(dir, inner.snapshot_gen, inner.wal_seq);
 
         Ok(Self {
-            inner: Mutex::new(inner),
+            inner: RwLock::new(inner),
         })
     }
 
@@ -856,7 +875,7 @@ impl RingStore {
     pub fn enable_fulltext(&self) -> Result<(), Oxigraph> {
         let mut inner = self
             .inner
-            .lock()
+            .write()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         if inner.fulltext.is_some() {
@@ -896,7 +915,7 @@ impl RingStore {
     /// flusher thread against the currently-active WAL file; switching to
     /// `Always` stops it. No-op for in-memory stores (no WAL to flush).
     pub fn set_sync_policy(&self, policy: SyncPolicy) {
-        if let Ok(mut inner) = self.inner.lock() {
+        if let Ok(mut inner) = self.inner.write() {
             inner.sync_policy = policy;
             inner.respawn_flusher();
         }
@@ -907,7 +926,7 @@ impl RingStore {
     /// `SyncPolicy::Interval` to guarantee all acknowledged writes are
     /// durable. No-op for in-memory stores.
     pub fn flush_wal(&self) -> Result<(), Oxigraph> {
-        if let Ok(inner) = self.inner.lock()
+        if let Ok(inner) = self.inner.read()
             && let Some(w) = &inner.wal
         {
             w.sync()
@@ -956,7 +975,7 @@ impl RingStore {
     pub fn backup(&self, destination: &Path) -> Result<(), Oxigraph> {
         let inner = self
             .inner
-            .lock()
+            .read()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         let dir = inner.data_dir.clone().ok_or_else(|| {
@@ -1029,7 +1048,7 @@ impl RingStore {
     pub fn compact(&self) -> Result<(), Oxigraph> {
         let mut inner = self
             .inner
-            .lock()
+            .write()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
         inner.compact_locked()
     }
@@ -1038,7 +1057,7 @@ impl RingStore {
     /// triggers automatic inline compaction for a persistent store. Default
     /// is 1,000,000. Has no effect on in-memory (`RingStore::new()`) stores.
     pub fn set_auto_compact_threshold(&self, threshold: usize) {
-        if let Ok(mut inner) = self.inner.lock() {
+        if let Ok(mut inner) = self.inner.write() {
             inner.auto_compact_threshold = threshold;
         }
     }
@@ -1095,7 +1114,7 @@ impl RingStore {
     ) -> Result<usize, Oxigraph> {
         let mut inner = self
             .inner
-            .lock()
+            .write()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         // Start from whatever's already compacted into the Ring (usually
@@ -1155,7 +1174,7 @@ impl RingStore {
 
     /// Number of triples stored across all graphs (approximation during merge).
     pub fn triple_count(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let ring_total: usize = inner.graphs.values().map(|r| r.n()).sum();
 
         let delta_inserts = inner.delta.insert_count();
@@ -1168,7 +1187,7 @@ impl RingStore {
     /// observability signal for how close a persistent store is to its next
     /// automatic compaction (see `maybe_auto_compact`/`set_auto_compact_threshold`).
     pub fn delta_len(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         inner.delta.len()
     }
 
@@ -1180,7 +1199,7 @@ impl RingStore {
     /// `MemSize` trait and direct capacity accounting), not theoretical
     /// estimates — see `GraphRing::mem_size_bytes` / `Dictionary::mem_size_bytes`.
     pub fn memory_breakdown(&self) -> MemoryBreakdown {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let ring_bytes: usize = inner.graphs.values().map(|r| r.mem_size_bytes()).sum();
         let dict_bytes = inner.dict.mem_size_bytes();
         let triple_count: usize = inner.graphs.values().map(|r| r.n()).sum();
@@ -1197,7 +1216,7 @@ impl RingStore {
     /// summed across graphs, since dedup only applies within one graph's
     /// six tries).
     pub fn per_ordering_breakdown(&self) -> PerOrderingBreakdown {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let orders = [
             SortOrder::Spo,
             SortOrder::Sop,
@@ -1308,7 +1327,7 @@ impl oxigraph_nova_core::TextSearch for RingStore {
         predicate_id: Option<u64>,
         limit: usize,
     ) -> Vec<oxigraph_nova_core::TextMatch> {
-        let Ok(inner) = self.inner.lock() else {
+        let Ok(inner) = self.inner.read() else {
             return Vec::new();
         };
         match &inner.fulltext {
@@ -1318,7 +1337,7 @@ impl oxigraph_nova_core::TextSearch for RingStore {
     }
 
     fn text_search_ready(&self) -> bool {
-        match self.inner.lock() {
+        match self.inner.read() {
             Ok(inner) => inner.fulltext.is_some(),
             Err(_) => false,
         }
@@ -1393,18 +1412,18 @@ impl LftjSource for RingStore {
     }
 
     fn lftj_intern_term(&self, term: &Term) -> Option<u64> {
-        let inner = self.inner.lock().ok()?;
+        let inner = self.inner.read().ok()?;
         inner.dict.get_id(term).map(|id| id.as_u64())
     }
 
     fn lftj_decode_term(&self, id: u64) -> Option<Term> {
-        let inner = self.inner.lock().ok()?;
+        let inner = self.inner.read().ok()?;
         let tid = oxigraph_nova_core::TermId::new(id).ok()?;
         inner.dict.get_term_arc(tid).map(|arc| arc.as_ref().clone())
     }
 
     fn lftj_graph_id(&self, graph: &GraphName) -> Option<u8> {
-        let inner = self.inner.lock().ok()?;
+        let inner = self.inner.read().ok()?;
         inner.dict.get_graph_id(graph).map(|gid| gid.as_u8())
     }
 
@@ -1416,7 +1435,7 @@ impl LftjSource for RingStore {
         target_field: usize,
         graph_id: u8,
     ) -> u64 {
-        let inner = match self.inner.lock().ok() {
+        let inner = match self.inner.read().ok() {
             Some(i) => i,
             None => return u64::MAX,
         };
@@ -1435,7 +1454,7 @@ impl LftjSource for RingStore {
         target_field: usize,
         graph_id: u8,
     ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
-        let inner = self.inner.lock().ok()?;
+        let inner = self.inner.read().ok()?;
         let g_id = GraphId(graph_id);
         // If the graph has no Ring entry, return an always-exhausted iterator
         // (graph exists in dict but has no compacted triples → empty scan is correct).
@@ -1446,10 +1465,99 @@ impl LftjSource for RingStore {
     }
 
     fn lftj_has_delta(&self) -> bool {
-        match self.inner.lock() {
+        match self.inner.read() {
             Ok(inner) => !inner.delta.is_empty(),
             Err(_) => false,
         }
+    }
+
+    fn lftj_query_snapshot(&self) -> Option<Box<dyn LftjSnapshot + Send + Sync>> {
+        let inner = self.inner.read().ok()?;
+        // LFTJ is gated off when delta is non-empty; don't bother snapshotting.
+        if !inner.delta.is_empty() {
+            return None;
+        }
+        Some(Box::new(RingLftjSnapshot {
+            dict: inner.dict.decode_snapshot(),
+            graphs: inner.graphs.clone(),
+        }))
+    }
+}
+
+// ── Query-scoped LFTJ snapshot ────────────────────────────────────────────────
+
+/// Lock-free, query-scoped view of a [`RingStore`]'s LFTJ-readable state.
+///
+/// Built under a single `RwLock` read guard via
+/// [`LftjSource::lftj_query_snapshot`]; thereafter every
+/// `join_scan`/`decode`/`estimate` call is local to this value — no further
+/// store-level locking. Parallel LFTJ workers share one of these (via
+/// `Arc`/cheap `Clone` of the underlying handles) for the duration of a BGP
+/// evaluation.
+///
+/// The dictionary portion is a [`DictDecodeSnapshot`] (compacted tier
+/// `Arc`-shared, private decode cache per clone). The graph rings are
+/// `GraphRingHandle`s (`Arc`-shared Owned or Mapped), so cloning this
+/// snapshot is O(graphs) pointer bumps — never a deep copy of the LOUDS
+/// tries or Front-Coded buffers.
+struct RingLftjSnapshot {
+    dict: DictDecodeSnapshot,
+    graphs: HashMap<GraphId, GraphRingHandle>,
+}
+
+impl LftjSnapshot for RingLftjSnapshot {
+    fn decode_term(&self, id: u64) -> Option<Term> {
+        self.dict.decode_term(id)
+    }
+
+    fn intern_term(&self, term: &Term) -> Option<u64> {
+        self.dict.get_id(term).map(|id| id.as_u64())
+    }
+
+    fn graph_id(&self, graph: &GraphName) -> Option<u8> {
+        self.dict.get_graph_id(graph).map(|gid| gid.as_u8())
+    }
+
+    fn estimate_count(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+        graph_id: u8,
+    ) -> u64 {
+        match self.graphs.get(&GraphId(graph_id)) {
+            None => 0,
+            Some(ring) => ring.estimate_count(s, p, o, target_field),
+        }
+    }
+
+    fn join_scan(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+        graph_id: u8,
+    ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
+        match self.graphs.get(&GraphId(graph_id)) {
+            None => Some(Box::new(EmptyTrieIter)),
+            Some(ring) => Some(ring.join_scan(s, p, o, target_field)),
+        }
+    }
+
+    fn supports_veo_estimates(&self) -> bool {
+        true
+    }
+
+    fn clone_for_worker(&self) -> Option<Box<dyn LftjSnapshot + Send + Sync>> {
+        // DictDecodeSnapshot::Clone installs a fresh empty decode cache so
+        // each rayon chunk has zero decode-cache contention; GraphRingHandle
+        // is Arc-shared (pointer bumps only).
+        Some(Box::new(RingLftjSnapshot {
+            dict: self.dict.clone(),
+            graphs: self.graphs.clone(),
+        }))
     }
 }
 
@@ -1475,7 +1583,7 @@ impl QuadStore for RingStore {
     fn insert(&self, quad: &Quad) -> Result<bool, Oxigraph> {
         let mut inner = self
             .inner
-            .lock()
+            .write()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         // Log intent durably BEFORE applying, so a crash between the two can
@@ -1489,7 +1597,7 @@ impl QuadStore for RingStore {
     fn remove(&self, quad: &Quad) -> Result<bool, Oxigraph> {
         let mut inner = self
             .inner
-            .lock()
+            .write()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         inner.wal_append(&WalRecord::RemoveQuad(quad.clone()))?;
@@ -1507,7 +1615,7 @@ impl QuadStore for RingStore {
     ) -> Result<Box<dyn Iterator<Item = Result<StoredQuad, Oxigraph>> + '_>, Oxigraph> {
         let inner = self
             .inner
-            .lock()
+            .read()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         // ── Encode filter terms (None if not in dict → return empty immediately) ──
@@ -1638,7 +1746,7 @@ impl QuadStore for RingStore {
     fn len(&self) -> Result<usize, Oxigraph> {
         let inner = self
             .inner
-            .lock()
+            .read()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
         let ring_total: usize = inner.graphs.values().map(|r| r.n()).sum();
         let delta_inserts = inner.delta.insert_count();
@@ -1649,7 +1757,7 @@ impl QuadStore for RingStore {
     fn contains(&self, quad: &Quad) -> Result<bool, Oxigraph> {
         let inner = self
             .inner
-            .lock()
+            .read()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         let g_id = match inner.dict.get_graph_id(&quad.graph_name) {
@@ -1691,7 +1799,7 @@ impl QuadStore for RingStore {
     ) -> Result<Box<dyn Iterator<Item = Result<GraphName, Oxigraph>> + '_>, Oxigraph> {
         let inner = self
             .inner
-            .lock()
+            .read()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         let mut seen: HashSet<u8> = HashSet::new();
@@ -1725,7 +1833,7 @@ impl QuadStore for RingStore {
         if let GraphName::NamedNode(_) = graph {
             let mut inner = self
                 .inner
-                .lock()
+                .write()
                 .map_err(|e| Oxigraph::Storage(e.to_string()))?;
             inner.wal_append(&WalRecord::RegisterGraph(graph.clone()))?;
             inner.apply_register_graph(graph)?;
@@ -1753,7 +1861,7 @@ impl QuadStore for RingStore {
 
         let mut inner = self
             .inner
-            .lock()
+            .write()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         // Log every quad's intent durably BEFORE applying any of them (one
@@ -1781,7 +1889,7 @@ impl QuadStore for RingStore {
 
         let mut inner = self
             .inner
-            .lock()
+            .write()
             .map_err(|e| Oxigraph::Storage(e.to_string()))?;
 
         let records: Vec<WalRecord> = ops

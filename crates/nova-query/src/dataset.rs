@@ -232,6 +232,36 @@ pub trait DatasetLftjSource: Send + Sync {
     ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
         None
     }
+
+    /// Capture a query-scoped, lock-free LFTJ view of this dataset.
+    ///
+    /// When `Some`, the returned [`Dataset`] implements the same LFTJ surface
+    /// but without re-acquiring any store-level lock for each
+    /// `join_scan`/`decode`/`estimate` call — critical for the parallel
+    /// root-level LFTJ path. Returns `None` when the backend cannot (or need
+    /// not) snapshot (default; non-CLTJ stores, or when delta is non-empty).
+    ///
+    /// The returned value is only required to implement the LFTJ methods;
+    /// `find_quads`/`named_graphs` may return empty results (LFTJ never
+    /// calls them during the join).
+    ///
+    /// Implementations that carry a private per-snapshot decode cache should
+    /// also implement [`lftj_clone_for_worker`][DatasetLftjSource::lftj_clone_for_worker]
+    /// so parallel rayon chunks each get a fresh empty cache.
+    fn lftj_query_snapshot(&self) -> Option<Box<dyn Dataset>> {
+        None
+    }
+
+    /// Cheaply clone this dataset for a parallel LFTJ worker / rayon chunk.
+    ///
+    /// Default: no specialized clone (`None`); the parallel path then
+    /// shares `&self` across workers (fine for lock-free backends and for
+    /// stub datasets in tests). Snapshot adapters that own a private
+    /// decode-cache `Mutex` override this to return a clone with a **fresh
+    /// empty** cache, eliminating cross-worker decode contention.
+    fn lftj_clone_for_worker(&self) -> Option<Box<dyn Dataset>> {
+        None
+    }
 }
 
 // ── Dataset trait ─────────────────────────────────────────────────────────────
@@ -467,6 +497,107 @@ impl<S: QuadStore + 'static> DatasetLftjSource for StoreDataset<S> {
             _ => return None, // AnyNamed/Union → fallback
         };
         self.store.lftj_real_count(s, p, o, target_field, graph_id)
+    }
+
+    fn lftj_query_snapshot(&self) -> Option<Box<dyn Dataset>> {
+        let snap = self.store.lftj_query_snapshot()?;
+        // `lftj_query_snapshot` returns `Box<dyn LftjSnapshot>`; convert to
+        // `Arc<dyn LftjSnapshot>` without an extra layer of boxing.
+        let snap: Arc<dyn oxigraph_nova_core::LftjSnapshot + Send + Sync> = Arc::from(snap);
+        Some(Box::new(LftjSnapshotDataset { snap }))
+    }
+}
+
+// ── LFTJ snapshot adapter ─────────────────────────────────────────────────────
+
+/// Wraps a store-level [`LftjSnapshot`] as a [`Dataset`] so the LFTJ
+/// evaluator can run entirely against a lock-free query-scoped view.
+///
+/// Only the LFTJ methods are meaningful — `find_quads`/`named_graphs` return
+/// empty results (the join path never calls them).
+struct LftjSnapshotDataset {
+    snap: Arc<dyn oxigraph_nova_core::LftjSnapshot + Send + Sync>,
+}
+
+impl DatasetLftjSource for LftjSnapshotDataset {
+    fn supports_lftj(&self) -> bool {
+        true
+    }
+
+    fn lftj_has_delta(&self) -> bool {
+        // Snapshots are only produced when delta is empty.
+        false
+    }
+
+    fn supports_veo_estimates(&self) -> bool {
+        self.snap.supports_veo_estimates()
+    }
+
+    fn lftj_intern_term(&self, term: &Term, _graph: &GraphSelector) -> Option<u64> {
+        self.snap.intern_term(term)
+    }
+
+    fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+        self.snap.decode_term(id)
+    }
+
+    fn lftj_estimate_count(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+        graph: &GraphSelector,
+    ) -> u64 {
+        let graph_id: u8 = match graph {
+            GraphSelector::Default => 0u8,
+            GraphSelector::Named(gn) => match self.snap.graph_id(gn) {
+                Some(id) => id,
+                None => return u64::MAX,
+            },
+            _ => return u64::MAX,
+        };
+        self.snap.estimate_count(s, p, o, target_field, graph_id)
+    }
+
+    fn lftj_join_scan(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+        graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
+        let graph_id: u8 = match graph {
+            GraphSelector::Default => 0u8,
+            GraphSelector::Named(gn) => self.snap.graph_id(gn)?,
+            _ => return None,
+        };
+        self.snap.join_scan(s, p, o, target_field, graph_id)
+    }
+
+    fn lftj_clone_for_worker(&self) -> Option<Box<dyn Dataset>> {
+        // Prefer a store-level clone with a fresh decode cache (RingLftjSnapshot
+        // installs an empty DictDecodeSnapshot cache). Fall back to sharing the
+        // same Arc when the backend has nothing to specialize.
+        if let Some(cloned) = self.snap.clone_for_worker() {
+            let snap: Arc<dyn oxigraph_nova_core::LftjSnapshot + Send + Sync> = Arc::from(cloned);
+            Some(Box::new(LftjSnapshotDataset { snap }))
+        } else {
+            Some(Box::new(LftjSnapshotDataset {
+                snap: Arc::clone(&self.snap),
+            }))
+        }
+    }
+}
+
+impl Dataset for LftjSnapshotDataset {
+    fn find_quads<'a>(&'a self, _pattern: &QuadPattern) -> Result<QuadIter<'a>> {
+        Ok(Box::new(std::iter::empty()))
+    }
+
+    fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+        Ok(Box::new(std::iter::empty()))
     }
 }
 
