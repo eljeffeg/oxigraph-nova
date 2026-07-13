@@ -41,15 +41,6 @@ spargeo       = { workspace = true, optional = true }
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 js-sys = { workspace = true }
 
-# Data parallelism (parallel ORDER BY / GROUP BY / UNION branches / large
-# result-set expression evaluation — see `crate::evaluator`'s
-# `should_parallelize`). Excluded on wasm32-unknown-unknown: rayon's
-# work-stealing thread pool isn't supported there, and nova-js (the only
-# wasm32 consumer of this crate) always runs single-threaded anyway.
-[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-rayon = { workspace = true }
-
-
 [features]
 default = ["sparopt", "mmap"]
 sparopt = ["dep:sparopt"]

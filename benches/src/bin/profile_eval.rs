@@ -123,7 +123,7 @@ fn run_query<D: Dataset>(ds: &D, name: &str, sparql: &str, iters: usize, count_a
     let q = SparqlParser::new().parse_query(sparql).unwrap();
     // warmup
     for _ in 0..2 {
-        let mut ev = Evaluator::new(ds);
+        let ev = Evaluator::new(ds);
         let _ = ev.evaluate(&q).unwrap();
     }
     let mut times = Vec::with_capacity(iters);
@@ -133,7 +133,7 @@ fn run_query<D: Dataset>(ds: &D, name: &str, sparql: &str, iters: usize, count_a
     let mut alloc_counts = Vec::with_capacity(iters);
     let mut alloc_byte_totals = Vec::with_capacity(iters);
     for i in 0..iters {
-        let mut ev = Evaluator::new(ds);
+        let ev = Evaluator::new(ds);
         let before = count_allocs.then(alloc_stats_snapshot);
         let t0 = Instant::now();
         let result = ev.evaluate(&q).unwrap();
@@ -256,7 +256,7 @@ fn main() {
         let pid = std::process::id();
         println!("[rss-loop] pid={pid} query={query_name} n={n}");
         for i in 0..n {
-            let mut ev = Evaluator::new(&ds);
+            let ev = Evaluator::new(&ds);
             let result = ev.evaluate(&q).unwrap();
             let rows = match result {
                 QueryResult::Solutions { stream, .. } => stream.count(),

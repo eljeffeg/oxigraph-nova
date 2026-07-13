@@ -169,11 +169,11 @@ impl Store {
         let parsed = SparqlParser::new().parse_query(query)?;
         if let Some(rs) = &self.reasoning {
             let overlay = rs.current(&self.store)?;
-            let mut evaluator = Evaluator::with_options(&*overlay, options);
+            let evaluator = Evaluator::with_options(&*overlay, options);
             collect_query_result(evaluator.evaluate(&parsed)?)
         } else {
             let dataset = StoreDataset::new(Arc::clone(&self.store));
-            let mut evaluator = Evaluator::with_options(&dataset, options);
+            let evaluator = Evaluator::with_options(&dataset, options);
             collect_query_result(evaluator.evaluate(&parsed)?)
         }
     }
@@ -197,11 +197,11 @@ impl Store {
         let vars = projected_variables(&parsed);
         let results = if let Some(rs) = &self.reasoning {
             let overlay = rs.current(&self.store)?;
-            let mut evaluator = Evaluator::with_options(&*overlay, options);
+            let evaluator = Evaluator::with_options(&*overlay, options);
             collect_query_result(evaluator.evaluate(&parsed)?)?
         } else {
             let dataset = StoreDataset::new(Arc::clone(&self.store));
-            let mut evaluator = Evaluator::with_options(&dataset, options);
+            let evaluator = Evaluator::with_options(&dataset, options);
             collect_query_result(evaluator.evaluate(&parsed)?)?
         };
         Ok((results, vars))
