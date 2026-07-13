@@ -304,7 +304,7 @@ fn get_large_store() -> Arc<RingStore> {
 
 fn count_solutions<D: Dataset>(dataset: &D, sparql: &str) -> usize {
     let q = SparqlParser::new().parse_query(sparql).unwrap();
-    let ev = Evaluator::new(dataset);
+    let mut ev = Evaluator::new(dataset);
     match ev.evaluate(&q).unwrap() {
         QueryResult::Solutions { stream, .. } => stream.count(),
         QueryResult::Boolean(b) => b as usize,

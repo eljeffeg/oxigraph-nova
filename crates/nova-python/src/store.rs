@@ -291,12 +291,13 @@ impl PyStore {
         let vars = oxigraph_nova_query::projected_variables(&parsed);
         let dataset = oxigraph_nova_query::StoreDataset::new(self.inner.inner());
 
-        let evaluator =
+        let mut evaluator =
             oxigraph_nova_query::Evaluator::with_options(&dataset, QueryOptions::default());
-        // Not wrapped in `py.detach`: `Evaluator` holds a `RefCell` for its base-IRI
-        // cache, so it isn't `Sync`/`Send` and can't cross the GIL-release boundary.
-        // This custom base_iri/prefixes path is the less common one; the fast path
-        // above (no custom parser options) still releases the GIL.
+        // Not wrapped in `py.detach`: `evaluate()` takes `&mut self` and this
+        // `evaluator` only lives for this one call, so there's no cross-call
+        // state to protect from the GIL release; this custom base_iri/prefixes
+        // path is the less common one anyway -- the fast path above (no custom
+        // parser options) still releases the GIL.
         let result = evaluator.evaluate(&parsed).map_err(map_anyhow_error)?;
         query_results_to_python(
             py,

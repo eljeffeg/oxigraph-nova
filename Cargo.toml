@@ -100,6 +100,14 @@ uuid = { version = "1", features = ["v4"] }
 # ── Random number generation ─────────────────────────────────────────────────
 rand = "0.10"   # SPARQL RAND() built-in
 
+# ── Data parallelism ─────────────────────────────────────────────────────────
+# Opt-in per-crate (currently only nova-query), and always excluded on
+# wasm32-unknown-unknown (rayon's thread pool has no meaning in a single-
+# threaded WASM environment, and nova-js targets that platform) — see
+# nova-query/Cargo.toml's inverse wasm32 cfg gate.
+rayon = "1.10"
+
+
 # ── Full-text search ────────────────────────────────────────────────────────
 # Opt-in via nova-storage-ring's `fulltext` cargo feature (crates/nova-fulltext).
 # Zero-cost when the feature is disabled: no crate in the default build graph

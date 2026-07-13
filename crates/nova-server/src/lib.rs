@@ -1259,11 +1259,11 @@ async fn execute_sparql_query<S: QuadStore + 'static>(
     let mut join = tokio::task::spawn_blocking(move || {
         if let Some(rs) = reasoning {
             let overlay = rs.current(&store)?;
-            let evaluator = Evaluator::with_options(&*overlay, options);
+            let mut evaluator = Evaluator::with_options(&*overlay, options);
             evaluator.evaluate(&query_for_eval)
         } else {
             let dataset = StoreDataset::new(store);
-            let evaluator = Evaluator::with_options(&dataset, options);
+            let mut evaluator = Evaluator::with_options(&dataset, options);
             evaluator.evaluate(&query_for_eval)
         }
     });

@@ -76,7 +76,7 @@ fn main() {
     let pid = std::process::id();
     println!("[rss-loop-mimalloc] pid={pid} query={query_name} n={n}");
     for i in 0..n {
-        let ev = Evaluator::new(&ds);
+        let mut ev = Evaluator::new(&ds);
         let result = ev.evaluate(&q).unwrap();
         let rows = match result {
             QueryResult::Solutions { stream, .. } => stream.count(),

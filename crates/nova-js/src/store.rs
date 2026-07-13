@@ -164,7 +164,7 @@ impl JsStore {
                 .map_err(JsError::from)?;
             let vars = projected_variables(&parsed);
             let dataset = StoreDataset::new(self.store.inner());
-            let evaluator = Evaluator::with_options(&dataset, QueryOptions::default());
+            let mut evaluator = Evaluator::with_options(&dataset, QueryOptions::default());
             let result = evaluator.evaluate(&parsed).map_err(map_anyhow_error)?;
             (
                 oxigraph_nova_store::collect_query_result(result).map_err(map_anyhow_error)?,

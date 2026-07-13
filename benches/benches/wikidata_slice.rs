@@ -204,7 +204,7 @@ fn build_memory_store(quads: &[Quad]) -> Arc<MemoryStore> {
 /// immediately visible in benchmark output.
 fn count_solutions<D: Dataset>(dataset: &D, sparql: &str) -> usize {
     let q = SparqlParser::new().parse_query(sparql).unwrap();
-    let ev = Evaluator::new(dataset);
+    let mut ev = Evaluator::new(dataset);
     match ev.evaluate(&q).unwrap() {
         QueryResult::Solutions { stream, .. } => stream.count(),
         QueryResult::Boolean(b) => b as usize,
@@ -540,6 +540,103 @@ fn bench_query_path_bound(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Benchmark 9: Parallel evaluator paths (ORDER BY / GROUP BY / UNION) ──────
+//
+// These benchmarks exercise `evaluator.rs`'s rayon-parallelized code paths
+// directly (`GP::OrderBy`'s par_sort, `eval_group`'s per-group aggregate
+// computation, and `GP::Union`'s two-branch fork) at row counts on both
+// sides of `PARALLEL_ROW_THRESHOLD` (10_000, see
+// `crates/nova-query/src/evaluator.rs`). Used to tune that constant against
+// real timing data rather than a guess.
+//
+// All three queries here use a single triple pattern (no join), so both
+// backends would evaluate the *pattern* itself in O(N) with no meaningful
+// gap between them -- what's being measured is the cost of the
+// post-pattern parallel step (sorting/grouping/unioning), which is
+// evaluator-side and backend-agnostic. Only RingStore is benchmarked here
+// to keep focus on that step and avoid doubling runtime for a comparison
+// that wouldn't be informative.
+//
+// `PARALLEL_SMALL_N` produces row counts safely below the threshold (the
+// sequential path is taken); `PARALLEL_LARGE_N` safely above it (the rayon
+// path is taken). Comparing the two shows whether the threshold is set at a
+// sensible crossover point -- i.e. that the large case actually benefits
+// from going parallel, and the small case isn't paying rayon dispatch
+// overhead for too little work.
+
+/// Row count safely below `PARALLEL_ROW_THRESHOLD` (10_000) -- exercises the
+/// sequential fallback path in `ORDER BY`/`GROUP BY`.
+const PARALLEL_SMALL_N: usize = 3_000;
+
+/// Row count safely above `PARALLEL_ROW_THRESHOLD` (10_000) -- exercises the
+/// rayon-parallel path in `ORDER BY`/`GROUP BY`.
+const PARALLEL_LARGE_N: usize = 30_000;
+
+/// `ORDER BY` over N rows -- exercises `GP::OrderBy`'s `par_sort_by` once N
+/// crosses `PARALLEL_ROW_THRESHOLD`.
+fn bench_query_orderby(c: &mut Criterion) {
+    let mut group = c.benchmark_group("query/orderby");
+
+    for &n in &[PARALLEL_SMALL_N, PARALLEL_LARGE_N] {
+        let quads = generate_quads(n);
+        let ds = StoreDataset::new(build_ring_store(&quads));
+        let sparql = format!("{PREFIXES}SELECT * WHERE {{ ?s wdt:P31 ?class }} ORDER BY ?s");
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("ring", n), &ds, |b, ds| {
+            b.iter(|| black_box(count_solutions(ds, &sparql)))
+        });
+    }
+    group.finish();
+}
+
+/// `GROUP BY ?class` with a `COUNT` aggregate. Always exactly 10 groups
+/// (class0..class9) regardless of N -- this is the "few groups, many rows
+/// per group" shape task (b) targets: `groups.len()` would never cross the
+/// threshold on its own, but total row count does once N is large enough,
+/// so this benchmark specifically validates gating on total rows rather
+/// than group count.
+fn bench_query_groupby(c: &mut Criterion) {
+    let mut group = c.benchmark_group("query/groupby");
+
+    for &n in &[PARALLEL_SMALL_N, PARALLEL_LARGE_N] {
+        let quads = generate_quads(n);
+        let ds = StoreDataset::new(build_ring_store(&quads));
+        let sparql = format!(
+            "{PREFIXES}SELECT ?class (COUNT(?s) AS ?c) WHERE {{ ?s wdt:P31 ?class }} GROUP BY ?class"
+        );
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("ring", n), &ds, |b, ds| {
+            b.iter(|| black_box(count_solutions(ds, &sparql)))
+        });
+    }
+    group.finish();
+}
+
+/// Two-branch `UNION`, each branch contributing N rows (2N total) --
+/// exercises `GP::Union`'s unconditional `rayon::join` fork of the two
+/// branches at both a small and large N, since that call site forks
+/// regardless of size (there's no row count to threshold on until after
+/// both branches have already been evaluated).
+fn bench_query_union(c: &mut Criterion) {
+    let mut group = c.benchmark_group("query/union");
+
+    for &n in &[PARALLEL_SMALL_N, PARALLEL_LARGE_N] {
+        let quads = generate_quads(n);
+        let ds = StoreDataset::new(build_ring_store(&quads));
+        let sparql = format!(
+            "{PREFIXES}SELECT * WHERE {{ {{ ?s wdt:P31 ?class }} UNION {{ ?s wdt:P131 ?region }} }}"
+        );
+
+        group.throughput(Throughput::Elements((n * 2) as u64));
+        group.bench_with_input(BenchmarkId::new("ring", n), &ds, |b, ds| {
+            b.iter(|| black_box(count_solutions(ds, &sparql)))
+        });
+    }
+    group.finish();
+}
+
 // ── Criterion registration ────────────────────────────────────────────────────
 
 criterion_group!(
@@ -552,5 +649,9 @@ criterion_group!(
     bench_query_path,
     bench_query_path_bound,
     bench_query_triangle,
+    bench_query_orderby,
+    bench_query_groupby,
+    bench_query_union,
 );
 criterion_main!(benches);
+

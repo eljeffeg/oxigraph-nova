@@ -62,6 +62,76 @@ fn xsd_nn(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{XSD}{local}"))
 }
 
+// ── Data parallelism ──────────────────────────────────────────────────────────
+//
+// Independent per-row/per-group work (ORDER BY, GROUP BY aggregation,
+// UNION's two branches, and Extend/Filter/Project's per-row expression
+// evaluation) can be dispatched across a rayon thread pool once there's
+// enough of it to outweigh dispatch overhead. `should_parallelize` is the
+// single gate all row/group-count-based call sites check first (UNION's two
+// branches are instead always forked via `rayon::join` unconditionally --
+// see its call site -- since there's no row count to threshold on until
+// after both sides have already been evaluated).
+//
+// Not available on wasm32-unknown-unknown: rayon isn't linked there at all
+// (see nova-query/Cargo.toml's wasm32 cfg-gate), and that target only ever
+// runs single-threaded anyway (nova-js, its sole consumer), so
+// `should_parallelize` simply always returns `false` there and every call
+// site's wasm32 branch runs the plain sequential path.
+
+/// Row/group-count threshold above which independent per-row/per-group work
+/// is dispatched across rayon's thread pool instead of run sequentially in
+/// place.
+///
+/// Tuned against the `query/orderby`, `query/groupby`, and `query/union`
+/// Criterion benchmarks in `benches/benches/wikidata_slice.rs` (16-core
+/// Apple Silicon; run with `cargo bench -p oxigraph-nova-bench --bench
+/// wikidata_slice -- "query/orderby|query/groupby|query/union"`), comparing
+/// the rayon-parallel path against a forced-sequential build at matching row
+/// counts:
+///
+/// - `ORDER BY`'s `par_sort_by` is a clear win right at 10,000 rows (~9%
+///   faster at N=10,000, ~16-20% faster at N=15,000-150,000) and keeps
+///   improving with N, so 10,000 is not too high a bar for it.
+/// - `GROUP BY`/aggregation is far more sensitive to how expensive the
+///   *aggregate function* is: `eval_group` only parallelizes the per-group
+///   aggregate computation (grouping itself stays sequential), so with a
+///   cheap aggregate (`COUNT`) over few groups the parallel step is roughly
+///   neutral at N=10,000-15,000 (within noise either way) and only pulls
+///   ahead once N is large enough to make even cheap per-group work add up
+///   (~7% faster at N=150,000). A more expensive aggregate (e.g. many
+///   `GROUP_CONCAT`s) would cross over sooner.
+///
+/// 10,000 was kept as a single shared threshold across all call sites
+/// (rather than a separate, lower one for `ORDER BY` alone) since it's
+/// already a clear win for sorting, roughly break-even for cheap
+/// aggregation, and avoids a second tunable constant for what is, in
+/// practice, a narrow trade-off.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+const PARALLEL_ROW_THRESHOLD: usize = 10_000;
+
+
+/// Returns `true` if `n` independent rows/groups of work is large enough to
+/// be worth dispatching across rayon's thread pool rather than processing
+/// sequentially. Always `false` on wasm32-unknown-unknown (see module note
+/// above).
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[inline]
+fn should_parallelize(n: usize) -> bool {
+    n >= PARALLEL_ROW_THRESHOLD
+}
+
+// Kept for API symmetry with the non-wasm32 definition above (so call sites
+// don't need their own wasm32 `#[cfg]` just to skip calling it) even though
+// every call site's wasm32 branch currently takes the plain sequential path
+// directly without consulting it at all.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[inline]
+#[allow(dead_code)]
+fn should_parallelize(_n: usize) -> bool {
+    false
+}
+
 // ── Full-text search extension functions (`text:query`/`text:contains`) ─────────
 //
 // Non-standard SPARQL extension functions, parsed by `spargebra` as
@@ -421,8 +491,14 @@ impl QueryResult {
 
 pub struct Evaluator<'a, D: Dataset> {
     dataset: &'a D,
-    /// BASE IRI extracted from the current query; used by IRI()/URI() to resolve relative strings.
-    base_iri: std::cell::RefCell<Option<String>>,
+    /// BASE IRI extracted from the current query; used by IRI()/URI() to
+    /// resolve relative strings. A plain field (not `RefCell`), since it is
+    /// written exactly once at the top of `evaluate()` (which therefore
+    /// takes `&mut self`) and only ever read afterward by the recursive,
+    /// still-`&self` evaluation helpers — this keeps `Evaluator` `Sync`
+    /// (no interior-mutability cells), which is required for any future
+    /// `rayon`-based parallel evaluation over `&Evaluator`.
+    base_iri: Option<String>,
     /// Per-query cancellation/result-cap limits; see `crate::options`.
     options: crate::options::QueryOptions,
 }
@@ -431,7 +507,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
     pub fn new(dataset: &'a D) -> Self {
         Self {
             dataset,
-            base_iri: std::cell::RefCell::new(None),
+            base_iri: None,
             options: crate::options::QueryOptions::default(),
         }
     }
@@ -441,7 +517,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
     pub fn with_options(dataset: &'a D, options: crate::options::QueryOptions) -> Self {
         Self {
             dataset,
-            base_iri: std::cell::RefCell::new(None),
+            base_iri: None,
             options,
         }
     }
@@ -455,9 +531,9 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
     /// output can show evaluation latency per query. `skip_all` avoids requiring
     /// `Query`/`Self` to implement `Debug` just for span field capture.
     #[tracing::instrument(name = "evaluate", skip_all, fields(query_kind = query_kind_label(query)))]
-    pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
+    pub fn evaluate(&mut self, query: &Query) -> Result<QueryResult> {
         // Extract BASE IRI from the query so IRI()/URI() can resolve relative strings.
-        *self.base_iri.borrow_mut() = match query {
+        self.base_iri = match query {
             Query::Select { base_iri, .. } => base_iri.as_ref().map(|i| i.as_str().to_string()),
             Query::Ask { base_iri, .. } => base_iri.as_ref().map(|i| i.as_str().to_string()),
             Query::Construct { base_iri, .. } => base_iri.as_ref().map(|i| i.as_str().to_string()),
@@ -552,19 +628,47 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 }
 
                 let solutions = self.eval_pattern(inner, active_graph)?;
-                Ok(solutions
-                    .into_iter()
-                    .filter(|sol| {
-                        self.eval_expr(expr, sol, active_graph)
-                            .and_then(|t| to_ebv(&t))
-                            .unwrap_or(false)
-                    })
-                    .collect())
+                let predicate = |sol: &Solution| {
+                    self.eval_expr(expr, sol, active_graph)
+                        .and_then(|t| to_ebv(&t))
+                        .unwrap_or(false)
+                };
+                // Per-row expression evaluation is independent across rows;
+                // large result sets are filtered across rayon's thread
+                // pool, small ones stay sequential. Not available on
+                // wasm32-unknown-unknown (see the "Data parallelism"
+                // module note above) -- always sequential there.
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                let filtered: Solutions = if should_parallelize(solutions.len()) {
+                    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                    solutions.into_par_iter().filter(predicate).collect()
+                } else {
+                    solutions.into_iter().filter(predicate).collect()
+                };
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                let filtered: Solutions = solutions.into_iter().filter(predicate).collect();
+                Ok(filtered)
             }
 
             GP::Union { left, right } => {
-                let mut ls = self.eval_pattern(left, active_graph)?;
-                let rs = self.eval_pattern(right, active_graph)?;
+                // Independent branches -- always forked across rayon's
+                // thread pool (no row count to threshold on until after
+                // both sides have already been evaluated; see the
+                // "Data parallelism" module note near the top of this
+                // file). Sequential on wasm32-unknown-unknown, where rayon
+                // isn't even a dependency (see nova-query/Cargo.toml).
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                let (ls, rs) = rayon::join(
+                    || self.eval_pattern(left, active_graph),
+                    || self.eval_pattern(right, active_graph),
+                );
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                let (ls, rs) = (
+                    self.eval_pattern(left, active_graph),
+                    self.eval_pattern(right, active_graph),
+                );
+                let mut ls = ls?;
+                let rs = rs?;
                 ls.extend(rs);
                 Ok(ls)
             }
@@ -577,13 +681,27 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 expression,
             } => {
                 let mut solutions = self.eval_pattern(inner, active_graph)?;
-                for sol in &mut solutions {
+                let extend_one = |sol: &mut Solution| {
                     if let Some(val) = self.eval_expr(expression, sol, active_graph)
                         && !sol.contains(variable)
                     {
                         sol.insert(variable.clone(), val);
                     }
+                };
+                // Per-row expression evaluation is independent across rows;
+                // large result sets are extended across rayon's thread
+                // pool, small ones stay sequential. Not available on
+                // wasm32-unknown-unknown (see the "Data parallelism"
+                // module note above) -- always sequential there.
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                if should_parallelize(solutions.len()) {
+                    use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+                    solutions.par_iter_mut().for_each(extend_one);
+                } else {
+                    solutions.iter_mut().for_each(extend_one);
                 }
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                solutions.iter_mut().for_each(extend_one);
                 Ok(solutions)
             }
 
@@ -615,7 +733,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             GP::OrderBy { inner, expression } => {
                 let mut solutions = self.eval_pattern(inner, active_graph)?;
                 let ag = active_graph;
-                solutions.sort_by(|a, b| {
+                let cmp = |a: &Solution, b: &Solution| {
                     for oe in expression {
                         let (e, asc) = match oe {
                             OrderExpression::Asc(e) => (e, true),
@@ -630,16 +748,43 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                         }
                     }
                     std::cmp::Ordering::Equal
-                });
+                };
+                // Large result sets sort across rayon's thread pool
+                // (`par_sort_by` is a parallel merge sort, still stable);
+                // small ones stay on the calling thread to avoid dispatch
+                // overhead. Not available on wasm32-unknown-unknown (see
+                // the "Data parallelism" module note above) -- always
+                // sequential there.
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                if should_parallelize(solutions.len()) {
+                    use rayon::slice::ParallelSliceMut;
+                    solutions.par_sort_by(cmp);
+                } else {
+                    solutions.sort_by(cmp);
+                }
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                solutions.sort_by(cmp);
                 Ok(solutions)
             }
 
             GP::Project { inner, variables } => {
                 let solutions = self.eval_pattern(inner, active_graph)?;
-                Ok(solutions
-                    .into_iter()
-                    .map(|sol| sol.project(variables.iter()))
-                    .collect())
+                let project_one = |sol: Solution| sol.project(variables.iter());
+                // Per-row projection is independent across rows; large
+                // result sets are projected across rayon's thread pool,
+                // small ones stay sequential. Not available on
+                // wasm32-unknown-unknown (see the "Data parallelism"
+                // module note above) -- always sequential there.
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                let projected: Solutions = if should_parallelize(solutions.len()) {
+                    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                    solutions.into_par_iter().map(project_one).collect()
+                } else {
+                    solutions.into_iter().map(project_one).collect()
+                };
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                let projected: Solutions = solutions.into_iter().map(project_one).collect();
+                Ok(projected)
             }
 
             GP::Distinct { inner } => {
@@ -729,7 +874,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 ));
             }
         };
-        handler.handle(service_name, inner, self.base_iri.borrow().as_deref())
+        handler.handle(service_name, inner, self.base_iri.as_deref())
     }
 
     // =========================================================================
@@ -911,6 +1056,15 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         active_graph: &GraphSelector,
     ) -> Result<Solutions> {
         let inner_sols = self.eval_pattern(inner, active_graph)?;
+        // Gate parallelism on total input row count, not `groups.len()`:
+        // the common "few groups, many rows per group" shape (e.g.
+        // `GROUP BY ?type` over millions of rows aggregated into a handful
+        // of type buckets) has a tiny group count but a huge amount of
+        // aggregate work overall (`eval_aggregate` scans every row in every
+        // group) -- gating on group count alone would leave that shape
+        // permanently sequential. Captured now, before `inner_sols` is
+        // consumed by the grouping loop below.
+        let total_rows = inner_sols.len();
 
         let mut groups: HashMap<Vec<Option<String>>, Vec<Solution>> = HashMap::new();
         for sol in inner_sols {
@@ -925,10 +1079,17 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             groups.insert(vec![], vec![]);
         }
 
-        let mut result = Vec::new();
-        for group in groups.values() {
+        // Grouping (the HashMap build above) stays sequential -- it's a
+        // single shared mutable map being built incrementally, not
+        // independent per-group work. Once the groups exist, though,
+        // computing each group's aggregate row is fully independent of
+        // every other group, so a large total row count (summed across all
+        // groups -- see `total_rows` above) is dispatched across rayon's
+        // thread pool; small ones stay sequential to avoid dispatch
+        // overhead. Not available on wasm32-unknown-unknown (see the "Data
+        // parallelism" module note above) -- always sequential there.
+        let compute_group_row = |group: &Vec<Solution>| -> Solution {
             let mut sol = Solution::new();
-
             if let Some(first) = group.first() {
                 for v in variables {
                     if let Some(t) = first.get(v) {
@@ -936,16 +1097,32 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                     }
                 }
             }
-
             for (agg_var, agg_expr) in aggregates {
                 if let Some(val) = self.eval_aggregate(agg_expr, group, active_graph) {
                     sol.insert(agg_var.clone(), val);
                 }
             }
-            result.push(sol);
-        }
+            sol
+        };
+
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let result: Vec<Solution> = if should_parallelize(total_rows) {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            groups
+                .values()
+                .collect::<Vec<_>>()
+                .par_iter()
+                .map(|g| compute_group_row(g))
+                .collect()
+        } else {
+            groups.values().map(compute_group_row).collect()
+        };
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let result: Vec<Solution> = groups.values().map(compute_group_row).collect();
+
         Ok(result)
     }
+
 
     fn eval_aggregate(
         &self,
@@ -1371,7 +1548,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 if s.is_empty() {
                     return None;
                 }
-                resolve_iri_against_base(&s, self.base_iri.borrow().as_deref()).map(Term::NamedNode)
+                resolve_iri_against_base(&s, self.base_iri.as_deref()).map(Term::NamedNode)
             }
             Function::BNode => {
                 // SPARQL 1.1 §17.4.2.7: BNODE(strExpr) — repeated calls with the
@@ -3672,13 +3849,25 @@ mod tests {
         d
     }
 
+    /// Locks in the invariant (required for future `rayon`-based parallel
+    /// evaluation over `&Evaluator`) that `Evaluator` holds no interior
+    /// mutability and is therefore `Sync` whenever its `Dataset` is. If a
+    /// future change reintroduces a `RefCell`/`Cell` field, this fails to
+    /// compile rather than silently regressing.
+    fn _assert_sync<T: Sync>() {}
+    #[test]
+    fn evaluator_is_sync() {
+        _assert_sync::<Evaluator<'static, InMemoryDataset>>();
+    }
+
     #[test]
     fn select_all() {
         let d = make_dataset();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
             .unwrap();
+
         let QueryResult::Solutions { stream, .. } = ev.evaluate(&q).unwrap() else {
             panic!()
         };
@@ -3689,7 +3878,7 @@ mod tests {
     #[test]
     fn ask_true() {
         let d = make_dataset();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("ASK { <http://ex/alice> <http://ex/name> \"Alice\" }")
             .unwrap();
@@ -3702,7 +3891,7 @@ mod tests {
     #[test]
     fn ask_false() {
         let d = make_dataset();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("ASK { <http://ex/alice> <http://ex/name> \"Nobody\" }")
             .unwrap();
@@ -3715,7 +3904,7 @@ mod tests {
     #[test]
     fn filter_by_name() {
         let d = make_dataset();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query(r#"SELECT ?s WHERE { ?s <http://ex/name> ?n FILTER(?n = "Alice") }"#)
             .unwrap();
@@ -3734,7 +3923,7 @@ mod tests {
     fn optional_join() {
         let mut d = make_dataset();
         d.add_default(iri("http://ex/carol"), iri("http://ex/name"), lit("Carol"));
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query(
                 r#"
@@ -3759,7 +3948,7 @@ mod tests {
     #[test]
     fn union_query() {
         let d = make_dataset();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query(
                 r#"
@@ -3781,7 +3970,7 @@ mod tests {
     fn distinct_query() {
         let mut d = make_dataset();
         d.add_default(iri("http://ex/alice"), iri("http://ex/name"), lit("Alice"));
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("SELECT DISTINCT ?s WHERE { ?s <http://ex/name> ?n }")
             .unwrap();
@@ -3795,7 +3984,7 @@ mod tests {
     #[test]
     fn limit_offset() {
         let d = make_dataset();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o } ORDER BY ?s LIMIT 2 OFFSET 1")
             .unwrap();
@@ -3809,7 +3998,7 @@ mod tests {
     #[test]
     fn count_aggregate() {
         let d = make_dataset();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("SELECT (COUNT(?s) AS ?cnt) WHERE { ?s <http://ex/name> ?n }")
             .unwrap();
@@ -3825,7 +4014,7 @@ mod tests {
     #[test]
     fn values_inline() {
         let d = make_dataset();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query(
                 r#"
@@ -3845,7 +4034,7 @@ mod tests {
     #[test]
     fn bind_extend() {
         let d = make_dataset();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query(
                 r#"
@@ -3872,7 +4061,7 @@ mod tests {
     #[test]
     fn hash_md5() {
         let d = InMemoryDataset::new();
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query(r#"SELECT (MD5("abc") AS ?h) WHERE {}"#)
             .unwrap();
@@ -3890,7 +4079,7 @@ mod tests {
         let mut d = InMemoryDataset::new();
         d.add_default(iri("http://ex/a"), iri("http://ex/p"), iri("http://ex/b"));
         d.add_default(iri("http://ex/b"), iri("http://ex/p"), iri("http://ex/c"));
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/a> <http://ex/p>+ ?x }")
             .unwrap();
@@ -3911,7 +4100,7 @@ mod tests {
         let mut d = InMemoryDataset::new();
         d.add_default(iri("http://ex/a"), iri("http://ex/p"), iri("http://ex/b"));
         d.add_default(iri("http://ex/b"), iri("http://ex/p"), iri("http://ex/c"));
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/a> <http://ex/p>* ?x }")
             .unwrap();
@@ -3931,7 +4120,7 @@ mod tests {
     fn property_path_reverse() {
         let mut d = InMemoryDataset::new();
         d.add_default(iri("http://ex/a"), iri("http://ex/p"), iri("http://ex/b"));
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         // SPARQL: `<b> ^<p> ?x` ≡ `?x <p> <b>`, i.e. find x where (x, p, b) ∈ graph → x = a.
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/b> ^<http://ex/p> ?x }")
@@ -3952,7 +4141,7 @@ mod tests {
         let mut d = InMemoryDataset::new();
         d.add_default(iri("http://ex/a"), iri("http://ex/p"), iri("http://ex/b"));
         d.add_default(iri("http://ex/a"), iri("http://ex/q"), iri("http://ex/c"));
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/a> <http://ex/p>|<http://ex/q> ?x }")
             .unwrap();
@@ -3975,7 +4164,7 @@ mod tests {
         let q_iri = iri("http://ex/q");
         d.add_default(iri("http://ex/a"), p.clone(), iri("http://ex/b"));
         d.add_default(iri("http://ex/b"), q_iri.clone(), iri("http://ex/c"));
-        let ev = Evaluator::new(&d);
+        let mut ev = Evaluator::new(&d);
         let q = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { <http://ex/a> <http://ex/p>/<http://ex/q> ?x }")
             .unwrap();
@@ -4029,7 +4218,7 @@ mod tests {
             let dataset = StoreDataset::new(Arc::clone(&store));
             let options = QueryOptions::new()
                 .with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
-            let ev = Evaluator::with_options(&dataset, options);
+            let mut ev = Evaluator::with_options(&dataset, options);
             let q = SparqlParser::new()
                 .parse_query(
                     r#"PREFIX text: <http://oxigraph-nova.dev/fn/text#>
@@ -4056,7 +4245,7 @@ mod tests {
             let dataset = StoreDataset::new(Arc::clone(&store));
             let options = QueryOptions::new()
                 .with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
-            let ev = Evaluator::with_options(&dataset, options);
+            let mut ev = Evaluator::with_options(&dataset, options);
             let q = SparqlParser::new()
                 .parse_query(
                     r#"PREFIX text: <http://oxigraph-nova.dev/fn/text#>
@@ -4080,7 +4269,7 @@ mod tests {
             // not panic or error.
             let store = make_store_with_text();
             let dataset = StoreDataset::new(Arc::clone(&store));
-            let ev = Evaluator::new(&dataset); // default QueryOptions, no text_search
+            let mut ev = Evaluator::new(&dataset); // default QueryOptions, no text_search
             let q = SparqlParser::new()
                 .parse_query(
                     r#"PREFIX text: <http://oxigraph-nova.dev/fn/text#>
@@ -4125,7 +4314,7 @@ mod tests {
             let dataset = StoreDataset::new(Arc::clone(&store));
             let options = QueryOptions::new()
                 .with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
-            let ev = Evaluator::with_options(&dataset, options);
+            let mut ev = Evaluator::with_options(&dataset, options);
             // `?o` is bound as the object of <name> (a literal, matched by
             // the search) AND as the predicate of a second triple pattern
             // `?a ?o ?b` -- since no quad in the store actually uses the
@@ -4165,7 +4354,7 @@ mod tests {
             let dataset = StoreDataset::new(Arc::clone(&store));
             let options = QueryOptions::new()
                 .with_text_search(store.clone() as Arc<dyn oxigraph_nova_core::TextSearch>);
-            let ev = Evaluator::with_options(&dataset, options);
+            let mut ev = Evaluator::with_options(&dataset, options);
             let q = SparqlParser::new()
                 .parse_query(
                     r#"PREFIX text: <http://oxigraph-nova.dev/fn/text#>
@@ -4229,7 +4418,7 @@ mod tests {
         #[test]
         fn no_handler_configured_errors_without_silent() {
             let d = InMemoryDataset::new();
-            let ev = Evaluator::new(&d); // default QueryOptions: no service_handler
+            let mut ev = Evaluator::new(&d); // default QueryOptions: no service_handler
             let q = SparqlParser::new()
                 .parse_query("SELECT ?x WHERE { SERVICE <http://example.org/sparql> { ?s ?p ?x } }")
                 .unwrap();
@@ -4239,7 +4428,7 @@ mod tests {
         #[test]
         fn no_handler_configured_silent_yields_empty() {
             let d = InMemoryDataset::new();
-            let ev = Evaluator::new(&d); // default QueryOptions: no service_handler
+            let mut ev = Evaluator::new(&d); // default QueryOptions: no service_handler
             let q = SparqlParser::new()
                 .parse_query(
                     "SELECT ?x WHERE { SERVICE SILENT <http://example.org/sparql> { ?s ?p ?x } }",
@@ -4256,7 +4445,7 @@ mod tests {
         fn configured_handler_dispatches_and_returns_its_solutions() {
             let d = InMemoryDataset::new();
             let options = QueryOptions::new().with_service_handler(Arc::new(FixedHandler));
-            let ev = Evaluator::with_options(&d, options);
+            let mut ev = Evaluator::with_options(&d, options);
             let q = SparqlParser::new()
                 .parse_query("SELECT ?x WHERE { SERVICE <http://example.org/sparql> { ?s ?p ?x } }")
                 .unwrap();
@@ -4275,7 +4464,7 @@ mod tests {
         fn failing_handler_errors_without_silent() {
             let d = InMemoryDataset::new();
             let options = QueryOptions::new().with_service_handler(Arc::new(FailingHandler));
-            let ev = Evaluator::with_options(&d, options);
+            let mut ev = Evaluator::with_options(&d, options);
             let q = SparqlParser::new()
                 .parse_query("SELECT ?x WHERE { SERVICE <http://example.org/sparql> { ?s ?p ?x } }")
                 .unwrap();
@@ -4286,7 +4475,7 @@ mod tests {
         fn failing_handler_silent_yields_empty() {
             let d = InMemoryDataset::new();
             let options = QueryOptions::new().with_service_handler(Arc::new(FailingHandler));
-            let ev = Evaluator::with_options(&d, options);
+            let mut ev = Evaluator::with_options(&d, options);
             let q = SparqlParser::new()
                 .parse_query(
                     "SELECT ?x WHERE { SERVICE SILENT <http://example.org/sparql> { ?s ?p ?x } }",
@@ -4303,7 +4492,7 @@ mod tests {
         fn variable_service_name_is_unsupported() {
             let d = InMemoryDataset::new();
             let options = QueryOptions::new().with_service_handler(Arc::new(FixedHandler));
-            let ev = Evaluator::with_options(&d, options);
+            let mut ev = Evaluator::with_options(&d, options);
             let q = SparqlParser::new()
                 .parse_query("SELECT ?x WHERE { SERVICE ?svc { ?s ?p ?x } }")
                 .unwrap();
@@ -4360,7 +4549,7 @@ mod tests {
         #[test]
         fn distance_between_bound_points_dispatches_through_bgp() {
             let d = make_geo_dataset();
-            let ev = Evaluator::new(&d);
+            let mut ev = Evaluator::new(&d);
             let q = SparqlParser::new()
                 .parse_query(&format!(
                     r#"PREFIX geof: <{GEOF}>
@@ -4385,7 +4574,7 @@ mod tests {
         #[test]
         fn distance_between_identical_points_is_zero() {
             let d = InMemoryDataset::new();
-            let ev = Evaluator::new(&d);
+            let mut ev = Evaluator::new(&d);
             let q = SparqlParser::new()
                 .parse_query(&format!(
                     r#"PREFIX geof: <{GEOF}>
@@ -4408,7 +4597,7 @@ mod tests {
         #[test]
         fn sf_intersects_true_for_overlapping_polygons() {
             let d = InMemoryDataset::new();
-            let ev = Evaluator::new(&d);
+            let mut ev = Evaluator::new(&d);
             let q = SparqlParser::new()
                 .parse_query(&format!(
                     r#"PREFIX geof: <{GEOF}>
@@ -4432,7 +4621,7 @@ mod tests {
         #[test]
         fn sf_intersects_false_for_disjoint_polygons() {
             let d = InMemoryDataset::new();
-            let ev = Evaluator::new(&d);
+            let mut ev = Evaluator::new(&d);
             let q = SparqlParser::new()
                 .parse_query(&format!(
                     r#"PREFIX geof: <{GEOF}>
@@ -4458,7 +4647,7 @@ mod tests {
         #[test]
         fn area_of_a_polygon_is_positive() {
             let d = InMemoryDataset::new();
-            let ev = Evaluator::new(&d);
+            let mut ev = Evaluator::new(&d);
             let q = SparqlParser::new()
                 .parse_query(&format!(
                     r#"PREFIX geof: <{GEOF}>
@@ -4488,7 +4677,7 @@ mod tests {
             // IRI (wrong namespace) and returns `None` -- BIND leaves the
             // variable unbound rather than erroring.
             let d = InMemoryDataset::new();
-            let ev = Evaluator::new(&d);
+            let mut ev = Evaluator::new(&d);
             let q = SparqlParser::new()
                 .parse_query(&format!(
                     r#"PREFIX geof: <{GEOF}>

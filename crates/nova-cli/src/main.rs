@@ -364,7 +364,7 @@ fn run_query(
     let dataset = StoreDataset::new(Arc::clone(&store));
     let options =
         oxigraph_nova_query::QueryOptions::default().with_union_default_graph(union_default_graph);
-    let evaluator = Evaluator::with_options(&dataset, options);
+    let mut evaluator = Evaluator::with_options(&dataset, options);
     let result = evaluator.evaluate(&parsed)?;
 
     // Serialize directly into the destination writer (file or stdout) rather
