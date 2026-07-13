@@ -133,16 +133,55 @@
 //! Re-benchmarked against a true sequential baseline (obtained by temporarily
 //! forcing `PARALLEL_LFTJ_ROOT_THRESHOLD = usize::MAX`, since Criterion's own
 //! `change:` percentage compares against its last saved run, not a fixed
-//! reference), chunked dispatch at the production threshold of 64 measured:
-//! `star_class_region` and `star_with_features` — no statistically
+//! reference), chunked dispatch alone at the production threshold of 64
+//! measured: `star_class_region` and `star_with_features` — no statistically
 //! significant change; `full_star` — a small ~4% regression; `triangle`
-//! (the highest join fan-out shape) — a ~13% **improvement**. This is a
-//! dramatic swing from the original one-task-per-value regression, and
-//! confirms the diagnosis: dispatch granularity, not lock contention, was
-//! the bottleneck. A further, adaptive skew-mitigation layer (splitting
-//! *below* the root for a single outsized subtree, the way HoneyComb
-//! partitions every level) remains deferred until profiling on a real
-//! skewed dataset shows this chunked single-level split is insufficient.
+//! (the highest join fan-out shape) — a ~13% **improvement**. This fixed the
+//! regression but left only modest absolute speedup — residual contention
+//! on the store `RwLock` (re-acquired for every `join_scan`/`decode`/
+//! `estimate`) and on the shared dictionary decode-cache `Mutex` still
+//! serialized the workers.
+//!
+//! ### Query-scoped snapshot + per-worker decode caches
+//!
+//! The residual contention is removed by a two-part snapshot path:
+//!
+//! 1. **Query-scoped lock-free snapshot** (`LftjSource::lftj_query_snapshot`
+//!    → `RingLftjSnapshot`). Under a single store `RwLock` read guard, when
+//!    the LSM delta is empty, the store freezes an `Arc`-shared view of the
+//!    LOUDS graphs plus a `DictDecodeSnapshot` of the dictionary. After that
+//!    one acquisition, every subsequent `join_scan` / `estimate_count` /
+//!    `decode_term` call on the snapshot is lock-free (the succinct
+//!    structures and the compacted Front-Coded tier are immutable).
+//! 2. **Per-worker decode caches.** Sharing one snapshot across rayon
+//!    workers would re-introduce contention on the snapshot's private
+//!    decode-cache `Mutex`. `DictDecodeSnapshot::clone` (invoked once per
+//!    rayon chunk via `LftjSnapshot::clone_for_worker`) therefore Arc-shares
+//!    the delta maps / compacted tier / graph table (O(1) refcount bumps)
+//!    and installs a **fresh empty** worker-sized LRU
+//!    (`WORKER_DECODE_CACHE_CAPACITY = 8192`, not the live dictionary's
+//!    100_000 — `lru::LruCache::new` pre-allocates a full-capacity
+//!    `HashMap`). Sequential evaluation keeps the full 100_000 cache.
+//!
+//! When the delta is non-empty (or the backend does not specialize
+//! `lftj_query_snapshot`), evaluation falls back to the locked path with
+//! no behavior change. On the snapshot path, `eval_bgp_lftj_cancellable`
+//! prefers the snapshot for the entire `run_lftj_root` call.
+//!
+//! Re-benchmarked on `bsbm_large` (chunked parallel *with* the snapshot +
+//! per-worker caches, vs. the previous chunked-only baseline):
+//!
+//! | Query | Δ wall-clock | Δ throughput |
+//! |---|---|---|
+//! | `star_class_region` | −22% | +29% |
+//! | `star_with_features` | −60% | +148% |
+//! | `full_star` | −62% | +165% |
+//! | `triangle` | −56% | — |
+//!
+//! A further, adaptive skew-mitigation layer (splitting *below* the root
+//! for a single outsized subtree, the way HoneyComb partitions every
+//! level) remains deferred until profiling on a real skewed dataset shows
+//! this chunked single-level split is insufficient.
 
 use crate::dataset::{Dataset, GraphSelector};
 use crate::options::CancellationToken;
