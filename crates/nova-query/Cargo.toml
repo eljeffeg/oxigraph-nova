@@ -22,6 +22,7 @@ md-5          = { workspace = true }   # MD5 hash function
 regex         = { workspace = true }   # SPARQL REGEX() / REPLACE() built-ins
 uuid          = { workspace = true }   # SPARQL UUID() / STRUUID() built-ins
 rand          = { workspace = true }   # SPARQL RAND() built-in
+smallvec      = { workspace = true }   # Stack-inline buffers for LFTJ per-step active/scans/VEO
 
 # Opt-in via the `http-client` feature: fetch client for LOAD and the
 # built-in SERVICE handler. oxrdfio parses LOAD's fetched RDF; sparesults

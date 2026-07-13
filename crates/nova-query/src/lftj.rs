@@ -187,9 +187,15 @@ use crate::dataset::{Dataset, GraphSelector};
 use crate::options::CancellationToken;
 use crate::solution::{Solution, Solutions};
 use oxigraph_nova_core::{GraphName, Variable};
+use smallvec::SmallVec;
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Inline capacity for the hot per-`lftj_step` / `lftj_enumerate_level` buffers
+/// (`active` patterns, open `scans`, VEO reorder). Typical BGP fan-out is well
+/// under this; larger queries spill to the heap transparently via `SmallVec`.
+const LFTJ_INLINE_CAP: usize = 8;
 
 // ── LFTJ vs nested-loop fallback counters (process-wide) ──────────────────────
 //
@@ -525,20 +531,23 @@ fn build_spec<D: Dataset>(
 /// For non-CLTJ backends all estimates are `u64::MAX`, so the sort is stable
 /// (preserves first-appearance order).
 ///
-/// Sorting 3–6 elements is O(1) — the overhead is negligible.
+/// Sorting 3–6 elements is O(1) — the overhead is negligible. The result is a
+/// stack-inline [`SmallVec`] so callers that only need a temporary reorder
+/// (the common case of ≤ [`LFTJ_INLINE_CAP`] unbound variables) pay no heap
+/// allocation for the sort buffer.
 fn veo_sort<D: Dataset + ?Sized>(
     unbound: &[usize],
     specs: &[PatternSpec],
     bindings: &[Option<u64>],
     dataset: &D,
     graph: &GraphSelector,
-) -> Vec<usize> {
+) -> SmallVec<[usize; LFTJ_INLINE_CAP]> {
     struct Candidate {
         var_idx: usize,
         weight: u64,
     }
 
-    let mut candidates: Vec<Candidate> = unbound
+    let mut candidates: SmallVec<[Candidate; LFTJ_INLINE_CAP]> = unbound
         .iter()
         .map(|&vi| {
             let mut weight = u64::MAX;
@@ -667,8 +676,10 @@ fn lftj_step<D: Dataset + ?Sized>(
     // heap-allocation + closure-per-call cost on every recursive invocation.
     //
     // Gate on `dataset.supports_veo_estimates()` to skip the overhead for
-    // non-CLTJ backends without regressing CLTJ* behaviour.
-    let veo_buf: Vec<usize>;
+    // non-CLTJ backends without regressing CLTJ* behaviour. The sort buffer
+    // is a stack-inline `SmallVec` so the common ≤8-var case never heap-
+    // allocates just to reorder.
+    let veo_buf: SmallVec<[usize; LFTJ_INLINE_CAP]>;
     let order: &[usize] = if dataset.supports_veo_estimates() && unbound.len() > 1 {
         veo_buf = veo_sort(unbound, specs, bindings, dataset, graph);
         &veo_buf
@@ -680,7 +691,7 @@ fn lftj_step<D: Dataset + ?Sized>(
     let remaining = &order[1..];
 
     // ── Find patterns active for this variable ──────────────────────────────
-    let active: Vec<&PatternSpec> = specs
+    let active: SmallVec<[&PatternSpec; LFTJ_INLINE_CAP]> = specs
         .iter()
         .filter(|sp| sp.is_active_for_var(var_idx))
         .collect();
@@ -703,8 +714,10 @@ fn lftj_step<D: Dataset + ?Sized>(
     }
 
     // ── Obtain one scan per active pattern ───────────────────────────────────
-    let mut scans: Vec<Box<dyn oxigraph_nova_core::TrieIterator>> =
-        Vec::with_capacity(active.len());
+    // Stack-inline for the common case of a few patterns active on one
+    // variable (typical star / triangle fan-out ≪ LFTJ_INLINE_CAP).
+    let mut scans: SmallVec<[Box<dyn oxigraph_nova_core::TrieIterator>; LFTJ_INLINE_CAP]> =
+        SmallVec::with_capacity(active.len());
     for sp in &active {
         let (sv, pv, ov, target_field) = sp.resolve_for_var(var_idx, bindings);
         match dataset.lftj_join_scan(sv, pv, ov, target_field, graph) {
@@ -799,7 +812,7 @@ fn lftj_enumerate_level<D: Dataset + ?Sized>(
     unbound: &[usize],
     bindings: &[Option<u64>],
 ) -> Option<(usize, Vec<usize>, Vec<u64>)> {
-    let veo_buf: Vec<usize>;
+    let veo_buf: SmallVec<[usize; LFTJ_INLINE_CAP]>;
     let order: &[usize] = if dataset.supports_veo_estimates() && unbound.len() > 1 {
         veo_buf = veo_sort(unbound, specs, bindings, dataset, graph);
         &veo_buf
@@ -808,9 +821,11 @@ fn lftj_enumerate_level<D: Dataset + ?Sized>(
     };
 
     let var_idx = order[0];
+    // `remaining` is returned to the caller and lives across the whole root
+    // fan-out, so a heap `Vec` is appropriate here (not a per-step buffer).
     let remaining: Vec<usize> = order[1..].to_vec();
 
-    let active: Vec<&PatternSpec> = specs
+    let active: SmallVec<[&PatternSpec; LFTJ_INLINE_CAP]> = specs
         .iter()
         .filter(|sp| sp.is_active_for_var(var_idx))
         .collect();
@@ -821,8 +836,8 @@ fn lftj_enumerate_level<D: Dataset + ?Sized>(
         return None;
     }
 
-    let mut scans: Vec<Box<dyn oxigraph_nova_core::TrieIterator>> =
-        Vec::with_capacity(active.len());
+    let mut scans: SmallVec<[Box<dyn oxigraph_nova_core::TrieIterator>; LFTJ_INLINE_CAP]> =
+        SmallVec::with_capacity(active.len());
     for sp in &active {
         let (sv, pv, ov, target_field) = sp.resolve_for_var(var_idx, bindings);
         let scan = dataset.lftj_join_scan(sv, pv, ov, target_field, graph)?;
@@ -1378,7 +1393,7 @@ mod tests {
         let unbound = vec![0usize, 1usize];
         let order = veo_sort(&unbound, &specs, &bindings, &ds, &graph);
         // All estimates are u64::MAX (equal) → stable → original order preserved.
-        assert_eq!(order, vec![0, 1]);
+        assert_eq!(order.as_slice(), &[0, 1]);
     }
 
     /// Verify VEO sort prefers the variable with the smaller **real
@@ -1451,8 +1466,8 @@ mod tests {
         let unbound = vec![0usize, 1usize];
         let order = veo_sort(&unbound, &specs, &bindings, &ds, &graph);
         assert_eq!(
-            order,
-            vec![1, 0],
+            order.as_slice(),
+            &[1, 0],
             "VEO must prefer var 1 (real subtree size 2) over var 0 (real subtree size 10)"
         );
     }
