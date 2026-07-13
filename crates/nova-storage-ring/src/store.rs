@@ -94,10 +94,11 @@ use oxigraph_nova_fulltext::FulltextIndex;
 use oxigraph_nova_storage_common::dict_snapshot;
 use oxigraph_nova_storage_common::manifest::{self, Manifest};
 use oxigraph_nova_storage_common::wal::{self, WalRecord, WalWriter};
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::Instant;
@@ -873,10 +874,7 @@ impl RingStore {
     /// [`oxigraph_nova_core::TextSearch`]'s module docs).
     #[cfg(feature = "fulltext")]
     pub fn enable_fulltext(&self) -> Result<(), Oxigraph> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let mut inner = self.inner.write();
 
         if inner.fulltext.is_some() {
             return Ok(()); // already enabled
@@ -915,10 +913,9 @@ impl RingStore {
     /// flusher thread against the currently-active WAL file; switching to
     /// `Always` stops it. No-op for in-memory stores (no WAL to flush).
     pub fn set_sync_policy(&self, policy: SyncPolicy) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.sync_policy = policy;
-            inner.respawn_flusher();
-        }
+        let mut inner = self.inner.write();
+        inner.sync_policy = policy;
+        inner.respawn_flusher();
     }
 
     /// Explicitly fsync the active WAL file right now, regardless of
@@ -926,9 +923,8 @@ impl RingStore {
     /// `SyncPolicy::Interval` to guarantee all acknowledged writes are
     /// durable. No-op for in-memory stores.
     pub fn flush_wal(&self) -> Result<(), Oxigraph> {
-        if let Ok(inner) = self.inner.read()
-            && let Some(w) = &inner.wal
-        {
+        let inner = self.inner.read();
+        if let Some(w) = &inner.wal {
             w.sync()
                 .map_err(|e| Oxigraph::Storage(format!("WAL flush failed: {e}")))?;
         }
@@ -973,10 +969,7 @@ impl RingStore {
     /// still sitting in the source directory (pending best-effort cleanup)
     /// are intentionally not copied.
     pub fn backup(&self, destination: &Path) -> Result<(), Oxigraph> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let inner = self.inner.read();
 
         let dir = inner.data_dir.clone().ok_or_else(|| {
             Oxigraph::Storage(
@@ -1046,10 +1039,7 @@ impl RingStore {
     /// For persistent stores this also happens automatically once the delta
     /// crosses a configurable threshold — see `set_auto_compact_threshold`.
     pub fn compact(&self) -> Result<(), Oxigraph> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let mut inner = self.inner.write();
         inner.compact_locked()
     }
 
@@ -1057,9 +1047,7 @@ impl RingStore {
     /// triggers automatic inline compaction for a persistent store. Default
     /// is 1,000,000. Has no effect on in-memory (`RingStore::new()`) stores.
     pub fn set_auto_compact_threshold(&self, threshold: usize) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.auto_compact_threshold = threshold;
-        }
+        self.inner.write().auto_compact_threshold = threshold;
     }
 
     /// Bulk-load quads directly into the Ring, **bypassing the delta
@@ -1112,10 +1100,7 @@ impl RingStore {
         quads: impl IntoIterator<Item = Quad>,
         mut on_progress: Option<&mut dyn FnMut(u64)>,
     ) -> Result<usize, Oxigraph> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let mut inner = self.inner.write();
 
         // Start from whatever's already compacted into the Ring (usually
         // empty for a fresh store — this loop is then a no-op).
@@ -1174,7 +1159,7 @@ impl RingStore {
 
     /// Number of triples stored across all graphs (approximation during merge).
     pub fn triple_count(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let ring_total: usize = inner.graphs.values().map(|r| r.n()).sum();
 
         let delta_inserts = inner.delta.insert_count();
@@ -1187,7 +1172,7 @@ impl RingStore {
     /// observability signal for how close a persistent store is to its next
     /// automatic compaction (see `maybe_auto_compact`/`set_auto_compact_threshold`).
     pub fn delta_len(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner.delta.len()
     }
 
@@ -1199,7 +1184,7 @@ impl RingStore {
     /// `MemSize` trait and direct capacity accounting), not theoretical
     /// estimates — see `GraphRing::mem_size_bytes` / `Dictionary::mem_size_bytes`.
     pub fn memory_breakdown(&self) -> MemoryBreakdown {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let ring_bytes: usize = inner.graphs.values().map(|r| r.mem_size_bytes()).sum();
         let dict_bytes = inner.dict.mem_size_bytes();
         let triple_count: usize = inner.graphs.values().map(|r| r.n()).sum();
@@ -1216,7 +1201,7 @@ impl RingStore {
     /// summed across graphs, since dedup only applies within one graph's
     /// six tries).
     pub fn per_ordering_breakdown(&self) -> PerOrderingBreakdown {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let orders = [
             SortOrder::Spo,
             SortOrder::Sop,
@@ -1327,9 +1312,7 @@ impl oxigraph_nova_core::TextSearch for RingStore {
         predicate_id: Option<u64>,
         limit: usize,
     ) -> Vec<oxigraph_nova_core::TextMatch> {
-        let Ok(inner) = self.inner.read() else {
-            return Vec::new();
-        };
+        let inner = self.inner.read();
         match &inner.fulltext {
             Some(ft) => ft.search(query, predicate_id, limit),
             None => Vec::new(),
@@ -1337,10 +1320,7 @@ impl oxigraph_nova_core::TextSearch for RingStore {
     }
 
     fn text_search_ready(&self) -> bool {
-        match self.inner.read() {
-            Ok(inner) => inner.fulltext.is_some(),
-            Err(_) => false,
-        }
+        self.inner.read().fulltext.is_some()
     }
 }
 
@@ -1412,18 +1392,18 @@ impl LftjSource for RingStore {
     }
 
     fn lftj_intern_term(&self, term: &Term) -> Option<u64> {
-        let inner = self.inner.read().ok()?;
+        let inner = self.inner.read();
         inner.dict.get_id(term).map(|id| id.as_u64())
     }
 
     fn lftj_decode_term(&self, id: u64) -> Option<Term> {
-        let inner = self.inner.read().ok()?;
+        let inner = self.inner.read();
         let tid = oxigraph_nova_core::TermId::new(id).ok()?;
         inner.dict.get_term_arc(tid).map(|arc| arc.as_ref().clone())
     }
 
     fn lftj_graph_id(&self, graph: &GraphName) -> Option<u8> {
-        let inner = self.inner.read().ok()?;
+        let inner = self.inner.read();
         inner.dict.get_graph_id(graph).map(|gid| gid.as_u8())
     }
 
@@ -1435,10 +1415,7 @@ impl LftjSource for RingStore {
         target_field: usize,
         graph_id: u8,
     ) -> u64 {
-        let inner = match self.inner.read().ok() {
-            Some(i) => i,
-            None => return u64::MAX,
-        };
+        let inner = self.inner.read();
         let g_id = GraphId(graph_id);
         match inner.graphs.get(&g_id) {
             None => 0,
@@ -1454,7 +1431,7 @@ impl LftjSource for RingStore {
         target_field: usize,
         graph_id: u8,
     ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
-        let inner = self.inner.read().ok()?;
+        let inner = self.inner.read();
         let g_id = GraphId(graph_id);
         // If the graph has no Ring entry, return an always-exhausted iterator
         // (graph exists in dict but has no compacted triples → empty scan is correct).
@@ -1465,14 +1442,11 @@ impl LftjSource for RingStore {
     }
 
     fn lftj_has_delta(&self) -> bool {
-        match self.inner.read() {
-            Ok(inner) => !inner.delta.is_empty(),
-            Err(_) => false,
-        }
+        !self.inner.read().delta.is_empty()
     }
 
     fn lftj_query_snapshot(&self) -> Option<Box<dyn LftjSnapshot + Send + Sync>> {
-        let inner = self.inner.read().ok()?;
+        let inner = self.inner.read();
         // LFTJ is gated off when delta is non-empty; don't bother snapshotting.
         if !inner.delta.is_empty() {
             return None;
@@ -1581,10 +1555,7 @@ impl QuadStore for RingStore {
     // ─────────────────────────────────────────────────────────────────────────
 
     fn insert(&self, quad: &Quad) -> Result<bool, Oxigraph> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let mut inner = self.inner.write();
 
         // Log intent durably BEFORE applying, so a crash between the two can
         // always be recovered by replaying the WAL (see wal.rs module docs).
@@ -1595,10 +1566,7 @@ impl QuadStore for RingStore {
     }
 
     fn remove(&self, quad: &Quad) -> Result<bool, Oxigraph> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let mut inner = self.inner.write();
 
         inner.wal_append(&WalRecord::RemoveQuad(quad.clone()))?;
         let result = inner.apply_remove(quad)?;
@@ -1613,10 +1581,7 @@ impl QuadStore for RingStore {
         object: Option<&Term>,
         graph_name: Option<&GraphName>,
     ) -> Result<Box<dyn Iterator<Item = Result<StoredQuad, Oxigraph>> + '_>, Oxigraph> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let inner = self.inner.read();
 
         // ── Encode filter terms (None if not in dict → return empty immediately) ──
 
@@ -1744,10 +1709,7 @@ impl QuadStore for RingStore {
     }
 
     fn len(&self) -> Result<usize, Oxigraph> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let inner = self.inner.read();
         let ring_total: usize = inner.graphs.values().map(|r| r.n()).sum();
         let delta_inserts = inner.delta.insert_count();
         let delta_tombstones = inner.delta.tombstone_count();
@@ -1755,10 +1717,7 @@ impl QuadStore for RingStore {
     }
 
     fn contains(&self, quad: &Quad) -> Result<bool, Oxigraph> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let inner = self.inner.read();
 
         let g_id = match inner.dict.get_graph_id(&quad.graph_name) {
             None => return Ok(false),
@@ -1797,10 +1756,7 @@ impl QuadStore for RingStore {
     fn known_named_graphs(
         &self,
     ) -> Result<Box<dyn Iterator<Item = Result<GraphName, Oxigraph>> + '_>, Oxigraph> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let inner = self.inner.read();
 
         let mut seen: HashSet<u8> = HashSet::new();
         let mut graphs: Vec<GraphName> = Vec::new();
@@ -1831,10 +1787,7 @@ impl QuadStore for RingStore {
 
     fn register_named_graph(&self, graph: &GraphName) -> Result<(), Oxigraph> {
         if let GraphName::NamedNode(_) = graph {
-            let mut inner = self
-                .inner
-                .write()
-                .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+            let mut inner = self.inner.write();
             inner.wal_append(&WalRecord::RegisterGraph(graph.clone()))?;
             inner.apply_register_graph(graph)?;
         }
@@ -1859,10 +1812,7 @@ impl QuadStore for RingStore {
             return Ok(0);
         }
 
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let mut inner = self.inner.write();
 
         // Log every quad's intent durably BEFORE applying any of them (one
         // batched fsync for the whole set, instead of one per quad).
@@ -1887,10 +1837,7 @@ impl QuadStore for RingStore {
             return Ok((0, 0));
         }
 
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let mut inner = self.inner.write();
 
         let records: Vec<WalRecord> = ops
             .iter()

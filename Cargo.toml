@@ -112,6 +112,13 @@ rayon = "1.10"
 # larger queries spill to the heap transparently.
 smallvec = "1.15"
 
+# Faster, non-poisoning Mutex/RwLock for hot store/dict paths (and the rest of
+# the workspace's interior-mutability locks). parking_lot::Mutex/RwLock::lock
+# never returns Result — panicking while holding a guard aborts rather than
+# poisoning, which removes the pervasive `.unwrap()` / `.map_err(|e| ...)`
+# boilerplate around every acquisition.
+parking_lot = "0.12"
+
 # ── Full-text search ────────────────────────────────────────────────────────
 # Opt-in via nova-storage-ring's `fulltext` cargo feature (crates/nova-fulltext).
 # Zero-cost when the feature is disabled: no crate in the default build graph

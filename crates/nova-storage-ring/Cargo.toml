@@ -25,6 +25,7 @@ fulltext     = ["dep:oxigraph-nova-fulltext"]
 mmap = ["epserde/mmap", "sux/mmap", "oxigraph-nova-core/mmap", "oxigraph-nova-storage-common/mmap"]
 
 [dependencies]
+parking_lot = { workspace = true }   # RingStore RwLock (no poison)
 oxigraph-nova-core = { path = "../nova-core", default-features = false }
 oxigraph-nova-storage-common = { path = "../nova-storage-common", default-features = false } # generic WAL/MANIFEST/dict-persistence machinery (backend-agnostic)
 oxigraph-nova-fulltext = { path = "../nova-fulltext", optional = true }

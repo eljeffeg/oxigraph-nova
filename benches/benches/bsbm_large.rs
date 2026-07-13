@@ -97,7 +97,6 @@
 //! `large/ingest` benchmarks.  SPARQL query benchmarks always use synthetic data
 //! since the BSBM IRIs differ from our Wikidata-style prefixes.
 
-
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Subject, Term};
 use oxigraph_nova_query::{Dataset, Evaluator, QueryResult, StoreDataset};

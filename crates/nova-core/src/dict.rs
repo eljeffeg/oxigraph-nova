@@ -70,9 +70,10 @@ use crate::dict_compact::{
 };
 use epserde::deser::MemCase;
 use oxrdf::{BlankNode, GraphName, NamedNode, Term};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Capacity of the `TermId`-keyed decode cache on the live dictionary and
 /// the query-scoped sequential snapshot.
@@ -444,7 +445,7 @@ impl Dictionary {
         match self.id_to_term.get(id.as_u64() as usize) {
             Some(Some(arc)) => Some(Arc::clone(arc)),
             Some(None) => {
-                if let Some(arc) = self.decode_cache.lock().unwrap().get(&id) {
+                if let Some(arc) = self.decode_cache.lock().get(&id) {
                     return Some(Arc::clone(arc));
                 }
                 // Cache miss: Front-Coding forces decoding the *entire*
@@ -458,7 +459,7 @@ impl Dictionary {
                 // over hundreds of thousands of subjects).
                 let block = self.compacted.decode_block_for_id(id.as_u64())?;
                 let mut wanted: Option<Arc<Term>> = None;
-                let mut cache = self.decode_cache.lock().unwrap();
+                let mut cache = self.decode_cache.lock();
                 for (orig_id, result) in block {
                     if let Ok(arc) = result {
                         let tid = TermId(orig_id);
@@ -599,7 +600,7 @@ impl Dictionary {
         // Ranks/block offsets shift on every compaction — any previously
         // cached decode results may point at stale offsets, so drop them
         // all rather than trying to selectively invalidate.
-        self.decode_cache.lock().unwrap().clear();
+        self.decode_cache.lock().clear();
         Ok(())
     }
 
@@ -1066,12 +1067,12 @@ impl DictDecodeSnapshot {
         match self.id_to_term.get(id.as_u64() as usize) {
             Some(Some(arc)) => Some(Arc::clone(arc)),
             Some(None) => {
-                if let Some(arc) = self.decode_cache.lock().unwrap().get(&id) {
+                if let Some(arc) = self.decode_cache.lock().get(&id) {
                     return Some(Arc::clone(arc));
                 }
                 let block = self.compacted.decode_block_for_id(id.as_u64())?;
                 let mut wanted: Option<Arc<Term>> = None;
-                let mut cache = self.decode_cache.lock().unwrap();
+                let mut cache = self.decode_cache.lock();
                 for (orig_id, result) in block {
                     if let Ok(arc) = result {
                         let tid = TermId(orig_id);
@@ -1322,7 +1323,7 @@ mod tests {
             let _ = d.get_term_arc(id);
         }
         assert!(
-            !d.decode_cache.lock().unwrap().is_empty(),
+            !d.decode_cache.lock().is_empty(),
             "cache should be warm before the second compaction"
         );
 
@@ -1334,7 +1335,7 @@ mod tests {
         }
         d.compact().unwrap();
         assert_eq!(
-            d.decode_cache.lock().unwrap().len(),
+            d.decode_cache.lock().len(),
             0,
             "decode_cache must be cleared immediately after compact()"
         );
@@ -1370,12 +1371,12 @@ mod tests {
         for &id in &ids {
             let _ = d.get_term_arc(id);
             assert!(
-                d.decode_cache.lock().unwrap().len() <= DECODE_CACHE_CAPACITY,
+                d.decode_cache.lock().len() <= DECODE_CACHE_CAPACITY,
                 "decode_cache must never exceed its configured capacity"
             );
         }
         assert_eq!(
-            d.decode_cache.lock().unwrap().len(),
+            d.decode_cache.lock().len(),
             DECODE_CACHE_CAPACITY,
             "after decoding more ids than capacity, the cache should be fully (but not over-) populated"
         );
@@ -1401,7 +1402,7 @@ mod tests {
             let _ = snap.get_term_arc(id);
         }
         assert!(
-            !snap.decode_cache.lock().unwrap().is_empty(),
+            !snap.decode_cache.lock().is_empty(),
             "sequential snapshot cache should be warm"
         );
 
@@ -1419,12 +1420,12 @@ mod tests {
             "worker clone must Arc-share graph_to_id"
         );
         assert_eq!(
-            worker.decode_cache.lock().unwrap().len(),
+            worker.decode_cache.lock().len(),
             0,
             "worker clone must start with a fresh empty cache"
         );
         assert_eq!(
-            worker.decode_cache.lock().unwrap().cap().get(),
+            worker.decode_cache.lock().cap().get(),
             WORKER_DECODE_CACHE_CAPACITY,
             "worker clone must use the smaller worker capacity"
         );

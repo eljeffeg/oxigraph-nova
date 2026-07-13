@@ -17,6 +17,7 @@ default = ["mmap"]
 mmap = ["epserde/mmap", "sux/mmap"]
 
 [dependencies]
+parking_lot = { workspace = true }   # Dict decode-cache Mutex (no poison)
 oxrdf        = { workspace = true }
 anyhow       = { workspace = true }
 thiserror    = { workspace = true }

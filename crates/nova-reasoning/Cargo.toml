@@ -13,6 +13,7 @@ default = ["mmap"]
 mmap = ["oxigraph-nova-core/mmap"]
 
 [dependencies]
+parking_lot = { workspace = true }   # ReasoningState overlay RwLock
 oxigraph-nova-core = { path = "../nova-core", default-features = false }
 # `engine`/`reasoning_dataset` operate at the `Dataset` seam (not raw
 # `QuadStore`) so `ReasoningDataset<D: Dataset>` can wrap any SPARQL-facing

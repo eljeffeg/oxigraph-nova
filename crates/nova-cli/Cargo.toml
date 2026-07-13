@@ -21,6 +21,7 @@ geosparql = ["oxigraph-nova-server/geosparql"]
 
 
 [dependencies]
+parking_lot = { workspace = true }   # load error-slot Mutex
 oxigraph-nova-core         = { path = "../nova-core" }
 oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
 oxigraph-nova-query        = { path = "../nova-query" }
