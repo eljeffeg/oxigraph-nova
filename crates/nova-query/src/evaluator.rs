@@ -176,7 +176,11 @@ fn text_search_call(expr: &Expression) -> Option<(Variable, String, TextFn)> {
 ///
 /// - No `dataset` clause at all (no `FROM`/`FROM NAMED` anywhere in the
 ///   query) → the store's actual default graph is used, as before
-///   (`GraphSelector::Default`).
+///   (`GraphSelector::Default`) — unless the server-wide
+///   `union_default_graph` toggle is enabled (equivalent to upstream
+///   Oxigraph's `serve --union-default-graph`), in which case the RDF merge
+///   of the default graph and every named graph is used instead
+///   (`GraphSelector::Union`).
 /// - A `dataset` clause is present (i.e. the query has at least one `FROM`
 ///   or `FROM NAMED`) → the *effective* default graph for evaluating the
 ///   query's top-level pattern becomes the RDF merge of exactly the graphs
@@ -184,9 +188,15 @@ fn text_search_call(expr: &Expression) -> Option<(Variable, String, TextFn)> {
 ///   `GraphSelector::UnionOf`. Per spec this is true even when `dataset.default`
 ///   is empty (i.e., only `FROM NAMED` was specified): the effective default
 ///   graph is then empty, matching no quads, which `UnionOf(vec![])` does
-///   correctly (`graph_matches` returns `false` for every graph).
-fn dataset_clause_selector(dataset: Option<&spargebra::algebra::QueryDataset>) -> GraphSelector {
+///   correctly (`graph_matches` returns `false` for every graph). A query's
+///   own dataset clause always takes precedence over the server-wide
+///   `union_default_graph` toggle.
+fn dataset_clause_selector(
+    dataset: Option<&spargebra::algebra::QueryDataset>,
+    union_default_graph: bool,
+) -> GraphSelector {
     match dataset {
+        None if union_default_graph => GraphSelector::Union,
         None => GraphSelector::Default,
         Some(ds) => GraphSelector::UnionOf(
             ds.default
@@ -456,7 +466,8 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
 
         match query {
             Query::Select { pattern, .. } => {
-                let active_graph = dataset_clause_selector(query.dataset());
+                let active_graph =
+                    dataset_clause_selector(query.dataset(), self.options.union_default_graph);
                 let pattern = optimize_pattern(pattern);
                 let solutions = self.eval_pattern(&pattern, &active_graph)?;
                 let vars: Arc<[Variable]> = projected_variables(query).into();
@@ -464,7 +475,8 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 Ok(QueryResult::Solutions { vars, stream })
             }
             Query::Ask { pattern, .. } => {
-                let active_graph = dataset_clause_selector(query.dataset());
+                let active_graph =
+                    dataset_clause_selector(query.dataset(), self.options.union_default_graph);
                 let pattern = optimize_pattern(pattern);
                 let solutions = self.eval_pattern(&pattern, &active_graph)?;
                 Ok(QueryResult::Boolean(!solutions.is_empty()))
@@ -472,7 +484,8 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             Query::Construct {
                 template, pattern, ..
             } => {
-                let active_graph = dataset_clause_selector(query.dataset());
+                let active_graph =
+                    dataset_clause_selector(query.dataset(), self.options.union_default_graph);
                 let pattern = optimize_pattern(pattern);
                 let solutions = self.eval_pattern(&pattern, &active_graph)?;
 

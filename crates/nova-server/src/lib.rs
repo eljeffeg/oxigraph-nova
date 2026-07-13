@@ -275,6 +275,12 @@ pub struct AppState<S: QuadStore + 'static> {
     /// doc comment for the important caveat about what this does and does
     /// not guarantee.
     pub read_only: bool,
+    /// Server-wide default equivalent to upstream Oxigraph's
+    /// `serve --union-default-graph`, configured via
+    /// `Server::with_union_default_graph` / `--union-default-graph`.
+    /// Threaded into every query's `QueryOptions` (see
+    /// `oxigraph_nova_query::options::QueryOptions::union_default_graph`).
+    pub union_default_graph: bool,
 }
 
 /// Manual `Clone` impl — `Arc<S>` is always `Clone` regardless of whether `S`
@@ -291,6 +297,7 @@ impl<S: QuadStore + 'static> Clone for AppState<S> {
             service_handler: self.service_handler.clone(),
             reasoning: self.reasoning.clone(),
             read_only: self.read_only,
+            union_default_graph: self.union_default_graph,
         }
     }
 }
@@ -324,6 +331,7 @@ pub struct Server<S: QuadStore + 'static> {
     service_handler: Option<Arc<dyn ServiceHandler>>,
     reasoning: Option<Arc<ReasoningState<S>>>,
     read_only: bool,
+    union_default_graph: bool,
 }
 
 impl<S: QuadStore + Send + Sync + 'static> Server<S> {
@@ -346,6 +354,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             service_handler: default_service_handler(),
             reasoning: None,
             read_only: false,
+            union_default_graph: false,
         }
     }
 
@@ -428,6 +437,19 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
         self
     }
 
+    /// Enable a server-wide default equivalent to upstream Oxigraph's
+    /// `serve --union-default-graph`: a query with *no* `FROM`/`FROM NAMED`
+    /// dataset clause of its own then uses the RDF merge of the default
+    /// graph and every named graph as its effective default graph, instead
+    /// of just the store's actual default graph. A query that specifies its
+    /// own `FROM`/`FROM NAMED` clause is unaffected either way. See
+    /// `oxigraph_nova_query::options::QueryOptions::union_default_graph`'s
+    /// doc comment for the full semantics.
+    pub fn with_union_default_graph(mut self, on: bool) -> Self {
+        self.union_default_graph = on;
+        self
+    }
+
     /// Build the axum `Router`.
     ///
     /// Returns a router that can be used directly in integration tests via
@@ -445,6 +467,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             service_handler: self.service_handler,
             reasoning: self.reasoning,
             read_only: self.read_only,
+            union_default_graph: self.union_default_graph,
         };
 
         Router::new()
@@ -638,6 +661,7 @@ async fn service_description_get<S: QuadStore + 'static>(
         state.text_search.is_some(),
         state.reasoning.is_some(),
         service_description::GEOSPARQL_COMPILED_IN,
+        state.union_default_graph,
     );
 
     serialize_triples(&graph, accept_header(&headers))
@@ -1220,6 +1244,9 @@ async fn execute_sparql_query<S: QuadStore + 'static>(
     }
     if let Some(handler) = &state.service_handler {
         options = options.with_service_handler(Arc::clone(handler));
+    }
+    if state.union_default_graph {
+        options = options.with_union_default_graph(true);
     }
     let cancellation = state.query_timeout.map(|_| CancellationToken::new());
     if let Some(token) = &cancellation {
@@ -2797,6 +2824,151 @@ mod tests {
             body.contains("http://example.org/sparql"),
             "expected sd:endpoint to use Host header: {body}"
         );
+    }
+
+    // ── serve --union-default-graph ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_service_description_omits_union_default_graph_by_default() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header("accept", "application/n-triples")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(
+            !body.contains("http://www.w3.org/ns/sparql-service-description#UnionDefaultGraph"),
+            "must not advertise sd:UnionDefaultGraph when the server was not built with \
+             Server::with_union_default_graph, got:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_description_advertises_union_default_graph_when_enabled() {
+        let router = Server::new(make_store())
+            .with_union_default_graph(true)
+            .into_router();
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header("accept", "application/n-triples")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(
+            body.contains("http://www.w3.org/ns/sparql-service-description#UnionDefaultGraph"),
+            "expected sd:UnionDefaultGraph to be advertised when \
+             Server::with_union_default_graph(true) was used, got:\n{body}"
+        );
+    }
+
+    /// A store with one triple in the default graph and another, distinct
+    /// triple only in a named graph — used to distinguish "see only the
+    /// actual default graph" from "see the RDF merge of default + every
+    /// named graph" (`GraphSelector::Union`).
+    fn make_store_with_named_graph() -> Arc<MemoryStore> {
+        let store = make_store();
+        store
+            .insert(&Quad::new(
+                NamedNode::new_unchecked("http://ex/onlyinnamed"),
+                NamedNode::new_unchecked("http://ex/name"),
+                Term::Literal(Literal::new_simple_literal("OnlyInNamed")),
+                GraphName::NamedNode(NamedNode::new_unchecked("http://ex/g1")),
+            ))
+            .unwrap();
+        store
+    }
+
+    /// A FROM-less query must NOT see a named-graph-only triple by default
+    /// (the store's actual default graph is used, matching pre-existing
+    /// behavior exactly).
+    #[tokio::test]
+    async fn from_less_query_does_not_see_named_graph_by_default() {
+        let router = Server::new(make_store_with_named_graph()).into_router();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(
+                "ASK { <http://ex/onlyinnamed> <http://ex/name> \"OnlyInNamed\" }",
+            ))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["boolean"], false,
+            "without --union-default-graph, a FROM-less query must only see the \
+             store's actual default graph, got: {json}"
+        );
+    }
+
+    /// The same FROM-less query DOES see the named-graph-only triple once
+    /// `Server::with_union_default_graph(true)` is set — the effective
+    /// default graph becomes the RDF merge of the default graph and every
+    /// named graph.
+    #[tokio::test]
+    async fn from_less_query_sees_named_graph_when_union_default_graph_enabled() {
+        let router = Server::new(make_store_with_named_graph())
+            .with_union_default_graph(true)
+            .into_router();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sparql")
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(
+                "ASK { <http://ex/onlyinnamed> <http://ex/name> \"OnlyInNamed\" }",
+            ))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["boolean"], true,
+            "with --union-default-graph, a FROM-less query must see the RDF merge \
+             of the default graph and every named graph, got: {json}"
+        );
+    }
+
+    /// A query with its OWN `FROM`/`FROM NAMED` dataset clause must be
+    /// unaffected by `--union-default-graph` either way — the query's own
+    /// clause always takes precedence (see
+    /// `oxigraph_nova_query::evaluator::dataset_clause_selector`).
+    #[tokio::test]
+    async fn explicit_from_clause_unaffected_by_union_default_graph_flag() {
+        let sparql = "ASK FROM <http://ex/g1> { <http://ex/onlyinnamed> <http://ex/name> \"OnlyInNamed\" }";
+
+        for union_default_graph in [false, true] {
+            let mut builder = Server::new(make_store_with_named_graph());
+            if union_default_graph {
+                builder = builder.with_union_default_graph(true);
+            }
+            let router = builder.into_router();
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/sparql")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap();
+
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = body_json(resp).await;
+            assert_eq!(
+                json["boolean"], true,
+                "explicit FROM <http://ex/g1> must see the triple regardless of \
+                 union_default_graph={union_default_graph}, got: {json}"
+            );
+        }
     }
 
     // ── Graph Store HTTP Protocol: DELETE /store ──────────────────────────────

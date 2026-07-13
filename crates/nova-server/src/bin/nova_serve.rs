@@ -134,6 +134,7 @@ async fn main() {
     #[cfg_attr(not(feature = "fulltext"), allow(unused_mut))]
     let mut fulltext = false;
     let mut reasoning = false;
+    let mut union_default_graph = false;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -205,11 +206,14 @@ async fn main() {
             "--reasoning" => {
                 reasoning = true;
             }
+            "--union-default-graph" => {
+                union_default_graph = true;
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: nova_serve [--file <dataset> [--graph <iri>]]... [--location <dir>] \
                      [--bind 0.0.0.0:3030] [--compact-threshold <n>] [--sync-interval-ms <n>] \
-                     [--reasoning] [--fulltext]\n\
+                     [--reasoning] [--fulltext] [--union-default-graph]\n\
                      \n\
                      --file <file> (matching `oxigraph load --file`): bulk-load an RDF file.\n\
                      May be given more than once; each occurrence loads one more file. RDF\n\
@@ -271,7 +275,14 @@ async fn main() {
                      incrementally on the store's compaction cycle. Requires this binary\n\
                      to have been built with the `fulltext` cargo feature\n\
                      (`cargo run -p oxigraph-nova-server --features fulltext --bin nova_serve`);\n\
-                     passing --fulltext without that feature enabled is a hard error."
+                     passing --fulltext without that feature enabled is a hard error.\n\
+                     \n\
+                     --union-default-graph: server-wide default equivalent to upstream\n\
+                     Oxigraph's `oxigraph serve --union-default-graph` — a query with no\n\
+                     `FROM`/`FROM NAMED` dataset clause of its own then uses the RDF merge\n\
+                     of the default graph and every named graph as its effective default\n\
+                     graph, instead of just the store's actual default graph. A query that\n\
+                     specifies its own `FROM`/`FROM NAMED` clause is unaffected either way."
                 );
                 return;
             }
@@ -499,6 +510,10 @@ async fn main() {
         eprintln!("[nova_serve] Enabling OWL 2 RL reasoning (LftjFixpointEngine) ...");
         let engine: Arc<dyn ReasoningEngine> = Arc::new(LftjFixpointEngine::new());
         server = server.with_reasoning(engine);
+    }
+    if union_default_graph {
+        eprintln!("[nova_serve] Enabling server-wide union-default-graph ...");
+        server = server.with_union_default_graph(true);
     }
     server.run(&bind).await.expect("server failed");
 }

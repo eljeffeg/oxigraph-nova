@@ -66,6 +66,17 @@ mod sd {
     pub fn empty_graphs() -> NamedNode {
         NamedNode::new_unchecked("http://www.w3.org/ns/sparql-service-description#EmptyGraphs")
     }
+    /// `sd:UnionDefaultGraph` — declares that the default graph exposed to a
+    /// query with no `FROM`/`FROM NAMED` dataset clause of its own is the RDF
+    /// merge of the store's actual default graph and every named graph,
+    /// matching upstream Oxigraph's `oxigraph serve --union-default-graph`.
+    /// See `generate_service_description_graph`'s `union_default_graph_enabled`
+    /// parameter.
+    pub fn union_default_graph() -> NamedNode {
+        NamedNode::new_unchecked(
+            "http://www.w3.org/ns/sparql-service-description#UnionDefaultGraph",
+        )
+    }
     pub fn sparql_10_query() -> NamedNode {
         NamedNode::new_unchecked("http://www.w3.org/ns/sparql-service-description#SPARQL10Query")
     }
@@ -182,11 +193,17 @@ pub const GEOSPARQL_COMPILED_IN: bool = cfg!(feature = "geosparql");
 /// from [`GEOSPARQL_COMPILED_IN`] (a compile-time constant; unlike
 /// `fulltext`/`reasoning`, GeoSPARQL functions are pure and need no runtime
 /// `--geosparql` flag or server-side state).
+///
+/// `union_default_graph_enabled`: when `true`, advertises `sd:UnionDefaultGraph`
+/// as a `sd:feature` — set from whether the server was constructed with
+/// `Server::with_union_default_graph` (i.e. `--union-default-graph` was
+/// passed), matching upstream Oxigraph's `oxigraph serve --union-default-graph`.
 pub fn generate_service_description_graph(
     endpoint_url: &str,
     fulltext_enabled: bool,
     reasoning_enabled: bool,
     geosparql_enabled: bool,
+    union_default_graph_enabled: bool,
 ) -> Vec<Triple> {
     let root = NamedOrBlankNode::BlankNode(BlankNode::default());
     let mut graph = Vec::new();
@@ -265,11 +282,21 @@ pub fn generate_service_description_graph(
 
     // `sd:EmptyGraphs` — Nova allows a named graph to exist with zero triples
     // (e.g. after Graph Store Protocol `PUT` with an empty body, or `CREATE`),
-    // matching upstream. No `sd:UnionDefaultGraph`: Nova has no server-level
-    // "union default graph" toggle (upstream's `--union-default-graph` CLI
-    // flag) — `FROM`/`FROM NAMED`-driven union semantics are a per-query RDF
-    // Dataset construction detail (SPARQL spec, not a `sd:feature`).
+    // matching upstream.
     graph.push(Triple::new(root.clone(), sd::feature(), sd::empty_graphs()));
+
+    // `sd:UnionDefaultGraph` — only when the server was started with
+    // `--union-default-graph` (`Server::with_union_default_graph`); matches
+    // upstream Oxigraph's `oxigraph serve --union-default-graph` semantics.
+    // A query with its own `FROM`/`FROM NAMED` dataset clause is unaffected
+    // either way (see `oxigraph_nova_query::evaluator::dataset_clause_selector`).
+    if union_default_graph_enabled {
+        graph.push(Triple::new(
+            root.clone(),
+            sd::feature(),
+            sd::union_default_graph(),
+        ));
+    }
 
     let entailment_regime = if reasoning_enabled {
         "http://www.w3.org/ns/entailment/OWL-RL"

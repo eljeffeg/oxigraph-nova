@@ -8,8 +8,7 @@
 //! `convert`, `optimize`, `serve-read-only` — matching upstream's full
 //! subcommand surface (some flags are trimmed relative to upstream where
 //! Nova doesn't yet implement the corresponding capability — e.g. no
-//! `--explain`/`--stats`/`--union-default-graph`/`--lenient`/stdin input for
-//! `query`/`update`.
+//! `--explain`/`--stats`/stdin input for `query`/`update`.
 
 use clap::{Parser, Subcommand, ValueHint};
 use std::path::PathBuf;
@@ -78,6 +77,15 @@ pub enum Command {
         /// same base IRI is applied to each.
         #[arg(long, value_hint = ValueHint::Url)]
         base: Option<String>,
+        /// Attempt to keep loading even if the data file is invalid
+        ///
+        /// This disables most of the validation on RDF content (via
+        /// `oxrdfio::RdfParser::lenient`), matching upstream `oxigraph
+        /// load`'s `--lenient` flag — useful for ingesting slightly-invalid
+        /// real-world dumps (e.g. Wikidata) at the cost of silently
+        /// accepting some malformed input rather than erroring on it.
+        #[arg(long)]
+        lenient: bool,
     },
     /// Create a database backup into a target directory
     ///
@@ -211,6 +219,13 @@ pub enum Command {
         /// pass through unchanged.
         #[arg(long, value_hint = ValueHint::Url)]
         to_graph: Option<String>,
+        /// Attempt to keep converting even if the data file is invalid
+        ///
+        /// This disables most of the validation on RDF content (via
+        /// `oxrdfio::RdfParser::lenient`), matching upstream `oxigraph
+        /// convert`'s `--lenient` flag.
+        #[arg(long)]
+        lenient: bool,
     },
     /// Force storage compaction on a persistent store
     ///
@@ -267,6 +282,15 @@ pub enum Command {
         /// hard error at startup.
         #[arg(long)]
         fulltext: bool,
+        /// Server-wide default equivalent to upstream Oxigraph's `oxigraph
+        /// serve --union-default-graph`: a query with no `FROM`/`FROM NAMED`
+        /// dataset clause of its own then uses the RDF merge of the default
+        /// graph and every named graph as its effective default graph,
+        /// instead of just the store's actual default graph. A query that
+        /// specifies its own `FROM`/`FROM NAMED` clause is unaffected either
+        /// way.
+        #[arg(long)]
+        union_default_graph: bool,
     },
     /// Start the Nova SPARQL 1.2 HTTP server
     ///
@@ -329,5 +353,14 @@ pub enum Command {
         /// hard error at startup.
         #[arg(long)]
         fulltext: bool,
+        /// Server-wide default equivalent to upstream Oxigraph's `oxigraph
+        /// serve --union-default-graph`: a query with no `FROM`/`FROM NAMED`
+        /// dataset clause of its own then uses the RDF merge of the default
+        /// graph and every named graph as its effective default graph,
+        /// instead of just the store's actual default graph. A query that
+        /// specifies its own `FROM`/`FROM NAMED` clause is unaffected either
+        /// way.
+        #[arg(long)]
+        union_default_graph: bool,
     },
 }

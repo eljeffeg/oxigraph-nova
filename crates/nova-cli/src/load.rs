@@ -88,14 +88,24 @@ pub(crate) fn resolve_format_opt(format: Option<&str>, path: Option<&Path>) -> R
 
 /// Build a configured [`RdfParser`] for `fmt`, applying `graph` (as the
 /// default graph, for plain-triple formats) and `base` (as the base IRI,
-/// for formats that support relative IRIs) if given.
-fn make_parser(fmt: RdfFormat, graph: Option<&GraphName>, base: Option<&str>) -> Result<RdfParser> {
+/// for formats that support relative IRIs) if given. `lenient` disables
+/// most RDF content validation (see `oxrdfio::RdfParser::lenient`),
+/// matching `--lenient`.
+fn make_parser(
+    fmt: RdfFormat,
+    graph: Option<&GraphName>,
+    base: Option<&str>,
+    lenient: bool,
+) -> Result<RdfParser> {
     let target_graph = graph.cloned().unwrap_or(GraphName::DefaultGraph);
     let mut parser = RdfParser::from_format(fmt).with_default_graph(target_graph);
     if let Some(base_iri) = base {
         parser = parser
             .with_base_iri(base_iri)
             .with_context(|| format!("invalid --base IRI {base_iri:?}"))?;
+    }
+    if lenient {
+        parser = parser.lenient();
     }
     Ok(parser)
 }
@@ -125,11 +135,12 @@ pub fn load_sources_into_store(
     format: Option<&str>,
     graph: Option<&GraphName>,
     base: Option<&str>,
+    lenient: bool,
 ) -> Result<usize> {
     match files {
-        [] => load_stdin(store, format, graph, base),
-        [single] => load_single_file(store, single, format, graph, base),
-        multiple => load_multiple_files(store, multiple, format, graph, base),
+        [] => load_stdin(store, format, graph, base, lenient),
+        [single] => load_single_file(store, single, format, graph, base, lenient),
+        multiple => load_multiple_files(store, multiple, format, graph, base, lenient),
     }
 }
 
@@ -143,6 +154,7 @@ fn load_stdin(
     format: Option<&str>,
     graph: Option<&GraphName>,
     base: Option<&str>,
+    lenient: bool,
 ) -> Result<usize> {
     let name = format.with_context(
         || "--format is required when reading from stdin (no file extension to guess it from)",
@@ -158,7 +170,7 @@ fn load_stdin(
     warn_if_graph_ignored(fmt, graph);
 
     let reader = BufReader::new(std::io::stdin());
-    stream_into_store(store, make_parser(fmt, graph, base)?, reader, fmt)
+    stream_into_store(store, make_parser(fmt, graph, base, lenient)?, reader, fmt)
 }
 
 fn load_single_file(
@@ -167,13 +179,14 @@ fn load_single_file(
     format: Option<&str>,
     graph: Option<&GraphName>,
     base: Option<&str>,
+    lenient: bool,
 ) -> Result<usize> {
     let fmt = resolve_format(format, path)?;
     warn_if_graph_ignored(fmt, graph);
 
     let f = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(f);
-    stream_into_store(store, make_parser(fmt, graph, base)?, reader, fmt)
+    stream_into_store(store, make_parser(fmt, graph, base, lenient)?, reader, fmt)
 }
 
 /// Feed a single reader's parsed quads directly into `bulk_load`, without
@@ -235,6 +248,7 @@ fn load_multiple_files(
     format: Option<&str>,
     graph: Option<&GraphName>,
     base: Option<&str>,
+    lenient: bool,
 ) -> Result<usize> {
     // Resolve each file's format/parser up front (cheap, and surfaces
     // "can't guess format" errors before spawning any threads).
@@ -242,7 +256,7 @@ fn load_multiple_files(
     for path in files {
         let fmt = resolve_format(format, path)?;
         warn_if_graph_ignored(fmt, graph);
-        parsers.push((path.clone(), fmt, make_parser(fmt, graph, base)?));
+        parsers.push((path.clone(), fmt, make_parser(fmt, graph, base, lenient)?));
     }
 
     let (tx, rx) = mpsc::sync_channel::<Result<Quad, String>>(CHANNEL_BOUND);

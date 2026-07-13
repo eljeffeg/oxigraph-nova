@@ -107,6 +107,16 @@ pub struct QueryOptions {
     /// and a `SILENT` one evaluates to zero solutions — unchanged from the
     /// evaluator's behavior before this field existed.
     pub service_handler: Option<Arc<dyn ServiceHandler>>,
+    /// Server-wide default equivalent to upstream Oxigraph's
+    /// `serve --union-default-graph`: when `true`, a query with *no*
+    /// `FROM`/`FROM NAMED` dataset clause of its own uses the RDF merge of
+    /// the default graph and every named graph (`GraphSelector::Union`) as
+    /// its effective default graph, instead of just the store's actual
+    /// default graph. A query that *does* specify its own dataset clause is
+    /// unaffected either way (its `FROM`/`FROM NAMED` graphs always take
+    /// precedence — see `evaluator::dataset_clause_selector`). `false`
+    /// (the default) preserves the pre-existing behavior exactly.
+    pub union_default_graph: bool,
 }
 
 impl QueryOptions {
@@ -136,6 +146,13 @@ impl QueryOptions {
     /// clause errors and a `SILENT` one evaluates to zero solutions.
     pub fn with_service_handler(mut self, handler: Arc<dyn ServiceHandler>) -> Self {
         self.service_handler = Some(handler);
+        self
+    }
+
+    /// Enable/disable the server-wide union-default-graph default; see
+    /// [`QueryOptions::union_default_graph`]'s doc comment.
+    pub fn with_union_default_graph(mut self, on: bool) -> Self {
+        self.union_default_graph = on;
         self
     }
 

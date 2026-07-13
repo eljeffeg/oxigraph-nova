@@ -523,6 +523,86 @@ fn dump_to_file_roundtrips_through_load() {
     );
 }
 
+/// An N-Triples line with a too-long `@lang` tag — rejected by strict
+/// parsing, but accepted once `.lenient()` is applied (see `oxttl`'s own
+/// `lenient_parsing` test in `ntriples.rs`, which uses this exact fixture).
+const INVALID_LANGTAG_NT: &str = "<http://ex/s> <http://ex/p> \"baz\"@toolonglangtag .\n";
+
+#[test]
+fn load_without_lenient_rejects_invalid_langtag() {
+    let dir = TempDir::new("load_strict_langtag");
+    let path = dir.path().join("bad.nt");
+    std::fs::write(&path, INVALID_LANGTAG_NT).unwrap();
+
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success(),
+        "expected strict load of a too-long @lang tag to fail"
+    );
+}
+
+#[test]
+fn load_lenient_accepts_invalid_langtag() {
+    let dir = TempDir::new("load_lenient_langtag");
+    let path = dir.path().join("bad.nt");
+    std::fs::write(&path, INVALID_LANGTAG_NT).unwrap();
+
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        path.to_str().unwrap(),
+        "--lenient",
+    ]);
+    assert_success(&out, "load --lenient");
+    assert!(
+        stdout_str(&out).contains("1 triples"),
+        "expected --lenient to let the too-long @lang tag through, got: {}",
+        stdout_str(&out)
+    );
+}
+
+#[test]
+fn convert_without_lenient_rejects_invalid_langtag() {
+    let out = run_stdin(
+        &["convert", "--from-format", "nt", "--to-format", "nt"],
+        INVALID_LANGTAG_NT,
+    );
+    assert!(
+        !out.status.success(),
+        "expected strict convert of a too-long @lang tag to fail"
+    );
+}
+
+#[test]
+fn convert_lenient_accepts_invalid_langtag() {
+    let out = run_stdin(
+        &[
+            "convert",
+            "--from-format",
+            "nt",
+            "--to-format",
+            "nt",
+            "--lenient",
+        ],
+        INVALID_LANGTAG_NT,
+    );
+    assert_success(&out, "convert --lenient");
+    assert!(
+        stdout_str(&out).contains("toolonglangtag"),
+        "expected --lenient to let the too-long @lang tag through, got: {}",
+        stdout_str(&out)
+    );
+    assert!(stderr_str(&out).contains("Converted 1 quads"));
+}
+
 #[test]
 fn convert_stdin_to_stdout_ttl_to_nt() {
     let out = run_stdin(
@@ -665,4 +745,93 @@ fn serve_read_only_rejects_writes_over_http() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// `oxigraph serve --union-default-graph`: a FROM-less query must see the
+/// RDF merge of the default graph and every named graph, instead of just
+/// the store's actual default graph — exercised end-to-end through the
+/// real CLI subcommand/process wiring (`cli.rs`'s clap flag → `main.rs`'s
+/// `run_serve` → `Server::with_union_default_graph`).
+#[test]
+fn serve_union_default_graph_makes_from_less_query_see_named_graph() {
+    let dir = TempDir::new("union_default_graph");
+
+    // Load one triple into the default graph and another into a named
+    // graph.
+    let default_path = dir.path().join("default.nt");
+    std::fs::write(
+        &default_path,
+        "<http://ex/alice> <http://ex/name> \"Alice\" .\n",
+    )
+    .unwrap();
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        default_path.to_str().unwrap(),
+    ]);
+    assert_success(&out, "load (default graph)");
+
+    let named_path = dir.path().join("named.nt");
+    std::fs::write(
+        &named_path,
+        "<http://ex/onlyinnamed> <http://ex/name> \"OnlyInNamed\" .\n",
+    )
+    .unwrap();
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        named_path.to_str().unwrap(),
+        "--graph",
+        "http://ex/g1",
+    ]);
+    assert_success(&out, "load (named graph)");
+
+    let port = 22000 + (std::process::id() % 9000) as u16;
+    let bind = format!("127.0.0.1:{port}");
+    let mut child = Command::new(oxigraph_bin())
+        .args([
+            "serve",
+            "--location",
+            dir.path().to_str().unwrap(),
+            "--bind",
+            &bind,
+            "--union-default-graph",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn `oxigraph serve --union-default-graph`");
+
+    let ask_url = format!(
+        "http://{bind}/sparql?query=ASK%20%7B%20%3Chttp%3A%2F%2Fex%2Fonlyinnamed%3E%20\
+         %3Chttp%3A%2F%2Fex%2Fname%3E%20%22OnlyInNamed%22%20%7D"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut resp = loop {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("oxigraph serve --union-default-graph did not become ready within 10s");
+        }
+        match ureq::get(&ask_url).call() {
+            Ok(resp) => break resp,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+
+    let body = resp
+        .body_mut()
+        .read_to_string()
+        .expect("ASK response body was not UTF-8 text");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        body.contains("\"boolean\":true") || body.contains("\"boolean\": true"),
+        "expected --union-default-graph to make a FROM-less query see the named-graph-only \
+         triple, got: {body}"
+    );
 }

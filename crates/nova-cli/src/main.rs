@@ -74,12 +74,14 @@ fn main() -> anyhow::Result<()> {
             format,
             graph,
             base,
+            lenient,
         } => run_load(
             &location,
             &file,
             format.as_deref(),
             graph.as_deref(),
             base.as_deref(),
+            lenient,
         ),
         Command::Backup {
             location,
@@ -122,6 +124,7 @@ fn main() -> anyhow::Result<()> {
             from_graph,
             from_default_graph,
             to_graph,
+            lenient,
         } => run_convert(
             from_file.as_deref(),
             from_format.as_deref(),
@@ -130,6 +133,7 @@ fn main() -> anyhow::Result<()> {
             from_graph.as_deref(),
             from_default_graph,
             to_graph.as_deref(),
+            lenient,
         ),
         Command::Optimize { location } => run_optimize(&location),
         Command::ServeReadOnly {
@@ -139,6 +143,7 @@ fn main() -> anyhow::Result<()> {
             max_results,
             max_parallel_queries,
             fulltext,
+            union_default_graph,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_serve_read_only(
@@ -148,6 +153,7 @@ fn main() -> anyhow::Result<()> {
                 max_results,
                 max_parallel_queries,
                 fulltext,
+                union_default_graph,
             ))
         }
         Command::Serve {
@@ -160,6 +166,7 @@ fn main() -> anyhow::Result<()> {
             max_results,
             max_parallel_queries,
             fulltext,
+            union_default_graph,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_serve(
@@ -172,6 +179,7 @@ fn main() -> anyhow::Result<()> {
                 max_results,
                 max_parallel_queries,
                 fulltext,
+                union_default_graph,
             ))
         }
     }
@@ -190,6 +198,7 @@ fn run_load(
     format: Option<&str>,
     graph: Option<&str>,
     base: Option<&str>,
+    lenient: bool,
 ) -> anyhow::Result<()> {
     let graph_name = parse_graph_name(graph)?;
 
@@ -208,7 +217,8 @@ fn run_load(
         ),
     }
     let t0 = Instant::now();
-    let count = load::load_sources_into_store(&store, files, format, graph_name.as_ref(), base)?;
+    let count =
+        load::load_sources_into_store(&store, files, format, graph_name.as_ref(), base, lenient)?;
     // See `oxigraph_nova_server::mimalloc_tuning::mimalloc_collect_now`'s doc
     // comment: force an eager purge pass right after the build's transient
     // scratch-buffer allocation burst.
@@ -518,21 +528,26 @@ fn run_convert(
     from_graph: Option<&str>,
     from_default_graph: bool,
     to_graph: Option<&str>,
+    lenient: bool,
 ) -> anyhow::Result<()> {
     let from_fmt = load::resolve_format_opt(from_format, from_file)?;
     let to_fmt = load::resolve_format_opt(to_format, to_file)?;
     let from_graph_name = parse_graph_name(from_graph)?;
     let to_graph_name = parse_graph_name(to_graph)?;
 
+    let mut from_parser = RdfParser::from_format(from_fmt);
+    if lenient {
+        from_parser = from_parser.lenient();
+    }
     let quads: Box<dyn Iterator<Item = Result<oxrdf::Quad, oxrdfio::RdfParseError>>> =
         match from_file {
             Some(f) => {
                 let reader = std::io::BufReader::new(std::fs::File::open(f)?);
-                Box::new(RdfParser::from_format(from_fmt).for_reader(reader))
+                Box::new(from_parser.for_reader(reader))
             }
             None => {
                 let reader = std::io::BufReader::new(std::io::stdin());
-                Box::new(RdfParser::from_format(from_fmt).for_reader(reader))
+                Box::new(from_parser.for_reader(reader))
             }
         };
 
@@ -605,6 +620,7 @@ fn run_optimize(location: &std::path::Path) -> anyhow::Result<()> {
 
 // ── serve-read-only ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_serve_read_only(
     location: std::path::PathBuf,
     bind: String,
@@ -612,6 +628,7 @@ async fn run_serve_read_only(
     max_results: Option<usize>,
     max_parallel_queries: Option<usize>,
     fulltext: bool,
+    union_default_graph: bool,
 ) -> anyhow::Result<()> {
     println!(
         "[oxigraph serve-read-only] Opening persistent store at {} ...",
@@ -659,12 +676,16 @@ async fn run_serve_read_only(
     if let Some(ts) = text_search {
         server = server.with_text_search(ts);
     }
+    if union_default_graph {
+        server = server.with_union_default_graph(true);
+    }
 
     println!("[oxigraph serve-read-only] Ready (read-only). Serving on http://{bind}/sparql");
     server.run(&bind).await?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_serve(
     location: Option<std::path::PathBuf>,
     file: Option<std::path::PathBuf>,
@@ -675,6 +696,7 @@ async fn run_serve(
     max_results: Option<usize>,
     max_parallel_queries: Option<usize>,
     fulltext: bool,
+    union_default_graph: bool,
 ) -> anyhow::Result<()> {
     let store = match &location {
         Some(dir) => {
@@ -715,6 +737,7 @@ async fn run_serve(
                 None,
                 None,
                 None,
+                false,
             )?;
             // See `oxigraph_nova_server::mimalloc_tuning::mimalloc_collect_now`'s
             // doc comment.
@@ -767,6 +790,9 @@ async fn run_serve(
     }
     if let Some(ts) = text_search {
         server = server.with_text_search(ts);
+    }
+    if union_default_graph {
+        server = server.with_union_default_graph(true);
     }
     server.run(&bind).await?;
     Ok(())
