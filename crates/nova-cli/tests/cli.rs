@@ -835,3 +835,84 @@ fn serve_union_default_graph_makes_from_less_query_see_named_graph() {
          triple, got: {body}"
     );
 }
+
+/// `oxigraph query --union-default-graph`: the same semantics as `serve
+/// --union-default-graph` above, but for the offline `query` subcommand —
+/// a FROM-less query must see the RDF merge of the default graph and every
+/// named graph, instead of just the store's actual default graph.
+#[test]
+fn query_union_default_graph_makes_from_less_query_see_named_graph() {
+    let dir = TempDir::new("query_union_default_graph");
+
+    // Load one triple into the default graph and another into a named
+    // graph.
+    let default_path = dir.path().join("default.nt");
+    std::fs::write(
+        &default_path,
+        "<http://ex/alice> <http://ex/name> \"Alice\" .\n",
+    )
+    .unwrap();
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        default_path.to_str().unwrap(),
+    ]);
+    assert_success(&out, "load (default graph)");
+
+    let named_path = dir.path().join("named.nt");
+    std::fs::write(
+        &named_path,
+        "<http://ex/onlyinnamed> <http://ex/name> \"OnlyInNamed\" .\n",
+    )
+    .unwrap();
+    let out = run(&[
+        "load",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--file",
+        named_path.to_str().unwrap(),
+        "--graph",
+        "http://ex/g1",
+    ]);
+    assert_success(&out, "load (named graph)");
+
+    let ask_query = "ASK { <http://ex/onlyinnamed> <http://ex/name> \"OnlyInNamed\" }";
+
+    // Without --union-default-graph: a FROM-less query only sees the
+    // store's actual default graph, so the named-graph-only triple must
+    // NOT be visible.
+    let out = run(&[
+        "query",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--query",
+        ask_query,
+    ]);
+    assert_success(&out, "query (no --union-default-graph)");
+    let body = stdout_str(&out);
+    assert!(
+        body.contains("false"),
+        "expected a FROM-less query to NOT see the named-graph-only triple without \
+         --union-default-graph, got: {body}"
+    );
+
+    // With --union-default-graph: the same FROM-less query must now see
+    // the RDF merge of the default graph and every named graph.
+    let out = run(&[
+        "query",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--query",
+        ask_query,
+        "--union-default-graph",
+    ]);
+    assert_success(&out, "query --union-default-graph");
+    let body = stdout_str(&out);
+    assert!(
+        body.contains("true"),
+        "expected --union-default-graph to make a FROM-less query see the named-graph-only \
+         triple, got: {body}"
+    );
+}

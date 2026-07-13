@@ -93,13 +93,16 @@ fn main() -> anyhow::Result<()> {
             query_file,
             results_file,
             results_format,
+            union_default_graph,
         } => run_query(
             &location,
             query.as_deref(),
             query_file.as_deref(),
             results_file.as_deref(),
             results_format.as_deref(),
+            union_default_graph,
         ),
+
         Command::Update {
             location,
             update,
@@ -341,6 +344,7 @@ fn run_query(
     query_file: Option<&std::path::Path>,
     results_file: Option<&std::path::Path>,
     results_format: Option<&str>,
+    union_default_graph: bool,
 ) -> anyhow::Result<()> {
     let query_text = match (query, query_file) {
         (Some(q), None) => q.to_string(),
@@ -358,7 +362,9 @@ fn run_query(
 
     let parsed = SparqlParser::new().parse_query(&query_text)?;
     let dataset = StoreDataset::new(Arc::clone(&store));
-    let evaluator = Evaluator::new(&dataset);
+    let options =
+        oxigraph_nova_query::QueryOptions::default().with_union_default_graph(union_default_graph);
+    let evaluator = Evaluator::with_options(&dataset, options);
     let result = evaluator.evaluate(&parsed)?;
 
     // Serialize directly into the destination writer (file or stdout) rather

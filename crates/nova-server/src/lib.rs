@@ -2945,7 +2945,8 @@ mod tests {
     /// `oxigraph_nova_query::evaluator::dataset_clause_selector`).
     #[tokio::test]
     async fn explicit_from_clause_unaffected_by_union_default_graph_flag() {
-        let sparql = "ASK FROM <http://ex/g1> { <http://ex/onlyinnamed> <http://ex/name> \"OnlyInNamed\" }";
+        let sparql =
+            "ASK FROM <http://ex/g1> { <http://ex/onlyinnamed> <http://ex/name> \"OnlyInNamed\" }";
 
         for union_default_graph in [false, true] {
             let mut builder = Server::new(make_store_with_named_graph());

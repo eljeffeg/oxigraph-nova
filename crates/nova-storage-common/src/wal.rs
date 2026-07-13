@@ -39,6 +39,17 @@
 //! future appends start cleanly (no gap, no leftover garbage after the
 //! truncation point).
 //!
+//! ## Streaming replay
+//!
+//! [`replay`] reads through a `BufReader` and reuses a single payload
+//! buffer across records rather than loading the whole segment into memory
+//! up front — a WAL tail with many records (or a few very large ones) never
+//! requires more transient memory than one buffered chunk plus the largest
+//! single record, which matters on startup when replaying a long
+//! not-yet-compacted tail. Callers still consume records one at a time via
+//! the `apply` callback, so the lazy-iterator property holds all the way
+//! from disk to the caller.
+//!
 //! ## Fsync policy
 //!
 //! [`WalWriter::append`] calls `File::sync_data()` after every write — the
@@ -68,7 +79,7 @@
 
 use oxigraph_nova_core::{BlankNode, GraphName, Literal, NamedNode, Oxigraph, Quad, Subject, Term};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
 
 // ── WalRecord ────────────────────────────────────────────────────────────────
@@ -442,6 +453,26 @@ impl WalWriter {
 
 // ── Replay ─────────────────────────────────────────────────────────────────────
 
+/// Fills `buf` from `reader` as far as possible, tolerating
+/// [`ErrorKind::Interrupted`] retries. Returns the number of bytes actually
+/// read before hitting EOF — `buf.len()` on a full read, or fewer on a torn
+/// tail. This (rather than [`Read::read_exact`]) is what lets [`replay`]
+/// distinguish a clean end-of-file at a record boundary (0 bytes read) from
+/// a torn partial read (1..`buf.len()` bytes read) without treating both as
+/// the same "unexpected EOF" error.
+fn fill_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break, // EOF
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
 /// Replay all valid records in the WAL file at `path`, calling `apply` for
 /// each one in order.
 ///
@@ -450,54 +481,80 @@ impl WalWriter {
 /// record, truncating the file to the last valid record boundary so future
 /// appends start cleanly. Returns the number of records successfully
 /// replayed.
+///
+/// Reads through a `BufReader` and reuses one payload buffer across records
+/// (see the "Streaming replay" module doc) rather than materializing the
+/// whole segment in memory before starting.
 pub fn replay(path: &Path, mut apply: impl FnMut(WalRecord)) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);
     }
-    let mut file = File::open(path)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
 
-    let mut pos = 0usize;
     let mut count = 0usize;
-    let mut valid_len = 0usize;
+    let mut valid_len = 0u64;
+    let mut payload = Vec::new();
 
     loop {
-        if pos + 4 > data.len() {
+        // Length prefix.
+        let mut len_bytes = [0u8; 4];
+        let n = fill_or_eof(&mut reader, &mut len_bytes)?;
+        if n == 0 {
+            break; // clean EOF exactly at a record boundary — nothing torn
+        }
+        if n < 4 {
             break; // torn tail: not enough bytes for the length prefix
         }
-        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        let record_start = pos + 4;
-        let record_end = match record_start.checked_add(len) {
-            Some(v) => v,
-            None => break,
-        };
-        let crc_end = record_end + 4;
-        if crc_end > data.len() {
-            break; // torn tail: incomplete payload or CRC
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        // Sanity-check `len` against bytes actually remaining in the file
+        // *before* allocating anything: a torn/corrupt length prefix (e.g.
+        // a crash mid-write of the u32 itself, or a flipped bit) must not
+        // be trusted enough to drive a multi-gigabyte `resize`. A valid
+        // record's payload plus its trailing 4-byte CRC can never exceed
+        // what's left on disk after this record's own length prefix.
+        let remaining = file_len - valid_len - 4;
+        if (len as u64) + 4 > remaining {
+            break; // torn/corrupt tail: implausible length — stop, don't allocate
         }
-        let payload = &data[record_start..record_end];
-        let stored_crc = u32::from_le_bytes(data[record_end..crc_end].try_into().unwrap());
-        let actual_crc = crc32fast::hash(payload);
+
+        // Payload, reusing `payload`'s backing allocation across records.
+        payload.resize(len, 0);
+        let n = fill_or_eof(&mut reader, &mut payload)?;
+        if n < len {
+            break; // torn tail: incomplete payload
+        }
+
+        // Trailing CRC32.
+
+        let mut crc_bytes = [0u8; 4];
+        let n = fill_or_eof(&mut reader, &mut crc_bytes)?;
+        if n < 4 {
+            break; // torn tail: incomplete CRC
+        }
+        let stored_crc = u32::from_le_bytes(crc_bytes);
+        let actual_crc = crc32fast::hash(&payload);
         if actual_crc != stored_crc {
             break; // torn write: CRC mismatch — stop at this crash-safe boundary
         }
-        match decode_record(payload) {
+
+        match decode_record(&payload) {
             Ok(record) => {
                 apply(record);
                 count += 1;
             }
             Err(_) => break, // CRC matched but decode failed — extremely unlikely; stop defensively
         }
-        pos = crc_end;
-        valid_len = pos;
+        valid_len += 4 + len as u64 + 4;
     }
 
-    if valid_len < data.len() {
+    if valid_len < file_len {
         // Torn tail (or trailing garbage) detected — truncate so future
         // appends start cleanly, with no gap and no leftover garbage.
         let file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(valid_len as u64)?;
+        file.set_len(valid_len)?;
     }
 
     Ok(count)
@@ -602,6 +659,92 @@ mod tests {
     }
 
     #[test]
+    fn replay_does_not_truncate_a_cleanly_written_log() {
+        // A streaming replay implementation is uniquely prone to conflating
+        // "clean EOF exactly at a record boundary" with "torn tail" (both
+        // look like a short read at first glance) — assert the file's
+        // length is completely unchanged after replaying a log with no
+        // torn records at all.
+        let path = temp_path("clean_no_truncate.log");
+        let _ = std::fs::remove_file(&path);
+
+        let q1 = Quad::new(
+            nn("http://ex/s1"),
+            pred("http://ex/p"),
+            lit("a"),
+            GraphName::DefaultGraph,
+        );
+        let q2 = Quad::new(
+            nn("http://ex/s2"),
+            pred("http://ex/p"),
+            lit("b"),
+            GraphName::DefaultGraph,
+        );
+
+        {
+            let mut w = WalWriter::create_or_open(&path).unwrap();
+            w.append(&WalRecord::InsertQuad(q1.clone())).unwrap();
+            w.append(&WalRecord::InsertQuad(q2.clone())).unwrap();
+        }
+
+        let len_before = std::fs::metadata(&path).unwrap().len();
+        let mut replayed = Vec::new();
+        let count = replay(&path, |r| replayed.push(r)).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            replayed,
+            vec![WalRecord::InsertQuad(q1), WalRecord::InsertQuad(q2)]
+        );
+
+        let len_after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            len_before, len_after,
+            "replaying a cleanly-written log must not truncate it"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_handles_many_records_spanning_bufreader_refills() {
+        // Write enough records to force the streaming reader through
+        // several internal buffer refills (BufReader's default capacity is
+        // 8 KiB), proving records that straddle a refill boundary still
+        // decode correctly.
+        let path = temp_path("many_records.log");
+        let _ = std::fs::remove_file(&path);
+
+        let quads: Vec<Quad> = (0..2000)
+            .map(|i| {
+                Quad::new(
+                    nn(&format!("http://ex/s{i}")),
+                    pred("http://ex/p"),
+                    lit(&format!(
+                        "value-{i}-with-some-extra-padding-to-vary-record-size"
+                    )),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+
+        {
+            let mut w = WalWriter::create_or_open(&path).unwrap();
+            for q in &quads {
+                w.append(&WalRecord::InsertQuad(q.clone())).unwrap();
+            }
+        }
+
+        let mut replayed = Vec::new();
+        let count = replay(&path, |r| replayed.push(r)).unwrap();
+        assert_eq!(count, quads.len());
+        for (i, q) in quads.iter().enumerate() {
+            assert_eq!(replayed[i], WalRecord::InsertQuad(q.clone()));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn replay_missing_file_is_noop() {
         let path = temp_path("missing.log");
         let _ = std::fs::remove_file(&path);
@@ -651,6 +794,57 @@ mod tests {
         let mut replayed2 = Vec::new();
         let count2 = replay(&path, |r| replayed2.push(r)).unwrap();
         assert_eq!(count2, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn implausible_length_prefix_stops_replay_without_allocating() {
+        // A corrupt/torn length prefix must never be trusted enough to
+        // drive a huge `Vec::resize` before it's validated against what's
+        // actually left in the file. Simulate this by flipping the first
+        // record's length prefix to an enormous value (larger than the
+        // entire file), and assert replay stops cleanly (as if it were any
+        // other torn tail) instead of erroring or hanging on a giant alloc.
+        let path = temp_path("implausible_len.log");
+        let _ = std::fs::remove_file(&path);
+
+        let q1 = Quad::new(
+            nn("http://ex/s1"),
+            pred("http://ex/p"),
+            lit("a"),
+            GraphName::DefaultGraph,
+        );
+        let q2 = Quad::new(
+            nn("http://ex/s2"),
+            pred("http://ex/p"),
+            lit("b"),
+            GraphName::DefaultGraph,
+        );
+
+        {
+            let mut w = WalWriter::create_or_open(&path).unwrap();
+            w.append(&WalRecord::InsertQuad(q1)).unwrap();
+            w.append(&WalRecord::InsertQuad(q2)).unwrap();
+        }
+
+        // Corrupt the very first record's 4-byte length prefix (file offset
+        // 0..4) to an implausibly large value.
+        let mut data = std::fs::read(&path).unwrap();
+        data[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let mut replayed = Vec::new();
+        let count = replay(&path, |r| replayed.push(r)).unwrap();
+        assert_eq!(
+            count, 0,
+            "an implausible length prefix must stop replay at record 0, not error/hang"
+        );
+
+        // The file should be truncated to zero (nothing before the corrupt
+        // record was valid), so future appends start cleanly.
+        let len_after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len_after, 0);
 
         let _ = std::fs::remove_file(&path);
     }

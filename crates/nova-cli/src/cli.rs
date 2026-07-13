@@ -128,6 +128,16 @@ pub enum Command {
         /// extension).
         #[arg(long)]
         results_format: Option<String>,
+        /// Equivalent to upstream Oxigraph's `oxigraph query
+        /// --union-default-graph`: if this query has no `FROM`/`FROM NAMED`
+        /// dataset clause of its own, use the RDF merge of the default
+        /// graph and every named graph as its effective default graph,
+        /// instead of just the store's actual default graph. A query that
+        /// specifies its own `FROM`/`FROM NAMED` clause is unaffected either
+        /// way. See `Command::Serve::union_default_graph`'s doc comment for
+        /// the same semantics applied server-wide.
+        #[arg(long)]
+        union_default_graph: bool,
     },
     /// Run a SPARQL update against a persistent store, offline (no HTTP)
     Update {
