@@ -35,6 +35,8 @@ tokio          = { workspace = true }
 tracing        = { workspace = true }
 tracing-subscriber = { workspace = true }
 mimalloc = "0.1.52"
+parking_lot = { workspace = true }
+
 
 
 [[bin]]

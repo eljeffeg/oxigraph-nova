@@ -100,11 +100,18 @@ uuid = { version = "1", features = ["v4"] }
 # ── Random number generation ─────────────────────────────────────────────────
 rand = "0.10"   # SPARQL RAND() built-in
 
+# ── Synchronization ─────────────────────────────────────────────────────────
+# Faster Mutex/RwLock than std::sync (no poisoning, adaptive spinning). Used
+# by production hot paths (RingStore, Solution BNODE cache, extension
+# registry, fulltext writer, reasoning overlay, MemoryStore).
+parking_lot = "0.12"
+
 # ── Full-text search ────────────────────────────────────────────────────────
 # Opt-in via nova-storage-ring's `fulltext` cargo feature (crates/nova-fulltext).
 # Zero-cost when the feature is disabled: no crate in the default build graph
 # depends on tantivy.
 tantivy = "0.26"
+
 
 # ── GeoSPARQL functions ─────────────────────────────────────────────────────
 # Opt-in via nova-query's `geosparql` cargo feature. Pins the exact oxrdf

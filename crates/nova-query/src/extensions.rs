@@ -3,9 +3,10 @@
 
 use anyhow::Result;
 use oxrdf::{NamedNode, Term};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueType {
@@ -84,10 +85,10 @@ pub struct ExtensionRegistry {
 impl Debug for ExtensionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExtensionRegistry")
-            .field("functions", &self.functions.read().unwrap().len())
-            .field("operators", &self.operators.read().unwrap().len())
-            .field("aggregates", &self.aggregates.read().unwrap().len())
-            .field("term_functions", &self.term_functions.read().unwrap().len())
+            .field("functions", &self.functions.read().len())
+            .field("operators", &self.operators.read().len())
+            .field("aggregates", &self.aggregates.read().len())
+            .field("term_functions", &self.term_functions.read().len())
             .finish()
     }
 }
@@ -98,26 +99,17 @@ impl ExtensionRegistry {
     }
 
     pub fn register_function(&self, f: Box<dyn CustomFunction>) -> Result<()> {
-        self.functions
-            .write()
-            .unwrap()
-            .insert(f.name().to_string(), f);
+        self.functions.write().insert(f.name().to_string(), f);
         Ok(())
     }
 
     pub fn register_operator(&self, op: Box<dyn CustomOperator>) -> Result<()> {
-        self.operators
-            .write()
-            .unwrap()
-            .insert(op.symbol().to_string(), op);
+        self.operators.write().insert(op.symbol().to_string(), op);
         Ok(())
     }
 
     pub fn register_aggregate(&self, agg: Box<dyn CustomAggregate>) -> Result<()> {
-        self.aggregates
-            .write()
-            .unwrap()
-            .insert(agg.name().to_string(), agg);
+        self.aggregates.write().insert(agg.name().to_string(), agg);
         Ok(())
     }
 
@@ -129,15 +121,12 @@ impl ExtensionRegistry {
         name: NamedNode,
         f: impl Fn(&[Term]) -> Option<Term> + Send + Sync + 'static,
     ) -> Result<()> {
-        self.term_functions
-            .write()
-            .unwrap()
-            .insert(name, Arc::new(f));
+        self.term_functions.write().insert(name, Arc::new(f));
         Ok(())
     }
 
     /// Look up a registered `Term`-typed function by its IRI, if any.
     pub fn term_function(&self, name: &NamedNode) -> Option<TermFunction> {
-        self.term_functions.read().unwrap().get(name).cloned()
+        self.term_functions.read().get(name).cloned()
     }
 }

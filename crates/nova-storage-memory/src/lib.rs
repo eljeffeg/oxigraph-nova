@@ -7,8 +7,8 @@
 use oxigraph_nova_core::{
     GraphName, LftjSource, NamedNode, Oxigraph, Quad, QuadStore, StoredQuad, Term,
 };
+use parking_lot::RwLock;
 use std::collections::HashSet;
-use std::sync::RwLock;
 
 pub struct MemoryStore {
     quads: RwLock<Vec<Quad>>,
@@ -39,16 +39,10 @@ impl QuadStore for MemoryStore {
     fn insert(&self, quad: &Quad) -> Result<bool, Oxigraph> {
         // Auto-register the named graph when a quad is inserted.
         if let GraphName::NamedNode(n) = &quad.graph_name {
-            let mut set = self
-                .named_graph_iris
-                .write()
-                .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+            let mut set = self.named_graph_iris.write();
             set.insert(n.as_str().to_string());
         }
-        let mut quads = self
-            .quads
-            .write()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let mut quads = self.quads.write();
         if quads.contains(quad) {
             return Ok(false);
         }
@@ -57,10 +51,7 @@ impl QuadStore for MemoryStore {
     }
 
     fn remove(&self, quad: &Quad) -> Result<bool, Oxigraph> {
-        let mut quads = self
-            .quads
-            .write()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let mut quads = self.quads.write();
         if let Some(pos) = quads.iter().position(|q| q == quad) {
             quads.swap_remove(pos);
             return Ok(true);
@@ -75,10 +66,7 @@ impl QuadStore for MemoryStore {
         object: Option<&Term>,
         graph_name: Option<&GraphName>,
     ) -> Result<Box<dyn Iterator<Item = Result<StoredQuad, Oxigraph>> + '_>, Oxigraph> {
-        let quads = self
-            .quads
-            .read()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let quads = self.quads.read();
 
         let subject = subject.cloned();
         let predicate = predicate.cloned();
@@ -104,28 +92,17 @@ impl QuadStore for MemoryStore {
     }
 
     fn len(&self) -> Result<usize, Oxigraph> {
-        Ok(self
-            .quads
-            .read()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?
-            .len())
+        Ok(self.quads.read().len())
     }
 
     fn contains(&self, quad: &Quad) -> Result<bool, Oxigraph> {
-        Ok(self
-            .quads
-            .read()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?
-            .contains(quad))
+        Ok(self.quads.read().contains(quad))
     }
 
     fn known_named_graphs(
         &self,
     ) -> Result<Box<dyn Iterator<Item = Result<GraphName, Oxigraph>> + '_>, Oxigraph> {
-        let set = self
-            .named_graph_iris
-            .read()
-            .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+        let set = self.named_graph_iris.read();
         let graphs: Vec<GraphName> = set
             .iter()
             .map(|iri| GraphName::NamedNode(NamedNode::new_unchecked(iri.clone())))
@@ -139,10 +116,7 @@ impl QuadStore for MemoryStore {
     /// `GRAPH ?g { }` evaluation (which enumerates graphs via `known_named_graphs`).
     fn register_named_graph(&self, graph: &GraphName) -> Result<(), Oxigraph> {
         if let GraphName::NamedNode(n) = graph {
-            let mut set = self
-                .named_graph_iris
-                .write()
-                .map_err(|e| Oxigraph::Storage(e.to_string()))?;
+            let mut set = self.named_graph_iris.write();
             set.insert(n.as_str().to_string());
         }
         Ok(())

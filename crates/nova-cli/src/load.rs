@@ -43,10 +43,11 @@ use anyhow::{Context, Result};
 use oxigraph_nova_core::{GraphName, Quad};
 use oxigraph_nova_storage_ring::RingStore;
 use oxrdfio::{RdfFormat, RdfParseError, RdfParser};
+use parking_lot::Mutex;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::mpsc;
 
 /// Resolve a `--format` value (extension string or MIME type) or, if absent,
 /// guess from `path`'s extension — mirroring `oxigraph-cli`'s
@@ -208,9 +209,10 @@ fn stream_into_store(
 
     let count = store.bulk_load(quads).with_context(|| "bulk_load failed")?;
 
-    if let Some(e) = error_slot.into_inner().unwrap() {
+    if let Some(e) = error_slot.into_inner() {
         return Err(anyhow::Error::new(e).context(format!("{format_name} parse error")));
     }
+
     Ok(count)
 }
 
@@ -232,9 +234,10 @@ impl<I: Iterator<Item = Result<Quad, RdfParseError>>> Iterator for ErrorCapturin
         match self.inner.next() {
             Some(Ok(q)) => Some(q),
             Some(Err(e)) => {
-                *self.error_slot.lock().unwrap() = Some(e);
+                *self.error_slot.lock() = Some(e);
                 None
             }
+
             None => None,
         }
     }
@@ -304,7 +307,7 @@ fn load_multiple_files(
         };
         let count = store.bulk_load(quads).with_context(|| "bulk_load failed")?;
 
-        if let Some(msg) = error_slot.into_inner().unwrap() {
+        if let Some(msg) = error_slot.into_inner() {
             anyhow::bail!(msg);
         }
         Ok(count)
@@ -327,7 +330,7 @@ impl Iterator for MultiFileIter<'_> {
         match self.rx.recv() {
             Ok(Ok(q)) => Some(q),
             Ok(Err(msg)) => {
-                *self.error_slot.lock().unwrap() = Some(msg);
+                *self.error_slot.lock() = Some(msg);
                 None
             }
             Err(_) => None, // channel closed, all threads done

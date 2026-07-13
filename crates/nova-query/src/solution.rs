@@ -32,8 +32,9 @@
 // Re-export so calling code can write `oxigraph_nova_query::Variable`.
 pub use oxrdf::Variable as SparqlVariable;
 use oxrdf::{BlankNode, Term, Variable};
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 /// A single SPARQL solution mapping: a set of (variable → RDF term) bindings.
 ///
@@ -186,7 +187,7 @@ impl Solution {
         let cache = self
             .bnode_cache
             .get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
-        let mut cache = cache.lock().unwrap();
+        let mut cache = cache.lock();
         cache.entry(key.to_string()).or_default().clone()
     }
 

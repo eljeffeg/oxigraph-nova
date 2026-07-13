@@ -10,6 +10,8 @@ repository.workspace = true
 oxigraph-nova-core = { path = "../nova-core" }
 oxrdf         = { workspace = true }
 anyhow        = { workspace = true }
+parking_lot   = { workspace = true }
+
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

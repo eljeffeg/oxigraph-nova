@@ -51,8 +51,9 @@ use crate::{ReasoningDataset, ReasoningEngine};
 use anyhow::Result;
 use oxigraph_nova_core::QuadStore;
 use oxigraph_nova_query::StoreDataset;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 
 /// Sentinel `built_at_compaction_count` value meaning "the overlay has
 /// never been built yet" — guaranteed to differ from any real
@@ -89,7 +90,7 @@ impl<S: QuadStore + 'static> ReasoningState<S> {
         let current_gen = store.compaction_count();
 
         // Fast path: an up-to-date overlay already exists.
-        if let Some(overlay) = self.overlay.read().unwrap().as_ref()
+        if let Some(overlay) = self.overlay.read().as_ref()
             && !self.is_stale(current_gen)
         {
             return Ok(Arc::clone(overlay));
@@ -99,7 +100,7 @@ impl<S: QuadStore + 'static> ReasoningState<S> {
         // case another concurrent caller already rebuilt while we were
         // waiting for it (avoids a redundant `infer()` pass under
         // contention).
-        let mut guard = self.overlay.write().unwrap();
+        let mut guard = self.overlay.write();
         if let Some(overlay) = guard.as_ref()
             && !self.is_stale(current_gen)
         {

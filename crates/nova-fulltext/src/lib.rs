@@ -29,8 +29,8 @@
 //! intended to run once per LSM compaction cycle, not per write.
 
 use oxigraph_nova_core::{TextMatch, TextSearch};
+use parking_lot::Mutex;
 use std::path::Path;
-use std::sync::Mutex;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TEXT, Value,
@@ -159,7 +159,7 @@ impl FulltextIndex {
             doc.add_text(self.fields.lang, l);
         }
         let term = Term::from_field_bytes(self.fields.quad_key, &quad_key.to_be_bytes());
-        let writer = self.writer.lock().unwrap();
+        let writer = self.writer.lock();
         writer.delete_term(term);
         writer.add_document(doc)?;
         Ok(())
@@ -171,7 +171,7 @@ impl FulltextIndex {
     /// indexed for this key (e.g. a non-literal-object quad being removed).
     pub fn remove_by_key(&self, quad_key: u128) -> anyhow::Result<()> {
         let term = Term::from_field_bytes(self.fields.quad_key, &quad_key.to_be_bytes());
-        let writer = self.writer.lock().unwrap();
+        let writer = self.writer.lock();
         writer.delete_term(term);
         Ok(())
     }
@@ -181,7 +181,7 @@ impl FulltextIndex {
     /// `add_literal`/`remove_by_key` calls.
     pub fn commit(&self) -> anyhow::Result<()> {
         {
-            let mut writer = self.writer.lock().unwrap();
+            let mut writer = self.writer.lock();
             writer.commit()?;
         }
         self.reader.reload()?;
@@ -198,7 +198,7 @@ impl FulltextIndex {
     /// after the marker went stale for an already-populated index) never
     /// leaves duplicate documents behind.
     pub fn clear(&self) -> anyhow::Result<()> {
-        let writer = self.writer.lock().unwrap();
+        let writer = self.writer.lock();
         writer.delete_all_documents()?;
         Ok(())
     }

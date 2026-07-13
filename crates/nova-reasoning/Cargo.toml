@@ -19,6 +19,8 @@ oxigraph-nova-core = { path = "../nova-core", default-features = false }
 # dataset, mirroring `oxigraph-nova-query`'s own `StoreDataset` adapter.
 oxigraph-nova-query = { path = "../nova-query", default-features = false }
 anyhow = { workspace = true }
+parking_lot = { workspace = true }
+
 
 
 [dev-dependencies]
