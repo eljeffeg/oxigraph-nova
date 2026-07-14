@@ -78,6 +78,7 @@
 //! since the BSBM IRIs differ from our Wikidata-style prefixes.
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Subject, Term};
 use oxigraph_nova_query::{Dataset, Evaluator, QueryResult, StoreDataset};
 use oxigraph_nova_storage_ring::RingStore;
@@ -85,6 +86,9 @@ use spargebra::SparqlParser;
 use std::hint::black_box;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 // ── Namespace constants ───────────────────────────────────────────────────────
 

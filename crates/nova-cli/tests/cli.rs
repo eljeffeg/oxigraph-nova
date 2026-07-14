@@ -916,3 +916,110 @@ fn query_union_default_graph_makes_from_less_query_see_named_graph() {
          triple, got: {body}"
     );
 }
+
+// ── validate ─────────────────────────────────────────────────────────────
+
+/// A SHACL shapes graph that requires `ex:alice` to have at least one
+/// `ex:name` value. `NativeValidator` doesn't yet compile
+/// `sh:targetSubjectsOf`/`sh:targetObjectsOf` (see `oxigraph_nova_shacl::
+/// shape`'s module doc comment), so this uses `sh:targetNode` explicitly
+/// instead.
+const CONFORMING_SHAPES: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://ex/> .
+
+[] a sh:NodeShape ;
+   sh:targetNode ex:alice ;
+   sh:property [
+       sh:path ex:name ;
+       sh:minCount 1 ;
+   ] .
+"#;
+
+/// Same shape as [`CONFORMING_SHAPES`], but targeting `ex:bob` (who has no
+/// `ex:name` in `TURTLE_FIXTURE`) instead of `ex:alice` — expected to
+/// produce a `sh:minCount` violation.
+const VIOLATING_SHAPES: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://ex/> .
+
+[] a sh:NodeShape ;
+   sh:targetNode ex:bob ;
+   sh:property [
+       sh:path ex:name ;
+       sh:minCount 1 ;
+   ] .
+"#;
+
+#[test]
+fn validate_conforming_data_reports_conforms() {
+    let dir = load_fixture();
+    let shapes_path = dir.path().join("shapes.ttl");
+    std::fs::write(&shapes_path, CONFORMING_SHAPES).unwrap();
+
+    let out = run(&[
+        "validate",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--shapes",
+        shapes_path.to_str().unwrap(),
+    ]);
+    assert_success(&out, "validate (conforming)");
+    assert!(
+        stdout_str(&out).contains("CONFORMS"),
+        "expected CONFORMS, got: {}",
+        stdout_str(&out)
+    );
+}
+
+#[test]
+fn validate_violating_data_reports_violation_and_nonzero_exit() {
+    let dir = load_fixture();
+    let shapes_path = dir.path().join("shapes.ttl");
+    std::fs::write(&shapes_path, VIOLATING_SHAPES).unwrap();
+
+    let out = run(&[
+        "validate",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--shapes",
+        shapes_path.to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success(),
+        "expected validate to exit non-zero on violation"
+    );
+    let body = stdout_str(&out);
+    assert!(
+        body.contains("DOES NOT CONFORM"),
+        "expected a violation report, got: {body}"
+    );
+    assert!(
+        body.contains("http://ex/bob"),
+        "expected the focus node to be reported, got: {body}"
+    );
+}
+
+#[test]
+fn validate_results_file_writes_report_to_file() {
+    let dir = load_fixture();
+    let shapes_path = dir.path().join("shapes.ttl");
+    std::fs::write(&shapes_path, CONFORMING_SHAPES).unwrap();
+    let results_path = dir.path().join("report.txt");
+
+    let out = run(&[
+        "validate",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--shapes",
+        shapes_path.to_str().unwrap(),
+        "--results-file",
+        results_path.to_str().unwrap(),
+    ]);
+    assert_success(&out, "validate --results-file");
+    let contents = std::fs::read_to_string(&results_path).unwrap();
+    assert!(
+        contents.contains("CONFORMS"),
+        "expected report file to contain CONFORMS, got: {contents}"
+    );
+}

@@ -3,11 +3,12 @@
 //! Subcommand/flag names deliberately mirror upstream `oxigraph-cli`
 //! (see `./research/oxigraph/cli/src/cli.rs`) wherever Nova's feature surface
 //! overlaps — this binary is even named `oxigraph`, so scripts/muscle
-//! memory written against one carry over to the other. Nova ships 9
+//! memory written against one carry over to the other. Nova ships 10
 //! subcommands: `load`, `backup`, `serve`, `query`, `update`, `dump`,
-//! `convert`, `optimize`, `serve-read-only` — matching upstream's full
-//! subcommand surface (some flags are trimmed relative to upstream where
-//! Nova doesn't yet implement the corresponding capability — e.g. no
+//! `convert`, `optimize`, `serve-read-only`, `validate` — matching
+//! upstream's full subcommand surface plus Nova's own SHACL `validate`
+//! addition (some flags are trimmed relative to upstream where Nova doesn't
+//! yet implement the corresponding capability — e.g. no
 //! `--explain`/`--stats`/stdin input for `query`/`update`.
 
 use clap::{Parser, Subcommand, ValueHint};
@@ -372,5 +373,31 @@ pub enum Command {
         /// way.
         #[arg(long)]
         union_default_graph: bool,
+    },
+    /// Validate the store's data against a SHACL shapes graph, offline (no
+    /// HTTP)
+    ///
+    /// Uses `NativeValidator`, Nova's dependency-free SHACL Core subset (see
+    /// `oxigraph_nova_shacl`'s crate docs for exactly which targets/
+    /// constraints are compiled). Reports overall conformance plus any
+    /// violations/warnings found; exits with a non-zero status if the data
+    /// does not conform, so this subcommand can be used as a CI gate.
+    Validate {
+        /// Directory in which Nova data is persisted
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        location: PathBuf,
+        /// File containing the SHACL shapes graph to validate against
+        #[arg(short, long, value_hint = ValueHint::FilePath)]
+        shapes: PathBuf,
+        /// The format of the shapes file
+        ///
+        /// Accepts either an extension (`nt`, `ttl`, `nq`, `trig`, `rdf`,
+        /// `jsonld`) or a MIME type. By default, guessed from `--shapes`'s
+        /// extension.
+        #[arg(long)]
+        shapes_format: Option<String>,
+        /// Write the validation report to this file instead of stdout
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        results_file: Option<PathBuf>,
     },
 }

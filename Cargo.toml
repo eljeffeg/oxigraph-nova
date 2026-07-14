@@ -8,6 +8,7 @@ members = [
     "crates/nova-storage-ring",
     "crates/nova-fulltext",
     "crates/nova-reasoning",
+    "crates/nova-shacl",
     "crates/nova-server",
     "crates/nova-store",
     "crates/nova-cli",

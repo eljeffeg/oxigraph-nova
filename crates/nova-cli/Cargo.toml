@@ -25,6 +25,7 @@ oxigraph-nova-core         = { path = "../nova-core" }
 oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
 oxigraph-nova-query        = { path = "../nova-query" }
 oxigraph-nova-server       = { path = "../nova-server" }
+oxigraph-nova-shacl        = { path = "../nova-shacl" }
 oxrdf          = { workspace = true }
 oxrdfio        = { workspace = true }
 spargebra      = { workspace = true }

@@ -229,7 +229,63 @@ function-dispatch table, and `crates/nova-server/src/service_description.rs`
 for how enabled functions are advertised via `sd:extensionFunction` in the
 SPARQL Service Description.
 
+## SHACL validation
+
+`oxigraph-nova-shacl` adds SHACL Core validation — checking a data graph
+against a shapes graph and reporting conformance/violations — as a plain
+library dependency of `nova-server`/`nova-cli`, not a cargo feature: unlike
+full-text search, reasoning, or GeoSPARQL, there is nothing to opt into at
+build time. Validation is exposed two ways:
+
+```sh
+# 1. HTTP: validate the running server's entire store against a shapes
+#    graph supplied in the request body (content-negotiated the same way
+#    as the Graph Store Protocol's PUT/POST bodies):
+curl -X POST http://localhost:3030/validate \
+    -H 'Content-Type: text/turtle' --data-binary @shapes.ttl
+
+# 2. CLI: validate a persistent store offline (no HTTP, no running server) —
+#    exits non-zero if the data does not conform, so this doubles as a CI gate:
+cargo run --release --bin oxigraph -- validate \
+    --location ./data --shapes shapes.ttl
+```
+
+Both paths run the same default implementation, `NativeValidator` — a
+dependency-free SHACL Core subset — and produce the same Nova-owned
+validation report shape. The HTTP endpoint returns it as JSON:
+
+```json
+{
+  "conforms": false,
+  "violation_count": 1,
+  "warning_count": 0,
+  "results": [
+    {
+      "focus_node": "http://ex/alice",
+      "path": "http://ex/age",
+      "source_shape": "http://ex/PersonShape",
+      "source_constraint_component": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+      "severity": "Violation",
+      "message": "...",
+      "value": null
+    }
+  ]
+}
+```
+
+The `ShaclValidator` trait this is built on mirrors the OWL 2 RL reasoning
+seam above (`ReasoningEngine`) — a pluggable, `Dataset`-level operation, so
+alternative implementations (e.g. a heavier SHACL-SPARQL-capable backend)
+can be swapped in later without changing callers. See
+**[`ARCHITECTURE.md`](./ARCHITECTURE.md#8-shaclvalidator--shacl-validation-seam)**
+for the trait itself, and `crates/nova-shacl/src/lib.rs`'s module doc
+comment for exactly which SHACL Core targets (`sh:targetNode`,
+`sh:targetClass`, implicit class targets) and constraints (`sh:minCount`,
+`sh:maxCount`, `sh:datatype`, `sh:nodeKind`, `sh:class`, `sh:hasValue`,
+`sh:in`) `NativeValidator` currently compiles, and which are deferred.
+
 ## Design trade-offs vs. QLever
+
 
 
 QLever (C++) is a high-performance RDF store optimized for bulk-loaded static datasets. It uses six sorted compressed integer arrays and merge joins — an excellent approach for read-heavy analytical workloads over large, stable graphs. The table below shows how the two stores differ across a few dimensions; each row reflects a deliberate design choice, not a deficiency in either system.
@@ -307,8 +363,9 @@ Building the workspace also produces a standalone `oxigraph` binary
 (`crates/nova-cli`, package `oxigraph-nova-cli`) that matches upstream
 `oxigraph-cli`'s full 9-subcommand surface — `load`, `backup`, `query`,
 `update`, `dump`, `convert`, `optimize`, `serve`, and `serve-read-only` —
-against Nova's own `RingStore`, under the same binary name so scripts/muscle
-memory carry over:
+against Nova's own `RingStore`, plus Nova's own SHACL `validate` addition
+(10 subcommands total), under the same binary name so scripts/muscle memory
+carry over:
 
 ```sh
 cargo build --release --bin oxigraph
@@ -325,6 +382,7 @@ cargo build --release --bin oxigraph
 | `oxigraph optimize --location <dir>` | Force storage compaction on demand (`RingStore::compact()`) |
 | `oxigraph serve [--location <dir>] [--file <path>] [--bind <addr>]` | Start the same SPARQL 1.2 HTTP server described below, as a subcommand instead of a separate binary |
 | `oxigraph serve-read-only --location <dir> [--bind <addr>]` | Same as `serve`, but every write (`/update`, `PUT`/`POST`/`DELETE /store`) is rejected at the HTTP layer with `403 Forbidden` |
+| `oxigraph validate --location <dir> --shapes <path> [--shapes-format <fmt>] [--results-file <f>]` | Validate a persistent store's data against a SHACL shapes graph, offline (no HTTP) — exits non-zero if the data does not conform, so this doubles as a CI gate (see "SHACL validation" above) |
 
 ```sh
 # Bulk-load a dataset directly into a persistent store
@@ -357,6 +415,9 @@ cargo run --release --bin oxigraph -- serve --location ./data --bind 0.0.0.0:303
 
 # Serve the same store read-only — writes get 403 Forbidden
 cargo run --release --bin oxigraph -- serve-read-only --location ./data --bind 0.0.0.0:3031
+
+# Validate a persistent store against a SHACL shapes graph, offline
+cargo run --release --bin oxigraph -- validate --location ./data --shapes shapes.ttl
 ```
 
 Run `oxigraph <subcommand> --help` for the full flag reference for each
@@ -367,10 +428,8 @@ applies equally to `oxigraph serve`. `serve-read-only`'s write-gate is
 HTTP-layer only, not storage-level concurrent-multi-process read isolation —
 see `oxigraph serve-read-only --help` for the exact caveat.
 
-A handful of upstream `oxigraph-cli` flags aren't implemented yet (server-wide
-`--union-default-graph`, `--lenient` parsing, `load` stdin/multi-file input,
-query `--explain`/`--stats`).
-
+A handful of upstream `oxigraph-cli` flags aren't implemented yet (query
+`--explain`/`--stats`).
 
 ---
 

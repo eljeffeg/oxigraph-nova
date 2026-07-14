@@ -41,6 +41,7 @@ use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, NamedOrBlankNode, QuadStore, Term};
 use oxigraph_nova_query::{Evaluator, QueryResult, StoreDataset, execute_update};
 use oxigraph_nova_server::{Server, mimalloc_tuning};
+use oxigraph_nova_shacl::{NativeValidator, ShaclValidator};
 use oxigraph_nova_storage_ring::{RingStore, SyncPolicy};
 use oxrdfio::{RdfFormat, RdfParser, RdfSerializer};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
@@ -139,6 +140,18 @@ fn main() -> anyhow::Result<()> {
             lenient,
         ),
         Command::Optimize { location } => run_optimize(&location),
+        Command::Validate {
+            location,
+            shapes,
+            shapes_format,
+            results_file,
+        } => run_validate(
+            &location,
+            &shapes,
+            shapes_format.as_deref(),
+            results_file.as_deref(),
+        ),
+
         Command::ServeReadOnly {
             location,
             bind,
@@ -801,5 +814,91 @@ async fn run_serve(
         server = server.with_union_default_graph(true);
     }
     server.run(&bind).await?;
+    Ok(())
+}
+
+// ── validate ───────────────────────────────────────────────────────────────
+
+/// Format one [`oxigraph_nova_shacl::ValidationResult`] as a human-readable
+/// multi-line block, written to `out`.
+fn write_validation_result(
+    out: &mut dyn std::io::Write,
+    index: usize,
+    result: &oxigraph_nova_shacl::ValidationResult,
+) -> anyhow::Result<()> {
+    let severity = match result.severity {
+        oxigraph_nova_shacl::Severity::Violation => "Violation",
+        oxigraph_nova_shacl::Severity::Warning => "Warning",
+        oxigraph_nova_shacl::Severity::Info => "Info",
+    };
+    writeln!(out, "[{index}] {severity}: {}", result.message)?;
+    writeln!(out, "    focus node:  {}", result.focus_node)?;
+    if let Some(path) = &result.path {
+        writeln!(out, "    path:        {path}")?;
+    }
+    writeln!(out, "    source shape: {}", result.source_shape)?;
+    writeln!(
+        out,
+        "    constraint:  {}",
+        result.source_constraint_component
+    )?;
+    if let Some(value) = &result.value {
+        writeln!(out, "    value:       {value}")?;
+    }
+    Ok(())
+}
+
+fn run_validate(
+    location: &std::path::Path,
+    shapes_path: &std::path::Path,
+    shapes_format: Option<&str>,
+    results_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    eprintln!(
+        "[oxigraph validate] Opening persistent store at {} ...",
+        location.display()
+    );
+    let store = Arc::new(RingStore::open(location)?);
+
+    let fmt = load::resolve_format_opt(shapes_format, Some(shapes_path))?;
+    eprintln!(
+        "[oxigraph validate] Parsing shapes graph {} ({}) ...",
+        shapes_path.display(),
+        fmt.name()
+    );
+    let reader = std::io::BufReader::new(
+        std::fs::File::open(shapes_path)
+            .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", shapes_path.display()))?,
+    );
+    let shapes: Vec<oxrdf::Quad> = RdfParser::from_format(fmt)
+        .with_default_graph(GraphName::DefaultGraph)
+        .for_reader(reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("{} parse error: {e}", fmt.name()))?;
+
+    eprintln!("[oxigraph validate] Validating ...");
+    let dataset = StoreDataset::new(Arc::clone(&store));
+    let report = NativeValidator::new().validate(&shapes, &dataset)?;
+
+    let mut out = open_output(results_file)?;
+    if report.conforms {
+        writeln!(out, "CONFORMS")?;
+    } else {
+        writeln!(
+            out,
+            "DOES NOT CONFORM ({} violation(s), {} warning(s))",
+            report.violation_count(),
+            report.warning_count()
+        )?;
+        for (i, result) in report.results.iter().enumerate() {
+            write_validation_result(&mut out, i + 1, result)?;
+        }
+    }
+    out.flush()?;
+
+    eprintln!("[oxigraph validate] Done.");
+    if !report.conforms {
+        std::process::exit(1);
+    }
     Ok(())
 }

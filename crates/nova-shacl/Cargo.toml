@@ -1,0 +1,28 @@
+[package]
+name        = "oxigraph-nova-shacl"
+description = "SHACL Core validation: trait seam and a zero-dependency native validator for Oxigraph Nova"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+default = ["mmap"]
+# Forwards to `oxigraph-nova-core`'s `mmap` feature (see its doc comment).
+# This crate itself has no mmap-specific code.
+mmap = ["oxigraph-nova-core/mmap"]
+
+[dependencies]
+oxigraph-nova-core = { path = "../nova-core", default-features = false }
+# `native`/`shape` operate at the `Dataset` seam (not raw `QuadStore`) so
+# `NativeValidator` can validate against any SPARQL-facing dataset,
+# mirroring `oxigraph-nova-reasoning`'s own `Dataset`-level engine.
+oxigraph-nova-query = { path = "../nova-query", default-features = false }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# Only unit tests need a real storage backend + oxrdf term constructors —
+# the shape-compiler/native-validator core has no dependency on any concrete
+# QuadStore.
+oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
+oxrdf = { workspace = true }

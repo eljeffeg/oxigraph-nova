@@ -18,6 +18,7 @@ nova-core              (vocabulary + trait definitions; no storage/query logic)
   ├── nova-reasoning        (LftjFixpointEngine: OWL 2 RL forward-chaining reasoner)
   └── nova-query            (Dataset trait, SPARQL evaluator, LFTJ/WCOJ join engine,
                               extension registry, SERVICE federation)
+        ├── nova-shacl       (ShaclValidator trait, NativeValidator: SHACL Core validation)
         └── nova-server      (axum HTTP SPARQL 1.1 Protocol server, generic over QuadStore)
               └── nova-cli    (binary: wires RingStore + Server together)
 ```
@@ -82,6 +83,7 @@ implementations without touching (or forking) `nova-storage-ring` or
 | `oxigraph-nova-storage-ring` | CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + `BTreeMap<u128>` LSM delta + Leapfrog Triejoin; live-write, WAL-backed persistent storage engine with mmap'd ε-serde snapshot loading |
 | `oxigraph-nova-fulltext` | Tantivy-backed full-text index — opt-in via the `fulltext` cargo feature on `oxigraph-nova-storage-ring`; indexed incrementally on the compaction cycle |
 | `oxigraph-nova-reasoning` | OWL 2 RL forward-chaining reasoner — LFTJ-native semi-naive fixpoint driver (`LftjFixpointEngine`), `ReasoningDataset` in-memory overlay decorator, opt-in via `--reasoning` on the server |
+| `oxigraph-nova-shacl` | SHACL Core validation — `ShaclValidator` trait seam, Nova-owned `ValidationReport`/`ValidationResult` types, `NativeValidator` (dependency-free default implementation); always compiled in, not cargo-feature-gated |
 | `oxigraph-nova-server` | SPARQL 1.2 HTTP endpoint (`axum`), SPARQL Query/Update, Graph Store Protocol |
 | `oxigraph-nova-w3c-harness` | W3C SPARQL conformance test runner — fetches and caches real W3C manifests (test-only; not published) |
 | `oxigraph-nova-bench` | Criterion benchmarks comparing Ring+LFTJ vs in-memory and vs. other RDF stores (not published) |
@@ -375,6 +377,41 @@ a larger application's own router, wrapped with additional `tower` middleware
 (auth, rate-limiting, tracing, CORS, ...), or served directly. This is the
 seam to use when embedding SPARQL protocol support into an existing axum-based
 service rather than running `nova-cli`'s standalone binary.
+
+### 8. `ShaclValidator` — SHACL validation seam
+
+Defined in `nova-shacl/src/validator.rs`. Mirrors section 3's `ReasoningEngine`
+seam in shape: a single trait method operating at the `Dataset` level (not
+raw `QuadStore`), so any storage backend the SPARQL evaluator can already
+query can also be SHACL validated:
+
+```rust
+/// Validates a data graph (`data`) against a shapes graph (`shapes`),
+/// producing a Nova-owned ValidationReport.
+pub trait ShaclValidator: Send + Sync {
+    fn validate(&self, shapes: &[Quad], data: &dyn Dataset) -> Result<ValidationReport>;
+}
+```
+
+`shapes` is passed as a plain `&[Quad]` rather than a `Dataset` because
+shapes graphs are typically small and loaded once per validation call,
+whereas `data` is the (potentially large) dataset being checked and
+benefits from the lazy `Dataset::find_quads` query interface — the same
+`StoreDataset<S>` adapter from section 3 is what bridges a `QuadStore` into
+the `data` parameter here (see `nova-server`'s `validate_post` handler and
+`nova-cli`'s `run_validate` for both call sites).
+
+`NativeValidator` is the default, always-available, zero-external-dependency
+implementation — a compiled-shapes SHACL Core subset (see
+`crates/nova-shacl/src/lib.rs`'s module doc comment for exactly which
+targets/constraints are currently supported). Because the trait is a plain,
+object-safe seam, alternative implementations (a heavier SHACL-SPARQL-capable
+backend, a differential-testing oracle wrapping another validator) can be
+swapped in later without any caller needing to change — the same
+substitutability principle behind `ReasoningEngine`, `TextSearch`, and
+`ServiceHandler` above. Unlike those, `oxigraph-nova-shacl` is not
+cargo-feature-gated: it is a plain dependency of `nova-server`/`nova-cli`,
+always compiled in.
 
 ## Putting it together
 

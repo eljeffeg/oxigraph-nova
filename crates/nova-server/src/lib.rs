@@ -187,6 +187,7 @@ use oxigraph_nova_query::{
     Solutions, StoreDataset, clear_graph, execute_update,
 };
 use oxigraph_nova_reasoning::{ReasoningEngine, ReasoningState};
+use oxigraph_nova_shacl::{NativeValidator, ShaclValidator};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable};
 use oxrdfio::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
 use serde::Deserialize;
@@ -500,7 +501,10 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
                 "/reasoning/diagnostics",
                 get(reasoning_diagnostics_get::<S>),
             )
-
+            // SHACL validation of the store's data against a shapes graph
+            // supplied in the request body (see `validate_post`'s doc
+            // comment).
+            .route("/validate", post(validate_post::<S>))
             // Permissive CORS so browser-based SPARQL clients (e.g. YASGUI,
             // or any web app served from a different origin/port) can query
             // this endpoint directly via `fetch`/XHR without a proxy.
@@ -730,6 +734,117 @@ async fn reasoning_diagnostics_get<S: QuadStore + 'static>(
                 "enabled": true,
                 "inferred_len": overlay.inferred_len(),
                 "diagnostics": diagnostics,
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /validate` — SHACL validation of the store's data against a shapes
+/// graph supplied in the request body.
+///
+/// The shapes graph is content-negotiated the same way as Graph Store
+/// Protocol/bulk-load bodies (see `parse_body_triples`): `Content-Type` is
+/// resolved to an [`RdfFormat`] via `RdfFormat::from_media_type`, falling
+/// back to Turtle if absent/unrecognised. The data graph being validated is
+/// always this server's own store (every quad, across every graph) —
+/// there is no way to scope validation to a subset of the store via this
+/// endpoint.
+///
+/// Uses [`NativeValidator`] (Nova's dependency-free SHACL Core subset — see
+/// `oxigraph_nova_shacl`'s crate docs for current constraint/target
+/// coverage). Returns a JSON report:
+///
+/// ```json
+/// {
+///   "conforms": false,
+///   "violation_count": 1,
+///   "warning_count": 0,
+///   "results": [
+///     {
+///       "focus_node": "http://ex/alice",
+///       "path": "http://ex/age",
+///       "source_shape": "http://ex/PersonShape",
+///       "source_constraint_component": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+///       "severity": "Violation",
+///       "message": "...",
+///       "value": null
+///     },
+///     ...
+///   ]
+/// }
+/// ```
+///
+/// `focus_node`/`source_shape`/`value` are rendered via each `Term`'s
+/// `to_string()` (an IRI's `<...>`-free form for `NamedNode`s, an N-Triples
+/// literal for `Literal`s, `_:...` for blank nodes — matches `Term`'s
+/// `Display` impl).
+///
+/// **Blocking.** Shape compilation + validation runs on a `spawn_blocking`
+/// thread, matching every other potentially-expensive handler in this file.
+async fn validate_post<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let shape_triples = match parse_body_triples(ct, &body) {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+    let shapes: Vec<Quad> = shape_triples
+        .into_iter()
+        .map(|t| Quad::new(t.subject, t.predicate, t.object, GraphName::DefaultGraph))
+        .collect();
+
+    let store = Arc::clone(&state.store);
+    let result = tokio::task::spawn_blocking(move || {
+        let dataset = StoreDataset::new(store);
+        NativeValidator::new().validate(&shapes, &dataset)
+    })
+    .await;
+
+    match result {
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("internal error: {join_err}"),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("SHACL validation error: {e}"),
+        )
+            .into_response(),
+        Ok(Ok(report)) => {
+            let results: Vec<serde_json::Value> = report
+                .results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "focus_node": r.focus_node.to_string(),
+                        "path": r.path.as_ref().map(|p| p.to_string()),
+                        "source_shape": r.source_shape.to_string(),
+                        "source_constraint_component": r.source_constraint_component.to_string(),
+                        "severity": format!("{:?}", r.severity),
+                        "message": r.message,
+                        "value": r.value.as_ref().map(|v| v.to_string()),
+                    })
+                })
+                .collect();
+            let body = serde_json::json!({
+                "conforms": report.conforms,
+                "violation_count": report.violation_count(),
+                "warning_count": report.warning_count(),
+                "results": results,
             });
             (
                 StatusCode::OK,
@@ -3368,5 +3483,109 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── POST /validate ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_validate_conforming_returns_conforms_true() {
+        let router = make_router();
+        // Every ex:name value in make_store() is a plain string literal, so
+        // a shape requiring datatype xsd:string on ex:name should conform.
+        // `sh:targetSubjectsOf` is not yet supported by `NativeValidator`
+        // (see nova-shacl's `shape.rs` module doc comment), so target
+        // alice/bob explicitly via `sh:targetNode`.
+        let shapes = r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ex: <http://ex/> .
+            @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+            ex:NameShape a sh:NodeShape ;
+                sh:targetNode ex:alice, ex:bob ;
+                sh:property [
+                    sh:path ex:name ;
+                    sh:datatype xsd:string ;
+                ] .
+        "#;
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/validate")
+            .header("content-type", "text/turtle")
+            .body(Body::from(shapes))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["conforms"], true,
+            "expected conforming validation, got: {json}"
+        );
+        assert_eq!(json["violation_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_validate_violating_returns_conforms_false() {
+        let router = make_router();
+        // make_store()'s data has no ex:email triples at all, so a shape
+        // requiring minCount 1 on ex:email for alice/bob must report
+        // violations for both. `sh:targetSubjectsOf` is not yet supported
+        // by `NativeValidator` (see nova-shacl's `shape.rs` module doc
+        // comment), so target alice/bob explicitly via `sh:targetNode`.
+        let shapes = r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ex: <http://ex/> .
+
+            ex:EmailShape a sh:NodeShape ;
+                sh:targetNode ex:alice, ex:bob ;
+                sh:property [
+                    sh:path ex:email ;
+                    sh:minCount 1 ;
+                ] .
+        "#;
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/validate")
+            .header("content-type", "text/turtle")
+            .body(Body::from(shapes))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["conforms"], false,
+            "expected non-conforming validation, got: {json}"
+        );
+        let violation_count = json["violation_count"].as_u64().unwrap();
+        assert!(
+            violation_count >= 2,
+            "expected at least 2 violations (alice + bob missing ex:email), got: {json}"
+        );
+        let results = json["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "expected non-empty results: {json}");
+        assert!(
+            results[0]["source_constraint_component"]
+                .as_str()
+                .unwrap()
+                .contains("MinCountConstraintComponent"),
+            "expected a MinCountConstraintComponent violation, got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_malformed_shapes_body_returns_400() {
+        let router = make_router();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/validate")
+            .header("content-type", "text/turtle")
+            .body(Body::from("THIS IS NOT TURTLE {{{"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
