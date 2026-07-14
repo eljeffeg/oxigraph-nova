@@ -17,6 +17,11 @@ http-client = ["oxigraph-nova-server/http-client"]
 # Opt-in GeoSPARQL extension functions, forwarded through to nova-server's
 # own `geosparql` feature.
 geosparql = ["oxigraph-nova-server/geosparql"]
+# Opt-in MCP (Model Context Protocol) stdio server, exposing SPARQL query/
+# update/data-model-discovery tools to LLM agents (`oxigraph mcp serve`).
+# Zero-cost when disabled: `oxigraph-nova-mcp` (and its `rmcp`/`schemars`
+# dependencies) are only pulled in when this feature is enabled.
+mcp = ["dep:oxigraph-nova-mcp"]
 
 
 
@@ -26,6 +31,9 @@ oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
 oxigraph-nova-query        = { path = "../nova-query" }
 oxigraph-nova-server       = { path = "../nova-server" }
 oxigraph-nova-shacl        = { path = "../nova-shacl" }
+oxigraph-nova-reasoning    = { path = "../nova-reasoning" }
+oxigraph-nova-mcp          = { path = "../nova-mcp", optional = true }
+
 oxrdf          = { workspace = true }
 oxrdfio        = { workspace = true }
 spargebra      = { workspace = true }

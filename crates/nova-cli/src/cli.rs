@@ -3,12 +3,12 @@
 //! Subcommand/flag names deliberately mirror upstream `oxigraph-cli`
 //! (see `./research/oxigraph/cli/src/cli.rs`) wherever Nova's feature surface
 //! overlaps — this binary is even named `oxigraph`, so scripts/muscle
-//! memory written against one carry over to the other. Nova ships 10
+//! memory written against one carry over to the other. Nova ships 11
 //! subcommands: `load`, `backup`, `serve`, `query`, `update`, `dump`,
-//! `convert`, `optimize`, `serve-read-only`, `validate` — matching
-//! upstream's full subcommand surface plus Nova's own SHACL `validate`
-//! addition (some flags are trimmed relative to upstream where Nova doesn't
-//! yet implement the corresponding capability — e.g. no
+//! `convert`, `optimize`, `serve-read-only`, `validate`, `mcp` — matching
+//! upstream's full subcommand surface plus Nova's own SHACL `validate` and
+//! MCP `mcp serve` additions (some flags are trimmed relative to upstream
+//! where Nova doesn't yet implement the corresponding capability — e.g. no
 //! `--explain`/`--stats`/stdin input for `query`/`update`.
 
 use clap::{Parser, Subcommand, ValueHint};
@@ -399,5 +399,54 @@ pub enum Command {
         /// Write the validation report to this file instead of stdout
         #[arg(long, value_hint = ValueHint::FilePath)]
         results_file: Option<PathBuf>,
+    },
+    /// MCP (Model Context Protocol) server commands, exposing SPARQL query/
+    /// update/data-model-discovery tools to LLM agents
+    ///
+    /// Requires this binary to have been built with the `mcp` cargo feature
+    /// (`cargo run -p oxigraph-nova-cli --features mcp`); running any `mcp`
+    /// subcommand without that feature enabled is a hard error at startup.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum McpCommand {
+    /// Start the MCP server over stdio (Phase A / MVP transport — see
+    /// `oxigraph_nova_mcp`'s crate docs for the full tool list and an HTTP
+    /// `/mcp` transport's status as a deferred Phase B)
+    ///
+    /// **Concurrency**: do not point `--location` at a directory that is
+    /// concurrently open in another `oxigraph serve`/`nova_serve` process —
+    /// `RingStore` is a single-writer-WAL design (see
+    /// `oxigraph_nova_storage_ring::store`'s module doc, "Isolation
+    /// semantics").
+    Serve {
+        /// Directory in which the data should be persisted
+        ///
+        /// If not present, an in-memory store is used.
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        location: Option<PathBuf>,
+        /// Enable an OWL 2 RL reasoning overlay: `sparql_query` then
+        /// evaluates against the store's reasoning closure instead of the
+        /// raw store, mirroring `oxigraph serve --reasoning` (once/if that
+        /// flag exists) / `nova_serve`'s own `--reasoning` wiring.
+        #[arg(long)]
+        reasoning: bool,
+        /// Enable Tantivy-backed full-text search (`text:query`/
+        /// `text:contains` SPARQL extension functions), indexed
+        /// incrementally on the store's compaction cycle.
+        ///
+        /// Requires this binary to have also been built with the
+        /// `fulltext` cargo feature; passing this flag without that
+        /// feature enabled is a hard error at startup.
+        #[arg(long)]
+        fulltext: bool,
+        /// Cap the number of result rows/triples a single `sparql_query`
+        /// tool call may produce. Unset by default (no cap).
+        #[arg(long)]
+        max_results: Option<usize>,
     },
 }

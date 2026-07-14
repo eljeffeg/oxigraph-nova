@@ -36,7 +36,7 @@ mod cli;
 mod load;
 
 use clap::Parser;
-use cli::{Args, Command};
+use cli::{Args, Command, McpCommand};
 use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, NamedOrBlankNode, QuadStore, Term};
 use oxigraph_nova_query::{Evaluator, QueryResult, StoreDataset, execute_update};
@@ -198,6 +198,17 @@ fn main() -> anyhow::Result<()> {
                 union_default_graph,
             ))
         }
+        Command::Mcp { command } => match command {
+            McpCommand::Serve {
+                location,
+                reasoning,
+                fulltext,
+                max_results,
+            } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(run_mcp_serve(location, reasoning, fulltext, max_results))
+            }
+        },
     }
 }
 
@@ -901,4 +912,95 @@ fn run_validate(
         std::process::exit(1);
     }
     Ok(())
+}
+
+// ── mcp serve ────────────────────────────────────────────────────────────────
+
+/// `oxigraph mcp serve` — construct a `NovaMcpService` and serve it over
+/// stdio (Phase A / MVP transport, per `oxigraph_nova_mcp`'s crate docs).
+///
+/// **Important**: unlike every other subcommand in this file, this handler
+/// must not `println!` anything to stdout once the stdio transport takes
+/// over — the MCP stdio transport uses stdout for the JSON-RPC protocol
+/// stream itself. All diagnostics below go to stderr / `tracing` instead.
+#[cfg(feature = "mcp")]
+async fn run_mcp_serve(
+    location: Option<std::path::PathBuf>,
+    reasoning: bool,
+    fulltext: bool,
+    max_results: Option<usize>,
+) -> anyhow::Result<()> {
+    let store = match &location {
+        Some(dir) => {
+            eprintln!(
+                "[oxigraph mcp serve] Opening persistent store at {} ...",
+                dir.display()
+            );
+            let store = RingStore::open(dir)?;
+            eprintln!(
+                "[oxigraph mcp serve] Recovered {} triples from WAL.",
+                store.triple_count()
+            );
+            store
+        }
+        None => {
+            eprintln!("[oxigraph mcp serve] Using an in-memory store (no --location given).");
+            RingStore::new()
+        }
+    };
+    let store = Arc::new(store);
+
+    #[cfg(feature = "fulltext")]
+    let text_search: Option<Arc<dyn oxigraph_nova_core::TextSearch>> = if fulltext {
+        eprintln!("[oxigraph mcp serve] Enabling full-text search (text:query/text:contains) ...");
+        store.enable_fulltext()?;
+        Some(Arc::clone(&store) as Arc<dyn oxigraph_nova_core::TextSearch>)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "fulltext"))]
+    let text_search: Option<Arc<dyn oxigraph_nova_core::TextSearch>> = {
+        if fulltext {
+            anyhow::bail!(
+                "--fulltext was passed, but this binary was not built with the `fulltext` \
+                 cargo feature (rebuild with `--features mcp,fulltext`)"
+            );
+        }
+        None
+    };
+
+    let mut service = oxigraph_nova_mcp::NovaMcpService::new(Arc::clone(&store));
+    if reasoning {
+        eprintln!("[oxigraph mcp serve] Enabling OWL 2 RL reasoning overlay ...");
+        let engine: Arc<dyn oxigraph_nova_reasoning::ReasoningEngine> =
+            Arc::new(oxigraph_nova_reasoning::LftjFixpointEngine::new());
+        service = service.with_reasoning(Arc::new(oxigraph_nova_reasoning::ReasoningState::new(
+            engine,
+        )));
+    }
+    if let Some(ts) = text_search {
+        service = service.with_text_search(ts);
+    }
+    if let Some(n) = max_results {
+        service = service.with_max_results(n);
+    }
+
+    eprintln!("[oxigraph mcp serve] Ready. Serving MCP over stdio ...");
+    oxigraph_nova_mcp::serve_stdio(service).await?;
+    eprintln!("[oxigraph mcp serve] Client disconnected; shutting down.");
+    Ok(())
+}
+
+/// Hard error: this binary was not built with the `mcp` cargo feature.
+#[cfg(not(feature = "mcp"))]
+async fn run_mcp_serve(
+    _location: Option<std::path::PathBuf>,
+    _reasoning: bool,
+    _fulltext: bool,
+    _max_results: Option<usize>,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "`oxigraph mcp serve` was invoked, but this binary was not built with the `mcp` cargo \
+         feature (rebuild with `cargo run -p oxigraph-nova-cli --features mcp`)"
+    );
 }

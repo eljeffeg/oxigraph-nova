@@ -12,6 +12,7 @@ members = [
     "crates/nova-server",
     "crates/nova-store",
     "crates/nova-cli",
+    "crates/nova-mcp",
     "crates/nova-python",
     "crates/nova-js",
     "tests/w3c",
@@ -146,8 +147,19 @@ spareval = { version = "0.2.6", features = ["sparql-12"] }
 reasonable = { version = "0.4.4", features = ["rdf-12"] }
 
 
+# ── MCP server (crates/nova-mcp, opt-in via nova-cli's `mcp` feature) ───────
+# Official Rust MCP SDK. `server` + `transport-io` give us the stdio-based
+# server transport (`rmcp::transport::stdio`) needed for the CLI's
+# `oxigraph mcp serve` subcommand. `schemars`
+# is pulled in transitively by rmcp's own `server` feature, but is also
+# listed explicitly since nova-mcp derives `schemars::JsonSchema` on its own
+# tool-parameter structs.
+rmcp     = { version = "2.2.0", features = ["server", "transport-io"] }
+schemars = { version = "1.2.1" }
+
 
 [profile.release]
+
 opt-level      = 3
 lto            = "thin"
 codegen-units  = 1       # maximise inlining + cross-crate optimisation (slower compile)

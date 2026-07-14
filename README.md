@@ -284,27 +284,55 @@ comment for exactly which SHACL Core targets (`sh:targetNode`,
 `sh:maxCount`, `sh:datatype`, `sh:nodeKind`, `sh:class`, `sh:hasValue`,
 `sh:in`) `NativeValidator` currently compiles, and which are deferred.
 
-## Design trade-offs vs. QLever
+## MCP server (opt-in)
 
+`oxigraph-nova-mcp` exposes SPARQL query/update and data-model-discovery
+tools to LLM agents over the [Model Context Protocol](https://modelcontextprotocol.io/)
+(MCP), built on the official Rust MCP SDK (`rmcp`). It is gated behind an
+opt-in `mcp` cargo feature on the `oxigraph` CLI (zero-cost when disabled,
+matching the `fulltext`/`geosparql` pattern):
 
+```sh
+# Build with MCP support and start the stdio server against a persistent store
+cargo run --release --bin oxigraph --features mcp -- \
+    mcp serve --location ./data --reasoning --fulltext
+```
 
-QLever (C++) is a high-performance RDF store optimized for bulk-loaded static datasets. It uses six sorted compressed integer arrays and merge joins — an excellent approach for read-heavy analytical workloads over large, stable graphs. The table below shows how the two stores differ across a few dimensions; each row reflects a deliberate design choice, not a deficiency in either system.
+The server communicates over stdio — the standard transport MCP clients
+(Claude Desktop, Claude Code, and similar agent tooling) use to launch a
+local MCP server as a subprocess. A typical client config simply points at
+the built binary:
 
-| Dimension | QLever | Oxigraph Nova |
-|---|---|---|
-| Sequential predicate scan | Fast | Fast (Ring POS/PSO traversal — same orderings, near-optimal space) |
-| 2–3 way join, selective | Fast | Fast (dictionary integer IDs, no Term clone overhead) |
-| Cyclic joins | Merge-join based | LFTJ: worst-case optimal over Ring `TrieIterator`s |
-| Live writes | SPARQL UPDATE via offline diff/merge | O(log n) per write into `BTreeMap` delta; Ring rebuild with no read downtime |
-| Full-text + SPARQL | Integrated | Tantivy-backed, opt-in (`--fulltext`), incrementally indexed on the compaction cycle |
-| Reasoning | None | OWL 2 RL reasoning, opt-in (`--reasoning`), LFTJ-native semi-naive fixpoint engine |
-| Memory footprint | Six sorted compressed arrays | Single compact Ring (tens of bytes/triple at benchmark scale) |
-| Persistence | On-disk from the start | Optional: in-memory by default, or a crash-safe WAL + MANIFEST + mmap'd ε-serde snapshot store (`--location <dir>`) with near-zero-copy load of both the Ring index and the term dictionary |
+```json
+{
+  "mcpServers": {
+    "oxigraph-nova": {
+      "command": "/path/to/oxigraph",
+      "args": ["mcp", "serve", "--location", "/path/to/data"]
+    }
+  }
+}
+```
 
-Nova runs in two modes. The default is a purely in-process, heap-resident store (matches Oxigraph's own no-`--location` in-memory mode, for apples-to-apples comparisons). Passing `--location <dir>` to `nova_serve` switches to a persistent, crash-recoverable mode: every write is first logged to a write-ahead log, snapshots (Ring + dictionary) are mmap'd back in on restart instead of being fully re-parsed, and a MANIFEST file provides the single atomic commit point tying a snapshot generation to a WAL segment.
+Four tools are exposed, all evaluated against the same `Evaluator`/
+`StoreDataset` (or reasoning-overlay, if `--reasoning` is passed) path
+`nova-server`'s HTTP endpoint already uses:
 
+| Tool | Purpose |
+|---|---|
+| `sparql_query` `{ query }` | Run a SPARQL query — SELECT/ASK results as SPARQL-results-JSON, CONSTRUCT/DESCRIBE as N-Triples |
+| `sparql_update` `{ update }` | Run a SPARQL update, returning a success summary |
+| `describe_data_model` | Named graphs, distinct predicates, `rdf:type` classes, and a triple count — lets an agent orient itself before writing a query blind |
+| `list_graphs` | A cheap named-graphs + triple-count subset of `describe_data_model`, for quick orientation without a full-store scan |
 
----
+`--reasoning` and `--fulltext` enable the same OWL 2 RL reasoning overlay
+and Tantivy-backed full-text search described above (each requiring the
+corresponding cargo feature to also be built in), and `--max-results <n>`
+caps the number of rows/triples a single `sparql_query` call may return.
+
+See `crates/nova-mcp/src/lib.rs`'s module doc comment for the full tool
+reference and transport details.
+
 
 ## Conformance and compatibility
 
@@ -313,7 +341,6 @@ Oxigraph Nova targets full conformance with the W3C SPARQL 1.1 and (Working Draf
 Because Nova reuses the Oxigraph project's own parsing crates (`spargebra`, `oxrdf`, etc. — see the table above), any gap in those crates shows up here too.
 
 
----
 
 ## Building
 
@@ -355,7 +382,6 @@ identical synthetic BSBM-style datasets and identical SPARQL queries, run throug
 
 See [`benches/external/README.md`](./benches/external/README.md) for the full methodology, storage-model fairness notes, and instructions to run the harness yourself.
 
----
 
 ## Command-line interface (`oxigraph`)
 
@@ -364,25 +390,28 @@ Building the workspace also produces a standalone `oxigraph` binary
 `oxigraph-cli`'s full 9-subcommand surface — `load`, `backup`, `query`,
 `update`, `dump`, `convert`, `optimize`, `serve`, and `serve-read-only` —
 against Nova's own `RingStore`, plus Nova's own SHACL `validate` addition
-(10 subcommands total), under the same binary name so scripts/muscle memory
-carry over:
+and an opt-in `mcp` subcommand (11 subcommands total; `mcp` itself has one
+nested action today, `mcp serve`, gated behind the `mcp` cargo feature —
+see "MCP server (opt-in)" above), under the same binary name so
+scripts/muscle memory carry over:
 
 ```sh
 cargo build --release --bin oxigraph
 ```
 
-| Subcommand | Purpose |
-|---|---|
-| `oxigraph load --location <dir> --file <path> [--format <fmt>] [--graph <iri>]` | Bulk-load a file directly into a persistent store, bypassing HTTP entirely (much faster than the Graph Store Protocol for large datasets) |
-| `oxigraph backup --location <dir> --destination <dir>` | Create a crash-safe, independent copy of a persistent store's WAL + MANIFEST + snapshot |
-| `oxigraph query --location <dir> (--query <q> \| --query-file <f>) [--results-file <f>] [--results-format <fmt>]` | Run a SPARQL query against a persistent store, offline (no HTTP) — results format-negotiated the same way as `/sparql` |
-| `oxigraph update --location <dir> (--update <u> \| --update-file <f>)` | Run a SPARQL update against a persistent store, offline (no HTTP) |
-| `oxigraph dump --location <dir> [--file <f>] [--format <fmt>] [--graph <iri>]` | Serialize a store's logical RDF content out to a file, optionally restricted to one graph |
-| `oxigraph convert [--from-file <f>] [--from-format <fmt>] [--to-file <f>] [--to-format <fmt>]` | Stream-convert one RDF file to another format, with no store involved at all — supports stdin/stdout |
-| `oxigraph optimize --location <dir>` | Force storage compaction on demand (`RingStore::compact()`) |
-| `oxigraph serve [--location <dir>] [--file <path>] [--bind <addr>]` | Start the same SPARQL 1.2 HTTP server described below, as a subcommand instead of a separate binary |
-| `oxigraph serve-read-only --location <dir> [--bind <addr>]` | Same as `serve`, but every write (`/update`, `PUT`/`POST`/`DELETE /store`) is rejected at the HTTP layer with `403 Forbidden` |
-| `oxigraph validate --location <dir> --shapes <path> [--shapes-format <fmt>] [--results-file <f>]` | Validate a persistent store's data against a SHACL shapes graph, offline (no HTTP) — exits non-zero if the data does not conform, so this doubles as a CI gate (see "SHACL validation" above) |
+| Subcommand | Argument | Purpose |
+|---|---|---|
+| oxigraph load | `--location <dir> --file <path> [--format <fmt>] [--graph <iri>]` | Bulk-load a file directly into a persistent store, bypassing HTTP entirely (much faster than the Graph Store Protocol for large datasets) |
+| oxigraph backup | `--location <dir> --destination <dir>` | Create a crash-safe, independent copy of a persistent store's WAL + MANIFEST + snapshot |
+| oxigraph query | `--location <dir> (--query <q> \| --query-file <f>) [--results-file <f>] [--results-format <fmt>]` | Run a SPARQL query against a persistent store, offline (no HTTP) — results format-negotiated the same way as `/sparql` |
+| oxigraph update | `--location <dir> (--update <u> \| --update-file <f>)` | Run a SPARQL update against a persistent store, offline (no HTTP) |
+| oxigraph dump | `--location <dir> [--file <f>] [--format <fmt>] [--graph <iri>]` | Serialize a store's logical RDF content out to a file, optionally restricted to one graph |
+| oxigraph convert | `[--from-file <f>] [--from-format <fmt>] [--to-file <f>] [--to-format <fmt>]` | Stream-convert one RDF file to another format, with no store involved at all — supports stdin/stdout |
+| oxigraph optimize | `--location <dir>` | Force storage compaction on demand (`RingStore::compact()`) |
+| oxigraph serve | `[--location <dir>] [--file <path>] [--bind <addr>]` | Start the same SPARQL 1.2 HTTP server described below, as a subcommand instead of a separate binary |
+| oxigraph serve-read-only | `--location <dir> [--bind <addr>]` | Same as `serve`, but every write (`/update`, `PUT`/`POST`/`DELETE /store`) is rejected at the HTTP layer with `403 Forbidden` |
+| oxigraph validate | `--location <dir> --shapes <path> [--shapes-format <fmt>] [--results-file <f>]` | Validate a persistent store's data against a SHACL shapes graph, offline (no HTTP) — exits non-zero if the data does not conform, so this doubles as a CI gate (see "SHACL validation" above) |
+| oxigraph mcp serve | `[--location <dir>] [--reasoning] [--fulltext] [--max-results <n>]` | `mcp`'s nested `serve` action: start an MCP (Model Context Protocol) server over stdio, exposing SPARQL query/update/data-model-discovery tools to LLM agents — requires the `mcp` cargo feature (see "MCP server (opt-in)" above) |
 
 ```sh
 # Bulk-load a dataset directly into a persistent store
@@ -418,6 +447,9 @@ cargo run --release --bin oxigraph -- serve-read-only --location ./data --bind 0
 
 # Validate a persistent store against a SHACL shapes graph, offline
 cargo run --release --bin oxigraph -- validate --location ./data --shapes shapes.ttl
+
+# Start an MCP server over stdio for LLM-agent access (requires --features mcp)
+cargo run --release --bin oxigraph --features mcp -- mcp serve --location ./data
 ```
 
 Run `oxigraph <subcommand> --help` for the full flag reference for each

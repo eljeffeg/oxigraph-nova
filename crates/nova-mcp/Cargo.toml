@@ -1,0 +1,33 @@
+[package]
+name        = "oxigraph-nova-mcp"
+description = "MCP (Model Context Protocol) server exposing Oxigraph Nova SPARQL query/update/data-model-discovery tools to LLM agents"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+oxigraph-nova-core         = { path = "../nova-core" }
+oxigraph-nova-query        = { path = "../nova-query" }
+oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
+# Reasoning is a lightweight crate (no heavy deps of its own), so — mirroring
+# `oxigraph-nova-server`'s own unconditional dependency on it — it's always
+# compiled in here rather than behind its own extra feature flag; the only
+# heavyweight *new* deps this crate introduces are `rmcp`/`schemars`
+# themselves, gated one level up at `oxigraph-nova-cli`'s `mcp` feature.
+oxigraph-nova-reasoning    = { path = "../nova-reasoning" }
+
+rmcp       = { workspace = true }
+schemars   = { workspace = true }
+oxrdf      = { workspace = true }
+oxrdfio    = { workspace = true }
+spargebra  = { workspace = true }
+sparesults = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true }
+tracing    = { workspace = true }
+anyhow     = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
