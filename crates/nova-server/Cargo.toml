@@ -30,6 +30,8 @@ oxigraph-nova-query        = { path = "../nova-query" }
 oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
 oxigraph-nova-reasoning    = { path = "../nova-reasoning" }
 oxigraph-nova-shacl        = { path = "../nova-shacl" }
+oxigraph-nova-cypher       = { path = "../nova-cypher" }
+
 oxrdf          = { workspace = true }
 oxrdfio        = { workspace = true }
 spargebra      = { workspace = true }

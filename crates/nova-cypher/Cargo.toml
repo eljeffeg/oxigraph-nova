@@ -1,0 +1,27 @@
+[package]
+name        = "oxigraph-nova-cypher"
+description = "openCypher frontend for Oxigraph Nova: lexer, parser, and RDF/property-graph"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+# Only the algebra + term types are needed to *build* a `spargebra::Query` —
+# this crate never evaluates a query itself, so it deliberately does not
+# depend on `oxigraph-nova-query`'s `Evaluator`/`Dataset` seam. Any caller
+# (nova-server, nova-cli, nova-mcp, or a test) hands the produced
+# `spargebra::Query` to `oxigraph_nova_query::Evaluator` itself.
+oxrdf     = { workspace = true }
+spargebra = { workspace = true }
+anyhow    = { workspace = true }
+
+[dev-dependencies]
+# Only integration tests need a real evaluator + storage backend to confirm
+# lowered queries actually run and return correct results end-to-end.
+oxigraph-nova-core          = { path = "../nova-core", default-features = false }
+oxigraph-nova-query          = { path = "../nova-query", default-features = false }
+oxigraph-nova-storage-ring   = { path = "../nova-storage-ring" }
+oxrdf              = { workspace = true }
+pretty_assertions = { workspace = true }
+

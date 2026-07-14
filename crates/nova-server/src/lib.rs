@@ -14,10 +14,31 @@
 //! Oxigraph's `/sparql`, which accepts *either* a query or an update, Nova's
 //! `/sparql`/`/query` are query-only; use `/update` for updates.
 //!
+//! Also exposes an experimental openCypher query surface (see
+//! `oxigraph_nova_cypher`'s crate doc comment for the supported subset —
+//! read-only `MATCH`/`WHERE`/`RETURN`/`ORDER BY`/`SKIP`/`LIMIT` plus the
+//! write clauses `CREATE`/`SET`/`DELETE`/`DETACH DELETE`/`REMOVE`), each
+//! endpoint a thin wrapper translating Cypher into the equivalent SPARQL
+//! algebra (`oxigraph_nova_cypher::parse_and_lower`/`parse_and_lower_update`)
+//! and then reusing exactly the same evaluation/serialization machinery as
+//! `/sparql`/`/update` above:
+//!
+//!   GET  `/cypher?query=<encoded>`                              — read query via URL param
+//!   POST `/cypher`  Content-Type: text/plain (or unset)         — read query in body
+//!   POST `/cypher`  Content-Type: application/x-www-form-urlencoded; `query=` field
+//!   POST `/cypher/update`  Content-Type: text/plain (or unset)  — write clauses in body
+//!   POST `/cypher/update`  Content-Type: application/x-www-form-urlencoded; `update=` field
+//!
+//! Result serialization for `/cypher` is content-negotiated identically to
+//! `/sparql` (see below); `/cypher/update` returns `200 OK` on success like
+//! `/update`. `/cypher/update` honors the same `read_only` server flag as
+//! `/update`.
+//!
 //! Also implements the SPARQL 1.1 Graph Store HTTP Protocol (W3C Rec):
 //!
 //!   GET    `/store?graph=<iri>` / `?default`                    — read a graph
 //!   PUT    `/store?graph=<iri>` / `?default`                    — replace a graph
+
 //!   POST   `/store?graph=<iri>` / `?default`                    — merge into a graph
 //!   DELETE `/store?graph=<iri>` / `?default`                    — clear a graph
 //!
@@ -182,6 +203,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use oxigraph_nova_core::{QuadStore, TextSearch};
+use oxigraph_nova_cypher::{parse_and_lower, parse_and_lower_update};
 use oxigraph_nova_query::{
     CancellationToken, EvalLimitError, Evaluator, QueryOptions, QueryResult, ServiceHandler,
     Solutions, StoreDataset, clear_graph, execute_update,
@@ -479,7 +501,12 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
             // unmodified.
             .route("/query", get(sparql_get::<S>).post(sparql_post::<S>))
             .route("/update", post(sparql_update::<S>))
+            // Experimental openCypher query surface — see the module doc
+            // comment above for the supported subset and dispatch rules.
+            .route("/cypher", get(cypher_get::<S>).post(cypher_post::<S>))
+            .route("/cypher/update", post(cypher_update_post::<S>))
             .route(
+
                 "/store",
                 get(store_get::<S>)
                     .put(store_put::<S>)
@@ -636,6 +663,108 @@ async fn sparql_update<S: QuadStore + 'static>(
     };
 
     execute_sparql_update(&state.store, &update_str)
+}
+
+/// `GET /cypher?query=<percent-encoded Cypher>`
+async fn cypher_get<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+    AxumQuery(params): AxumQuery<SparqlQueryParams>,
+    headers: HeaderMap,
+) -> Response {
+    match params.query {
+        None => (StatusCode::BAD_REQUEST, "Missing ?query= parameter").into_response(),
+        Some(q) => execute_cypher_query(&state, &q, accept_header(&headers)).await,
+    }
+}
+
+/// `POST /cypher`
+///
+/// Accepted content-types (mirrors `/sparql`'s leniency — there is no
+/// registered `application/cypher-query` media type to require):
+///   - `application/x-www-form-urlencoded` — body contains `query=<encoded>`
+///   - `text/plain` / no content-type      — lenient: body treated as Cypher text
+async fn cypher_post<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Empty request body").into_response();
+    }
+
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let query_str: String = if ct.starts_with("application/x-www-form-urlencoded") {
+        match form_param(&body, "query") {
+            Some(q) => q,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Missing 'query' field in form body",
+                )
+                    .into_response();
+            }
+        }
+    } else if ct.is_empty() || ct.starts_with("text/plain") {
+        // Lenient: accept untyped or plain-text bodies as direct Cypher.
+        body
+    } else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Use Content-Type: text/plain or application/x-www-form-urlencoded",
+        )
+            .into_response();
+    };
+
+    execute_cypher_query(&state, &query_str, accept_header(&headers)).await
+}
+
+/// `POST /cypher/update` — openCypher write clauses
+/// (`CREATE`/`SET`/`DELETE`/`DETACH DELETE`/`REMOVE`).
+///
+/// Accepted content-types: same leniency as `POST /cypher` above.
+async fn cypher_update_post<S: QuadStore + 'static>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if state.read_only {
+        return (StatusCode::FORBIDDEN, "This server is read-only").into_response();
+    }
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Empty request body").into_response();
+    }
+
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let update_str: String = if ct.starts_with("application/x-www-form-urlencoded") {
+        match form_param(&body, "update") {
+            Some(u) => u,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Missing 'update' field in form body",
+                )
+                    .into_response();
+            }
+        }
+    } else if ct.is_empty() || ct.starts_with("text/plain") {
+        body
+    } else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Use Content-Type: text/plain or application/x-www-form-urlencoded",
+        )
+            .into_response();
+    };
+
+    execute_cypher_update(&state.store, &update_str)
 }
 
 /// `GET /` — SPARQL Service Description.
@@ -1010,6 +1139,29 @@ fn execute_sparql_update<S: QuadStore + 'static>(store: &Arc<S>, sparql: &str) -
         Ok(u) => u,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("SPARQL parse error: {e}")).into_response();
+        }
+    };
+
+    match execute_update(store, &update) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Update execution error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Parse (as openCypher, lowering to the equivalent SPARQL Update algebra
+/// via `oxigraph_nova_cypher::parse_and_lower_update`) → execute a write
+/// request against the store. Mirrors `execute_sparql_update` exactly,
+/// swapping only the parse step — everything downstream (the actual
+/// `execute_update` call and its error handling) is identical.
+fn execute_cypher_update<S: QuadStore + 'static>(store: &Arc<S>, cypher: &str) -> Response {
+    let update = match parse_and_lower_update(cypher) {
+        Ok(u) => u,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("Cypher parse error: {e}")).into_response();
         }
     };
 
@@ -1447,6 +1599,157 @@ async fn execute_sparql_query<S: QuadStore + 'static>(
             }
         },
 
+        Ok(Ok(QueryResult::Triples(stream))) => match stream.collect::<anyhow::Result<Vec<_>>>() {
+            Ok(triples) => serialize_triples(&triples, accept),
+            Err(e) => {
+                QUERY_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("error collecting results: {e}"),
+                )
+                    .into_response()
+            }
+        },
+    }
+}
+
+/// Parse (as openCypher, lowering to the equivalent SPARQL algebra via
+/// `oxigraph_nova_cypher::parse_and_lower`) → adapt store → evaluate →
+/// serialise. Mirrors `execute_sparql_query` exactly, swapping only the
+/// parse step (step 1) — every downstream concern (concurrency limiting,
+/// timeout/cancellation racing, `max_results`, content-negotiated
+/// serialization, metrics) is identical and fully reused since
+/// `parse_and_lower` produces the same `spargebra::Query` type the
+/// evaluator already consumes.
+async fn execute_cypher_query<S: QuadStore + 'static>(
+    state: &AppState<S>,
+    cypher: &str,
+    accept: &str,
+) -> Response {
+    QUERIES_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+    // 0. Concurrency limit — reject immediately rather than queue.
+    let _permit = if let Some(sem) = &state.query_semaphore {
+        match Arc::clone(sem).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                QUERY_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Too many concurrent queries; please try again later",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    // 1. Parse (Cypher → SPARQL algebra).
+    let query = {
+        let _span = tracing::info_span!("parse_cypher_query").entered();
+        match parse_and_lower(cypher) {
+            Ok(q) => q,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("Cypher parse error: {e}"))
+                    .into_response();
+            }
+        }
+    };
+
+    // 2. Build per-query options and hand evaluation to a blocking thread.
+    let mut options = QueryOptions::new();
+    if let Some(max) = state.max_results {
+        options = options.with_max_results(max);
+    }
+    if let Some(ts) = &state.text_search {
+        options = options.with_text_search(Arc::clone(ts));
+    }
+    if let Some(handler) = &state.service_handler {
+        options = options.with_service_handler(Arc::clone(handler));
+    }
+    if state.union_default_graph {
+        options = options.with_union_default_graph(true);
+    }
+    let cancellation = state.query_timeout.map(|_| CancellationToken::new());
+    if let Some(token) = &cancellation {
+        options = options.with_cancellation(token.clone());
+    }
+
+    let store = Arc::clone(&state.store);
+    let reasoning = state.reasoning.clone();
+    let query_for_eval = query.clone();
+    let mut join = tokio::task::spawn_blocking(move || {
+        if let Some(rs) = reasoning {
+            let overlay = rs.current(&store)?;
+            let evaluator = Evaluator::with_options(&*overlay, options);
+            evaluator.evaluate(&query_for_eval)
+        } else {
+            let dataset = StoreDataset::new(store);
+            let evaluator = Evaluator::with_options(&dataset, options);
+            evaluator.evaluate(&query_for_eval)
+        }
+    });
+
+    // 3. Evaluate, racing against the configured timeout (if any).
+    let outcome = if let Some(timeout) = state.query_timeout {
+        tokio::select! {
+            res = &mut join => res,
+            _ = tokio::time::sleep(timeout) => {
+                if let Some(token) = &cancellation {
+                    token.cancel();
+                }
+                (&mut join).await
+            }
+        }
+    } else {
+        (&mut join).await
+    };
+
+    // 4. Serialise (or map an evaluation/limit error to an HTTP status).
+    match outcome {
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("internal error: {join_err}"),
+        )
+            .into_response(),
+        Ok(Err(e)) => match e.downcast_ref::<EvalLimitError>() {
+            Some(EvalLimitError::Cancelled) => {
+                QUERY_TIMEOUTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::GATEWAY_TIMEOUT, "Query timed out").into_response()
+            }
+            Some(EvalLimitError::ResultLimitExceeded(n)) => {
+                QUERY_RESULT_LIMIT_EXCEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Query exceeded the result limit of {n} row(s)"),
+                )
+                    .into_response()
+            }
+            None => {
+                QUERY_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Evaluation error: {e}"),
+                )
+                    .into_response()
+            }
+        },
+        Ok(Ok(QueryResult::Boolean(b))) => serialize_boolean(b, accept),
+        Ok(Ok(qr @ QueryResult::Solutions { .. })) => match qr.into_solutions_vec() {
+            Ok((vars_arc, solutions)) => {
+                let vars: Vec<Variable> = vars_arc.to_vec();
+                serialize_solutions(&vars, solutions, accept)
+            }
+            Err(e) => {
+                QUERY_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("error collecting results: {e}"),
+                )
+                    .into_response()
+            }
+        },
         Ok(Ok(QueryResult::Triples(stream))) => match stream.collect::<anyhow::Result<Vec<_>>>() {
             Ok(triples) => serialize_triples(&triples, accept),
             Err(e) => {
@@ -2275,6 +2578,249 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── /cypher and /cypher/update ─────────────────────────────────────────────
+
+    /// Insert two Cypher-native nodes (via `CREATE (n {name: ...})`, which
+    /// lowers `name` to a `<PROP_NS>name` triple — see
+    /// `oxigraph_nova_cypher::PROP_NS`) into `router`'s store, for use by
+    /// `MATCH (n) WHERE n.name = ...`-style read tests below. Cypher's data
+    /// model (`LABEL_NS`/`REL_NS`/`PROP_NS`-namespaced triples) is distinct
+    /// from arbitrary SPARQL-inserted triples like `make_store()`'s
+    /// `http://ex/name`, so these read tests seed their own Cypher-created
+    /// fixture data rather than reusing `make_store()`.
+    async fn seed_cypher_names(router: &Router) {
+        for name in ["Alice", "Bob"] {
+            let cypher = format!(r#"CREATE (n {{name: "{name}"}})"#);
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/cypher/update")
+                .body(Body::from(cypher))
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cypher_get_returns_two_names() {
+        let router = Server::new(Arc::new(MemoryStore::new())).into_router();
+        seed_cypher_names(&router).await;
+
+        // MATCH (n) RETURN n.name — URL-encoded.
+        let q = "MATCH+%28n%29+RETURN+n.name";
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/cypher?query={q}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "expected 200 OK");
+        let json = body_json(resp).await;
+        let bindings = json["results"]["bindings"].as_array().unwrap();
+        assert_eq!(
+            bindings.len(),
+            2,
+            "expected 2 bindings, got {}",
+            bindings.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cypher_get_missing_query_returns_400() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/cypher")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_cypher_post_text_plain_match_returns_names() {
+        let router = Server::new(Arc::new(MemoryStore::new())).into_router();
+        seed_cypher_names(&router).await;
+
+        let cypher = "MATCH (n) RETURN n.name";
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher")
+            .header("content-type", "text/plain")
+            .body(Body::from(cypher))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let bindings = json["results"]["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cypher_post_no_content_type_is_lenient() {
+        let router = Server::new(Arc::new(MemoryStore::new())).into_router();
+        seed_cypher_names(&router).await;
+
+        let cypher = "MATCH (n) RETURN n.name";
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher")
+            .body(Body::from(cypher))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_cypher_post_form_urlencoded() {
+        let router = Server::new(Arc::new(MemoryStore::new())).into_router();
+        seed_cypher_names(&router).await;
+
+        // query=MATCH (n) RETURN n.name
+        let form = "query=MATCH+%28n%29+RETURN+n.name";
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(form))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let bindings = json["results"]["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cypher_post_empty_body_returns_400() {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_cypher_post_parse_error_returns_400() {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher")
+            .body(Body::from("THIS IS NOT CYPHER"))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(resp).await;
+        assert!(
+            body.contains("Cypher parse error"),
+            "expected Cypher parse error message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cypher_post_unsupported_content_type_returns_415() {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = make_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_cypher_update_create_node() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        let cypher = r#"CREATE (n {name: "Carol"})"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher/update")
+            .body(Body::from(cypher))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The store should have grown by (at least) the new node's name triple.
+        let len_after = store.len().unwrap();
+        assert!(
+            len_after > 3,
+            "expected store to have grown past the initial 3 quads, got {len_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cypher_update_form_urlencoded() {
+        let store = make_store();
+        let router = Server::new(Arc::clone(&store)).into_router();
+
+        // update=CREATE (n {name: "Dave"})
+        let form = "update=CREATE+%28n+%7Bname%3A+%22Dave%22%7D%29";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher/update")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(form))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(store.len().unwrap() > 3);
+    }
+
+    #[tokio::test]
+    async fn test_cypher_update_empty_body_returns_400() {
+        let router = make_router();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher/update")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_cypher_update_parse_error_returns_400() {
+        let router = make_router();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher/update")
+            .body(Body::from("NOT A CYPHER UPDATE {{{"))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_cypher_update_read_only_returns_403() {
+        let router = Server::new(make_store()).read_only(true).into_router();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/cypher/update")
+            .body(Body::from(r#"CREATE (n {name: "X"})"#))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // ── Content-negotiated CONSTRUCT/DESCRIBE serialization ───────────────────

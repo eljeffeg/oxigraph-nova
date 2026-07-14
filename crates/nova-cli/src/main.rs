@@ -36,7 +36,7 @@ mod cli;
 mod load;
 
 use clap::Parser;
-use cli::{Args, Command, McpCommand};
+use cli::{Args, Command, CypherCommand, McpCommand};
 use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, NamedOrBlankNode, QuadStore, Term};
 use oxigraph_nova_query::{Evaluator, QueryResult, StoreDataset, execute_update};
@@ -208,6 +208,26 @@ fn main() -> anyhow::Result<()> {
                 let rt = tokio::runtime::Runtime::new()?;
                 rt.block_on(run_mcp_serve(location, reasoning, fulltext, max_results))
             }
+        },
+        Command::Cypher { command } => match command {
+            CypherCommand::Query {
+                location,
+                query,
+                query_file,
+                results_file,
+                results_format,
+            } => run_cypher_query(
+                &location,
+                query.as_deref(),
+                query_file.as_deref(),
+                results_file.as_deref(),
+                results_format.as_deref(),
+            ),
+            CypherCommand::Update {
+                location,
+                update,
+                update_file,
+            } => run_cypher_update(&location, update.as_deref(), update_file.as_deref()),
         },
     }
 }
@@ -460,6 +480,101 @@ fn run_update(
     execute_update(&store, &parsed)?;
 
     println!("[oxigraph update] Done.");
+    Ok(())
+}
+
+// ── cypher query ───────────────────────────────────────────────────────────
+
+fn run_cypher_query(
+    location: &std::path::Path,
+    query: Option<&str>,
+    query_file: Option<&std::path::Path>,
+    results_file: Option<&std::path::Path>,
+    results_format: Option<&str>,
+) -> anyhow::Result<()> {
+    let query_text = match (query, query_file) {
+        (Some(q), None) => q.to_string(),
+        (None, Some(f)) => std::fs::read_to_string(f)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", f.display()))?,
+        (None, None) => anyhow::bail!("one of --query / --query-file is required"),
+        (Some(_), Some(_)) => unreachable!("clap enforces --query/--query-file mutual exclusion"),
+    };
+
+    eprintln!(
+        "[oxigraph cypher query] Opening persistent store at {} ...",
+        location.display()
+    );
+    let store = Arc::new(RingStore::open(location)?);
+
+    let parsed = oxigraph_nova_cypher::parse_and_lower(&query_text)?;
+    let dataset = StoreDataset::new(Arc::clone(&store));
+    let options = oxigraph_nova_query::QueryOptions::default();
+    let evaluator = Evaluator::with_options(&dataset, options);
+    let result = evaluator.evaluate(&parsed)?;
+
+    let mut out = open_output(results_file)?;
+    match result {
+        QueryResult::Boolean(b) => {
+            let fmt = resolve_results_format(results_format, results_file)?;
+            QueryResultsSerializer::from_format(fmt).serialize_boolean_to_writer(&mut out, b)?;
+        }
+        QueryResult::Solutions { stream, .. } => {
+            let fmt = resolve_results_format(results_format, results_file)?;
+            let variables = query_select_vars(&parsed);
+            let mut ser = QueryResultsSerializer::from_format(fmt)
+                .serialize_solutions_to_writer(&mut out, variables.clone())?;
+            for sol in stream {
+                let sol = sol?;
+                ser.serialize(
+                    variables
+                        .iter()
+                        .filter_map(|v| sol.get(v).map(|t| (v.as_ref(), t.as_ref()))),
+                )?;
+            }
+            ser.finish()?;
+        }
+        QueryResult::Triples(stream) => {
+            let fmt = resolve_triples_format(results_format, results_file)?;
+            let mut ser = RdfSerializer::from_format(fmt).for_writer(&mut out);
+            for t in stream {
+                let t = t?;
+                ser.serialize_triple(&t)?;
+            }
+            ser.finish()?;
+        }
+    }
+    out.flush()?;
+    eprintln!("[oxigraph cypher query] Done.");
+    Ok(())
+}
+
+// ── cypher update ──────────────────────────────────────────────────────────
+
+fn run_cypher_update(
+    location: &std::path::Path,
+    update: Option<&str>,
+    update_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let update_text = match (update, update_file) {
+        (Some(u), None) => u.to_string(),
+        (None, Some(f)) => std::fs::read_to_string(f)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", f.display()))?,
+        (None, None) => anyhow::bail!("one of --update / --update-file is required"),
+        (Some(_), Some(_)) => {
+            unreachable!("clap enforces --update/--update-file mutual exclusion")
+        }
+    };
+
+    println!(
+        "[oxigraph cypher update] Opening persistent store at {} ...",
+        location.display()
+    );
+    let store = Arc::new(RingStore::open(location)?);
+
+    let parsed = oxigraph_nova_cypher::parse_and_lower_update(&update_text)?;
+    execute_update(&store, &parsed)?;
+
+    println!("[oxigraph cypher update] Done.");
     Ok(())
 }
 
@@ -917,7 +1032,7 @@ fn run_validate(
 // ── mcp serve ────────────────────────────────────────────────────────────────
 
 /// `oxigraph mcp serve` — construct a `NovaMcpService` and serve it over
-/// stdio (Phase A / MVP transport, per `oxigraph_nova_mcp`'s crate docs).
+/// stdio (MVP transport, per `oxigraph_nova_mcp`'s crate docs).
 ///
 /// **Important**: unlike every other subcommand in this file, this handler
 /// must not `println!` anything to stdout once the stdio transport takes

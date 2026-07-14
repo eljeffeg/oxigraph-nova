@@ -1,4 +1,5 @@
 # Oxigraph Nova
+<p align="center" style="background-color:rgba(0, 0, 0, 0.2);"><img src="docs/nova.png" style="width: 400px;" alt="Banner"></p>
 
 **A Rust-native RDF 1.2 / SPARQL 1.2 triple store with a novel succinct index and worst-case optimal joins.**
 
@@ -17,7 +18,7 @@ In short:
 | **Primary Goal**       | Production excellence, stability, compliance  | Algorithmic innovation + latest standards          |
 | **Storage Engine**     | RocksDB (mature, battle-tested)               | CompactLTJ Ring + LSM delta (research-oriented)    |
 | **Join Evaluation**    | Traditional (actively being optimized)        | Leapfrog Triejoin (worst-case optimal)             |
-| **RDF / SPARQL Level** | Full RDF 1.1 + preliminary 1.2                | Full RDF 1.2 / SPARQL 1.2            |
+| **RDF / SPARQL Level** | Full RDF 1.1 + preliminary 1.2                | Full RDF 1.2 / SPARQL 1.2 / openCypher             |
 | **Stability Profile**  | High — ready for production use               | Experimental / bleeding-edge                       |
 | **Ideal For**          | General deployments, broad adoption           | Research, high-performance analytics, standards work |
 
@@ -60,7 +61,7 @@ reads.
 The full crate layout, the CompactLTJ/Leapfrog-Triejoin design in depth, and
 the extension seams for building on top of Nova (`QuadStore`, `Dataset`,
 `TextSearch`, `ServiceHandler`, custom SPARQL functions, embedding the HTTP
-server) are documented in **[`ARCHITECTURE.md`](./ARCHITECTURE.md)**.
+server) are documented in **[`ARCHITECTURE.md`](./docs/ARCHITECTURE.md)**.
 
 ---
 
@@ -134,7 +135,7 @@ cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
 
 Every `/sparql` query is then evaluated over an in-memory `ReasoningDataset`
 overlay instead of the raw store — see
-**[`ARCHITECTURE.md`](./ARCHITECTURE.md#3-dataset--datasetlftjsource--the-evaluators-storage-seam)**
+**[`ARCHITECTURE.md`](./docs/ARCHITECTURE.md#3-dataset--datasetlftjsource--the-evaluators-storage-seam)**
 for how this decorator is built on the `Dataset` trait.
 
 Rule coverage spans `rdfs:subClassOf`/`subPropertyOf` transitivity, `rdf:type`
@@ -277,7 +278,7 @@ The `ShaclValidator` trait this is built on mirrors the OWL 2 RL reasoning
 seam above (`ReasoningEngine`) — a pluggable, `Dataset`-level operation, so
 alternative implementations (e.g. a heavier SHACL-SPARQL-capable backend)
 can be swapped in later without changing callers. See
-**[`ARCHITECTURE.md`](./ARCHITECTURE.md#8-shaclvalidator--shacl-validation-seam)**
+**[`ARCHITECTURE.md`](./docs/ARCHITECTURE.md#8-shaclvalidator--shacl-validation-seam)**
 for the trait itself, and `crates/nova-shacl/src/lib.rs`'s module doc
 comment for exactly which SHACL Core targets (`sh:targetNode`,
 `sh:targetClass`, implicit class targets) and constraints (`sh:minCount`,
@@ -286,8 +287,8 @@ comment for exactly which SHACL Core targets (`sh:targetNode`,
 
 ## MCP server (opt-in)
 
-`oxigraph-nova-mcp` exposes SPARQL query/update and data-model-discovery
-tools to LLM agents over the [Model Context Protocol](https://modelcontextprotocol.io/)
+`oxigraph-nova-mcp` exposes SPARQL and openCypher query/update tools, plus
+data-model-discovery helpers, to LLM agents over the [Model Context Protocol](https://modelcontextprotocol.io/)
 (MCP), built on the official Rust MCP SDK (`rmcp`). It is gated behind an
 opt-in `mcp` cargo feature on the `oxigraph` CLI (zero-cost when disabled,
 matching the `fulltext`/`geosparql` pattern):
@@ -314,7 +315,7 @@ the built binary:
 }
 ```
 
-Four tools are exposed, all evaluated against the same `Evaluator`/
+Six tools are exposed, all evaluated against the same `Evaluator`/
 `StoreDataset` (or reasoning-overlay, if `--reasoning` is passed) path
 `nova-server`'s HTTP endpoint already uses:
 
@@ -322,6 +323,8 @@ Four tools are exposed, all evaluated against the same `Evaluator`/
 |---|---|
 | `sparql_query` `{ query }` | Run a SPARQL query — SELECT/ASK results as SPARQL-results-JSON, CONSTRUCT/DESCRIBE as N-Triples |
 | `sparql_update` `{ update }` | Run a SPARQL update, returning a success summary |
+| `cypher_query` `{ query }` | Run an openCypher read query (`MATCH`/`RETURN`/…) — same result formats as `sparql_query` |
+| `cypher_update` `{ update }` | Run an openCypher write statement (`CREATE`/`SET`/`DELETE`/`REMOVE`) |
 | `describe_data_model` | Named graphs, distinct predicates, `rdf:type` classes, and a triple count — lets an agent orient itself before writing a query blind |
 | `list_graphs` | A cheap named-graphs + triple-count subset of `describe_data_model`, for quick orientation without a full-store scan |
 
@@ -333,6 +336,78 @@ caps the number of rows/triples a single `sparql_query` call may return.
 See `crates/nova-mcp/src/lib.rs`'s module doc comment for the full tool
 reference and transport details.
 
+
+## openCypher support
+
+`oxigraph-nova-cypher` translates an openCypher subset into the same
+`spargebra::Query` / `spargebra::Update` representations Nova's SPARQL
+stack already evaluates — no separate Cypher engine. Reads and writes
+are exposed on all three query surfaces (HTTP, CLI, MCP).
+
+### Supported subset
+
+| Clause | Notes |
+|---|---|
+| `MATCH` / `WHERE` / `RETURN` / `ORDER BY` / `SKIP` / `LIMIT` / `DISTINCT` | Phase 1 reads |
+| `CREATE` / `SET` / `DELETE` / `DETACH DELETE` / `REMOVE` | Phase 2 writes (optional preceding `MATCH`/`WHERE`) |
+| Variable-length relationships | Unbounded forms only: `-[:TYPE*]->`, `-[:TYPE*0..]->`, `-[:TYPE*1..]->` (SPARQL property paths have no bounded `{min,max}`) |
+| Relationship properties on `MATCH` | `-[r:KNOWS {since: 2020}]->` lowers to RDF 1.2 quoted-triple annotations (`<< ?from :TYPE ?to >> :since 2020`) |
+
+Not supported (clear error, never a panic): `MERGE`, `WITH`, `OPTIONAL MATCH`,
+`UNION`, multiple `MATCH` clauses, bounded variable-length relationships
+(`*min..max` with an explicit max), chained property access (`a.b.c`),
+expression-level property access on a relationship variable
+(`WHERE r.since > 2000`), and `CREATE` with relationship properties
+(pending an `oxrdf` upgrade — see below).
+
+### RDF ↔ property-graph mapping
+
+Cypher's LPG model maps onto plain RDF triples under fixed namespaces
+(exported as `LABEL_NS` / `REL_NS` / `PROP_NS`):
+
+| Cypher | RDF |
+|---|---|
+| node label `:Person` | `?n rdf:type <…/cypher/label/Person>` |
+| node property `{name: "Alice"}` | `?n <…/cypher/prop/name> "Alice"` |
+| relationship `-[:KNOWS]->` | `?a <…/cypher/rel/KNOWS> ?b` |
+| relationship property `{since: 2020}` (MATCH) | `<< ?a <…/cypher/rel/KNOWS> ?b >> <…/cypher/prop/since> 2020` |
+
+### HTTP / CLI / MCP
+
+```sh
+# HTTP read
+curl -X POST http://localhost:3030/cypher \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data-urlencode 'query=MATCH (n:Person) WHERE n.age > 30 RETURN n.name AS name'
+
+# HTTP write
+curl -X POST http://localhost:3030/cypher/update \
+    -H 'Content-Type: text/plain' \
+    --data 'CREATE (n:Person {name: "Alice", age: 42})'
+
+# CLI offline read / write (against a persistent store)
+cargo run --release --bin oxigraph -- cypher update --location ./data \
+    --update 'CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})'
+cargo run --release --bin oxigraph -- cypher query --location ./data \
+    --query 'MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS a, b.name AS b'
+```
+
+The MCP server (see "MCP server (opt-in)" above) also exposes
+`cypher_query` / `cypher_update` tools alongside the SPARQL ones.
+
+### Relationship properties and the oxrdf 0.5 caveat
+
+`MATCH` relationship properties work today via RDF 1.2 annotation triples
+because Nova's query engine already supports matching a quoted triple as a
+BGP subject. `CREATE` with relationship properties is rejected with a clear
+error: inserting a quad whose *subject* is a quoted triple requires
+`oxrdf::Quad.subject` to gain a `Triple` variant, which is expected in
+oxrdf 0.5. Until that upgrade lands, seed annotated relationships via SPARQL
+Update / Turtle-star if you need them on disk, then query them with Cypher
+`MATCH`.
+
+See `crates/nova-cypher/src/lib.rs` and `crates/nova-cypher/src/lower.rs`
+for the full grammar, mapping table, and lowering strategy.
 
 ## Conformance and compatibility
 
@@ -389,11 +464,12 @@ Building the workspace also produces a standalone `oxigraph` binary
 (`crates/nova-cli`, package `oxigraph-nova-cli`) that matches upstream
 `oxigraph-cli`'s full 9-subcommand surface — `load`, `backup`, `query`,
 `update`, `dump`, `convert`, `optimize`, `serve`, and `serve-read-only` —
-against Nova's own `RingStore`, plus Nova's own SHACL `validate` addition
-and an opt-in `mcp` subcommand (11 subcommands total; `mcp` itself has one
-nested action today, `mcp serve`, gated behind the `mcp` cargo feature —
-see "MCP server (opt-in)" above), under the same binary name so
-scripts/muscle memory carry over:
+against Nova's own `RingStore`, plus Nova's own SHACL `validate` addition,
+an openCypher `cypher` subcommand (`cypher query` / `cypher update`), and
+an opt-in `mcp` subcommand (12 top-level subcommands; `cypher` and `mcp`
+each have nested actions — `mcp serve` is gated behind the `mcp` cargo
+feature; see "MCP server (opt-in)" and "openCypher support" above),
+under the same binary name so scripts/muscle memory carry over:
 
 ```sh
 cargo build --release --bin oxigraph
@@ -411,7 +487,9 @@ cargo build --release --bin oxigraph
 | oxigraph serve | `[--location <dir>] [--file <path>] [--bind <addr>]` | Start the same SPARQL 1.2 HTTP server described below, as a subcommand instead of a separate binary |
 | oxigraph serve-read-only | `--location <dir> [--bind <addr>]` | Same as `serve`, but every write (`/update`, `PUT`/`POST`/`DELETE /store`) is rejected at the HTTP layer with `403 Forbidden` |
 | oxigraph validate | `--location <dir> --shapes <path> [--shapes-format <fmt>] [--results-file <f>]` | Validate a persistent store's data against a SHACL shapes graph, offline (no HTTP) — exits non-zero if the data does not conform, so this doubles as a CI gate (see "SHACL validation" above) |
-| oxigraph mcp serve | `[--location <dir>] [--reasoning] [--fulltext] [--max-results <n>]` | `mcp`'s nested `serve` action: start an MCP (Model Context Protocol) server over stdio, exposing SPARQL query/update/data-model-discovery tools to LLM agents — requires the `mcp` cargo feature (see "MCP server (opt-in)" above) |
+| oxigraph cypher query | `--location <dir> (--query <q> \| --query-file <f>) [--results-file <f>] [--results-format <fmt>]` | Run an openCypher read query against a persistent store, offline — results format-negotiated the same way as `/cypher` / `/sparql` (see "openCypher support" above) |
+| oxigraph cypher update | `--location <dir> (--update <u> \| --update-file <f>)` | Run an openCypher write statement against a persistent store, offline (see "openCypher support" above) |
+| oxigraph mcp serve | `[--location <dir>] [--reasoning] [--fulltext] [--max-results <n>]` | `mcp`'s nested `serve` action: start an MCP (Model Context Protocol) server over stdio, exposing SPARQL/openCypher query/update and data-model-discovery tools to LLM agents — requires the `mcp` cargo feature (see "MCP server (opt-in)" above) |
 
 ```sh
 # Bulk-load a dataset directly into a persistent store
@@ -447,6 +525,12 @@ cargo run --release --bin oxigraph -- serve-read-only --location ./data --bind 0
 
 # Validate a persistent store against a SHACL shapes graph, offline
 cargo run --release --bin oxigraph -- validate --location ./data --shapes shapes.ttl
+
+# Run an openCypher write, then a read, offline
+cargo run --release --bin oxigraph -- cypher update --location ./data \
+    --update 'CREATE (n:Person {name: "Alice"})'
+cargo run --release --bin oxigraph -- cypher query --location ./data \
+    --query 'MATCH (n:Person) RETURN n.name AS name'
 
 # Start an MCP server over stdio for LLM-agent access (requires --features mcp)
 cargo run --release --bin oxigraph --features mcp -- mcp serve --location ./data
@@ -502,9 +586,10 @@ cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
     --location ./data --file dataset.nt --bind 0.0.0.0:3030
 ```
 
-Once running, the server exposes the SPARQL 1.1 Protocol and the SPARQL 1.1
-Graph Store HTTP Protocol, both content-negotiated via `Accept`/`Content-Type`
-exactly as Oxigraph's own server does:
+Once running, the server exposes the SPARQL 1.1 Protocol, the SPARQL 1.1
+Graph Store HTTP Protocol, and openCypher query/update endpoints, all
+content-negotiated via `Accept`/`Content-Type` exactly as Oxigraph's own
+server does (Cypher results reuse the same SPARQL-results serializers):
 
 ```sh
 # SPARQL query (also available at /query, matching Oxigraph's endpoint naming)
@@ -517,6 +602,14 @@ curl -X POST http://localhost:3030/sparql \
 curl -X POST http://localhost:3030/update \
     -H 'Content-Type: application/sparql-update' \
     --data 'INSERT DATA { <http://ex/s> <http://ex/p> "v" }'
+
+# openCypher query / update (same result-format negotiation as /sparql)
+curl -X POST http://localhost:3030/cypher \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data-urlencode 'query=MATCH (n:Person) RETURN n.name AS name LIMIT 10'
+curl -X POST http://localhost:3030/cypher/update \
+    -H 'Content-Type: text/plain' \
+    --data 'CREATE (n:Person {name: "Alice"})'
 
 # Graph Store Protocol — read/replace/merge/clear a graph (identical to Oxigraph's /store)
 curl http://localhost:3030/store?default

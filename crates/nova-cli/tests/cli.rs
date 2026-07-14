@@ -1023,3 +1023,94 @@ fn validate_results_file_writes_report_to_file() {
         "expected report file to contain CONFORMS, got: {contents}"
     );
 }
+
+// ── cypher ───────────────────────────────────────────────────────────────
+
+/// `oxigraph cypher update` followed by `oxigraph cypher query` against a
+/// fresh store: `CREATE (n {name: "Alice"})` then `MATCH (n) RETURN
+/// n.name`. Deliberately does *not* reuse `load_fixture()`'s SPARQL Turtle
+/// fixture — Cypher's data model lowers scalar properties into a distinct
+/// `PROP_NS` IRI namespace (see `oxigraph_nova_cypher`'s crate docs), so
+/// Cypher-created/queried data must be seeded via Cypher itself.
+#[test]
+fn cypher_update_create_then_cypher_query_returns_it() {
+    let dir = TempDir::new("cypher_roundtrip");
+
+    let out = run(&[
+        "cypher",
+        "update",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--update",
+        "CREATE (n {name: \"Alice\"})",
+    ]);
+    assert_success(&out, "cypher update (CREATE)");
+
+    let out = run(&[
+        "cypher",
+        "query",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--query",
+        "MATCH (n) RETURN n.name",
+    ]);
+    assert_success(&out, "cypher query (MATCH/RETURN)");
+    assert!(
+        stdout_str(&out).contains("Alice"),
+        "expected cypher query results to contain Alice, got: {}",
+        stdout_str(&out)
+    );
+}
+
+/// `oxigraph cypher query --results-format csv` — confirms results-format
+/// negotiation (shared with plain `oxigraph query`) also works for Cypher
+/// reads.
+#[test]
+fn cypher_query_csv_results_format() {
+    let dir = TempDir::new("cypher_csv");
+
+    let out = run(&[
+        "cypher",
+        "update",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--update",
+        "CREATE (n {name: \"Bob\"})",
+    ]);
+    assert_success(&out, "cypher update (CREATE)");
+
+    let out = run(&[
+        "cypher",
+        "query",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--query",
+        "MATCH (n) RETURN n.name",
+        "--results-format",
+        "csv",
+    ]);
+    assert_success(&out, "cypher query (csv)");
+    let body = stdout_str(&out);
+    assert!(body.contains("Bob"), "csv row missing, body: {body}");
+}
+
+/// Malformed Cypher must propagate a non-zero exit + an error message,
+/// mirroring `load_parse_error_propagates_nonzero_exit`'s SPARQL analogue.
+#[test]
+fn cypher_query_parse_error_propagates_nonzero_exit() {
+    let dir = TempDir::new("cypher_parse_error");
+
+    let out = run(&[
+        "cypher",
+        "query",
+        "--location",
+        dir.path().to_str().unwrap(),
+        "--query",
+        "THIS IS NOT VALID CYPHER @@@",
+    ]);
+    assert!(
+        !out.status.success(),
+        "expected malformed Cypher to fail, got: {}",
+        stdout_str(&out)
+    );
+}

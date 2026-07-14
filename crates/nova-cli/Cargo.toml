@@ -32,7 +32,9 @@ oxigraph-nova-query        = { path = "../nova-query" }
 oxigraph-nova-server       = { path = "../nova-server" }
 oxigraph-nova-shacl        = { path = "../nova-shacl" }
 oxigraph-nova-reasoning    = { path = "../nova-reasoning" }
+oxigraph-nova-cypher       = { path = "../nova-cypher" }
 oxigraph-nova-mcp          = { path = "../nova-mcp", optional = true }
+
 
 oxrdf          = { workspace = true }
 oxrdfio        = { workspace = true }

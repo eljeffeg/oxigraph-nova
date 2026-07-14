@@ -16,8 +16,13 @@ oxigraph-nova-storage-ring = { path = "../nova-storage-ring" }
 # heavyweight *new* deps this crate introduces are `rmcp`/`schemars`
 # themselves, gated one level up at `oxigraph-nova-cli`'s `mcp` feature.
 oxigraph-nova-reasoning    = { path = "../nova-reasoning" }
+# openCypher support for the `cypher_query`/`cypher_update` tools — a thin
+# translation layer to SPARQL algebra, no heavy deps of its own (see
+# `oxigraph-nova-cypher`'s own Cargo.toml: just oxrdf/spargebra/anyhow).
+oxigraph-nova-cypher       = { path = "../nova-cypher" }
 
 rmcp       = { workspace = true }
+
 schemars   = { workspace = true }
 oxrdf      = { workspace = true }
 oxrdfio    = { workspace = true }

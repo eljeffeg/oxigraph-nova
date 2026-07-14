@@ -21,8 +21,7 @@
 //!
 //! `oxigraph_nova_cli`'s `mcp serve` subcommand, which constructs a
 //! [`NovaMcpService`] and serves it via `rmcp::transport::stdio()`. An HTTP
-//! `/mcp` transport is a possible future Phase B, deferred until a concrete
-//! need arises.
+//! `/mcp` transport is a possible future, deferred until a need arises.
 //!
 //! ## Concurrency
 //!
@@ -63,6 +62,22 @@ pub struct SparqlQueryRequest {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SparqlUpdateRequest {
     /// The SPARQL 1.1 Update text.
+    pub update: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CypherQueryRequest {
+    /// The openCypher read query text (`MATCH`/`WHERE`/`RETURN`/`ORDER BY`/
+    /// `SKIP`/`LIMIT`) — see `oxigraph_nova_cypher`'s crate doc comment for
+    /// the supported subset.
+    pub query: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CypherUpdateRequest {
+    /// The openCypher write clause(s) (`CREATE`/`SET`/`DELETE`/`DETACH
+    /// DELETE`/`REMOVE`) — see `oxigraph_nova_cypher`'s crate doc comment
+    /// for the supported subset.
     pub update: String,
 }
 
@@ -338,6 +353,106 @@ impl NovaMcpService {
     }
 
     #[tool(
+        description = "Run an experimental openCypher read query against the store (MATCH/\
+                        WHERE/RETURN/ORDER BY/SKIP/LIMIT). Translated internally to SPARQL \
+                        algebra and evaluated the same way as sparql_query; results are \
+                        returned as SPARQL-results-JSON (or Turtle for a CONSTRUCT-shaped \
+                        translation). Call describe_data_model first if you don't already \
+                        know the store's graphs/predicates/classes."
+    )]
+    async fn cypher_query(
+        &self,
+        Parameters(CypherQueryRequest { query }): Parameters<CypherQueryRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let parsed = match oxigraph_nova_cypher::parse_and_lower(&query) {
+            Ok(q) => q,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Cypher parse error: {e}"
+                ))]));
+            }
+        };
+
+        let store = Arc::clone(&self.store);
+        let reasoning = self.reasoning.clone();
+        let text_search = self.text_search.clone();
+        let max_results = self.max_results;
+
+        let outcome = tokio::task::spawn_blocking(move || -> AnyResult<String> {
+            let mut options = QueryOptions::default();
+            if let Some(ts) = text_search {
+                options = options.with_text_search(ts);
+            }
+            if let Some(mr) = max_results {
+                options = options.with_max_results(mr);
+            }
+
+            if let Some(rs) = reasoning {
+                let overlay = rs.current(&store)?;
+                let evaluator = Evaluator::with_options(overlay.as_ref(), options);
+                let result = evaluator.evaluate(&parsed)?;
+                serialize_query_result(&parsed, result)
+            } else {
+                let dataset = StoreDataset::new(Arc::clone(&store));
+                let evaluator = Evaluator::with_options(&dataset, options);
+                let result = evaluator.evaluate(&parsed)?;
+                serialize_query_result(&parsed, result)
+            }
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(text)) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
+            Ok(Err(e)) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "query evaluation error: {e}"
+            ))])),
+            Err(join_err) => Err(McpError::internal_error(join_err.to_string(), None)),
+        }
+    }
+
+    #[tool(
+        description = "Run an experimental openCypher write query against the store (CREATE/\
+                        SET/DELETE/DETACH DELETE/REMOVE). Translated internally to a SPARQL \
+                        Update and applied the same way as sparql_update. Returns a \
+                        triple-count-before/after summary on success."
+    )]
+    async fn cypher_update(
+        &self,
+        Parameters(CypherUpdateRequest { update }): Parameters<CypherUpdateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let parsed = match oxigraph_nova_cypher::parse_and_lower_update(&update) {
+            Ok(u) => u,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Cypher parse error: {e}"
+                ))]));
+            }
+        };
+
+        let store = Arc::clone(&self.store);
+        let outcome = tokio::task::spawn_blocking(move || -> AnyResult<(usize, usize)> {
+            let before = store.len().map_err(|e| anyhow::anyhow!("{e}"))?;
+            execute_update(&store, &parsed)?;
+            let after = store.len().map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((before, after))
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok((before, after))) => {
+                let delta = after as i64 - before as i64;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Update applied successfully. Triple count: {before} -> {after} ({delta:+})"
+                ))]))
+            }
+            Ok(Err(e)) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "update error: {e}"
+            ))])),
+            Err(join_err) => Err(McpError::internal_error(join_err.to_string(), None)),
+        }
+    }
+
+    #[tool(
         description = "Describe the store's data model: named graphs, distinct predicates, \
                         rdf:type classes, and a triple count. Call this first to orient \
                         yourself before writing a query blind."
@@ -438,6 +553,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "cypher_query".to_string(),
+                "cypher_update".to_string(),
                 "describe_data_model".to_string(),
                 "list_graphs".to_string(),
                 "sparql_query".to_string(),
@@ -487,5 +604,35 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
 
         assert_eq!(store.triple_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn cypher_round_trip_create_query() {
+        let store = Arc::new(RingStore::new());
+        let svc = NovaMcpService::new(Arc::clone(&store));
+
+        let result = svc
+            .cypher_update(Parameters(CypherUpdateRequest {
+                update: "CREATE (n {name: \"Alice\"})".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let result = svc
+            .cypher_query(Parameters(CypherQueryRequest {
+                query: "MATCH (n) RETURN n.name".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let found_alice = result.content.iter().any(|block| {
+            block
+                .as_text()
+                .map(|t| t.text.contains("Alice"))
+                .unwrap_or(false)
+        });
+        assert!(found_alice, "expected result content to mention Alice");
     }
 }

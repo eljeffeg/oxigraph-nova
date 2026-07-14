@@ -410,13 +410,77 @@ pub enum Command {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Experimental openCypher query/update commands against a persistent
+    /// store, offline (no HTTP)
+    ///
+    /// See `oxigraph_nova_cypher`'s crate doc comment for the supported
+    /// subset (read-only `MATCH`/`WHERE`/`RETURN`/`ORDER BY`/`SKIP`/`LIMIT`
+    /// plus the write clauses `CREATE`/`SET`/`DELETE`/`DETACH DELETE`/
+    /// `REMOVE`). Each subcommand is a thin wrapper translating Cypher into
+    /// the equivalent SPARQL algebra
+    /// (`oxigraph_nova_cypher::parse_and_lower`/`parse_and_lower_update`)
+    /// and then reusing exactly the same query/update machinery as
+    /// `query`/`update` above.
+    Cypher {
+        #[command(subcommand)]
+        command: CypherCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CypherCommand {
+    /// Run an openCypher read query against a persistent store, offline (no
+    /// HTTP)
+    ///
+    /// Results are format-negotiated the same way as `oxigraph query`, just
+    /// driven by `--results-format` (or the extension of `--results-file`)
+    /// instead of an `Accept` header.
+    Query {
+        /// Directory in which Nova data is persisted
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        location: PathBuf,
+        /// The Cypher query to execute, given directly on the command line
+        ///
+        /// Exactly one of `--query` / `--query-file` is required.
+        #[arg(short, long, conflicts_with = "query_file")]
+        query: Option<String>,
+        /// Read the Cypher query from a file instead of the command line
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "query")]
+        query_file: Option<PathBuf>,
+        /// Write results to this file instead of stdout
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        results_file: Option<PathBuf>,
+        /// The format results should be written in
+        ///
+        /// For SELECT-shaped results, one of: `json`, `xml`, `csv`, `tsv`
+        /// (default: `json`, or guessed from `--results-file`'s extension).
+        #[arg(long)]
+        results_format: Option<String>,
+    },
+    /// Run an openCypher write query (`CREATE`/`SET`/`DELETE`/`DETACH
+    /// DELETE`/`REMOVE`) against a persistent store, offline (no HTTP)
+    Update {
+        /// Directory in which Nova data is persisted
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        location: PathBuf,
+        /// The Cypher write clause(s) to execute, given directly on the
+        /// command line
+        ///
+        /// Exactly one of `--update` / `--update-file` is required.
+        #[arg(short, long, conflicts_with = "update_file")]
+        update: Option<String>,
+        /// Read the Cypher write clause(s) from a file instead of the
+        /// command line
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "update")]
+        update_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum McpCommand {
-    /// Start the MCP server over stdio (Phase A / MVP transport — see
+    /// Start the MCP server over stdio (MVP transport — see
     /// `oxigraph_nova_mcp`'s crate docs for the full tool list and an HTTP
-    /// `/mcp` transport's status as a deferred Phase B)
+    /// `/mcp` transport's status as a deferred)
     ///
     /// **Concurrency**: do not point `--location` at a directory that is
     /// concurrently open in another `oxigraph serve`/`nova_serve` process —
