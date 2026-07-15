@@ -34,8 +34,8 @@
 
 use crate::cltj::{CltjData, CltjSnapshot, VocabRepr, build_cltj_data};
 use crate::louds::{
-    BorrowedL, BorrowedLouds, BorrowedS, BorrowedT, LoudsCore, LoudsMemBreakdown, LoudsNav,
-    LoudsTrie, t_backend,
+    BorrowedL, BorrowedLouds, BorrowedT, LoudsCore, LoudsMemBreakdown, LoudsNav, LoudsTrie,
+    t_backend,
 };
 use epserde::Epserde;
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
@@ -412,15 +412,15 @@ impl GraphRing {
 // LOUDS substrate `B`/`L`/`S` and any vocab representation `V: AsRef<[u64]>`
 // — this is what lets a future borrowed/mmap'd
 // `RingSnapshot<CltjSnapshot<DeserType<Vec<u64>>, ..., [DeserType<LoudsCore>; 6]>>`
-// reconstruct directly into a navigable `GraphRing<LoudsTrie<B, L, S>, V>`
+// reconstruct directly into a navigable `GraphRing<LoudsTrie<B, L>, V>`
 // with **zero extra code** versus the owned round-trip path.
-impl<B, L, S, V: AsRef<[u64]>> GraphRing<LoudsTrie<B, L, S>, V> {
+impl<B, L, V: AsRef<[u64]>> GraphRing<LoudsTrie<B, L>, V> {
     /// Reconstruct a `GraphRing` from a [`RingSnapshot`] loaded from disk (or
     /// from an in-memory round-trip buffer, or a borrowed `load_mmap`'d
     /// view).
     pub(crate) fn from_snapshot(
-        snap: RingSnapshot<CltjSnapshot<V, V, V, [LoudsCore<t_backend::TBitvec<B>, L, S>; 6]>>,
-    ) -> GraphRing<LoudsTrie<B, L, S>, V> {
+        snap: RingSnapshot<CltjSnapshot<V, V, V, [LoudsCore<t_backend::TBitvec<B>, L>; 6]>>,
+    ) -> GraphRing<LoudsTrie<B, L>, V> {
         // `n == 0` is the empty-graph sentinel (see `RingSnapshot`'s doc
         // comment) — `snap.cltj` is always a structurally valid
         // `CltjSnapshot` (never `Option`-wrapped), but for an empty graph
@@ -483,7 +483,7 @@ impl GraphRing<BorrowedLouds, VocabRepr> {
         // borrowed slice inside `c.tries` is tied to `c`/`view`'s real
         // (finite) borrow, whereas the `Borrowed*` aliases declare `'static`
         // (a documented lie — see `BorrowedT`'s doc comment). `Clone` on
-        // `LoudsCore`/`SidecarCore`/`TBitvec` only copies pointer/length
+        // `LoudsCore`/`TBitvec` only copies pointer/length
         // fields (never deep data), so this is a cheap, lifetime-only
         // extension — exactly the same kind of unsafety as the three
         // vocab-slice transmutes above. Soundness rests on the same caller
@@ -493,7 +493,7 @@ impl GraphRing<BorrowedLouds, VocabRepr> {
         // it is reachable — enforced structurally (not just by convention)
         // by `MappedGraphRing`'s encapsulation, which is the sole caller of
         // `from_mapped` (see `MappedGraphRing::new`).
-        let tries: [LoudsCore<t_backend::TBitvec<BorrowedT>, BorrowedL, BorrowedS>; 6] =
+        let tries: [LoudsCore<t_backend::TBitvec<BorrowedT>, BorrowedL>; 6] =
             unsafe { std::mem::transmute_copy(&c.tries) };
 
         let cltj = CltjSnapshot {
@@ -508,7 +508,7 @@ impl GraphRing<BorrowedLouds, VocabRepr> {
                 VocabRepr,
                 VocabRepr,
                 VocabRepr,
-                [LoudsCore<t_backend::TBitvec<BorrowedT>, BorrowedL, BorrowedS>; 6],
+                [LoudsCore<t_backend::TBitvec<BorrowedT>, BorrowedL>; 6],
             >,
         > = RingSnapshot { n: view.n, cltj };
         GraphRing::from_snapshot(snap)
@@ -527,7 +527,7 @@ impl GraphRing<BorrowedLouds, VocabRepr> {
 /// **lifetime-extended `'static` lie**: three `unsafe { transmute }` calls on
 /// the vocab slices, plus one `unsafe { transmute_copy }` on the whole
 /// `tries` array (a lifetime-only extension — the array's real element type
-/// already matches `Borrowed*` exactly after the `BorrowedEfDict`/`BorrowedS`
+/// already matches `Borrowed*` exactly after the `BorrowedL`
 /// alias fixes; see their doc comments in `louds.rs`). None of these
 /// transmutes change any type's bit-layout or perform type-punning — they
 /// only erase a borrow's true (finite) lifetime to `'static`, mirroring the

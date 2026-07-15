@@ -9,10 +9,9 @@ publish      = false
 
 [features]
 default  = []
-# Elias-Fano O(1) succ() for high-degree sidecar nodes
-l-opt-ef = ["oxigraph-nova-storage-ring/l-opt-ef"]
 
 # ── Runtime deps (needed by both [[bench]] and [[example]] targets) ──────────
+
 [dependencies]
 oxigraph-nova-core           = { path = "../crates/nova-core" }
 oxigraph-nova-query          = { path = "../crates/nova-query" }

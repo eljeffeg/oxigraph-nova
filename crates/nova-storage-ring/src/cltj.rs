@@ -125,7 +125,7 @@ impl AsRef<[u64]> for VocabRepr {
 /// over the vocab representation `V` (bounded by `AsRef<[u64]>`) so that a
 /// future mmap'd/zero-copy snapshot load can populate `vocab` with borrowed
 /// `&[u64]` slices directly, with **no code duplication** versus the owned
-/// `Vec<u64>` path — this mirrors the `LoudsTrie<B, L, S>` generic-substrate
+/// `Vec<u64>` path — this mirrors the `LoudsTrie<B, L>` generic-substrate
 /// pattern used throughout this module.
 ///
 /// Direct indexing keeps `key()` at O(1) with no bit-unpacking, and `seek()`
@@ -182,14 +182,14 @@ impl<Louds: LoudsNav, V: AsRef<[u64]>> CltjTrie<Louds, V> {
     }
 
     /// Real allocated byte size of this trie's LOUDS structure (T + L +
-    /// sidecar), **excluding** vocab (vocab is `Arc`-shared across multiple
+    /// ), **excluding** vocab (vocab is `Arc`-shared across multiple
     /// tries within a [`CltjData`]; see [`CltjData::mem_size_bytes`] for the
     /// correctly deduped total).
     pub fn louds_mem_size_bytes(&self) -> usize {
         self.louds.mem_size_bytes()
     }
 
-    /// Per-component (T/L/sidecar) memory breakdown of this trie's LOUDS
+    /// Per-component (T/L) memory breakdown of this trie's LOUDS
     /// structure.  Excludes vocab — see
     /// [`CltjData::mem_breakdown_per_ordering`] for per-field vocab bytes.
     pub fn mem_breakdown(&self) -> LoudsMemBreakdown {
@@ -429,21 +429,21 @@ impl CltjSnapshot {
 // logic, so this is generic over any LOUDS substrate `B`/`L`/`S` and any
 // vocab representation `V: AsRef<[u64]>` — this is what lets a future
 // borrowed/mmap'd `CltjSnapshot<DeserType<Vec<u64>>, ..., [DeserType<LoudsCore>; 6]>`
-// reconstruct directly into a navigable `CltjData<LoudsTrie<B, L, S>, V>` with
+// reconstruct directly into a navigable `CltjData<LoudsTrie<B, L>, V>` with
 // **zero extra code** versus the owned round-trip path.
-impl<B, L, S, V: AsRef<[u64]>> CltjData<LoudsTrie<B, L, S>, V> {
+impl<B, L, V: AsRef<[u64]>> CltjData<LoudsTrie<B, L>, V> {
     /// Reconstruct a `CltjData` from a [`CltjSnapshot`] loaded from disk (or
     /// from an in-memory round-trip buffer, or a borrowed `load_mmap`'d
     /// view).
     ///
-    /// Rebuilds each `CltjTrie`'s sidecar via [`LoudsTrie::from_core`] and
+    /// Rebuilds each `CltjTrie` via [`LoudsTrie::from_core`] and
     /// redistributes the three vocab arrays across the six tries per the
     /// static ordering permutation documented in [`build_cltj_data`] (18
     /// references, 3 unique `Arc` allocations — matching the runtime
     /// hot-path layout exactly).
     pub(crate) fn from_snapshot(
-        snap: CltjSnapshot<V, V, V, [LoudsCore<t_backend::TBitvec<B>, L, S>; 6]>,
-    ) -> CltjData<LoudsTrie<B, L, S>, V> {
+        snap: CltjSnapshot<V, V, V, [LoudsCore<t_backend::TBitvec<B>, L>; 6]>,
+    ) -> CltjData<LoudsTrie<B, L>, V> {
         let orig_s = Arc::new(snap.vocab_s);
         let orig_p = Arc::new(snap.vocab_p);
         let orig_o = Arc::new(snap.vocab_o);
@@ -484,7 +484,7 @@ impl<B, L, S, V: AsRef<[u64]>> CltjData<LoudsTrie<B, L, S>, V> {
         ];
 
         let mut cores = snap.tries.into_iter();
-        let tries: [Arc<CltjTrie<LoudsTrie<B, L, S>, V>>; 6] = vocabs.map(|vocab| {
+        let tries: [Arc<CltjTrie<LoudsTrie<B, L>, V>>; 6] = vocabs.map(|vocab| {
             let core = cores.next().expect("CltjSnapshot always has 6 tries");
             Arc::new(CltjTrie {
                 louds: LoudsTrie::from_core(core),
@@ -498,21 +498,21 @@ impl<B, L, S, V: AsRef<[u64]>> CltjData<LoudsTrie<B, L, S>, V> {
 
 /// ε-serde-serializable snapshot of a [`CltjData`]: three deduped vocab
 /// arrays (plain `Vec<u64>`, not `Arc`-wrapped — `Arc` is not directly
-/// epserde-serializable) plus six [`LoudsCore`]s (T+L only, sidecar
+/// epserde-serializable) plus six [`LoudsCore`]s (T+L
 /// excluded), one per [`SortOrder`] in the fixed order
 /// SPO/SOP/PSO/POS/OPS/OSP.
 ///
 /// This is the persistent on-disk representation.  Loading redistributes
 /// the three vocab
 /// arrays across the six tries per the static ordering permutation in
-/// [`build_cltj_data`], and rebuilds each trie's sidecar via
+/// [`build_cltj_data`], and rebuilds each trie via
 /// [`LoudsTrie::from_core`] — see [`CltjData::from_snapshot`].
 // `tries` uses the "whole array as bare generic parameter" pattern: epserde's
 // zero-copy eligibility check only recognizes a field as zero-copy when its
 // declared type is a bare generic parameter of the struct, and arrays are not
 // themselves recognized as zero-copy-eligible unless the *entire array type*
 // is substituted in as the generic parameter's default.  This mirrors the
-// pattern used for `TBitvec`/`SidecarCore`/`LoudsCore` in `louds.rs`.
+// pattern used for `TBitvec`/`LoudsCore` in `louds.rs`.
 #[derive(Epserde)]
 pub(crate) struct CltjSnapshot<
     VocabS = Vec<u64>,

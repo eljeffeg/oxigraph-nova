@@ -1206,7 +1206,6 @@ impl RingStore {
                 for (i, (_ord, b, vocab_u)) in breakdown.iter().enumerate() {
                     per_order[i].t_bytes += b.t_bytes;
                     per_order[i].l_bytes += b.l_bytes;
-                    per_order[i].sidecar_bytes += b.sidecar_bytes;
                     vocab_undeduped[i] += vocab_u;
                 }
             }
@@ -1233,7 +1232,7 @@ pub struct PerOrderingBreakdown {
     /// The six orderings, in fixed order (index-aligned with `per_order` and
     /// `vocab_undeduped`).
     pub orders: [SortOrder; 6],
-    /// T/L/sidecar breakdown per ordering, summed across all graphs.
+    /// T/L breakdown per ordering, summed across all graphs.
     pub per_order: [LoudsMemBreakdown; 6],
     /// Undeduped vocab bytes per ordering (i.e. as if each ordering's three
     /// vocab arrays were NOT shared with the other five orderings), summed

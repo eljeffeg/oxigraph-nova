@@ -24,13 +24,15 @@
 //! leap([lo,hi], c) = first k in [lo,hi] with L[k] ≥ c  (exponential search)
 //! ```
 //!
-//! ## L label array: `BitFieldVec<usize>` (sux)
+//! ## L label array: per-depth `BitFieldVec` (sux)
 //!
-//! L is stored as a `sux::bits::BitFieldVec<usize>` using ⌈log₂(U)⌉ bits per
-//! label, where U = alphabet size (max local ID + 1).  This provides bit-packed
-//! storage with direct index access, and — since sux 0.14's `BitFieldVec`
-//! derives `epserde::Epserde` — a zero-copy ε-serde + mmap persistence path.
-//! Typically 14–17 bits/label for real datasets.
+//! Labels are stored in three `sux::bits::BitFieldVec` regions (depth 0 / 1 / 2),
+//! each packed at ⌈log₂(max_label_at_depth + 1)⌉.  Global LOUDS positions are
+//! unchanged: dummy at 0 lives in the depth-0 region; depth-1 and depth-2 labels
+//! follow contiguously.  `label_at` / `leap` keep the same `[lo, hi]` contracts
+//! and stay O(1) per access.  Independent per-depth widths avoid paying the
+//! largest column alphabet on shallower depths (e.g. a small predicate alphabet
+//! at depth 2 when objects force a wide bit-width).
 //!
 //! ## T bitvector substrate
 //!
@@ -45,31 +47,11 @@
 //! The `T` substrate is fully encapsulated in the `t_backend` module below.
 //! All paper navigation formulas and all unit tests are substrate-independent.
 //!
-//! ## High-degree sidecar with SIMD `partition_point`
-
-//! `leap()` benefits from SIMD-vectorised scanning on `&[u32]` slices via
-//! `partition_point`, which the compiler can optimize to AVX2/NEON vector
-//! compares.  Bit-packed L storage improves memory but prevents direct SIMD
-//! access (requires bit-extract per comparison).  The sidecar optimization
-//! restores SIMD performance for high-degree nodes where it matters most.
+//! ## Leap on bit-packed L
 //!
-//! L-opt B restores SIMD `partition_point` for high-degree nodes by maintaining
-//! a **sidecar array** alongside the bit-packed L.  For every node whose degree
-//! ≥ `SIDECAR_THRESH` (16), the sidecar stores the child labels as a contiguous
-//! `Box<[u32]>`.  `leap()` branches:
-//!
-//! - **degree < SIDECAR_THRESH**: inline scalar exponential/binary search (cheap
-//!   for 1–15 labels — most RDF nodes).
-//! - **degree ≥ SIDECAR_THRESH**: `partition_point` on `&[u32]` sidecar —
-//!   O(log d) SIMD, O(1) fallback to scalar if sidecar lookup misses (safety).
-//!
-//! The sidecar is keyed by `hi` (the exclusive-upper-bound label position of the
-//! node's child range in L), which is the only information available at `leap`
-//! call-time without changing the signature.  `lo = hi - degree + 1` is derived.
-//!
-//! Space impact: sidecar stored only for high-degree nodes; negligible overhead
-//! relative to the LOUDS index itself.  The 20 B/triple compact target is
-//! maintained.
+//! `leap()` is a lower-bound / successor search over a node's monotone child
+//! labels in bit-packed L: exponential search then binary search with
+//! `label_at` (BitFieldVec `index_value`).
 //!
 //! ## Construction
 //!
@@ -79,188 +61,11 @@
 //! the output vectors are required.
 
 // sux::prelude::* brings in BitFieldVec plus all rank/select traits used by t_backend.
-// ── Adaptive Elias-Fano sidecar payload ──────────────────────────────────────
-//
-// sux is always a dependency (since Step 10c-L L-opt A), so EfDict/
-// EliasFanoBuilder/Succ are always available — no conditional compilation needed
-// for the imports.  The feature flag `l-opt-ef` only controls the crossover
-// threshold (EF_THRESH_EFFECTIVE), enabling per-degree A/B benchmarking.
 use epserde::Epserde;
 use mem_dbg::{MemSize, SizeFlags};
-use sux::dict::{EfDict, EliasFanoBuilder};
 use sux::prelude::*;
-use sux::traits::Succ;
-// SliceByValue::index_value — the safe aligned accessor for BitFieldVec L reads.
-// value-traits 0.2.0 is the same version sux 0.14 depends on (pinned for trait compatibility).
-use value_traits::slices::SliceByValue; // not re-exported by sux::prelude — must be imported explicitly
-
-/// Intermediate, construction-time-only sidecar payload for a single
-/// high-degree node, produced during `build_sidecar`'s BFS walk before
-/// being flattened into the ε-serde-serializable [`SidecarCore`]
-/// representation. This type is never itself serialized (only
-/// `SidecarCore`'s parallel vectors are).
-enum SidecarPayload {
-    /// SIMD-friendly contiguous label array: `partition_point` O(log d).
-    Slice(Box<[u32]>),
-    /// Elias-Fano indexed dictionary: `succ()` O(1).
-    Ef(EfDict<usize>),
-}
-
-/// ε-serde-serializable sidecar.
-///
-/// Stores **sorted parallel vectors** keyed by
-/// `hi` (ascending) with **binary-search** lookup (`his.binary_search`)
-/// replacing the hash lookup, and both payload kinds (SIMD slice / Elias-Fano)
-/// flattened into shared backing arrays instead of a payload enum:
-///
-/// - `his`/`los`: sorted-by-`his` parallel arrays of (node_hi, node_lo) for
-///   every high-degree node (`degree >= SIDECAR_THRESH`).
-/// - `kind`: 0 = `Slice` payload, 1 = `Ef` payload, one per entry.
-/// - `slice_start`: for `Slice` entries, the starting offset into
-///   `slice_flat` (labels are `slice_flat[start .. start + (hi - lo + 1)]`).
-///   Unused (0) for `Ef` entries.
-/// - `slice_flat`: concatenated label arrays for every `Slice` entry, in
-///   entry order.
-/// - `ef_idx`: for `Ef` entries, the index into `ef_dicts`. Unused (0) for
-///   `Slice` entries.
-/// - `ef_dicts`: one `EfDict<usize>` per `Ef` entry, in entry order. `EfDict`
-///   is already `epserde::Epserde`-derivable (from `sux`), and epserde
-///   supports `Vec<T>` generically for any `T: Epserde`, so this composes
-///   through `#[derive(Epserde)]` with zero extra work.
-///
-/// Every field here is a plain `Vec` of a primitive or an `Epserde` type, so
-/// `SidecarCore` (and therefore all of [`LoudsCore`]) is now **fully**
-/// ε-serde-serializable.
-// `Clone` is derived (with per-field-type bounds auto-added by the derive
-// macro) so that a *borrowed* `SidecarCore<&[usize], ..., &[EfDict<usize>]>`
-// view (produced by `load_mmap`, whose fields are all cheap-to-copy slice
-// references) can be cloned out of a shared `&DeserType<...>` reference into
-// an owned-by-value instance — see `GraphRing::from_mapped`.
-#[derive(Epserde, Default, Clone)]
-pub(crate) struct SidecarCore<
-    His = Vec<usize>,
-    Los = Vec<usize>,
-    Kind = Vec<u8>,
-    SliceStart = Vec<usize>,
-    EfIdx = Vec<usize>,
-    SliceFlat = Vec<u32>,
-    EfDicts = Vec<EfDict<usize>>,
-> {
-    his: His,
-    los: Los,
-    kind: Kind,
-    slice_start: SliceStart,
-    ef_idx: EfIdx,
-    slice_flat: SliceFlat,
-    ef_dicts: EfDicts,
-}
-
-/// Substrate-generic read-only view over any [`SidecarCore`] instantiation
-/// (owned `Vec<_>` fields, as produced by [`LoudsTrie::build_sidecar`], OR the
-/// borrowed/mmap'd `DeserType` fields produced by ε-serde's `load_mmap`).
-///
-/// This collapses `SidecarCore`'s 7 individual generic parameters behind a
-/// single trait bound, so that a generic `LoudsTrie<T, L, S>` only needs one
-/// `S: SidecarSub` bound instead of threading all 7 parameters through.
-///
-/// Blanket-implemented for every `SidecarCore<His, Los, ...>` whose fields
-/// are `AsRef<[_]>` over the expected element types — satisfied by both
-/// `Vec<T>` (owned) and epserde's borrowed-slice `DeserType` forms.
-pub(crate) trait EfDictsSub {
-    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)>;
-    fn ef_mem_size(&self) -> usize;
-}
-
-impl EfDictsSub for Vec<EfDict<usize>> {
-    #[inline]
-    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)> {
-        self[idx].succ(target)
-    }
-    fn ef_mem_size(&self) -> usize {
-        // `FOLLOW_REFS` is required so that `Borrowed*`-substrate fields
-        // (mmap'd `&'static [_]` slices, see `BorrowedEfDict` below) report
-        // their real referenced-data size instead of just the reference's
-        // own pointer width; it is a no-op for owned `Vec`/`Box`-backed
-        // fields (their `MemSize` impls do not gate on this flag).
-        self.iter()
-            .map(|ef| ef.mem_size(SizeFlags::FOLLOW_REFS))
-            .sum()
-    }
-}
-
-pub(crate) trait SidecarSub {
-    fn find(&self, hi: usize) -> Option<usize>;
-    fn lo(&self, idx: usize) -> usize;
-    fn kind(&self, idx: usize) -> u8;
-    fn slice_start(&self, idx: usize) -> usize;
-    fn ef_idx(&self, idx: usize) -> usize;
-    fn slice_flat_range(&self, start: usize, end: usize) -> &[u32];
-    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)>;
-    fn mem_size_bytes(&self) -> usize;
-}
-
-impl<His, Los, Kind, SliceStart, EfIdx, SliceFlat, EfDicts> SidecarSub
-    for SidecarCore<His, Los, Kind, SliceStart, EfIdx, SliceFlat, EfDicts>
-where
-    His: AsRef<[usize]>,
-    Los: AsRef<[usize]>,
-    Kind: AsRef<[u8]>,
-    SliceStart: AsRef<[usize]>,
-    EfIdx: AsRef<[usize]>,
-    SliceFlat: AsRef<[u32]>,
-    EfDicts: EfDictsSub,
-{
-    #[inline]
-    fn find(&self, hi: usize) -> Option<usize> {
-        self.his.as_ref().binary_search(&hi).ok()
-    }
-
-    #[inline]
-    fn lo(&self, idx: usize) -> usize {
-        self.los.as_ref()[idx]
-    }
-
-    #[inline]
-    fn kind(&self, idx: usize) -> u8 {
-        self.kind.as_ref()[idx]
-    }
-
-    #[inline]
-    fn slice_start(&self, idx: usize) -> usize {
-        self.slice_start.as_ref()[idx]
-    }
-
-    #[inline]
-    fn ef_idx(&self, idx: usize) -> usize {
-        self.ef_idx.as_ref()[idx]
-    }
-
-    #[inline]
-    fn slice_flat_range(&self, start: usize, end: usize) -> &[u32] {
-        &self.slice_flat.as_ref()[start..end]
-    }
-
-    #[inline]
-    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)> {
-        self.ef_dicts.ef_succ(idx, target)
-    }
-
-    fn mem_size_bytes(&self) -> usize {
-        let his = self.his.as_ref();
-        let los = self.los.as_ref();
-        let kind = self.kind.as_ref();
-        let slice_start = self.slice_start.as_ref();
-        let ef_idx = self.ef_idx.as_ref();
-        let slice_flat = self.slice_flat.as_ref();
-        std::mem::size_of_val(his)
-            + std::mem::size_of_val(los)
-            + std::mem::size_of_val(kind)
-            + std::mem::size_of_val(slice_start)
-            + std::mem::size_of_val(ef_idx)
-            + std::mem::size_of_val(slice_flat)
-            + self.ef_dicts.ef_mem_size()
-    }
-}
+// SliceByValue::index_value — safe aligned accessor for BitFieldVec L reads.
+use value_traits::slices::SliceByValue;
 
 // ── T bitvector backend ───────────────────────────────────────────────────────
 
@@ -406,59 +211,6 @@ pub(crate) mod t_backend {
 
 // ── LoudsTrie ─────────────────────────────────────────────────────────────────
 
-/// Minimum node degree to store a SIMD-friendly u32 sidecar (L-opt B).
-///
-/// Nodes with `degree >= SIDECAR_THRESH` get a contiguous `Box<[u32]>` sidecar
-/// of their child labels so that `leap()` can use `partition_point` (SIMD-
-/// vectorisable) instead of scalar `index_value` bit-extracts.
-///
-/// Threshold = 16 labels:
-/// - RDF datasets: the vast majority of nodes have degree 1–3 (scalar path is
-///   fastest for them — no branch overhead, no cache pressure from sidecar).
-/// - High-degree nodes (e.g. hot predicates with many objects) are exactly the
-///   nodes where SIMD parallelism pays off — 16+ labels span ≥ 2 SIMD lanes.
-/// - 16 u32 = 64 bytes = one cache line — aligned with typical SIMD register
-///   width and cache-line granularity.
-pub const SIDECAR_THRESH: usize = 16;
-
-/// Minimum node degree to prefer Elias-Fano `succ()` over SIMD `partition_point`.
-///
-/// ## Measured crossover (aarch64, degree-sweep bench, 2026-07-01)
-///
-/// Sweep: 10k entities × 4 features, POS-trie degrees 16/32/64/128/256/512.
-/// Baseline = adaptive (Slice for D<128, Ef for D≥128); A/B = forced-Ef.
-///
-/// | Degree | Baseline path | Forced-Ef Δ | Verdict            |
-/// |--------|---------------|-------------|--------------------|
-/// |  16    | Slice         | +1.84%      | Within noise       |
-/// |  32    | Slice         | +2.15%      | Slice wins (barely)|
-/// |  64    | Slice         | +2.98%      | Slice wins         |
-/// | 128    | Ef (control)  | +2.50%      | Same path — noise  |
-/// | 256    | Ef (control)  | +1.55%      | Same path — noise  |
-/// | 512    | Ef (control)  | +0.60%      | Same path — noise  |
-///
-/// Noise floor ≈ 1.5–2.5% (inferred from D=128–512 controls where both arms use Ef).
-/// D=64 Slice advantage (+2.98%) is just above the noise floor → Slice wins at ≤64.
-/// Prior `feature_lookup` benchmark (D≈500, 1.25M triples): Ef −3.1% → Ef wins at ≥500.
-///
-/// **Crossover is in the [64, 500] range.**  EF_THRESH=128 is positioned inside
-/// that window (log-midpoint ≈ 179).  No clean A/B data at D=128–256 (baseline
-/// already used Ef there); 128 remains the measured conservative floor.
-///
-/// All sidecar nodes with `degree < EF_THRESH` keep the Slice path.
-pub const EF_THRESH: usize = 128;
-
-/// Effective EF threshold — compile-time override via `l-opt-ef` feature.
-///
-/// With `--features l-opt-ef`: forces EF for ALL sidecar nodes (EF_THRESH_EFFECTIVE
-/// = SIDECAR_THRESH=16), enabling clean A/B benchmarking against the Slice path.
-///
-/// Without the feature: adaptive — EF only for `degree >= EF_THRESH` (= 128).
-#[cfg(feature = "l-opt-ef")]
-const EF_THRESH_EFFECTIVE: usize = SIDECAR_THRESH;
-#[cfg(not(feature = "l-opt-ef"))]
-const EF_THRESH_EFFECTIVE: usize = EF_THRESH;
-
 /// Per-component memory breakdown of a single [`LoudsTrie`].
 /// Does not include the shared vocab arrays, which live one level up in
 /// [`crate::cltj::CltjData`] (Arc-deduped across all six tries).
@@ -468,15 +220,35 @@ pub struct LoudsMemBreakdown {
     pub t_bytes: usize,
     /// L label array: bit-packed `BitFieldVec`.
     pub l_bytes: usize,
-    /// High-degree sidecar (Slice or Elias-Fano payloads).
-    pub sidecar_bytes: usize,
 }
 
 impl LoudsMemBreakdown {
-    /// Sum of all three components.
+    /// Sum of T + L.
     pub fn total(&self) -> usize {
-        self.t_bytes + self.l_bytes + self.sidecar_bytes
+        self.t_bytes + self.l_bytes
     }
+}
+
+/// ⌈log₂(max+1)⌉ bit-width for packing labels (minimum 1).
+#[inline]
+fn bit_width_for_max(max_label: u32) -> usize {
+    ((u64::BITS - (max_label as u64).leading_zeros()) as usize).max(1)
+}
+
+/// Pack `labels` into a `BitFieldVec` at width derived from the slice max.
+fn pack_labels(labels: &[u32]) -> BitFieldVec {
+    let max = labels.iter().copied().max().unwrap_or(0);
+    let w = bit_width_for_max(max);
+    let mut v = BitFieldVec::new(w, 0);
+    for &lbl in labels {
+        v.push(lbl as usize);
+    }
+    v
+}
+
+/// Empty 1-bit BitFieldVec (used for vacant depth regions).
+fn empty_labels() -> BitFieldVec {
+    BitFieldVec::new(1, 0)
 }
 
 /// A LOUDS-encoded height-3 trie.
@@ -484,80 +256,57 @@ impl LoudsMemBreakdown {
 /// Both T (bitvector) and L (label array) include a dummy entry at index 0 so
 /// that the virtual root has identifier v = 0.  All paper formulas hold as-is.
 ///
-/// ## Label storage
-///
-/// `l` is a `sux::bits::BitFieldVec` (backend `Vec<usize>`) storing ⌈log₂(U)⌉
-/// bits per label using bit-packed storage with direct index access.  Since
-/// `BitFieldVec` derives `epserde::Epserde`, this is also the basis for the
-/// ε-serde mmap persistence path.
-/// `l_len` stores the logical length (= n_edges + 1 for the dummy) separately
-/// to avoid pulling in `value_traits::SliceByValue` as a direct dependency.
-///
-/// `t` is a `t_backend::TBitvec` selected at compile time by Cargo features.
-/// Default = sux Rank9+SelectAdapt (best performance in benchmarks).
-///
-/// ## High-degree sidecar
-///
-/// `sidecar` maps `hi` → (node_lo, sorted_labels) for nodes with
-/// `degree >= SIDECAR_THRESH`.  `leap()` uses this to run `partition_point` on
-/// a contiguous `&[u32]` instead of scalar `index_value` bit-extracts.
-pub(crate) struct LoudsTrie<B = t_backend::SuxRS, L = BitFieldVec, S = SidecarCore> {
+/// L is three per-depth `BitFieldVec`s. Global positions `[0, l_len)` still
+/// address labels: dummy + depth-0 in `l0`, then depth-1 in `l1` from
+/// `d1_start`, then depth-2 in `l2` from `d2_start`. `t` is Rank9+SelectAdapt.
+/// Leap is exp+binary on L.
+pub(crate) struct LoudsTrie<B = t_backend::SuxRS, L = BitFieldVec> {
     /// LOUDS bitvector with dummy `false` at index 0.
-    /// Supports O(1) `rank1` and `select1` via the active `t_backend`.
     t: t_backend::TBitvec<B>,
-    /// Label array with dummy `0` at index 0, bit-packed at ⌈log₂(U)⌉ bits/entry.
-    l: L,
-    /// Logical length of `l` (= n_edges + 1).  Stored explicitly to avoid
-    /// importing `value_traits::SliceByValue` just for `.len()`.
+    /// Depth-0 labels including dummy `0` at local index 0 (global pos 0).
+    l0: L,
+    /// Depth-1 labels (global pos `d1_start..d2_start`).
+    l1: L,
+    /// Depth-2 labels (global pos `d2_start..l_len`).
+    l2: L,
+    /// First global L position of depth-1 labels (`1 + n_depth0`).
+    d1_start: usize,
+    /// First global L position of depth-2 labels.
+    d2_start: usize,
+    /// Logical length of L (= n_edges + 1).
     l_len: usize,
-    /// L-opt B sidecar: for high-degree nodes (degree >= SIDECAR_THRESH),
-    /// stores (node_lo, payload) keyed by `hi` (inclusive upper bound of the
-    /// node's label range in L), as sorted parallel vectors with binary
-    /// search — see [`SidecarCore`].
-    ///
-    /// `hi` is the only context available inside `leap(lo, hi, c)` without
-    /// changing the public signature.  `node_lo` is stored alongside to avoid
-    /// recomputing it from `hi` and `degree`.
-    sidecar: S,
 }
 
-/// Fully ε-serde-serializable core of a [`LoudsTrie`] — T, L, **and** the
-/// sidecar.
-///
-/// `t_backend::TBitvec`, `sux::bits::BitFieldVec`, and [`SidecarCore`] all
-/// derive `epserde::Epserde`, so this struct composes cleanly through
-/// `#[derive(Epserde)]` with zero extra trait-bound or lifetime work.
-///
-/// `Clone` is derived so that a *borrowed* `LoudsCore<TBitvec<BorrowedT>,
-/// BorrowedL, BorrowedS>` view produced by `load_mmap` can be cheaply cloned
-/// out of a shared `&DeserType<...>` reference (all fields are borrowed
-/// slices, so this only copies pointer/length data) — see
-/// `GraphRing::from_mapped`.
+/// Fully ε-serde-serializable core of a [`LoudsTrie`] — T + per-depth L.
 #[derive(Epserde, Clone)]
-pub(crate) struct LoudsCore<T = t_backend::TBitvec, L = BitFieldVec, S = SidecarCore> {
+pub(crate) struct LoudsCore<T = t_backend::TBitvec, L = BitFieldVec> {
     t: T,
-    l: L,
+    l0: L,
+    l1: L,
+    l2: L,
+    d1_start: usize,
+    d2_start: usize,
     l_len: usize,
-    sidecar: S,
 }
 
 // ── Reconstruction from core (generic over substrate) ─────────────────────────
 //
 // Pure field-moves with no owned-specific logic, so this is generic over any
-// substrate `B`/`L`/`S` — this is what lets a future borrowed/mmap'd
-// `LoudsCore<DeserType<TBitvec<B>>, DeserType<L>, DeserType<S>>` reconstruct
-// directly into a navigable `LoudsTrie<B, L, S>` with **zero extra code**
+// substrate `B`/`L` — this is what lets a future borrowed/mmap'd
+// `LoudsCore<DeserType<TBitvec<B>>, DeserType<L>>` reconstruct
+// directly into a navigable `LoudsTrie<B, L>` with **zero extra code**
 // versus the owned round-trip path.
-impl<B, L, S> LoudsTrie<B, L, S> {
-    /// Reconstruct a full `LoudsTrie` from a [`LoudsCore`] loaded from disk
-    /// (or from an in-memory round-trip buffer, or a borrowed `load_mmap`'d
-    /// view). The sidecar travels with the core as-is — no rebuild required.
-    pub(crate) fn from_core(core: LoudsCore<t_backend::TBitvec<B>, L, S>) -> Self {
+impl<B, L> LoudsTrie<B, L> {
+    /// Reconstruct a full `LoudsTrie` from a [`LoudsCore`].
+    pub(crate) fn from_core(core: LoudsCore<t_backend::TBitvec<B>, L>) -> Self {
         LoudsTrie {
             t: core.t,
-            l: core.l,
+            l0: core.l0,
+            l1: core.l1,
+            l2: core.l2,
+            d1_start: core.d1_start,
+            d2_start: core.d2_start,
             l_len: core.l_len,
-            sidecar: core.sidecar,
         }
     }
 }
@@ -565,21 +314,20 @@ impl<B, L, S> LoudsTrie<B, L, S> {
 // ── Construction (owned-only) ─────────────────────────────────────────────────
 //
 // These methods only ever operate on the default, fully-owned instantiation
-// (`B = SuxRS`, `L = BitFieldVec`, `S = SidecarCore`) — building a trie from
+// (`B = SuxRS`, `L = BitFieldVec`) — building a trie from
 // scratch, or converting to/from the ε-serde core, always produces/consumes
 // owned data.  Read-only navigation (below) is generic over any substrate.
 impl LoudsTrie {
-    /// Consume this trie into its fully ε-serde-serializable [`LoudsCore`]
-    /// (T + L + sidecar — no information is discarded or needs rebuilding).
-    ///
-    /// Used by the persistent snapshot format to serialize a freshly built
-    /// trie.
+    /// Consume this trie into its fully ε-serde-serializable [`LoudsCore`].
     pub(crate) fn into_core(self) -> LoudsCore {
         LoudsCore {
             t: self.t,
-            l: self.l,
+            l0: self.l0,
+            l1: self.l1,
+            l2: self.l2,
+            d1_start: self.d1_start,
+            d2_start: self.d2_start,
             l_len: self.l_len,
-            sidecar: self.sidecar,
         }
     }
 
@@ -587,11 +335,9 @@ impl LoudsTrie {
     ///
     /// Prepends dummy `false` / `0` entries automatically.
     ///
-    /// The `CompactVector` bit-width is computed from the maximum label value:
-    /// `⌈log₂(max_label + 1)⌉` bits, minimum 1.
-    ///
-    /// High-degree nodes (degree ≥ `SIDECAR_THRESH`) are recorded in the L-opt B
-    /// sidecar so that `leap()` can use SIMD `partition_point` on them.
+    /// Labels are split into three depth regions with independent bit-widths.
+    /// Depth boundaries are derived from the LOUDS T topology (BFS level-order):
+    /// depth-0 = root children, depth-1 = their children, depth-2 = the rest.
     ///
     /// Panics if `t_bits.len() != l_labels.len()`.
     pub fn from_raw(t_bits: &[bool], l_labels: &[u32]) -> Self {
@@ -601,171 +347,121 @@ impl LoudsTrie {
             "LoudsTrie: T and L must have the same length"
         );
 
-        // ── Build T bitvector (substrate selected by feature flag) ───────────
         let bits = std::iter::once(false).chain(t_bits.iter().copied());
         let t = t_backend::TBitvec::build(bits);
-
-        // ── Build L label array as BitFieldVec ────────────────────────────────
-        //
-        // Bit-width = ⌈log₂(max_label + 1)⌉, minimum 1.
-        // Build via push() — a direct inherent method on BitFieldVec<Vec<usize>>
-        // (no trait import needed).  Index 0 = dummy 0; indices 1..=n = labels.
-        let max_label = l_labels.iter().copied().max().unwrap_or(0) as u64;
-        let bit_width = ((u64::BITS - max_label.leading_zeros()) as usize).max(1);
         let l_len = l_labels.len() + 1;
-        let mut l: BitFieldVec = BitFieldVec::new(bit_width, 0);
-        l.push(0usize); // dummy entry at index 0
-        for &lbl in l_labels {
-            l.push(lbl as usize);
+
+        // Derive depth boundaries from T (height-3 LOUDS, dummy at 0).
+        // Root degree = selectnext1(1) - 0; without a full trie yet, scan T bits
+        // with dummy prepended: t_bits is paper form (no dummy).
+        // With dummy: T_rust[0]=false, then t_bits.
+        // degree(0) = selectnext1(1) - 0 = first 1 at/after pos 1, minus 0.
+        let (d1_start, d2_start) = depth_boundaries_from_t_bits(t_bits, l_len);
+
+        // Slice paper labels (no dummy) into depths:
+        // global pos 1..d1_start → depth 0 (len n0 = d1_start - 1)
+        // global pos d1_start..d2_start → depth 1
+        // global pos d2_start..l_len → depth 2
+        let n0 = d1_start.saturating_sub(1);
+        let n1 = d2_start.saturating_sub(d1_start);
+        debug_assert_eq!(n0 + n1 + l_len.saturating_sub(d2_start), l_labels.len());
+
+        let d0_slice = &l_labels[..n0.min(l_labels.len())];
+        let d1_slice = if n0 < l_labels.len() {
+            &l_labels[n0..(n0 + n1).min(l_labels.len())]
+        } else {
+            &[]
+        };
+        let d2_slice = if n0 + n1 < l_labels.len() {
+            &l_labels[n0 + n1..]
+        } else {
+            &[]
+        };
+
+        // l0: dummy + depth-0 labels
+        let max0 = d0_slice.iter().copied().max().unwrap_or(0);
+        let w0 = bit_width_for_max(max0);
+        let mut l0 = BitFieldVec::new(w0, 0);
+        l0.push(0usize); // dummy
+        for &lbl in d0_slice {
+            l0.push(lbl as usize);
         }
 
-        // ── Build L-opt B sidecar ─────────────────────────────────────────────
-        //
-        // Walk the T bitvector (already built) to enumerate every node and its
-        // child label range [node_lo, node_hi].  For nodes with degree ≥
-        // SIDECAR_THRESH, copy their labels into a Box<[u32]> keyed by `node_hi`.
-        //
-        // We use the same LOUDS primitives (rank1, select1) that the built `t`
-        // exposes, so this is one forward scan of the T bitvector post-build.
-        let sidecar = Self::build_sidecar(&t, &l, l_len);
+        let l1 = if d1_slice.is_empty() {
+            empty_labels()
+        } else {
+            pack_labels(d1_slice)
+        };
+        let l2 = if d2_slice.is_empty() {
+            empty_labels()
+        } else {
+            pack_labels(d2_slice)
+        };
 
         LoudsTrie {
             t,
-            l,
+            l0,
+            l1,
+            l2,
+            d1_start,
+            d2_start,
             l_len,
-            sidecar,
         }
     }
+}
 
-    /// Walk T to find every node's child range and populate the sidecar.
-    ///
-    /// Separate function to avoid a partial-move issue (called after `t`, `l`,
-    /// and `l_len` are computed but before they are moved into `Self`).
-    ///
-    /// Builds an intermediate `Vec<(hi, lo, SidecarPayload)>` during the BFS
-    /// walk (order is BFS, not sorted by `hi`), then sorts by `hi` and
-    /// flattens into the ε-serde-serializable [`SidecarCore`] representation.
-    fn build_sidecar(t: &t_backend::TBitvec, l: &BitFieldVec, l_len: usize) -> SidecarCore {
-        let mut entries: Vec<(usize, usize, SidecarPayload)> = Vec::new();
-        if l_len <= 1 {
-            return SidecarCore::default(); // empty trie
-        }
-
-        // Enumerate nodes by walking the T bitvector BFS-style.
-        // A node at T-position v has degree = selectnext1(v+1) - v.
-        // selectnext1(k) = select1(rank1(k)).
-        // Root is v=0. BFS queue: nodes are their T-positions.
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(0usize); // root
-
-        while let Some(v) = queue.pop_front() {
-            // Compute degree(v) = selectnext1(v+1) - v.
-            let rank = t.rank1(v + 1);
-            let next1 = t.select1(rank).unwrap_or(l_len);
-            let degree = next1.saturating_sub(v);
-            if degree == 0 {
-                continue;
-            }
-            let node_lo = v + 1;
-            let node_hi = v + degree;
-
-            // Enqueue depth-1 and depth-2 internal nodes.
-            // Leaf nodes (at depth 2 in a height-3 trie) have no T-encoding,
-            // so we only enqueue nodes whose children are internal (not leaves).
-            // In practice, we enqueue all internal nodes; leaf detection
-            // is implicit because `degree()` returns 0 for positions past T.
-
-            // Enqueue the children of this node (their T-positions = child() calls).
-            // child(v, i) = select1(v + i - 1).
-            for i in 1..=degree {
-                if let Some(child_v) = t.select1(v + i - 1)
-                    && child_v + 1 < l_len
-                {
-                    queue.push_back(child_v);
-                }
-            }
-
-            if degree >= SIDECAR_THRESH {
-                // Build the sidecar payload from the bit-packed L labels in [node_lo..=node_hi].
-                // Labels are sorted ascending — guaranteed by trie construction from sorted triples.
-                //
-                // Adaptive dispatch (Step 12):
-                //   degree >= EF_THRESH_EFFECTIVE → SidecarPayload::Ef  (O(1) succ)
-                //   degree <  EF_THRESH_EFFECTIVE → SidecarPayload::Slice  (SIMD partition_point)
-                //
-                // EF_THRESH_EFFECTIVE = SIDECAR_THRESH when `l-opt-ef` feature is set
-                // (all sidecar nodes use EF — A/B benchmark mode).
-                // EF_THRESH_EFFECTIVE = EF_THRESH (128) otherwise — conservative crossover floor.
-                let payload: SidecarPayload = if degree >= EF_THRESH_EFFECTIVE {
-                    // EF universe = max label value + 1.  Last label = max since sorted.
-                    let max_lbl = if node_hi < l_len {
-                        l.index_value(node_hi)
-                    } else {
-                        0
-                    };
-                    let mut efb = EliasFanoBuilder::new(degree, max_lbl.saturating_add(1));
-                    for pos in node_lo..=node_hi {
-                        efb.push(if pos < l_len { l.index_value(pos) } else { 0 });
-                    }
-                    SidecarPayload::Ef(efb.build_with_dict())
-                } else {
-                    let labels: Box<[u32]> = (node_lo..=node_hi)
-                        .map(|pos| {
-                            if pos < l_len {
-                                l.index_value(pos) as u32
-                            } else {
-                                0
-                            }
-                        })
-                        .collect::<Vec<u32>>()
-                        .into_boxed_slice();
-                    SidecarPayload::Slice(labels)
-                };
-
-                entries.push((node_hi, node_lo, payload));
-            }
-        }
-
-        // Sort by `hi` ascending (BFS order is level-order, not `hi`-sorted)
-        // so that `SidecarCore::find` can binary-search.
-        entries.sort_unstable_by_key(|(hi, _, _)| *hi);
-
-        let mut core: SidecarCore = SidecarCore::default();
-        for (hi, lo, payload) in entries {
-            core.his.push(hi);
-            core.los.push(lo);
-            match payload {
-                SidecarPayload::Slice(labels) => {
-                    core.kind.push(0);
-                    core.slice_start.push(core.slice_flat.len());
-                    core.ef_idx.push(0);
-                    core.slice_flat.extend_from_slice(&labels);
-                }
-                SidecarPayload::Ef(ef) => {
-                    core.kind.push(1);
-                    core.slice_start.push(0);
-                    core.ef_idx.push(core.ef_dicts.len());
-                    core.ef_dicts.push(ef);
-                }
-            }
-        }
-        core
+/// Compute `(d1_start, d2_start)` from paper-format T bits (no dummy).
+///
+/// Height-3 LOUDS level-order: after the root unary code, all depth-1 node
+/// unary codes, then all depth-2 node unary codes. Root degree = number of
+/// children of the root = number of depth-0 labels = index of first `true` in
+/// the root's unary block (which is `0^(d-1) 1`).
+fn depth_boundaries_from_t_bits(t_bits: &[bool], l_len: usize) -> (usize, usize) {
+    if t_bits.is_empty() {
+        // Empty trie: only dummy label at 0.
+        return (1, 1);
     }
+    // Root unary: first true ends the root block; degree = index+1.
+    let root_end = t_bits
+        .iter()
+        .position(|&b| b)
+        .expect("LOUDS root unary must end with 1");
+    let n0 = root_end + 1; // degree(root)
+    let d1_start = 1 + n0;
+
+    // Walk remaining T to sum degrees of depth-1 nodes (next n0 unary blocks).
+    let mut i = root_end + 1;
+    let mut n1 = 0usize;
+    for _ in 0..n0 {
+        if i >= t_bits.len() {
+            break;
+        }
+        let block_end = t_bits[i..]
+            .iter()
+            .position(|&b| b)
+            .map(|p| i + p)
+            .unwrap_or(t_bits.len().saturating_sub(1));
+        let degree = block_end - i + 1;
+        n1 += degree;
+        i = block_end + 1;
+    }
+    let d2_start = d1_start + n1;
+    // Clamp to l_len for safety on malformed inputs.
+    (d1_start.min(l_len), d2_start.min(l_len))
 }
 
 // ── Read-only navigation (generic over substrate) ─────────────────────────────
 //
 // Generic over `B` (T bitvector's inner rank/select backend), `L` (label
-// array substrate), and `S` (sidecar substrate) so that these methods work
+// array substrate) so that these methods work
 // identically whether the trie's fields are owned (`Vec`-backed, as built by
 // `from_raw`) or borrowed/mmap'd (as produced by ε-serde's `load_mmap` on a
 // `LoudsCore` — see `from_core`, which itself is owned-only, but whose result
 // can subsequently be treated generically here).
-impl<B, L, S> LoudsTrie<B, L, S>
+impl<B, L> LoudsTrie<B, L>
 where
     B: Rank + SelectUnchecked + MemSize,
     L: SliceByValue<Value = usize> + MemSize,
-    S: SidecarSub,
 {
     /// Number of trie edges (|T| = |L|, excluding the dummy at index 0).
     #[inline]
@@ -779,28 +475,19 @@ where
         self.n_edges() == 0
     }
 
-    /// Real allocated byte size of this trie's T + L + sidecar structures,
-    /// for memory-breakdown diagnostics (does not include shared vocab —
-    /// see `CltjTrie::mem_size_bytes` / `CltjData::mem_size_bytes` for the
-    /// Arc-deduped vocab accounting).
+    /// Real allocated byte size of this trie's T + L (no shared vocab).
     pub fn mem_size_bytes(&self) -> usize {
         let b = self.mem_breakdown();
-        b.t_bytes + b.l_bytes + b.sidecar_bytes
+        b.t_bytes + b.l_bytes
     }
 
-    /// Per-component breakdown of this trie's memory (T bitvector / L label
-    /// array / sidecar). Does not include shared
-    /// vocab — see `CltjData::mem_size_bytes` for the Arc-deduped vocab total.
+    /// Per-component breakdown (T / L). Vocab is Arc-deduped at `CltjData`.
     pub fn mem_breakdown(&self) -> LoudsMemBreakdown {
         LoudsMemBreakdown {
             t_bytes: self.t.mem_size_bytes(),
-            // `FOLLOW_REFS` is required so that a `Borrowed*`-substrate `L`
-            // (mmap'd `BitFieldVec<&'static [usize]>`, see `BorrowedL`)
-            // reports the real size of the referenced backing slice rather
-            // than just the reference's own pointer width; it is a no-op
-            // for the owned `BitFieldVec<Vec<usize>>` substrate.
-            l_bytes: self.l.mem_size(SizeFlags::FOLLOW_REFS),
-            sidecar_bytes: self.sidecar.mem_size_bytes(),
+            l_bytes: self.l0.mem_size(SizeFlags::FOLLOW_REFS)
+                + self.l1.mem_size(SizeFlags::FOLLOW_REFS)
+                + self.l2.mem_size(SizeFlags::FOLLOW_REFS),
         }
     }
 
@@ -864,63 +551,14 @@ where
     ///
     /// Returns `hi + 1` when no such index exists.
     ///
-    /// ## Sidecar dispatch
-    ///
-    /// For nodes with `degree >= SIDECAR_THRESH`, uses SIMD-friendly
-    /// `partition_point` on a contiguous `&[u32]` sidecar.  For small nodes
-    /// (most RDF trie nodes are degree 1–3), falls through to the inline
-    /// **exponential search** (doubling stride) then binary search — O(log ℓ)
-    /// amortised where ℓ is the leap distance.
-    ///
-    /// The sidecar is keyed by `hi` (inclusive upper bound of the node's label
-    /// range in L), which is the sole context `leap` receives.
+    /// Exponential search (doubling stride) then binary search over bit-packed
+    /// L via [`Self::label_at`] — O(log ℓ) amortised where ℓ is the leap
+    /// distance.
     pub fn leap(&self, lo: usize, hi: usize, c: u32) -> usize {
         if lo > hi {
             return hi.wrapping_add(1);
         }
 
-        // ── L-opt B: sidecar dispatch for high-degree nodes ───────────────────
-        //
-        // Keyed by `hi` — populated at construction for degree >= SIDECAR_THRESH.
-        // Binary search via `SidecarSub::find`, then dispatch on `kind`:
-        // 0 = Slice + partition_point (SIMD, O(log d)); 1 = EfDict + succ() (O(1)).
-        if let Some(idx) = self.sidecar.find(hi) {
-            let node_lo = self.sidecar.lo(idx);
-            let offset = lo.saturating_sub(node_lo);
-
-            return if self.sidecar.kind(idx) == 0 {
-                // SIMD-friendly `partition_point` on contiguous u32 sidecar.
-                let start = self.sidecar.slice_start(idx);
-                let end = start + (hi - node_lo + 1);
-                let labels = self.sidecar.slice_flat_range(start, end);
-                let slice = &labels[offset..];
-                if slice.is_empty() {
-                    return hi + 1;
-                }
-                let rel = slice.partition_point(|&v| v < c);
-                if rel >= slice.len() { hi + 1 } else { lo + rel }
-            } else {
-                // Elias-Fano O(1) succ: find first value >= c in the full
-                // label range, then clamp to [offset, end].
-                //
-                // rank < offset: labels[offset] >= labels[rank] >= c (sorted) → lo.
-                // rank >= offset: exact position node_lo + rank (>= lo).
-                // None: no value >= c in entire node range → hi + 1.
-                match self.sidecar.ef_succ(self.sidecar.ef_idx(idx), c as usize) {
-                    None => hi + 1,
-                    Some((rank, _)) => {
-                        if rank < offset {
-                            lo
-                        } else {
-                            node_lo + rank
-                        }
-                    }
-                }
-            };
-        }
-
-        // ── Scalar path for low-degree nodes (degree < SIDECAR_THRESH) ────────
-        //
         // Exponential search: find a bracket [left+1, right] containing target.
         if self.label_at(lo) >= c {
             return lo;
@@ -960,23 +598,23 @@ where
         if self.is_empty() { 0 } else { self.degree(0) }
     }
 
-    /// Label at position `pos` in L (includes dummy at 0).
+    /// Label at global position `pos` in L (includes dummy at 0).
     ///
-    /// Decodes one bit-packed word from the `BitFieldVec` using
+    /// Routes to the depth-specific `BitFieldVec`. Uses
     /// [`value_traits::slices::SliceByValue::index_value`] — the safe, aligned
-    /// accessor that does a proper bit-packed, bounds-checked read without loading
-    /// past the last allocated backing word.
-    ///
-    /// `get_unaligned` (the inherent method) reads a full 8-byte `Word` at an
-    /// arbitrary byte offset and **panics** when `pos` is near the buffer end
-    /// because the read overshoots the allocation.  `index_value` uses aligned
-    /// word reads with masking and is always safe.
+    /// accessor for bit-packed reads.
     #[inline]
     pub fn label_at(&self, pos: usize) -> u32 {
-        if pos < self.l_len {
-            self.l.index_value(pos) as u32
+        if pos >= self.l_len {
+            return 0;
+        }
+        if pos < self.d1_start {
+            // Depth 0 region (includes dummy at local 0).
+            self.l0.index_value(pos) as u32
+        } else if pos < self.d2_start {
+            self.l1.index_value(pos - self.d1_start) as u32
         } else {
-            0
+            self.l2.index_value(pos - self.d2_start) as u32
         }
     }
 }
@@ -986,13 +624,12 @@ where
 /// Object-safety-free trait bundling every [`LoudsTrie<B, L, S>`] navigation
 /// method that [`crate::cltj::CltjTrie`] needs, collapsing the three separate
 /// `B`/`L`/`S` generic parameters (and their three separate trait bounds)
-/// behind a single parameter — mirroring the [`SidecarSub`] bundling pattern
-/// used one level down for the sidecar substrate.
+/// behind a single parameter — bundling T/L substrate bounds behind one parameter.
 ///
 /// Blanket-implemented for every `LoudsTrie<B, L, S>` instantiation whose
 /// `B`/`L`/`S` satisfy the same bounds as the generic navigation `impl` block
 /// above — this includes both the owned/default instantiation
-/// (`LoudsTrie<t_backend::SuxRS, BitFieldVec, SidecarCore>`, produced by
+/// (`LoudsTrie<t_backend::SuxRS, BitFieldVec>`, produced by
 /// `from_raw`/`from_core`) and a future borrowed/mmap'd instantiation whose
 /// `B`/`L`/`S` are ε-serde's `DeserType` forms, with **zero code
 /// duplication**: `CltjTrie`/`CltjData`/`GraphRing` only need to be generic
@@ -1007,11 +644,10 @@ pub(crate) trait LoudsNav {
     fn mem_breakdown(&self) -> LoudsMemBreakdown;
 }
 
-impl<B, L, S> LoudsNav for LoudsTrie<B, L, S>
+impl<B, L> LoudsNav for LoudsTrie<B, L>
 where
     B: Rank + SelectUnchecked + MemSize,
     L: SliceByValue<Value = usize> + MemSize,
-    S: SidecarSub,
 {
     #[inline]
     fn root_degree(&self) -> usize {
@@ -1118,88 +754,17 @@ pub(crate) fn build_louds_from_sorted(sorted: &[[u32; 3]]) -> Option<LoudsTrie> 
 
 // ── Borrowed substrate ─────────────────────────────────────────────────────────
 //
-// Concrete types that ε-serde's `DeserType<LoudsCore>`/`DeserType<TBitvec>`/
-// `DeserType<BitFieldVec>`/`DeserType<SidecarCore>` resolve to when loaded via
-// `load_mmap`. Determined empirically by compiling a deliberately-wrong probe
-// (`let _: () = view.t;` etc.) against a real `load_mmap`'d value and reading
-// off the type-mismatch error's "found" type. These are exactly the
-// `B`/`L`/`S` substrate parameters that
-// instantiate a **borrowed/zero-copy** `LoudsTrie<B, L, S>` — matched against
-// the `LoudsNav` blanket impl's bounds (`Rank + SelectUnchecked + MemSize` for
-// `B`; `SliceByValue<Value = usize> + MemSize` for `L`; `SidecarSub` for `S`),
-// all of which sux/this crate's blanket impls satisfy automatically for these
-// borrowed forms — **zero extra code** versus the owned path.
-//
-// The `'static` lifetime here is a lie in the general case (the actual data
-// borrows from a `MemCase`'s mapped memory) — soundness is established by the
-// caller keeping the backing `Arc<epserde::deser::MemCase<StoreSnapshot>>`
-// alive for as long as any `BorrowedLouds` value derived from it is
-// reachable, exactly mirroring `VocabRepr::Mapped(&'static [u64])`'s
-// documented safety argument in `cltj.rs`.
+// Types that ε-serde's `DeserType` resolves to under `load_mmap`.
+// `'static` is a soundness lie tied to the caller's `MemCase` lifetime —
+// same pattern as `VocabRepr::Mapped`.
 pub(crate) type BorrowedT = SelectAdapt<
     AddNumBits<Rank9<BitVec<&'static [u64]>, &'static [BlockCounters]>>,
     &'static [usize],
 >;
 pub(crate) type BorrowedL = BitFieldVec<&'static [usize]>;
-// `ef_dicts`'s `DeserType` is NOT a borrowed slice `&[EfDict<usize>]` —
-// `EfDict<usize>` (= `EliasFano<usize, SelectZeroAdaptConst<..., Box<[usize]>,
-// 12, 3>, BitFieldVec<Box<[usize]>>>`) is a "deep" (non-zero-copy) type
-// because its own fields are not all bare generic parameters, so epserde
-// recurses into it: the *outer* `Vec<EfDict<usize>>` deserializes as an
-// owned `Vec<DeserType<EfDict<usize>>>`, while each *element*'s own
-// `Box<[usize]>` fields deserialize to borrowed `&[usize]` slices. This is
-// exactly `EliasFano<usize, SelectZeroAdaptConst<BitVec<&[usize]>,
-// &[usize], 12, 3>, BitFieldVec<&[usize]>>` — confirmed empirically via
-// `std::any::type_name_of_val` on a real `load_mmap`'d value. No transmute
-// is needed for this field: an
-// owned `Vec` of partially-borrowed elements clones cheaply (no deep data
-// copy — see `Clone` derived on `SidecarCore`/`LoudsCore`) and assigns
-// directly.
-pub(crate) type BorrowedEfDict = EliasFano<
-    usize,
-    SelectZeroAdaptConst<BitVec<&'static [usize]>, &'static [usize], 12, 3>,
-    BitFieldVec<&'static [usize]>,
->;
 
-// `BorrowedEfDict` is a distinct concrete type from `EfDict<usize>`, so it
-// needs its own `EfDictsSub` impl (the blanket `impl EfDictsSub for
-// Vec<EfDict<usize>>` above does not cover it). `succ()` is available on
-// `BorrowedEfDict` via the same `sux::traits::Succ` blanket impl that covers
-// `EfDict<usize>` (both are `EliasFano<usize, H, L>` for
-// `H: AsRef<[usize]> + SelectZeroUnchecked`, `L: SliceByValue<Value = usize>`
-// -- satisfied by both the owned `Box<[usize]>` and borrowed `&[usize]`
-// backing stores), so this impl is a byte-for-byte mirror of the owned one.
-impl EfDictsSub for Vec<BorrowedEfDict> {
-    #[inline]
-    fn ef_succ(&self, idx: usize, target: usize) -> Option<(usize, usize)> {
-        self[idx].succ(target)
-    }
-    fn ef_mem_size(&self) -> usize {
-        // `FOLLOW_REFS`: these `EfDict` elements are themselves borrowed
-        // (`&'static [_]`-backed) — without it, only the reference/pointer
-        // width would be counted instead of the referenced mmap'd data.
-        self.iter()
-            .map(|ef| ef.mem_size(SizeFlags::FOLLOW_REFS))
-            .sum()
-    }
-}
-
-pub(crate) type BorrowedS = SidecarCore<
-    &'static [usize],
-    &'static [usize],
-    &'static [u8],
-    &'static [usize],
-    &'static [usize],
-    &'static [u32],
-    Vec<BorrowedEfDict>,
->;
-
-/// Borrowed/mmap'd instantiation of [`LoudsTrie`] — zero-copy, all fields
-/// borrowed slices tied to a `MemCase`'s mapped memory (see [`BorrowedT`]/
-/// [`BorrowedL`]/[`BorrowedS`]'s doc comments for the lifetime-safety
-/// argument). Satisfies [`LoudsNav`] via the same blanket impl the owned form
-/// uses — no extra trait implementation required.
-pub(crate) type BorrowedLouds = LoudsTrie<BorrowedT, BorrowedL, BorrowedS>;
+/// Borrowed/mmap'd [`LoudsTrie`] (zero-copy slices from a `MemCase`).
+pub(crate) type BorrowedLouds = LoudsTrie<BorrowedT, BorrowedL>;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -1383,48 +948,35 @@ mod tests {
         assert_eq!(trie.leap(lo, hi, 11), hi + 1);
     }
 
-    /// Verify L-opt B sidecar: a high-degree node (degree ≥ SIDECAR_THRESH) must
-    /// produce the same `leap()` results as the scalar path would.
-    ///
-    /// We build a trie with one S node that has 20 O-children (degree=20 ≥ 16),
-    /// verify the sidecar is populated, and check all leap targets.
+    /// High-degree node: leap correctness on bit-packed L.
     #[test]
-    fn sidecar_high_degree_node() {
+    fn high_degree_leap() {
         // One subject (0), one predicate (0), 20 objects (0..19).
         let triples: Vec<[u32; 3]> = (0u32..20).map(|o| [0, 0, o]).collect();
         let trie = build_louds_from_sorted(&triples).expect("non-empty");
 
-        // The SP-node (depth-2) has degree 20 → sidecar should be populated.
         let s_node = trie.child(0, 1);
         let sp_node = trie.child(s_node, 1);
         assert_eq!(trie.degree(sp_node), 20, "SP-node degree must be 20");
         let lo = sp_node + 1;
         let hi = sp_node + 20;
 
-        // The sidecar must be present for this hi.
-        assert!(
-            trie.sidecar.find(hi).is_some(),
-            "sidecar must contain entry for hi={hi} (degree=20 >= SIDECAR_THRESH={SIDECAR_THRESH})"
-        );
-
-        // Every possible target — compare against manually expected position.
         for target in 0u32..20 {
             let got = trie.leap(lo, hi, target);
-            // Labels are 0..19 at positions lo..hi; target should land at lo+target.
             assert_eq!(got, lo + target as usize, "leap(lo, hi, {target}) wrong");
         }
-        // Target past max → exhausted.
         assert_eq!(
             trie.leap(lo, hi, 20),
             hi + 1,
             "leap past max should exhaust"
         );
-        // Target == 0 at start.
         assert_eq!(trie.leap(lo, hi, 0), lo);
-        // Seek from mid-range.
         let mid_lo = lo + 10;
-        let got_mid = trie.leap(mid_lo, hi, 15);
-        assert_eq!(got_mid, lo + 15, "leap from mid-range to 15");
+        assert_eq!(
+            trie.leap(mid_lo, hi, 15),
+            lo + 15,
+            "leap from mid-range to 15"
+        );
     }
 
     /// Verify that CompactVector bit-packing round-trips correctly for large label

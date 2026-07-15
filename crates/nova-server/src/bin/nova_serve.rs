@@ -444,21 +444,21 @@ async fn main() {
         let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
         eprintln!("[nova_serve] ── Per-ordering breakdown ──");
         eprintln!(
-            "[nova_serve]   {:<6} {:>10} {:>10} {:>10} {:>12}",
-            "Order", "T (MiB)", "L (MiB)", "Side (MiB)", "Vocab* (MiB)"
+            "[nova_serve]   {:<6} {:>10} {:>10} {:>12}",
+            "Order", "T (MiB)", "L (MiB)", "Vocab* (MiB)"
         );
         for i in 0..6 {
             let ord = bd.orders[i];
             let b = &bd.per_order[i];
             eprintln!(
-                "[nova_serve]   {:<6} {:>10.2} {:>10.2} {:>10.2} {:>12.2}",
+                "[nova_serve]   {:<6} {:>10.2} {:>10.2} {:>12.2}",
                 format!("{ord:?}"),
                 mib(b.t_bytes),
                 mib(b.l_bytes),
-                mib(b.sidecar_bytes),
                 mib(bd.vocab_undeduped[i]),
             );
         }
+
         eprintln!("[nova_serve]   (*Vocab is undeduped per-ordering; deduped total below)");
         eprintln!(
             "[nova_serve]   Vocab (deduped, real total):                   {:>10.2} MiB",

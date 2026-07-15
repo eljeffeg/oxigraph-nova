@@ -32,24 +32,25 @@
 # `docker stats` (the container boundary makes `vmmap` inapplicable there).
 #
 # Usage:
-#   ./run_comparison.sh [ENTITIES] [ITERS] [WARMUP]
+#   ./run_comparison.sh [ENTITIES] [ITERS] [WARMUP] [RESULT_FILE]
 #
 # Defaults: ENTITIES=50000 ITERS=30 WARMUP=5
 set -euo pipefail
 
 ENTITIES="${1:-50000}"
-ITERS="${2:-30}"
+ITERS="${2:-10}"
 WARMUP="${3:-5}"
+RESULT_FILE="${4:-RESULTS.md}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BENCH_DIR="/tmp/oxigraph-nova-bench"
 QLEVER_DIR="/tmp/qlever_bench"
 QLEVER_BIN="${QLEVER_BIN_DIR:-/Users/jgentes/Documents/Workspace/qlever/build}"
-DATA="$BENCH_DIR/dataset.nt"
-QUERIES="$BENCH_DIR/dataset.queries.json"
+DATA="$BENCH_DIR/dataset_${ENTITIES}.nt"
+QUERIES="$BENCH_DIR/dataset_${ENTITIES}.queries.json"
 OUT_DIR="$ROOT/benches/external"
 CSV="$OUT_DIR/raw_results.csv"
-RESULTS_MD="$OUT_DIR/RESULTS.md"
+RESULTS_MD="$OUT_DIR/$RESULT_FILE"
 
 NOVA_PORT=3030
 OXIGRAPH_PORT=7878

@@ -29,24 +29,25 @@
 # this one will generate its own if missing).
 #
 # Usage:
-#   ./run_comparison_disk.sh [ENTITIES] [ITERS] [WARMUP]
+#   ./run_comparison_disk.sh [ENTITIES] [ITERS] [WARMUP] [RESULT_FILE]
 #
-# Defaults: ENTITIES=50000 ITERS=30 WARMUP=5
+# Defaults: ENTITIES=500000 ITERS=10 WARMUP=3
 set -euo pipefail
 
-ENTITIES="${1:-50000}"
-ITERS="${2:-30}"
-WARMUP="${3:-5}"
+ENTITIES="${1:-500000}"
+ITERS="${2:-10}"
+WARMUP="${3:-3}"
+RESULT_FILE="${4:-RESULTS_DISK.md}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BENCH_DIR="/tmp/oxigraph-nova-bench"
 QLEVER_DIR="/tmp/qlever_bench_disk"
 QLEVER_BIN="${QLEVER_BIN_DIR:-/Users/jgentes/Documents/Workspace/qlever/build}"
-DATA="$BENCH_DIR/dataset.nt"
-QUERIES="$BENCH_DIR/dataset.queries.json"
+DATA="$BENCH_DIR/dataset_${ENTITIES}.nt"
+QUERIES="$BENCH_DIR/dataset_${ENTITIES}.queries.json"
 OUT_DIR="$ROOT/benches/external"
 CSV="$OUT_DIR/raw_results_disk.csv"
-RESULTS_MD="$OUT_DIR/RESULTS_DISK.md"
+RESULTS_MD="$OUT_DIR/$RESULT_FILE"
 
 NOVA_LOCATION="/tmp/oxigraph-nova-bench/nova_disk_data"
 OXIGRAPH_LOCATION_HOST="/tmp/oxigraph-nova-bench/oxigraph_disk_data"

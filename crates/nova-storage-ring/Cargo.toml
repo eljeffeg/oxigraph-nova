@@ -8,11 +8,8 @@ repository.workspace = true
 
 [features]
 default = ["mmap"]
-# Elias-Fano O(1) succ() for high-degree sidecar nodes (A/B benchmarking).
-# Overrides the adaptive threshold to force EF for all sidecar nodes.
-# Usage: cargo bench -p oxigraph-nova-bench --features l-opt-ef -- large/feature_lookup
-l-opt-ef     = []
 # Opt-in Tantivy-backed full-text search (see `crates/nova-fulltext`),
+
 # indexed incrementally on RingStore's compaction cycle. Zero-cost when
 # disabled: no tantivy dependency is even compiled in.
 fulltext     = ["dep:oxigraph-nova-fulltext"]
