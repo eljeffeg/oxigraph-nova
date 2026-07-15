@@ -4,13 +4,21 @@
 No third-party deps (matches the rest of the external harness). Charts are
 written as standalone .svg files and linked from RESULTS*.md so they render
 on GitHub and in local Markdown previews.
+
+Theme notes
+-----------
+Background is transparent so charts blend into the host page. Text/grid colors
+use CSS classes + ``prefers-color-scheme`` rather than ``currentColor``:
+embedded SVG images (Markdown ``![](...)``) do **not** inherit the page's
+``color``, so ``currentColor`` just resolves to black and disappears on dark
+GitHub/VS Code previews. Engine bar fills stay fixed (brand palette).
 """
 from __future__ import annotations
 
 import html
 import math
 import os
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 # Stable palette: Nova / Oxigraph / QLever
 ENGINE_COLORS = {
@@ -24,6 +32,30 @@ ENGINE_SHORT = {
     "oxigraph": "Oxigraph",
     "qlever": "QLever",
 }
+
+# Shared stylesheet: transparent bg, light-default text, dark via media query.
+# Classes used by chart elements:
+#   .title  — main heading / value labels
+#   .muted  — subtitle / axis tick labels
+#   .label  — category / legend labels
+#   .grid   — horizontal grid lines
+#   .axis   — plot axes
+_THEME_STYLE = """\
+<style>
+  .title { fill: #111827; }
+  .muted { fill: #6b7280; }
+  .label { fill: #374151; }
+  .grid  { stroke: #e5e7eb; stroke-width: 1; }
+  .axis  { stroke: #9ca3af; stroke-width: 1; }
+  @media (prefers-color-scheme: dark) {
+    .title { fill: #f3f4f6; }
+    .muted { fill: #9ca3af; }
+    .label { fill: #d1d5db; }
+    .grid  { stroke: #374151; }
+    .axis  { stroke: #6b7280; }
+  }
+</style>
+"""
 
 
 def _nice_max(value: float) -> float:
@@ -53,6 +85,17 @@ def _fmt_value(v: float, unit: str) -> str:
 
 def _escape(s: str) -> str:
     return html.escape(s, quote=True)
+
+
+def _svg_open(width: int, height: int, title: str) -> List[str]:
+    """Common SVG header: root, title, theme CSS. No opaque background."""
+    return [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" role="img" '
+        f'aria-label="{_escape(title)}">',
+        f"<title>{_escape(title)}</title>",
+        _THEME_STYLE.rstrip(),
+    ]
 
 
 def bar_chart(
@@ -85,21 +128,17 @@ def bar_chart(
     bar_w = (plot_w - gap * (n + 1)) / n if n else plot_w
     bar_w = max(bar_w, 24)
 
-    parts: List[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" role="img" '
-        f'aria-label="{_escape(title)}">',
-        f"<title>{_escape(title)}</title>",
-        f'<rect width="100%" height="100%" fill="#ffffff"/>',
-        f'<text x="{width / 2}" y="22" text-anchor="middle" '
+    parts: List[str] = _svg_open(width, height, title)
+    parts.append(
+        f'<text class="title" x="{width / 2}" y="22" text-anchor="middle" '
         f'font-family="system-ui, -apple-system, sans-serif" font-size="15" '
-        f'font-weight="600" fill="#111827">{_escape(title)}</text>',
-    ]
+        f'font-weight="600">{_escape(title)}</text>'
+    )
     if note:
         parts.append(
-            f'<text x="{width / 2}" y="40" text-anchor="middle" '
-            f'font-family="system-ui, -apple-system, sans-serif" font-size="11" '
-            f'fill="#6b7280">{_escape(note)}</text>'
+            f'<text class="muted" x="{width / 2}" y="40" text-anchor="middle" '
+            f'font-family="system-ui, -apple-system, sans-serif" font-size="11">'
+            f"{_escape(note)}</text>"
         )
 
     # Y grid + labels
@@ -109,26 +148,26 @@ def bar_chart(
         y = margin_t + plot_h * (1 - frac)
         val = max_v * frac
         parts.append(
-            f'<line x1="{margin_l}" y1="{y:.1f}" x2="{width - margin_r}" y2="{y:.1f}" '
-            f'stroke="#e5e7eb" stroke-width="1"/>'
+            f'<line class="grid" x1="{margin_l}" y1="{y:.1f}" '
+            f'x2="{width - margin_r}" y2="{y:.1f}"/>'
         )
         label = _fmt_value(val, unit)
         if unit and i == ticks:
             label = f"{label} {unit}"
         parts.append(
-            f'<text x="{margin_l - 8}" y="{y + 4:.1f}" text-anchor="end" '
-            f'font-family="system-ui, -apple-system, sans-serif" font-size="11" '
-            f'fill="#6b7280">{label}</text>'
+            f'<text class="muted" x="{margin_l - 8}" y="{y + 4:.1f}" text-anchor="end" '
+            f'font-family="system-ui, -apple-system, sans-serif" font-size="11">'
+            f"{label}</text>"
         )
 
     # Axes
     parts.append(
-        f'<line x1="{margin_l}" y1="{margin_t}" x2="{margin_l}" '
-        f'y2="{margin_t + plot_h}" stroke="#9ca3af" stroke-width="1"/>'
+        f'<line class="axis" x1="{margin_l}" y1="{margin_t}" x2="{margin_l}" '
+        f'y2="{margin_t + plot_h}"/>'
     )
     parts.append(
-        f'<line x1="{margin_l}" y1="{margin_t + plot_h}" x2="{width - margin_r}" '
-        f'y2="{margin_t + plot_h}" stroke="#9ca3af" stroke-width="1"/>'
+        f'<line class="axis" x1="{margin_l}" y1="{margin_t + plot_h}" '
+        f'x2="{width - margin_r}" y2="{margin_t + plot_h}"/>'
     )
 
     for i, (label, val, color) in enumerate(clean):
@@ -140,18 +179,18 @@ def bar_chart(
             f'fill="{color}" rx="3"/>'
         )
         # Value label above bar
-        val_y = y - 6 if bar_h > 12 else y - 6
+        val_y = y - 6
         parts.append(
-            f'<text x="{x + bar_w / 2:.1f}" y="{val_y:.1f}" text-anchor="middle" '
-            f'font-family="system-ui, -apple-system, sans-serif" font-size="11" '
-            f'font-weight="600" fill="#111827">{_fmt_value(val, unit)}'
+            f'<text class="title" x="{x + bar_w / 2:.1f}" y="{val_y:.1f}" '
+            f'text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" '
+            f'font-size="11" font-weight="600">{_fmt_value(val, unit)}'
             f'{(" " + unit) if unit and bar_h < plot_h * 0.15 else ""}</text>'
         )
         # Category label
         parts.append(
-            f'<text x="{x + bar_w / 2:.1f}" y="{margin_t + plot_h + 18}" '
+            f'<text class="label" x="{x + bar_w / 2:.1f}" y="{margin_t + plot_h + 18}" '
             f'text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" '
-            f'font-size="12" fill="#374151">{_escape(label)}</text>'
+            f'font-size="12">{_escape(label)}</text>'
         )
 
     parts.append("</svg>")
@@ -196,21 +235,17 @@ def grouped_bar_chart(
     bar_w = (group_w - bar_gap * (n_ser - 1)) / n_ser if n_ser else group_w
     bar_w = max(min(bar_w, 36), 8)
 
-    parts: List[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" role="img" '
-        f'aria-label="{_escape(title)}">',
-        f"<title>{_escape(title)}</title>",
-        f'<rect width="100%" height="100%" fill="#ffffff"/>',
-        f'<text x="{width / 2}" y="22" text-anchor="middle" '
+    parts: List[str] = _svg_open(width, height, title)
+    parts.append(
+        f'<text class="title" x="{width / 2}" y="22" text-anchor="middle" '
         f'font-family="system-ui, -apple-system, sans-serif" font-size="15" '
-        f'font-weight="600" fill="#111827">{_escape(title)}</text>',
-    ]
+        f'font-weight="600">{_escape(title)}</text>'
+    )
     if note:
         parts.append(
-            f'<text x="{width / 2}" y="40" text-anchor="middle" '
-            f'font-family="system-ui, -apple-system, sans-serif" font-size="11" '
-            f'fill="#6b7280">{_escape(note)}</text>'
+            f'<text class="muted" x="{width / 2}" y="40" text-anchor="middle" '
+            f'font-family="system-ui, -apple-system, sans-serif" font-size="11">'
+            f"{_escape(note)}</text>"
         )
 
     ticks = 4
@@ -219,25 +254,25 @@ def grouped_bar_chart(
         y = margin_t + plot_h * (1 - frac)
         val = max_v * frac
         parts.append(
-            f'<line x1="{margin_l}" y1="{y:.1f}" x2="{width - margin_r}" y2="{y:.1f}" '
-            f'stroke="#e5e7eb" stroke-width="1"/>'
+            f'<line class="grid" x1="{margin_l}" y1="{y:.1f}" '
+            f'x2="{width - margin_r}" y2="{y:.1f}"/>'
         )
         label = _fmt_value(val, unit)
         if unit and i == ticks:
             label = f"{label} {unit}"
         parts.append(
-            f'<text x="{margin_l - 8}" y="{y + 4:.1f}" text-anchor="end" '
-            f'font-family="system-ui, -apple-system, sans-serif" font-size="11" '
-            f'fill="#6b7280">{label}</text>'
+            f'<text class="muted" x="{margin_l - 8}" y="{y + 4:.1f}" text-anchor="end" '
+            f'font-family="system-ui, -apple-system, sans-serif" font-size="11">'
+            f"{label}</text>"
         )
 
     parts.append(
-        f'<line x1="{margin_l}" y1="{margin_t}" x2="{margin_l}" '
-        f'y2="{margin_t + plot_h}" stroke="#9ca3af" stroke-width="1"/>'
+        f'<line class="axis" x1="{margin_l}" y1="{margin_t}" x2="{margin_l}" '
+        f'y2="{margin_t + plot_h}"/>'
     )
     parts.append(
-        f'<line x1="{margin_l}" y1="{margin_t + plot_h}" x2="{width - margin_r}" '
-        f'y2="{margin_t + plot_h}" stroke="#9ca3af" stroke-width="1"/>'
+        f'<line class="axis" x1="{margin_l}" y1="{margin_t + plot_h}" '
+        f'x2="{width - margin_r}" y2="{margin_t + plot_h}"/>'
     )
 
     for ci, cat in enumerate(categories):
@@ -264,9 +299,10 @@ def grouped_bar_chart(
             )
 
         parts.append(
-            f'<text x="{group_x + group_w / 2:.1f}" y="{margin_t + plot_h + 16}" '
-            f'text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" '
-            f'font-size="11" fill="#374151">{_escape(cat)}</text>'
+            f'<text class="label" x="{group_x + group_w / 2:.1f}" '
+            f'y="{margin_t + plot_h + 16}" text-anchor="middle" '
+            f'font-family="system-ui, -apple-system, sans-serif" font-size="11">'
+            f"{_escape(cat)}</text>"
         )
 
     # Legend
@@ -280,9 +316,9 @@ def grouped_bar_chart(
             f'fill="{col}" rx="2"/>'
         )
         parts.append(
-            f'<text x="{lx + 18:.1f}" y="{legend_y}" '
-            f'font-family="system-ui, -apple-system, sans-serif" font-size="12" '
-            f'fill="#374151">{_escape(lab)}</text>'
+            f'<text class="label" x="{lx + 18:.1f}" y="{legend_y}" '
+            f'font-family="system-ui, -apple-system, sans-serif" font-size="12">'
+            f"{_escape(lab)}</text>"
         )
         lx += 14 + 6 + len(lab) * 7 + 16
 
@@ -291,14 +327,14 @@ def grouped_bar_chart(
 
 
 def _empty_svg(title: str, width: int, height: int) -> str:
-    return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}">'
-        f'<rect width="100%" height="100%" fill="#ffffff"/>'
-        f'<text x="{width / 2}" y="{height / 2}" text-anchor="middle" '
-        f'font-family="system-ui, sans-serif" font-size="14" fill="#9ca3af">'
-        f"{_escape(title)} — no data</text></svg>\n"
+    parts = _svg_open(width, height, title)
+    parts.append(
+        f'<text class="muted" x="{width / 2}" y="{height / 2}" text-anchor="middle" '
+        f'font-family="system-ui, sans-serif" font-size="14">'
+        f"{_escape(title)} — no data</text>"
     )
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
 
 
 def write_svg(path: str, svg: str) -> str:
