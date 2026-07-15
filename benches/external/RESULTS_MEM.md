@@ -29,6 +29,8 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 | Oxigraph (in-memory) | 4.90 s |
 | QLever (mmap, warmed) | 3.21 s |
 
+![Dataset load time by engine (lower is better)](charts/mem/load_time.svg)
+
 ## Memory Usage (Physical Footprint)
 
 Nova/QLever figures are macOS `vmmap -summary`'s "Physical footprint" (stable, allocator-retention-immune — see Methodology above); falls back to `ps -o rss` on non-macOS platforms.
@@ -39,6 +41,8 @@ Nova/QLever figures are macOS `vmmap -summary`'s "Physical footprint" (stable, a
 | Oxigraph (in-memory) | 338.7MiB | Pure heap (in-memory mode) |
 | QLever (mmap, warmed) | 92.4 MiB | Incl. memory-mapped index pages |
 
+![Memory usage by engine (lower is better)](charts/mem/memory.svg)
+
 ## CPU Usage (average % of one core during query phase)
 
 | Engine | Avg CPU % |
@@ -47,9 +51,13 @@ Nova/QLever figures are macOS `vmmap -summary`'s "Physical footprint" (stable, a
 | Oxigraph (in-memory) | 23.8% |
 | QLever (mmap, warmed) | 24.9% |
 
+![CPU usage by engine (lower is better)](charts/mem/cpu.svg)
+
 ## Latency Results (milliseconds, HTTP round-trip via curl)
 
-One sub-section per query, with each engine as a column and each percentile (p50, p95) as a row.
+One sub-section per query, with each engine as a column and each percentile (p50, p95) as a row. Charts use p50 latency (lower is better).
+
+![p50 latency by query and engine (lower is better)](charts/mem/latency_p50_overview.svg)
 
 ### scan
 
@@ -58,12 +66,16 @@ One sub-section per query, with each engine as a column and each percentile (p50
 | p50 (ms) | 50.23 | 47.44 | 95.49 |
 | p95 (ms) | 52.36 | 49.22 | 99.90 |
 
+![scan p50 latency (lower is better)](charts/mem/latency_p50_scan.svg)
+
 ### 2join
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | p50 (ms) | 2.32 | 3.61 | 3.35 |
 | p95 (ms) | 2.59 | 4.10 | 3.92 |
+
+![2join p50 latency (lower is better)](charts/mem/latency_p50_2join.svg)
 
 ### feature_lookup
 
@@ -72,12 +84,16 @@ One sub-section per query, with each engine as a column and each percentile (p50
 | p50 (ms) | 1.47 | 5.38 | 1.92 |
 | p95 (ms) | 1.69 | 8.26 | 2.33 |
 
+![feature_lookup p50 latency (lower is better)](charts/mem/latency_p50_feature_lookup.svg)
+
 ### star_with_features
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | p50 (ms) | 15.57 | 17.84 | 38.71 |
 | p95 (ms) | 16.22 | 19.01 | 39.78 |
+
+![star_with_features p50 latency (lower is better)](charts/mem/latency_p50_star_with_features.svg)
 
 ### path_2hop
 
@@ -86,12 +102,16 @@ One sub-section per query, with each engine as a column and each percentile (p50
 | p50 (ms) | 551.21 | 509.55 | 1252.92 |
 | p95 (ms) | 564.22 | 521.47 | 1291.71 |
 
+![path_2hop p50 latency (lower is better)](charts/mem/latency_p50_path_2hop.svg)
+
 ### triangle
 
 | Metric | Nova (Ring+LFTJ) | Oxigraph (in-memory) | QLever (mmap, warmed) |
 |---|---|---|---|
 | p50 (ms) | 305.07 | 337.84 | 425.02 |
 | p95 (ms) | 315.80 | 350.28 | 435.89 |
+
+![triangle p50 latency (lower is better)](charts/mem/latency_p50_triangle.svg)
 
 ## Raw per-query summary (mean, stddev, n)
 

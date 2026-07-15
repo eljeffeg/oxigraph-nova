@@ -31,6 +31,8 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 | Oxigraph (--location) | 62.18 s |
 | QLever (mmap, warmed) | 15.74 s |
 
+![Dataset load time by engine (lower is better)](charts/disk/load_time.svg)
+
 ## Memory Usage (Physical Footprint)
 
 | Engine | Memory | Storage model |
@@ -38,6 +40,8 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 | Nova (--location) | 356.1 MiB | WAL-backed heap (recovered/compacted state resident) |
 | Oxigraph (--location) | 2.898GiB | RocksDB-backed (block cache + heap) |
 | QLever (mmap, warmed) | 315.0 MiB | Incl. memory-mapped index pages |
+
+![Memory usage by engine (lower is better)](charts/disk/memory.svg)
 
 ## On-Disk Footprint
 
@@ -49,6 +53,8 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 | Oxigraph (--location) | 2064.4 MiB |
 | QLever (mmap, warmed) | 24.7 MiB |
 
+![On-disk footprint by engine (lower is better)](charts/disk/disk.svg)
+
 ## CPU Usage (average % of one core during query phase)
 
 | Engine | Avg CPU % |
@@ -57,9 +63,13 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 | Oxigraph (--location) | 66.9% |
 | QLever (mmap, warmed) | 19.5% |
 
+![CPU usage by engine (lower is better)](charts/disk/cpu.svg)
+
 ## Latency Results (milliseconds, HTTP round-trip via curl)
 
-One sub-section per query, with each engine as a column and each percentile (p50, p95) as a row.
+One sub-section per query, with each engine as a column and each percentile (p50, p95) as a row. Charts use p50 latency (lower is better).
+
+![p50 latency by query and engine (lower is better)](charts/disk/latency_p50_overview.svg)
 
 ### scan
 
@@ -68,12 +78,16 @@ One sub-section per query, with each engine as a column and each percentile (p50
 | p50 (ms) | 296.75 | 1087.52 | 485.00 |
 | p95 (ms) | 309.50 | 1136.39 | 512.00 |
 
+![scan p50 latency (lower is better)](charts/disk/latency_p50_scan.svg)
+
 ### 2join
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | p50 (ms) | 8.40 | 45.22 | 12.01 |
 | p95 (ms) | 9.29 | 46.73 | 12.58 |
+
+![2join p50 latency (lower is better)](charts/disk/latency_p50_2join.svg)
 
 ### feature_lookup
 
@@ -82,12 +96,16 @@ One sub-section per query, with each engine as a column and each percentile (p50
 | p50 (ms) | 3.14 | 18.11 | 5.50 |
 | p95 (ms) | 4.15 | 24.61 | 5.95 |
 
+![feature_lookup p50 latency (lower is better)](charts/disk/latency_p50_feature_lookup.svg)
+
 ### star_with_features
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | p50 (ms) | 72.06 | 276.89 | 190.60 |
 | p95 (ms) | 76.26 | 291.73 | 193.71 |
+
+![star_with_features p50 latency (lower is better)](charts/disk/latency_p50_star_with_features.svg)
 
 ### path_2hop
 
@@ -96,12 +114,16 @@ One sub-section per query, with each engine as a column and each percentile (p50
 | p50 (ms) | 2602.04 | 13610.11 | 6308.82 |
 | p95 (ms) | 2943.89 | 14212.44 | 6458.60 |
 
+![path_2hop p50 latency (lower is better)](charts/disk/latency_p50_path_2hop.svg)
+
 ### triangle
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | p50 (ms) | 1461.27 | 13347.38 | 2087.93 |
 | p95 (ms) | 1479.45 | 15320.67 | 2149.41 |
+
+![triangle p50 latency (lower is better)](charts/disk/latency_p50_triangle.svg)
 
 ## Raw per-query summary (mean, stddev, n)
 

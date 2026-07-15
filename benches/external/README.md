@@ -75,10 +75,30 @@ This will:
 4. Start all three engines (Nova in-process, Oxigraph via Docker, QLever natively), loading the identical dataset into each.
 5. Run each query with a warm-up pass, a correctness check (expected vs. actual result-row count), then N timed iterations via `curl`.
 6. Measure RSS/container memory for each engine.
-7. Generate `RESULTS.md` via `generate_report.py`.
+7. Generate `RESULTS.md` via `generate_report.py` (tables + pure-stdlib
+   SVG bar charts under `charts/mem/`, linked from the report).
 
 Raw per-request timings are written to `raw_results.csv` for further
 analysis if needed.
+
+### Charts
+
+Report generation writes standalone SVG bar charts (no pip deps) next to
+the Markdown:
+
+| Report | Chart directory |
+|--------|-----------------|
+| `RESULTS.md` | `charts/mem/` |
+| `RESULTS_DISK.md` | `charts/disk/` |
+
+Each report embeds:
+
+- Load time, memory (and on-disk size for the disk variant), CPU
+- Grouped p50 latency overview across all queries
+- Per-query p50 latency bars (Nova / Oxigraph / QLever)
+
+All charts are labeled **lower is better**. They re-generate automatically
+whenever the comparison harness runs.
 
 ## Scaling up
 

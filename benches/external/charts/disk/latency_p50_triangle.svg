@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="320" viewBox="0 0 640 320" role="img" aria-label="triangle — p50 latency">
+<title>triangle — p50 latency</title>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="320.0" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="15" font-weight="600" fill="#111827">triangle — p50 latency</text>
+<text x="320.0" y="40" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#6b7280">lower is better</text>
+<line x1="56" y1="256.0" x2="616" y2="256.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="48" y="260.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#6b7280">0.00</text>
+<line x1="56" y1="204.0" x2="616" y2="204.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="48" y="208.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#6b7280">3750</text>
+<line x1="56" y1="152.0" x2="616" y2="152.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="48" y="156.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#6b7280">7500</text>
+<line x1="56" y1="100.0" x2="616" y2="100.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="48" y="104.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#6b7280">11250</text>
+<line x1="56" y1="48.0" x2="616" y2="48.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="48" y="52.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#6b7280">15000 ms</text>
+<line x1="56" y1="48" x2="56" y2="256" stroke="#9ca3af" stroke-width="1"/>
+<line x1="56" y1="256" x2="616" y2="256" stroke="#9ca3af" stroke-width="1"/>
+<rect x="123.2" y="235.7" width="97.1" height="20.3" fill="#2563eb" rx="3"/>
+<text x="171.7" y="229.7" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#111827">1461 ms</text>
+<text x="171.7" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" fill="#374151">Nova</text>
+<rect x="287.5" y="70.9" width="97.1" height="185.1" fill="#dc2626" rx="3"/>
+<text x="336.0" y="64.9" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#111827">13347</text>
+<text x="336.0" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" fill="#374151">Oxigraph</text>
+<rect x="451.7" y="227.0" width="97.1" height="29.0" fill="#16a34a" rx="3"/>
+<text x="500.3" y="221.0" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#111827">2088 ms</text>
+<text x="500.3" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" fill="#374151">QLever</text>
+</svg>

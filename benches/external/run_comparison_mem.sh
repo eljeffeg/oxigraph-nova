@@ -40,7 +40,7 @@ set -euo pipefail
 ENTITIES="${1:-50000}"
 ITERS="${2:-10}"
 WARMUP="${3:-3}"
-RESULT_FILE="${4:-RESULTS.md}"
+RESULT_FILE="${4:-RESULTS_MEM.md}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BENCH_DIR="/tmp/oxigraph-nova-bench"

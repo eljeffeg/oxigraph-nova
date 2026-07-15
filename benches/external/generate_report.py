@@ -4,12 +4,30 @@
 Computes p50/p95/mean latency per (engine, query) and renders a Markdown
 comparison table, along with an explicit methodology/storage-model section
 so the memory-vs-disk asymmetry between engines is never left implicit.
+
+Also writes pure-stdlib SVG bar charts under charts/ and embeds them in the
+Markdown report (lower is better for latency/load/memory/CPU).
 """
 import argparse
 import csv
 import json
+import os
 import statistics
+import sys
 from collections import defaultdict
+
+# Allow `import svg_charts` whether invoked from repo root or this directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from svg_charts import (  # noqa: E402
+    ENGINE_COLORS,
+    ENGINE_SHORT,
+    bar_chart,
+    engine_items,
+    grouped_bar_chart,
+    parse_mem_string,
+    rel_md_image,
+    write_svg,
+)
 
 
 def pct(sorted_vals, p):
@@ -58,6 +76,16 @@ def main():
         "oxigraph": "Oxigraph (in-memory)",
         "qlever": "QLever (mmap, warmed)",
     }
+
+    out_path = os.path.abspath(args.out)
+    charts_dir = os.path.join(os.path.dirname(out_path), "charts", "mem")
+    os.makedirs(charts_dir, exist_ok=True)
+    chart_paths = []  # for logging
+
+    def emit_chart(filename, svg, alt):
+        path = write_svg(os.path.join(charts_dir, filename), svg)
+        chart_paths.append(path)
+        return rel_md_image(out_path, path, alt)
 
     lines = []
     lines.append("# Comparative Benchmark: Nova vs Oxigraph vs QLever\n")
@@ -138,6 +166,26 @@ def main():
     if args.qlever_load_s is not None:
         lines.append(f"| QLever (mmap, warmed) | {args.qlever_load_s:.2f} s |")
 
+    load_vals = {
+        "nova": args.nova_load_s,
+        "oxigraph": args.oxigraph_load_s,
+        "qlever": args.qlever_load_s,
+    }
+    if any(v is not None for v in load_vals.values()):
+        lines.append("")
+        lines.append(
+            emit_chart(
+                "load_time.svg",
+                bar_chart(
+                    "Dataset Load Time",
+                    engine_items(engines, load_vals),
+                    unit="s",
+                    note="lower is better",
+                ),
+                "Dataset load time by engine (lower is better)",
+            )
+        )
+
     lines.append("")
     lines.append("## Memory Usage (Physical Footprint)\n")
     lines.append(
@@ -155,6 +203,24 @@ def main():
         "Incl. memory-mapped index pages |"
     )
 
+    mem_vals = {
+        "nova": args.nova_rss_kb / 1024,
+        "oxigraph": parse_mem_string(args.oxigraph_mem),
+        "qlever": args.qlever_rss_kb / 1024,
+    }
+    lines.append("")
+    lines.append(
+        emit_chart(
+            "memory.svg",
+            bar_chart(
+                "Memory Usage (Physical Footprint)",
+                engine_items(engines, mem_vals),
+                unit="MiB",
+                note="lower is better",
+            ),
+            "Memory usage by engine (lower is better)",
+        )
+    )
 
     if (
         args.nova_cpu_pct is not None
@@ -172,12 +238,70 @@ def main():
         if args.qlever_cpu_pct is not None:
             lines.append(f"| QLever (mmap, warmed) | {args.qlever_cpu_pct:.1f}% |")
 
+        cpu_vals = {
+            "nova": args.nova_cpu_pct,
+            "oxigraph": args.oxigraph_cpu_pct,
+            "qlever": args.qlever_cpu_pct,
+        }
+        lines.append("")
+        lines.append(
+            emit_chart(
+                "cpu.svg",
+                bar_chart(
+                    "CPU Usage (avg % of one core)",
+                    engine_items(engines, cpu_vals),
+                    unit="%",
+                    note="lower is better",
+                ),
+                "CPU usage by engine (lower is better)",
+            )
+        )
+
+    # Precompute p50/p95 per (engine, query) for tables + charts
+    p50_by_eq = {}
+    p95_by_eq = {}
+    for engine in engines:
+        for qname in query_order:
+            vals = sorted(v * 1000 for v in data.get((engine, qname), []))
+            if vals:
+                p50_by_eq[(engine, qname)] = pct(vals, 0.50)
+                p95_by_eq[(engine, qname)] = pct(vals, 0.95)
+            else:
+                p50_by_eq[(engine, qname)] = None
+                p95_by_eq[(engine, qname)] = None
+
     lines.append("")
     lines.append("## Latency Results (milliseconds, HTTP round-trip via curl)\n")
     lines.append(
         "One sub-section per query, with each engine as a column and each "
-        "percentile (p50, p95) as a row.\n"
+        "percentile (p50, p95) as a row. Charts use p50 latency (lower is better).\n"
     )
+
+    # Overview grouped chart (all queries, p50)
+    series = []
+    for engine in engines:
+        series.append(
+            (
+                ENGINE_SHORT[engine],
+                [p50_by_eq[(engine, q)] for q in query_order],
+                ENGINE_COLORS[engine],
+            )
+        )
+    lines.append(
+        emit_chart(
+            "latency_p50_overview.svg",
+            grouped_bar_chart(
+                "Query Latency p50 (all queries)",
+                query_order,
+                series,
+                unit="ms",
+                note="lower is better",
+            ),
+            "p50 latency by query and engine (lower is better)",
+        )
+    )
+    lines.append("")
+
     for qname in query_order:
         lines.append(f"### {qname}\n")
         header_cells = ["Metric"] + [engine_labels[engine] for engine in engines]
@@ -187,15 +311,28 @@ def main():
         p50_cells = ["p50 (ms)"]
         p95_cells = ["p95 (ms)"]
         for engine in engines:
-            vals = sorted(v * 1000 for v in data.get((engine, qname), []))
-            if vals:
-                p50_cells.append(f"{pct(vals, 0.50):.2f}")
-                p95_cells.append(f"{pct(vals, 0.95):.2f}")
-            else:
-                p50_cells.append("n/a")
-                p95_cells.append("n/a")
+            p50 = p50_by_eq[(engine, qname)]
+            p95 = p95_by_eq[(engine, qname)]
+            p50_cells.append("n/a" if p50 is None else f"{p50:.2f}")
+            p95_cells.append("n/a" if p95 is None else f"{p95:.2f}")
         lines.append("| " + " | ".join(p50_cells) + " |")
         lines.append("| " + " | ".join(p95_cells) + " |")
+        lines.append("")
+        lines.append(
+            emit_chart(
+                f"latency_p50_{qname}.svg",
+                bar_chart(
+                    f"{qname} — p50 latency",
+                    engine_items(
+                        engines,
+                        {e: p50_by_eq[(e, qname)] for e in engines},
+                    ),
+                    unit="ms",
+                    note="lower is better",
+                ),
+                f"{qname} p50 latency (lower is better)",
+            )
+        )
         lines.append("")
 
     lines.append("## Raw per-query summary (mean, stddev, n)\n")
@@ -243,6 +380,7 @@ def main():
         f.write("\n".join(lines) + "\n")
 
     print(f"Wrote {args.out}")
+    print(f"Wrote {len(chart_paths)} SVG chart(s) under {charts_dir}")
 
 
 if __name__ == "__main__":

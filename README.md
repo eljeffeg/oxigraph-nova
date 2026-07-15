@@ -449,11 +449,10 @@ These are internal Criterion benchmarks (`benches/bsbm_large.rs`, `benches/wikid
 [Oxigraph](https://github.com/oxigraph/oxigraph) and [QLever](https://github.com/ad-freiburg/qlever) over
 identical synthetic BSBM-style datasets and identical SPARQL queries, run through the standard SPARQL 1.1 HTTP Protocol:
 
-| Report | Dataset | Storage mode |
-|---|---|---|
-| [`RESULTS.md`](./benches/external/RESULTS.md) | 50,000 entities (1.25M triples) | In-memory (all engines) |
-| [`RESULTS_500K.md`](./benches/external/RESULTS_500K.md) | 500,000 entities (12.5M triples) | In-memory (all engines) |
-| [`RESULTS_DISK.md`](./benches/external/RESULTS_DISK.md) | 50,000 entities (1.25M triples) | Persistent/disk-backed (each engine's native mode) |
+| Report | Storage mode |
+|---|---|
+| [`RESULTS_MEM.md`](./benches/external/RESULTS_MEM.md) | In-memory (all engines) |
+| [`RESULTS_DISK.md`](./benches/external/RESULTS_DISK.md) | Persistent/disk-backed (each engine's native mode) |
 
 See [`benches/external/README.md`](./benches/external/README.md) for the full methodology, storage-model fairness notes, and instructions to run the harness yourself.
 
