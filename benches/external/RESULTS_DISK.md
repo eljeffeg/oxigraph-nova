@@ -1,6 +1,6 @@
 # Comparative Benchmark (Disk-Backed): Nova vs Oxigraph vs QLever
 
-Dataset: 500,000 synthetic BSBM-style entities (12,500,000 triples), identical N-Triples file loaded into all three engines.
+Dataset: 250,000 synthetic BSBM-style entities (6,250,000 triples), identical N-Triples file loaded into all three engines.
 
 ## Methodology & Storage Model
 
@@ -27,17 +27,17 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 
 | Engine | Load time |
 |---|---|
-| Nova (--location) | 15.43 s |
-| Oxigraph (--location) | 140.88 s |
-| QLever (mmap, warmed) | 30.70 s |
+| Nova (--location) | 8.26 s |
+| Oxigraph (--location) | 62.18 s |
+| QLever (mmap, warmed) | 15.74 s |
 
 ## Memory Usage (Physical Footprint)
 
 | Engine | Memory | Storage model |
 |---|---|---|
-| Nova (--location) | 949.0 MiB | WAL-backed heap (recovered/compacted state resident) |
-| Oxigraph (--location) | 5.796GiB | RocksDB-backed (block cache + heap) |
-| QLever (mmap, warmed) | 599.3 MiB | Incl. memory-mapped index pages |
+| Nova (--location) | 356.1 MiB | WAL-backed heap (recovered/compacted state resident) |
+| Oxigraph (--location) | 2.898GiB | RocksDB-backed (block cache + heap) |
+| QLever (mmap, warmed) | 315.0 MiB | Incl. memory-mapped index pages |
 
 ## On-Disk Footprint
 
@@ -45,17 +45,17 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 
 | Engine | On-disk size |
 |---|---|
-| Nova (--location) | 221.1 MiB |
-| Oxigraph (--location) | 4129.5 MiB |
-| QLever (mmap, warmed) | 55.6 MiB |
+| Nova (--location) | 103.8 MiB |
+| Oxigraph (--location) | 2064.4 MiB |
+| QLever (mmap, warmed) | 24.7 MiB |
 
 ## CPU Usage (average % of one core during query phase)
 
 | Engine | Avg CPU % |
 |---|---|
-| Nova (--location) | 8.3% |
-| Oxigraph (--location) | 73.0% |
-| QLever (mmap, warmed) | 17.0% |
+| Nova (--location) | 9.1% |
+| Oxigraph (--location) | 66.9% |
+| QLever (mmap, warmed) | 19.5% |
 
 ## Latency Results (milliseconds, HTTP round-trip via curl)
 
@@ -65,43 +65,43 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 592.98 | 2222.08 | 937.40 |
-| p95 (ms) | 633.01 | 2346.96 | 959.58 |
+| p50 (ms) | 296.75 | 1087.52 | 485.00 |
+| p95 (ms) | 309.50 | 1136.39 | 512.00 |
 
 ### 2join
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 13.95 | 90.02 | 21.53 |
-| p95 (ms) | 15.18 | 95.33 | 22.61 |
+| p50 (ms) | 8.40 | 45.22 | 12.01 |
+| p95 (ms) | 9.29 | 46.73 | 12.58 |
 
 ### feature_lookup
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 4.75 | 24.91 | 6.92 |
-| p95 (ms) | 5.17 | 26.67 | 9.85 |
+| p50 (ms) | 3.14 | 18.11 | 5.50 |
+| p95 (ms) | 4.15 | 24.61 | 5.95 |
 
 ### star_with_features
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 142.27 | 569.78 | 387.75 |
-| p95 (ms) | 145.98 | 614.66 | 397.11 |
+| p50 (ms) | 72.06 | 276.89 | 190.60 |
+| p95 (ms) | 76.26 | 291.73 | 193.71 |
 
 ### path_2hop
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 5046.39 | 36218.99 | 12951.67 |
-| p95 (ms) | 5208.61 | 45461.82 | 13272.94 |
+| p50 (ms) | 2602.04 | 13610.11 | 6308.82 |
+| p95 (ms) | 2943.89 | 14212.44 | 6458.60 |
 
 ### triangle
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
-| p50 (ms) | 2844.02 | 33457.91 | 4238.43 |
-| p95 (ms) | 2897.42 | 41500.43 | 4268.89 |
+| p50 (ms) | 1461.27 | 13347.38 | 2087.93 |
+| p95 (ms) | 1479.45 | 15320.67 | 2149.41 |
 
 ## Raw per-query summary (mean, stddev, n)
 
@@ -112,58 +112,58 @@ One sub-section per query, with each engine as a column and each statistic (n, m
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 10 | 10 | 10 |
-| mean (ms) | 595.91 | 2247.99 | 941.23 |
-| stddev (ms) | 24.17 | 59.87 | 11.98 |
-| min (ms) | 567.04 | 2172.49 | 933.77 |
-| max (ms) | 645.15 | 2382.09 | 974.70 |
+| mean (ms) | 298.14 | 1087.05 | 490.03 |
+| stddev (ms) | 8.47 | 33.23 | 14.12 |
+| min (ms) | 286.08 | 1047.54 | 476.03 |
+| max (ms) | 310.46 | 1156.32 | 521.87 |
 
 ### 2join
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 10 | 10 | 10 |
-| mean (ms) | 14.05 | 91.04 | 21.44 |
-| stddev (ms) | 0.73 | 2.62 | 0.81 |
-| min (ms) | 12.85 | 87.74 | 20.50 |
-| max (ms) | 15.37 | 96.04 | 22.65 |
+| mean (ms) | 8.49 | 45.21 | 12.03 |
+| stddev (ms) | 0.52 | 1.04 | 0.35 |
+| min (ms) | 7.74 | 43.39 | 11.56 |
+| max (ms) | 9.31 | 47.05 | 12.76 |
 
 ### feature_lookup
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 10 | 10 | 10 |
-| mean (ms) | 4.67 | 24.95 | 7.50 |
-| stddev (ms) | 0.39 | 1.18 | 1.48 |
-| min (ms) | 4.08 | 23.52 | 6.76 |
-| max (ms) | 5.30 | 27.11 | 11.61 |
+| mean (ms) | 3.21 | 18.61 | 5.47 |
+| stddev (ms) | 0.62 | 3.90 | 0.41 |
+| min (ms) | 2.32 | 14.25 | 4.59 |
+| max (ms) | 4.54 | 26.50 | 6.11 |
 
 ### star_with_features
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 10 | 10 | 10 |
-| mean (ms) | 141.14 | 572.76 | 386.96 |
-| stddev (ms) | 3.95 | 26.91 | 7.68 |
-| min (ms) | 133.92 | 540.98 | 372.26 |
-| max (ms) | 146.25 | 627.62 | 401.41 |
+| mean (ms) | 72.45 | 274.46 | 191.01 |
+| stddev (ms) | 2.64 | 12.42 | 1.71 |
+| min (ms) | 69.70 | 259.09 | 189.08 |
+| max (ms) | 77.41 | 297.32 | 195.37 |
 
 ### path_2hop
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 10 | 10 | 10 |
-| mean (ms) | 5066.61 | 37425.91 | 12985.34 |
-| stddev (ms) | 79.97 | 5618.27 | 185.37 |
-| min (ms) | 5003.34 | 30026.08 | 12725.59 |
-| max (ms) | 5269.82 | 45712.07 | 13286.68 |
+| mean (ms) | 2657.42 | 13681.23 | 6330.23 |
+| stddev (ms) | 179.64 | 349.97 | 79.85 |
+| min (ms) | 2529.99 | 13287.31 | 6247.89 |
+| max (ms) | 3136.56 | 14217.11 | 6496.68 |
 
 ### triangle
 
 | Metric | Nova (--location, WAL-backed) | Oxigraph (--location, RocksDB-backed) | QLever (mmap, warmed) |
 |---|---|---|---|
 | n | 10 | 10 | 10 |
-| mean (ms) | 2843.72 | 34562.85 | 4244.44 |
-| stddev (ms) | 44.18 | 4351.47 | 15.77 |
-| min (ms) | 2776.94 | 30896.43 | 4228.06 |
-| max (ms) | 2909.10 | 45651.03 | 4275.55 |
+| mean (ms) | 1448.34 | 13560.36 | 2103.42 |
+| stddev (ms) | 31.58 | 1068.44 | 28.20 |
+| min (ms) | 1399.09 | 12669.36 | 2081.55 |
+| max (ms) | 1481.34 | 16341.61 | 2152.20 |
 

@@ -21,46 +21,40 @@
 //! The fix: persist the `Dictionary`'s state (the compacted Front-Coded
 //! tier, every quoted-triple term, and the `GraphId ↔ GraphName` mapping)
 //! alongside every snapshot generation, and reconstruct it via
-//! [`oxigraph_nova_core::Dictionary::from_mapped`] *before* replaying the
-//! WAL tail — so replay's `intern()` calls only ever append new terms after
-//! the snapshot's high-water-mark.
+//! [`oxigraph_nova_core::Dictionary::from_block_cached`] *before* replaying
+//! the WAL tail — so replay's `intern()` calls only ever append new terms
+//! after the snapshot's high-water-mark.
 //!
 //! This is a generic "any backend using `nova-core::Dictionary`" concern,
 //! not specific to any particular index structure — any storage backend
 //! (Ring, RocksDB, ...) that reuses `Dictionary` for term interning needs
 //! byte-for-byte the same persistence strategy.
 //!
-//! ## On-disk format — zero-copy ε-serde, uncompressed
+//! ## On-disk format — lz4 block container
 //!
-//! `Dictionary::to_snapshot()` (in `oxigraph-nova-core`) already produces
-//! the entire persistable representation as a single
+//! `Dictionary::to_snapshot()` (in `oxigraph-nova-core`) produces the entire
+//! persistable representation as a single
 //! `oxigraph_nova_core::DictSnapshot` — the compacted tier's Front-Coded
 //! byte buffer plus its `id2rank`/`rank2id` bit-packed permutation arrays
 //! (see `oxigraph_nova_core::dict_compact`'s module docs), every
 //! quoted-triple term (as parallel `TermId` arrays), and the graph table.
-//! This module's only job is to serialize that struct to disk via ε-serde
-//! and load it back — `save`/`load` are thin wrappers around
-//! `Dictionary::to_snapshot`/`Dictionary::from_mapped`.
 //!
-//! Like `nova-storage-ring`'s `nova.snapshot.<gen>`, this file is written
-//! **uncompressed** (no zstd) so it can be `load_mmap`'d directly: mmap-based
-//! zero-copy loading is only possible against a file whose bytes are
-//! byte-identical to the in-memory ε-serde layout, which compression would
-//! break. This trades the previous zstd-compressed on-disk footprint for a
-//! genuinely mapped (not merely process-resident) compacted dictionary tier
-//! — the same trade-off already made for the Ring index's
-//! `nova.snapshot.<gen>` (see `nova-storage-ring`'s `snapshot.rs` module
-//! docs).
+//! The write path wraps that snapshot in the [`crate::dict_lz4`] container:
+//! a slim ε-serde index payload (`DictIndexSnapshot` with empty
+//! `compacted.buf`) plus independent size-prepended lz4 blocks over the
+//! Front-Coded `buf` (default 64 KiB blocks). Open reconstructs a
+//! `Dictionary` via a bounded decompress LRU over those blocks rather than
+//! materializing the full buffer.
+//!
+//! **Why compress the dict but not the index:** the navigable LOUDS index
+//! (`nova.snapshot.<gen>`) must stay uncompressed mmap for larger-than-
+//! memory zero-copy LFTJ. The dictionary is a separate file, accessed via
+//! point decode + a TermId LRU, so residual lz4 after Front-Coding is a
+//! pure residency/disk win without blocking zero-copy index navigation.
 
-#[cfg(feature = "mmap")]
-use epserde::deser::{Deserialize, Flags};
-use epserde::ser::Serialize;
-#[cfg(feature = "mmap")]
-use oxigraph_nova_core::DictSnapshot;
+use crate::dict_lz4::{self, DEFAULT_BLOCK_SIZE};
 use oxigraph_nova_core::{Dictionary, Oxigraph};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "mmap")]
-use std::sync::Arc;
 
 fn tmp_sibling(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
@@ -68,11 +62,10 @@ fn tmp_sibling(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Serialize `dict`'s full persistable state to `path` (tmp-file + atomic
-/// rename, matching `manifest.rs`/`nova-storage-ring`'s snapshot write
-/// discipline), then `load_mmap` the just-written file back in and
-/// reconstruct a `Dictionary` whose compacted tier is a genuine zero-copy
-/// view of exactly the bytes on disk — never a redundant owned heap copy.
+/// Serialize `dict`'s full persistable state to `path` as an lz4 block
+/// container (tmp-file + atomic rename, matching `manifest.rs` /
+/// `nova-storage-ring`'s snapshot write discipline), then load it back
+/// and reconstruct a `Dictionary`.
 ///
 /// Requires that `dict` has just been `compact()`ed (its compacted tier
 /// must be the `Owned` variant — see
@@ -81,14 +74,10 @@ fn tmp_sibling(path: &Path) -> PathBuf {
 /// `dict.compact()` immediately before persisting.
 pub fn write_and_load_mmap(dict: &Dictionary, path: &Path) -> Result<Dictionary, Oxigraph> {
     let snap = dict.to_snapshot();
-    let mut buf: Vec<u8> = Vec::new();
-    unsafe {
-        snap.serialize(&mut buf)
-            .map_err(|e| Oxigraph::Storage(format!("dict snapshot serialize failed: {e}")))?;
-    }
+    let container = dict_lz4::compress_dict(snap, DEFAULT_BLOCK_SIZE)?;
 
     let tmp_path = tmp_sibling(path);
-    std::fs::write(&tmp_path, &buf)
+    std::fs::write(&tmp_path, &container)
         .map_err(|e| Oxigraph::Storage(format!("dict snapshot write failed: {e}")))?;
     std::fs::rename(&tmp_path, path)
         .map_err(|e| Oxigraph::Storage(format!("dict snapshot rename failed: {e}")))?;
@@ -96,32 +85,32 @@ pub fn write_and_load_mmap(dict: &Dictionary, path: &Path) -> Result<Dictionary,
     load_mmap_from_file(path)
 }
 
-/// Load a `Dictionary` from `path` via zero-copy `load_mmap` (rather than a
-/// full heap-copy deserialize). Returns a fresh, empty `Dictionary::new()`
-/// if `path` doesn't exist (fresh store, or a persistent store that has
-/// never been compacted).
+/// Load a `Dictionary` from `path`.
 ///
-/// Used by `RingStore::open()` (so a reopened persistent store's dictionary
-/// is zero-copy mapped from the moment it's loaded, not just after the next
-/// `compact()`) and by [`write_and_load_mmap`] (right after writing a fresh
-/// snapshot generation during `commit_compaction`).
+/// Files must be a `NOVA_DICT_LZ4` container (the only write format).
+/// Returns a fresh, empty `Dictionary::new()` if `path` doesn't exist
+/// (fresh store, or a persistent store that has never been compacted).
+///
+/// Used by `RingStore::open()` and by [`write_and_load_mmap`].
 ///
 /// Requires the `mmap` cargo feature (default-on; disabled for the wasm32
 /// build, see this crate's `Cargo.toml`). Disk-backed persistence
 /// (`RingStore::open`) is unavailable without it — see the `not(feature =
-/// "mmap")` fallback below, which returns an error rather than failing to
-/// compile, since wasm32 builds never call this path at runtime (in-memory
-/// `RingStore::new()` only).
+/// "mmap")` fallback below.
 #[cfg(feature = "mmap")]
 pub fn load_mmap_from_file(path: &Path) -> Result<Dictionary, Oxigraph> {
     if !path.exists() {
         return Ok(Dictionary::new());
     }
-    let mem = Arc::new(unsafe {
-        DictSnapshot::load_mmap(path, Flags::empty())
-            .map_err(|e| Oxigraph::Storage(format!("dict snapshot load_mmap failed: {e}")))?
-    });
-    Dictionary::from_mapped(mem)
+    if !dict_lz4::path_is_lz4_container(path)? {
+        return Err(Oxigraph::Storage(format!(
+            "dict snapshot: expected NOVA_DICT_LZ4 container at {}",
+            path.display()
+        )));
+    }
+    let container =
+        std::fs::read(path).map_err(|e| Oxigraph::Storage(format!("dict lz4 read failed: {e}")))?;
+    dict_lz4::load_dictionary_from_container(&container)
 }
 
 /// `mmap`-disabled fallback (see the gated definition above): disk-backed
@@ -167,6 +156,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let loaded = write_and_load_mmap(&dict, &path).unwrap();
 
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(
+            dict_lz4::is_lz4_container(&on_disk),
+            "write_and_load_mmap must produce a NOVA_DICT_LZ4 container"
+        );
+
         assert_eq!(
             loaded.get_id(&Term::NamedNode(NamedNode::new_unchecked("http://ex/a"))),
             Some(a)
@@ -199,6 +194,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let loaded = write_and_load_mmap(&dict, &path).unwrap();
         assert!(loaded.is_empty());
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(dict_lz4::is_lz4_container(&on_disk));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -283,6 +280,43 @@ mod tests {
             loaded.get_term_arc(triple_id).as_deref(),
             Some(&triple_term)
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Large-enough dict that spans multiple lz4 blocks still round-trips
+    /// every TermId.
+    #[test]
+    fn multi_block_dict_round_trip() {
+        let mut dict = Dictionary::new();
+        let mut ids = Vec::new();
+        // Enough unique literals to force multi-block Front-Coded and lz4
+        // coverage under the default block size.
+        for i in 0..20_000 {
+            let t = Term::Literal(Literal::new_simple_literal(format!(
+                "label for entity {i:05} with some padding text to bulk the dict"
+            )));
+            ids.push(dict.intern(&t).unwrap());
+        }
+        dict.compact().unwrap();
+
+        let path = temp_path("multi_block");
+        let _ = std::fs::remove_file(&path);
+        let loaded = write_and_load_mmap(&dict, &path).unwrap();
+
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(dict_lz4::is_lz4_container(&on_disk));
+        // Container header: raw_len at [24..32) is the Front-Coded buf length.
+        let raw_len = u64::from_le_bytes(on_disk[24..32].try_into().unwrap());
+        assert!(raw_len > 0);
+
+        for (i, &id) in ids.iter().enumerate() {
+            let expected = Term::Literal(Literal::new_simple_literal(format!(
+                "label for entity {i:05} with some padding text to bulk the dict"
+            )));
+            assert_eq!(loaded.get_id(&expected), Some(id));
+            assert_eq!(loaded.get_term_arc(id).as_deref(), Some(&expected));
+        }
 
         let _ = std::fs::remove_file(&path);
     }

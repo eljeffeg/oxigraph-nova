@@ -1,4 +1,5 @@
 pub mod dict;
+mod dict_block_cache;
 mod dict_compact;
 pub mod error;
 
@@ -7,6 +8,10 @@ pub mod text_search;
 pub mod trie;
 
 pub use dict::{Dictionary, GRAPH_DEFAULT, GraphId, MAX_TERM_ID, TermId};
+pub use dict_block_cache::{
+    BlockCachedCompactedTier, DEFAULT_BUF_BLOCK_CACHE, DEFAULT_BUF_LZ4_BLOCK, DictIndexSnapshot,
+    dict_block_cache_types,
+};
 pub use dict_compact::DictSnapshot;
 pub use error::Oxigraph;
 // Re-export the Oxigraph RDF type system directly — no custom wrappers.

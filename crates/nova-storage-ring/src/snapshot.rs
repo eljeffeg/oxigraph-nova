@@ -23,7 +23,7 @@
 //!   `Dictionary`'s state (every term, in `TermId` order, plus the
 //!   `GraphId ↔ GraphName` mapping) is persisted alongside every snapshot
 //!   generation (`nova.dict.<gen>`) and reconstructed via
-//!   `Dictionary::rebuild` *before* the WAL tail is replayed, so replay's
+//!   `Dictionary::from_block_cached` *before* the WAL tail is replayed, so replay's
 //!   `intern()` calls only ever append new terms after the snapshot's
 //!   high-water-mark.
 //!

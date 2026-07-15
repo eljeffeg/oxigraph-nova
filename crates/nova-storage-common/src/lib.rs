@@ -20,6 +20,7 @@
 //! | [`wal`] | Write-ahead log: crash-safe framing/replay engine + RDF quad/term byte encoders |
 //! | [`manifest`] | The crash-safe commit point tying a snapshot generation to a WAL segment |
 //! | [`dict_snapshot`] | Persistence for `oxigraph_nova_core::Dictionary` (term/graph interning state) |
+//! | [`dict_lz4`] | lz4_flex block-container codec for `nova.dict.<gen>` |
 //!
 //! ### What's deliberately NOT here
 //!
@@ -29,9 +30,11 @@
 //! only provides the generic surrounding machinery: durable intent logging,
 //! crash-safe generation/segment bookkeeping, and dictionary persistence.
 
+pub mod dict_lz4;
 pub mod dict_snapshot;
 pub mod manifest;
 pub mod wal;
 
+pub use dict_lz4::{DEFAULT_BLOCK_SIZE as DICT_LZ4_DEFAULT_BLOCK_SIZE, MAGIC as DICT_LZ4_MAGIC};
 pub use manifest::{MANIFEST_FILE_NAME, Manifest};
 pub use wal::{WalRecord, WalWriter};

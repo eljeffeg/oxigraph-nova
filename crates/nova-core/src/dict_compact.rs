@@ -134,8 +134,7 @@ fn bit_width_for(max_val: u64) -> usize {
 
 // ── Term ↔ (tag, primary, aux) ──────────────────────────────────────────────
 //
-// Mirrors `oxigraph-nova-storage-common`'s (legacy) `dict_snapshot.rs`
-// on-disk codec, minus tag 6 (quoted triples), which never reaches this tier.
+// Term codec for the Front-Coded tier (tag 6 / quoted triples never reach this tier).
 
 pub(crate) fn term_sort_key(term: &Term) -> (u8, Vec<u8>) {
     match term {
@@ -242,9 +241,7 @@ pub(crate) fn term_from_parts(tag: u8, primary: Vec<u8>, aux: &[u8]) -> Result<T
 ///
 /// Generic over every variable-length field's backing storage — see the
 /// module docs above. All existing callers use the default, fully-owned
-/// instantiation (plain `CompactedTier`); a `load_mmap`'d instantiation
-/// (see [`BorrowedCompactedTier`]) substitutes borrowed slices with zero
-/// code duplication.
+/// instantiation (plain `CompactedTier`).
 #[derive(Epserde, Clone)]
 pub struct CompactedTier<
     Buf = Vec<u8>,
@@ -384,10 +381,7 @@ impl CompactedTier {
 
     /// Deep-clone this owned tier — used by [`crate::dict::Dictionary::to_snapshot`]
     /// to build a persistable snapshot without mutating (or taking
-    /// ownership of) the live `Dictionary`. Cheaper than the byte-buffer
-    /// this replaces had to pay at every save anyway (the legacy on-disk
-    /// codec re-decoded, re-sorted, and re-encoded every term from scratch
-    /// on each `save()` call).
+    /// ownership of) the live `Dictionary`.
     pub(crate) fn clone_owned(&self) -> Self {
         Self {
             block_size: self.block_size,
@@ -592,39 +586,6 @@ where
     }
 }
 
-// ── Borrowed substrate ─────────────────────────────────────────────────────
-//
-// Concrete types that ε-serde's `DeserType<CompactedTier>` resolves to when
-// loaded via `load_mmap` — determined empirically (mirroring the approach
-// documented in `nova-storage-ring`'s `louds.rs`), by compiling this crate
-// against a real `load_mmap`'d value and reading off the "found" type from
-// any resulting mismatch. The `'static` lifetime here is a documented lie —
-// soundness is established structurally by [`MappedCompactedTier`], which
-// keeps the backing `Arc<epserde::deser::MemCase<DictSnapshot>>` alive for as
-// long as any borrowed field derived from it is reachable.
-pub(crate) type BorrowedBuf = &'static [u8];
-pub(crate) type BorrowedBlockStarts = &'static [u32];
-pub(crate) type BorrowedBlockTags = &'static [u8];
-pub(crate) type BorrowedKeyFlat = &'static [u8];
-pub(crate) type BorrowedKeyOffsets = &'static [u32];
-pub(crate) type BorrowedRank2Id = BitFieldVec<&'static [usize]>;
-pub(crate) type BorrowedId2Rank = BitFieldVec<&'static [usize]>;
-
-/// Borrowed/mmap'd instantiation of [`CompactedTier`] — zero-copy, all
-/// variable-length fields borrowed slices tied to a `MemCase`'s mapped
-/// memory. Satisfies the generic navigation `impl` block above via the same
-/// `AsRef<[_]>`/`SliceByValue` bounds the owned form uses — no extra trait
-/// implementation required.
-pub(crate) type BorrowedCompactedTier = CompactedTier<
-    BorrowedBuf,
-    BorrowedBlockStarts,
-    BorrowedBlockTags,
-    BorrowedKeyFlat,
-    BorrowedKeyOffsets,
-    BorrowedRank2Id,
-    BorrowedId2Rank,
->;
-
 // ── DictSnapshot ─────────────────────────────────────────────────────────────
 
 /// ε-serde-serializable snapshot of a whole [`crate::dict::Dictionary`]:
@@ -635,7 +596,7 @@ pub(crate) type BorrowedCompactedTier = CompactedTier<
 /// This is the persistent on-disk representation — see
 /// `oxigraph_nova_storage_common::dict_snapshot`'s `write_and_load_mmap`/
 /// `load_mmap_from_file`, and [`crate::dict::Dictionary::to_snapshot`]/
-/// [`crate::dict::Dictionary::from_mapped`].
+/// [`crate::dict::Dictionary::from_block_cached`].
 ///
 /// Quoted-triple terms are persisted as just their three component
 /// `TermId`s (`triple_ids`/`triple_s`/`triple_p`/`triple_o`, parallel
@@ -644,7 +605,7 @@ pub(crate) type BorrowedCompactedTier = CompactedTier<
 /// *before* the triple itself, so every component is guaranteed to already
 /// be reconstructible (either from the compacted tier, or from an
 /// earlier-processed nested quoted triple) by the time
-/// [`crate::dict::Dictionary::from_mapped`] processes it.
+/// [`crate::dict::Dictionary::from_block_cached`] processes it.
 ///
 /// The graph table is similarly flattened: `graph_ids` (one `GraphId` per
 /// entry) plus `graph_kinds` (0=NamedNode, 1=BlankNode, 2=DefaultGraph) and
@@ -653,9 +614,8 @@ pub(crate) type BorrowedCompactedTier = CompactedTier<
 /// flatten-into-parallel-arrays pattern used for the compacted tier's block
 /// keys, since epserde has no direct `HashMap`/tuple/`GraphName` support.
 ///
-/// Generic over `Compacted` (default [`CompactedTier`]) so that a
-/// `load_mmap`'d view substitutes the borrowed [`BorrowedCompactedTier`]
-/// form here with **zero extra code** — mirrors the "bare generic parameter
+/// Generic over `Compacted` (default [`CompactedTier`]) so ε-serde can
+/// specialize field storage if needed — mirrors the "bare generic parameter
 /// with a default" pattern used throughout `nova-storage-ring`.
 #[derive(Epserde)]
 pub struct DictSnapshot<Compacted = CompactedTier> {
@@ -673,33 +633,30 @@ pub struct DictSnapshot<Compacted = CompactedTier> {
 
 // ── CompactedTierHandle ──────────────────────────────────────────────────────
 
-/// A compacted-tier handle that is either the owned in-memory form (built
-/// directly by [`CompactedTier::build`]) or a zero-copy `load_mmap`'d form
-/// (installed after `Dictionary::from_mapped` reconstructs a persistent
-/// store's dictionary from disk).
+/// A compacted-tier handle: either the owned in-memory form (built by
+/// [`CompactedTier::build`]) or a **block-cached** form whose Front-Coded
+/// `buf` is lz4-blocked with a bounded decompress LRU.
 ///
-/// Mirrors `oxigraph_nova_storage_ring::ring::GraphRingHandle` exactly: both
-/// variants expose the same read-only method surface (`CompactedTier<...>`'s
-/// inherent methods are already generic over the backing substrate — see the
-/// `impl<Buf, ...>` block above), so every method here is a one-line match
-/// delegating to whichever concrete instantiation is present.
+/// Both variants expose the same read-only method surface so
+/// `Dictionary::get_term_arc` / `get_id` do not care which substrate is live.
 pub(crate) enum CompactedTierHandle {
     Owned(Box<CompactedTier>),
-    Mapped(Arc<MappedCompactedTier>),
+    /// Indexes resident; `buf` decompressed on demand into a small LRU.
+    BlockCached(Box<crate::dict_block_cache::BlockCachedCompactedTier>),
 }
 
 impl CompactedTierHandle {
     pub(crate) fn get_id(&self, term: &Term) -> Option<u64> {
         match self {
             CompactedTierHandle::Owned(t) => t.get_id(term),
-            CompactedTierHandle::Mapped(m) => m.tier().get_id(term),
+            CompactedTierHandle::BlockCached(t) => t.get_id(term),
         }
     }
 
     pub(crate) fn decode_id(&self, id: u64) -> Option<Result<Arc<Term>, Oxigraph>> {
         match self {
             CompactedTierHandle::Owned(t) => t.decode_id(id),
-            CompactedTierHandle::Mapped(m) => m.tier().decode_id(id),
+            CompactedTierHandle::BlockCached(t) => t.decode_id(id),
         }
     }
 
@@ -709,14 +666,14 @@ impl CompactedTierHandle {
     ) -> Option<Vec<(u64, Result<Arc<Term>, Oxigraph>)>> {
         match self {
             CompactedTierHandle::Owned(t) => t.decode_block_for_id(id),
-            CompactedTierHandle::Mapped(m) => m.tier().decode_block_for_id(id),
+            CompactedTierHandle::BlockCached(t) => t.decode_block_for_id(id),
         }
     }
 
     pub(crate) fn mem_size_bytes(&self) -> usize {
         match self {
             CompactedTierHandle::Owned(t) => t.mem_size_bytes(),
-            CompactedTierHandle::Mapped(m) => m.tier().mem_size_bytes(),
+            CompactedTierHandle::BlockCached(t) => t.mem_size_bytes(),
         }
     }
 
@@ -724,114 +681,20 @@ impl CompactedTierHandle {
     pub(crate) fn is_empty(&self) -> bool {
         match self {
             CompactedTierHandle::Owned(t) => t.is_empty(),
-            CompactedTierHandle::Mapped(m) => m.tier().is_empty(),
+            CompactedTierHandle::BlockCached(t) => t.is_empty(),
         }
     }
 
     /// Test-only accessor for directly inspecting the owned tier's
     /// permutation arrays (see `dict.rs`'s `#[cfg(test)]` module). Panics if
-    /// this handle is `Mapped` (never the case in these tests, since they
-    /// never go through `Dictionary::from_mapped`).
+    /// this handle is not `Owned`.
     #[cfg(test)]
     pub(crate) fn expect_owned(&self) -> &CompactedTier {
         match self {
             CompactedTierHandle::Owned(t) => t,
-            CompactedTierHandle::Mapped(_) => panic!("expected an Owned compacted tier"),
+            CompactedTierHandle::BlockCached(_) => {
+                panic!("expected an Owned compacted tier, got BlockCached")
+            }
         }
-    }
-}
-
-/// Owns the mmap'd backing memory for a dictionary's zero-copy
-/// `CompactedTier` and exposes it only through a private field + accessor,
-/// so the `MemCase`-outlives-tier invariant is enforced **structurally**
-/// rather than by caller convention.
-///
-/// Mirrors `oxigraph_nova_storage_ring::ring::MappedGraphRing` exactly — see
-/// its doc comment for the full safety rationale (self-referential mmap
-/// pattern, `'static` lifetime lies erased via `unsafe` transmutes, and why
-/// a private field + single accessor is what makes the invariant structural
-/// instead of documentation-only).
-///
-/// SAFETY (binding contract for [`MappedCompactedTier::new`], the sole place
-/// that constructs a [`BorrowedCompactedTier`]):
-/// 1. The only unsafe operations in this reconstruction path are lifetime
-///    extensions (`transmute`/`transmute_copy`) on borrowed slices/
-///    `BitFieldVec`s that already point into `mem`'s mapped memory — no
-///    unsafe type-punning transmute is used.
-/// 2. Soundness depends entirely on this struct owning/cloning the
-///    `Arc<epserde::deser::MemCase<DictSnapshot>>` that backs the mmap'd
-///    memory `tier`'s borrowed fields point into, and never releasing that
-///    `Arc` before `tier` itself is dropped.
-/// 3. The `tier` field **must remain private** — if made `pub`/`pub(crate)`,
-///    a caller could move it out of `self`, decoupling its borrowed
-///    lifetime from `_mem`'s.
-pub(crate) struct MappedCompactedTier {
-    /// Kept alive for as long as `tier`'s borrowed fields are reachable —
-    /// see the SAFETY contract above. Never accessed directly.
-    _mem: Arc<epserde::deser::MemCase<DictSnapshot>>,
-    /// Private — see SAFETY contract point 3 above.
-    tier: BorrowedCompactedTier,
-}
-
-impl MappedCompactedTier {
-    /// Construct a `MappedCompactedTier` from a `load_mmap`'d
-    /// [`DictSnapshot`].
-    ///
-    /// `mem` must be the same `Arc` (or a clone of it) that the caller keeps
-    /// alive for the lifetime of the whole store's mmap'd generation — see
-    /// this struct's SAFETY contract above.
-    pub(crate) fn new(mem: Arc<epserde::deser::MemCase<DictSnapshot>>) -> Self {
-        let view = mem.uncase();
-        let c = &view.compacted;
-
-        // SAFETY: see the type-level doc comment above — every borrowed
-        // field here points into the same `MemCase` mapped memory that the
-        // caller is required to keep alive for as long as this
-        // `MappedCompactedTier` is reachable. `buf`/`block_starts`/
-        // `block_tags`/`key_flat`/`key_offsets` are genuinely borrowed
-        // slices (`Copy`), so the transmutes below are lifetime-only
-        // extensions, not type-punning casts. `rank2id`/`id2rank` are
-        // `BitFieldVec<&[usize]>` values (pointer + length + bit-width
-        // metadata, no owned heap allocation) — `transmute_copy` performs a
-        // cheap bitwise copy of that value out of the `&view.compacted`
-        // borrow, exactly mirroring `GraphRing::from_mapped`'s `tries`
-        // field handling in `nova-storage-ring`'s `ring.rs`.
-        let buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(c.buf) };
-        let block_starts: &'static [u32] =
-            unsafe { std::mem::transmute::<&[u32], &'static [u32]>(c.block_starts) };
-        let block_tags: &'static [u8] =
-            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(c.block_tags) };
-        let key_flat: &'static [u8] =
-            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(c.key_flat) };
-        let key_offsets: &'static [u32] =
-            unsafe { std::mem::transmute::<&[u32], &'static [u32]>(c.key_offsets) };
-        let rank2id: BitFieldVec<&'static [usize]> =
-            unsafe { std::mem::transmute_copy(&c.rank2id) };
-        let id2rank: BitFieldVec<&'static [usize]> =
-            unsafe { std::mem::transmute_copy(&c.id2rank) };
-
-        let tier = CompactedTier {
-            block_size: c.block_size,
-            high_water: c.high_water,
-            encoded_count: c.encoded_count,
-            buf,
-            block_starts,
-            block_tags,
-            key_flat,
-            key_offsets,
-            rank2id,
-            id2rank,
-            rank2id_bit_width: c.rank2id_bit_width,
-            id2rank_bit_width: c.id2rank_bit_width,
-        };
-
-        MappedCompactedTier { _mem: mem, tier }
-    }
-
-    /// Borrow the navigable, zero-copy tier. This is the *only* way to
-    /// reach `tier` from outside this module — see SAFETY contract point 3
-    /// on the struct doc comment above.
-    pub(crate) fn tier(&self) -> &BorrowedCompactedTier {
-        &self.tier
     }
 }

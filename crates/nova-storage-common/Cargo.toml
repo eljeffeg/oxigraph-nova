@@ -18,11 +18,14 @@ oxrdf         = { workspace = true }
 anyhow        = { workspace = true }
 thiserror     = { workspace = true }
 crc32fast     = "1.5"     # WAL record + MANIFEST framing checksum
-epserde       = { version = "0.12.5", default-features = false, features = ["derive", "std"] } # mmap load of nova.dict.<gen> (DictSnapshot); see `mmap` feature above
-
-# NOTE: `nova.dict.<gen>` is written uncompressed (see dict_snapshot.rs) so
-# it can be mmap'd directly, mirroring `nova-storage-ring`'s `nova.snapshot.<gen>`
+epserde       = { version = "0.12.5", default-features = false, features = ["derive", "std"] } # mmap/read_mem load of nova.dict.<gen> (DictSnapshot); see `mmap` feature above
+# lz4 block-container for `nova.dict.<gen>` (dict only; index stays uncompressed mmap).
+# `default-features = false` drops frame + safe-encode/decode (faster block path).
+# `alloc` is required for Vec-returning APIs (`compress_prepend_size` /
+# `decompress_size_prepended`) when default features are off (lz4_flex ≥ 0.14).
+lz4_flex      = { version = "0.14", default-features = false, features = ["alloc"] }
 
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+

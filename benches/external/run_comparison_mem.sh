@@ -34,12 +34,12 @@
 # Usage:
 #   ./run_comparison.sh [ENTITIES] [ITERS] [WARMUP] [RESULT_FILE]
 #
-# Defaults: ENTITIES=50000 ITERS=30 WARMUP=5
+# Defaults: ENTITIES=50000 ITERS=10 WARMUP=3
 set -euo pipefail
 
 ENTITIES="${1:-50000}"
 ITERS="${2:-10}"
-WARMUP="${3:-5}"
+WARMUP="${3:-3}"
 RESULT_FILE="${4:-RESULTS.md}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

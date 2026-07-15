@@ -24,6 +24,13 @@ sux          = { version = "0.14", default-features = false, features = ["epserd
 value-traits = "0.2.0"  # SliceByValue::index_value for safe BitFieldVec reads
 lru          = "0.18.1"   # TermId-keyed decode cache for compacted-tier terms (PFC dictionary)
 epserde      = { version = "0.12.5", default-features = false, features = ["derive", "std"] } # mmap residency for CompactedTier's Front-Coded buffer; see `mmap` feature above
+# lz4 block-cache over CompactedTier.buf (dict_block_cache).
+# `default-features = false` drops frame + safe-encode/decode (faster block path).
+# `alloc` is required for Vec-returning APIs (`compress_prepend_size` /
+# `decompress_size_prepended`) when default features are off (lz4_flex ≥ 0.14).
+lz4_flex     = { version = "0.14", default-features = false, features = ["alloc"] }
+
+
 
 
 
