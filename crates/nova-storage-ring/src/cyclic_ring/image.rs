@@ -73,6 +73,21 @@ impl IdRemap {
         self.to_external.get(dense as usize).copied()
     }
 
+    /// Smallest dense id whose external is ≥ `target`, if any.
+    ///
+    /// Dense ids are assigned in ascending external order, so this is the
+    /// correct lower_bound for leapfrog `seek` on external TermIds.
+    #[inline]
+    pub fn dense_ceil(&self, target: u64) -> Option<u32> {
+        let i = self.to_external.partition_point(|&e| e < target);
+        if i >= self.to_external.len() {
+            None
+        } else {
+            Some(i as u32)
+        }
+    }
+
+
     /// Map an external triple into shared-alphabet coordinates.
     pub fn map_triple(&self, t: [u64; 3]) -> Option<[u32; 3]> {
         Some([
@@ -202,36 +217,14 @@ impl BraidedGraphImage {
         self.index.enumerate_spo()
     }
 
-    /// ID-level join_scan in **external** coordinates.
-    ///
-    /// Bound fields are translated external→dense; yielded keys are
-    /// translated dense→external. Unmappable bound IDs yield an empty scan.
-    pub fn join_scan_external(
-        &self,
-        s: Option<u64>,
-        p: Option<u64>,
-        o: Option<u64>,
-        target_field: usize,
-    ) -> Vec<u64> {
-        let map_bound = |ext: Option<u64>| -> Option<Option<u64>> {
-            match ext {
-                None => Some(None),
-                Some(e) => self.remap.to_dense(e).map(|d| Some(u64::from(d))),
-            }
-        };
-        let (Some(sd), Some(pd), Some(od)) = (map_bound(s), map_bound(p), map_bound(o)) else {
-            return Vec::new();
-        };
-        self.index
-            .collect_join_scan(sd, pd, od, target_field)
-            .into_iter()
-            .filter_map(|d| self.remap.to_external(d as u32))
-            .collect()
-    }
+    // join_scan_external / join_scan_streaming / estimate_count_external live
+    // in `scan.rs` (impl BraidedGraphImage) so streaming RNV/RDI stays colocated
+    // with the LFTJ seam.
 
     /// Rebuild a heap-only image from this image's external SPO enumeration
     /// (round-trip stress).
     pub fn rebuild_from_external_roundtrip(&self) -> Self {
+
         let ext = self.enumerate_spo_external();
         Self::from_external_triples(&ext)
     }

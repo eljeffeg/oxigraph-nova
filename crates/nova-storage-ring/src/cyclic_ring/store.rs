@@ -331,8 +331,19 @@ impl LftjSource for RingStore {
         target_field: usize,
         graph_id: u8,
     ) -> u64 {
-        self.lftj_real_count(s, p, o, target_field, graph_id)
-            .unwrap_or(0)
+        // Cheap LOUDS-style heuristic — never full distinct materialization.
+        let img = {
+            let inner = self.inner.lock();
+            if !inner.delta.is_empty() {
+                return 0;
+            }
+            let g_id = GraphId(graph_id);
+            inner.graphs.get(&g_id).map(Arc::clone)
+        };
+        match img {
+            None => 0,
+            Some(img) => img.estimate_count_external(s, p, o, target_field),
+        }
     }
 
     fn lftj_join_scan(
@@ -343,8 +354,8 @@ impl LftjSource for RingStore {
         target_field: usize,
         graph_id: u8,
     ) -> Option<Box<dyn TrieIterator>> {
-        // Short-lock snapshot: clone Arc under the mutex, then scan off-lock so
-        // concurrent LFTJ opens / decode don't serialize on O(|range|) work.
+        // Short-lock snapshot + streaming RNV/run scan (LOUDS-shaped lazy cursor).
+        // Never materialize the full distinct-value Vec on open.
         let img = {
             let inner = self.inner.lock();
             // LFTJ only on fully compacted state (delta must be empty).
@@ -357,14 +368,13 @@ impl LftjSource for RingStore {
         // Mutex released before any ring navigation.
         match img {
             None => Some(Box::new(EmptyTrieIter)),
-            Some(img) => {
-                let vals = img.join_scan_external(s, p, o, target_field);
-                if vals.is_empty() {
-                    Some(Box::new(EmptyTrieIter))
-                } else {
-                    Some(Box::new(BraidedExternalScan::new(vals)))
-                }
-            }
+            Some(img) => Some(BraidedGraphImage::join_scan_streaming(
+                img,
+                s,
+                p,
+                o,
+                target_field,
+            )),
         }
     }
 
@@ -376,6 +386,10 @@ impl LftjSource for RingStore {
         target_field: usize,
         graph_id: u8,
     ) -> Option<u64> {
+        // VEO is called for every candidate at every depth. Exact distinct
+        // walks were the 2join hang; use the same cheap estimate LOUDS uses
+        // via estimate_count (vocab/range heuristic). Return Some so VEO does
+        // not fall through to another path.
         let img = {
             let inner = self.inner.lock();
             if !inner.delta.is_empty() {
@@ -386,9 +400,10 @@ impl LftjSource for RingStore {
         };
         match img {
             None => Some(0),
-            Some(img) => Some(img.join_scan_external(s, p, o, target_field).len() as u64),
+            Some(img) => Some(img.estimate_count_external(s, p, o, target_field)),
         }
     }
+
 
     fn lftj_has_delta(&self) -> bool {
         !self.inner.lock().delta.is_empty()
@@ -396,53 +411,8 @@ impl LftjSource for RingStore {
 }
 
 
-/// Flat external-ID scan for store-level LFTJ (same shape as Phase 4b).
-struct BraidedExternalScan {
-    vals: Vec<u64>,
-    pos: usize,
-}
-
-impl BraidedExternalScan {
-    fn new(vals: Vec<u64>) -> Self {
-        Self { vals, pos: 0 }
-    }
-}
-
-impl TrieIterator for BraidedExternalScan {
-    fn key(&self) -> u64 {
-        self.vals[self.pos]
-    }
-
-    fn seek(&mut self, target: u64) {
-        if self.at_end() {
-            return;
-        }
-        if self.vals[self.pos] >= target {
-            return;
-        }
-        self.pos = self.vals.partition_point(|&v| v < target);
-    }
-
-    fn advance(&mut self) {
-        if !self.at_end() {
-            self.pos += 1;
-        }
-    }
-
-    fn open(&self) -> Box<dyn TrieIterator> {
-        Box::new(EmptyTrieIter)
-    }
-
-    fn at_end(&self) -> bool {
-        self.pos >= self.vals.len()
-    }
-
-    fn remaining_count(&self) -> u64 {
-        self.vals.len().saturating_sub(self.pos) as u64
-    }
-}
-
 // ── QuadStore ─────────────────────────────────────────────────────────────────
+
 
 impl QuadStore for RingStore {
     fn delta_len(&self) -> Option<usize> {
