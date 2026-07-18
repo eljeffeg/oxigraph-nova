@@ -260,7 +260,7 @@ fn empty_labels() -> BitFieldVec {
 /// address labels: dummy + depth-0 in `l0`, then depth-1 in `l1` from
 /// `d1_start`, then depth-2 in `l2` from `d2_start`. `t` is Rank9+SelectAdapt.
 /// Leap is exp+binary on L.
-pub(crate) struct LoudsTrie<B = t_backend::SuxRS, L = BitFieldVec> {
+pub struct LoudsTrie<B = t_backend::SuxRS, L = BitFieldVec> {
     /// LOUDS bitvector with dummy `false` at index 0.
     t: t_backend::TBitvec<B>,
     /// Depth-0 labels including dummy `0` at local index 0 (global pos 0).
@@ -695,7 +695,7 @@ fn emit_node(d: usize, t: &mut Vec<bool>) {
 /// already removed.
 ///
 /// Returns `None` for an empty input slice.
-pub(crate) fn build_louds_from_sorted(sorted: &[[u32; 3]]) -> Option<LoudsTrie> {
+pub fn build_louds_from_sorted(sorted: &[[u32; 3]]) -> Option<LoudsTrie> {
     if sorted.is_empty() {
         return None;
     }

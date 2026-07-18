@@ -1,0 +1,163 @@
+use mem_dbg::{MemSize, SizeFlags};
+use qwt::{
+    bitvector::rs_wide::RSWide,
+    perf_and_test_utils::{gen_queries, type_of, TimingQueries},
+    AccessBin, RankBin, SelectBin,
+};
+
+const N_RUNS: usize = 5;
+const N_QUERIES: usize = 10_000_000;
+
+fn perf_rank1<T>(ds: &T, queries: &[usize], n: usize, logn: usize, u: usize)
+where
+    T: RankBin + MemSize,
+{
+    let mut result = 0;
+
+    let mut t = TimingQueries::new(N_RUNS, N_QUERIES);
+    for _ in 0..N_RUNS {
+        t.start();
+        for &query in queries.iter() {
+            let i = (query + result) % n;
+            result = unsafe { ds.rank1_unchecked(i) };
+        }
+        t.stop();
+    }
+    let (t_min, t_max, t_avg) = t.get();
+    println!(
+        "RANK: [ds_name: {}, n: {}, logn: {}, bitsize: {:?}, min_time (ns): {}, max_time (ns): {}, avg_time (ns): {}, space (bytes): {}, space (Mbyte): {:.2}]",
+        type_of(&ds),
+        n,
+        logn,
+        u,
+        t_min,
+        t_max,
+        t_avg,
+        ds.mem_size(SizeFlags::default()),
+        ds.mem_size(SizeFlags::default()) as f64 / (1024.0 * 1024.0)
+    );
+}
+
+fn perf_select1<T>(ds: &T, queries: &[usize], n: usize, logn: usize, u: usize)
+where
+    T: SelectBin + MemSize,
+{
+    let mut result = 0;
+
+    let mut t = TimingQueries::new(N_RUNS, N_QUERIES);
+    for _ in 0..N_RUNS {
+        t.start();
+        for &query in queries.iter() {
+            let i = query + result % 2;
+            result = ds
+                .select1(i)
+                .unwrap_or_else(|| panic!("None on select1({})", i));
+        }
+        t.stop();
+    }
+    let (t_min, t_max, t_avg) = t.get();
+    println!(
+        "SELECT1: [ds_name: {}, n: {}, logn: {}, bitsize: {:?}, min_time (ns): {}, max_time (ns): {}, avg_time (ns): {}, space (bytes): {}, space (Mbytes): {:.2}]",
+        type_of(&ds),
+        n,
+        logn,
+        u,
+        t_min,
+        t_max,
+        t_avg,
+        ds.mem_size(SizeFlags::default()),
+        ds.mem_size(SizeFlags::default()) as f64 / (1024.0 * 1024.0)
+    );
+}
+
+fn perf_select0<T>(ds: &T, queries: &[usize], n: usize, logn: usize, u: usize)
+where
+    T: SelectBin + MemSize,
+{
+    let mut result = 0;
+
+    let mut t = TimingQueries::new(N_RUNS, N_QUERIES);
+    for _ in 0..N_RUNS {
+        t.start();
+        for &query in queries.iter() {
+            let i = query + result % 2;
+            result = ds
+                .select0(i)
+                .unwrap_or_else(|| panic!("None on select0({})", i));
+        }
+        t.stop();
+    }
+    let (t_min, t_max, t_avg) = t.get();
+    println!(
+        "SELECT0: [ds_name: {}, n: {}, logn: {}, bitsize: {:?}, min_time (ns): {}, max_time (ns): {}, avg_time (ns): {}, space (bytes): {}, space (Mbytes): {:.2}]",
+        type_of(&ds),
+        n,
+        logn,
+        u,
+        t_min,
+        t_max,
+        t_avg,
+        ds.mem_size(SizeFlags::default()),
+        ds.mem_size(SizeFlags::default()) as f64 / (1024.0 * 1024.0)
+    );
+}
+
+fn perf_get<T>(ds: &T, queries: &[usize], n: usize, logn: usize, u: usize)
+where
+    T: AccessBin + MemSize,
+{
+    let mut result = false;
+
+    let mut t = TimingQueries::new(N_RUNS, N_QUERIES);
+    for _ in 0..N_RUNS {
+        t.start();
+        for &query in queries.iter() {
+            let i = (query + result as usize) % n;
+            result = unsafe { ds.get_unchecked(i) };
+        }
+        t.stop();
+    }
+    let (t_min, t_max, t_avg) = t.get();
+    println!(
+        "GET: [ds_name: {}, n: {}, logn: {}, bitsize: {:?}, min_time (ns): {}, max_time (ns): {}, avg_time (ns): {}, space (bytes): {}, space (Mbytes): {:.2}]",
+        type_of(&ds),
+        n,
+        logn,
+        u,
+        t_min,
+        t_max,
+        t_avg,
+        ds.mem_size(SizeFlags::default()),
+        ds.mem_size(SizeFlags::default()) as f64 / (1024.0 * 1024.0)
+    );
+}
+
+fn main() {
+    for logn in 15..34 {
+        let n: usize = 1 << logn;
+
+        let fill_factor = 2; // 1/2 full
+
+        let bv = (0..n).filter(|x| x % fill_factor == 0).collect();
+        let rs = RSWide::new(bv);
+
+        println!(
+            "created new bitvector | count_ones: {} | count_zeros: {} | len: {}",
+            rs.count_ones(),
+            rs.count_zeros(),
+            rs.len()
+        );
+
+        let queries = gen_queries(N_QUERIES, n);
+        perf_rank1(&rs, &queries, n, logn, n);
+
+        let queries = gen_queries(N_QUERIES, n);
+        perf_get(&rs, &queries, n, logn, n);
+
+        let queries = gen_queries(N_QUERIES, rs.count_ones() - 1);
+        perf_select1(&rs, &queries, n, logn, n);
+
+        let queries = gen_queries(N_QUERIES, rs.count_zeros() - 1);
+        perf_select0(&rs, &queries, n, logn, n);
+    }
+}

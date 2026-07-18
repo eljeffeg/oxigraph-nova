@@ -53,10 +53,14 @@ All `rdf-12` / `sparql-12` feature flags are enabled across the parsing stack fr
 Nova separates the storage engine from the SPARQL evaluator behind two small
 traits, `QuadStore` and `Dataset` — the only seam the query engine depends
 on. The default storage engine (`oxigraph-nova-storage-ring`) implements
-those traits on top of **the Ring**: six succinct CompactLTJ LOUDS tries (one
-per triple ordering) combined with **Leapfrog Triejoin** for worst-case
-optimal joins, plus a `BTreeMap`-backed LSM delta so live writes never block
-reads.
+those traits on top of **six-order CompactLTJ LOUDS** (`RingStore`) combined
+with **Leapfrog Triejoin** for worst-case optimal joins, plus a
+`BTreeMap`-backed LSM delta so live writes never block reads.
+
+The same crate also hosts the **Braided Ring** pilot (feature
+`cyclic-ring-pilot`): cyclic QWT columns, `NOVARNG1` mmap images, and D2
+braided multi-range intersection — **not** wired into SPARQL yet. See
+[`research/BRAIDED_RING.md`](./research/BRAIDED_RING.md).
 
 The full crate layout, the CompactLTJ/Leapfrog-Triejoin design in depth, and
 the extension seams for building on top of Nova (`QuadStore`, `Dataset`,

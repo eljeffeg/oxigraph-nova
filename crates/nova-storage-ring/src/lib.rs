@@ -42,6 +42,10 @@
 //! are completely unaffected.
 
 pub mod cltj;
+/// Braided Ring pilot: cyclic QWT + `NOVARNG1` + D2 intersection.
+/// Feature `cyclic-ring-pilot`. Not on the default `RingStore` query path.
+#[cfg(feature = "cyclic-ring-pilot")]
+pub mod cyclic_ring;
 pub mod delta;
 #[cfg(feature = "fulltext")]
 mod fulltext;
@@ -55,7 +59,7 @@ pub mod store;
 // Re-exported here so existing callers (`nova_serve.rs`, tests, benches)
 // that referred to `oxigraph_nova_storage_ring::wal`/`WalRecord`/`WalWriter`
 // keep working unchanged.
-pub use louds::LoudsMemBreakdown;
+pub use louds::{LoudsMemBreakdown, LoudsTrie, build_louds_from_sorted};
 pub use oxigraph_nova_storage_common::{WalRecord, WalWriter, wal};
 pub use ring::SortOrder;
 pub use store::{

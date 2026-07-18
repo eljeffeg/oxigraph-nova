@@ -9,6 +9,10 @@ publish      = false
 
 [features]
 default  = []
+# Braided Ring pilot (cyclic QWT / NOVARNG1 / D2).
+cyclic-ring-pilot = ["oxigraph-nova-storage-ring/cyclic-ring-pilot"]
+# DROP-branch matrices for e511 --full-campaign.
+diagnostics = ["oxigraph-nova-storage-ring/diagnostics"]
 
 # ── Runtime deps (needed by both [[bench]] and [[example]] targets) ──────────
 
