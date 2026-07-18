@@ -57,8 +57,8 @@
 
 use qwt::mem_dbg::{MemSize, SizeFlags};
 use qwt::{AccessUnsigned, QWT256, RankUnsigned, SelectUnsigned};
-use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
+
 
 /// E5.10 W0 — immutable mapped QWT (`NOVAQWT1`).
 pub mod mapped_qwt;
@@ -70,6 +70,8 @@ pub mod facade;
 pub mod scan;
 /// Phase 4b per-graph read-only canonical-ID image adapter.
 pub mod image;
+/// Phase 5 in-memory QuadStore: Dictionary + Delta + BraidedGraphImage.
+pub mod store;
 
 pub use facade::BraidedRingIndex;
 pub use image::{BraidedGraphImage, IdRemap};
@@ -77,6 +79,8 @@ pub use mapped_ring::{
     MappedRingA, MappedRingError, open_novarng1_mmap, write_novarng1_file, write_novarng1_v1,
 };
 pub use scan::BraidedJoinScan;
+pub use store::BraidedStore;
+
 
 
 // ── Column / range ────────────────────────────────────────────────────────────
@@ -259,9 +263,9 @@ pub struct CyclicRing {
     pub universe: u32,
     /// Optional external counters (shared with harness).
     counters: Option<&'static GlobalCounters>,
-    /// Thread-local allocation detector: bumps on any Vec created in hot path.
-    /// (range_next_value must not allocate.)
-    hot_path_allocs: Cell<u64>,
+    /// Hot-path allocation detector (range_next_value must not allocate).
+    /// Atomic so `CyclicRing` / store wrappers are `Send + Sync` for QuadStore.
+    hot_path_allocs: AtomicU64,
 }
 
 impl CyclicRing {
@@ -272,12 +276,13 @@ impl CyclicRing {
     }
 
     pub fn hot_path_allocs(&self) -> u64 {
-        self.hot_path_allocs.get()
+        self.hot_path_allocs.load(Ordering::Relaxed)
     }
 
     pub fn reset_hot_path_allocs(&self) {
-        self.hot_path_allocs.set(0);
+        self.hot_path_allocs.store(0, Ordering::Relaxed);
     }
+
 
     // ── build ────────────────────────────────────────────────────────────
 
@@ -334,11 +339,12 @@ impl CyclicRing {
             n,
             universe,
             counters: None,
-            hot_path_allocs: Cell::new(0),
+            hot_path_allocs: AtomicU64::new(0),
         }
     }
 
     /// Build **Ring B** (reverse cyclic class) from role-local triples.
+
     /// Same shared-alphabet remap as [`Self::build_from_role_local`].
     ///
     /// Cyclic class: OPS → SOP → PSO (last columns C_s, C_p, C_o).
@@ -401,11 +407,12 @@ impl CyclicRing {
             n,
             universe,
             counters: None,
-            hot_path_allocs: Cell::new(0),
+            hot_path_allocs: AtomicU64::new(0),
         }
     }
 
     /// Exact complete bytes (qwt MemSize + A arrays + shell), matching E5.6 accounting.
+
     pub fn mem_bytes(&self) -> usize {
         let q = self.c_o.mem_size(SizeFlags::default())
             + self.c_p.mem_size(SizeFlags::default())
