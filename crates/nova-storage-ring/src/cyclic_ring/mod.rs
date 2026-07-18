@@ -64,6 +64,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub mod mapped_qwt;
 /// E5.10 W1 — mmap-backed Ring A shell (`NOVARNG1` / `MappedRingA`).
 pub mod mapped_ring;
+/// Phase 4 ID-level facade + differential oracles (not QuadStore / not SPARQL).
+pub mod facade;
+
+pub use facade::BraidedRingIndex;
+pub use mapped_ring::{
+    MappedRingA, MappedRingError, open_novarng1_mmap, write_novarng1_file, write_novarng1_v1,
+};
 
 // ── Column / range ────────────────────────────────────────────────────────────
 
