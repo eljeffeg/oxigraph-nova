@@ -20,7 +20,7 @@
 //! insert — proving the store does not hand out a single fixed snapshot for
 //! the whole "query".
 //!
-//! See `crates/nova-storage-ring/src/store.rs`'s module doc comment
+//! See `crates/nova-storage-louds/src/store.rs`'s module doc comment
 //! ("Isolation semantics") and `crates/nova-query/src/update.rs`'s module
 //! doc comment ("Atomicity") for the corresponding design documentation.
 

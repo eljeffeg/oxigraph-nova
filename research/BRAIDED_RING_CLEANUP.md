@@ -1,7 +1,8 @@
 # Braided Ring cleanup summary
 
 **Date:** 2026-07-17
-**Status:** Phase 0–2 **executed** on `braided-ring-productize` (diagnostics freeze, path extract, crate split with LOUDS re-export). Phases 3–4 still planned.
+**Status:** Phase 0–3 **executed** on `braided-ring-productize` (diagnostics freeze, path extract, crate split with LOUDS re-export, research archive + Ring B/URing diagnostics gate). Phase 4 still planned (facade + differentials; no SPARQL cutover yet).
+
 **Active status page:** [`BRAIDED_RING.md`](./BRAIDED_RING.md)
 **Goal:** stop calling the product path “PRISM,” land the cyclic/braided index as `nova-storage-ring`, isolate the production LOUDS backend as `nova-storage-louds`, and strip research/test ballast.
 
@@ -254,12 +255,15 @@ Path-extract KEEP only (no hybrid/PRISM/ultra) from `main` + research freeze sur
 
 **Remaining Phase-2 polish (optional, not blocking):** drop re-export and migrate dependents to `oxigraph-nova-storage-louds`; rename `cyclic-ring-pilot` → `braided-ring`.
 
-### Phase 3 — delete / archive research code
+### Phase 3 — delete / archive research code — **DONE** (local, this branch)
 
-1. Remove `prism/`, `ultra_pi.rs`, `hybrid_l2.rs` from default tree (or `research/archive/src/`).
-2. Strip `cltj.rs` / `louds.rs` cfg branches for those features after extract.
-3. Archive e4x/e5x probe bins.
-4. CI matrix: louds + braided only.
+1. ~~`prism/` / `ultra_pi` / `hybrid_l2` absent on productize branch (never path-extracted).~~
+2. ~~LOUDS modules live in `nova-storage-louds` (no research cfg on product path).~~
+3. ~~Archive e4x/e5x probe bins under `benches/archive/` (+ README); keep e510/e511/gen_dataset/profile_eval*.~~
+4. ~~Ring B builders + URing oracle gated `#[cfg(any(test, feature = "diagnostics"))]`.~~
+5. ~~Docs: README / ARCHITECTURE / CLAUDE / isolation test paths → `storage-louds` for LOUDS modules.~~
+6. ~~Green: cyclic_ring 39, louds 83, store check, bench bins check.~~
+
 
 ### Phase 4 — optional productization
 

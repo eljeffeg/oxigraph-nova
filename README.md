@@ -52,14 +52,14 @@ All `rdf-12` / `sparql-12` feature flags are enabled across the parsing stack fr
 
 Nova separates the storage engine from the SPARQL evaluator behind two small
 traits, `QuadStore` and `Dataset` — the only seam the query engine depends
-on. The default storage engine (`oxigraph-nova-storage-ring`) implements
-those traits on top of **six-order CompactLTJ LOUDS** (`RingStore`) combined
-with **Leapfrog Triejoin** for worst-case optimal joins, plus a
-`BTreeMap`-backed LSM delta so live writes never block reads.
+on. Production **six-order CompactLTJ LOUDS** lives in
+`oxigraph-nova-storage-louds` (`RingStore` + LSM delta + WAL/snapshot).
+Dependents still import `oxigraph_nova_storage_ring::RingStore` via a temporary
+re-export during the Braided Ring productization split.
 
-The same crate also hosts the **Braided Ring** pilot (feature
-`cyclic-ring-pilot`): cyclic QWT columns, `NOVARNG1` mmap images, and D2
-braided multi-range intersection — **not** wired into SPARQL yet. See
+**Braided Ring** (feature `cyclic-ring-pilot` on `oxigraph-nova-storage-ring`):
+cyclic QWT columns, `NOVARNG1` mmap images, and D2 braided multi-range
+intersection — **not** wired into SPARQL yet. See
 [`research/BRAIDED_RING.md`](./research/BRAIDED_RING.md).
 
 The full crate layout, the CompactLTJ/Leapfrog-Triejoin design in depth, and
@@ -117,8 +117,8 @@ recovering from a prior crash) and triggers a one-time full rebuild
 automatically rather than silently serving stale results.
 
 See `crates/nova-fulltext/src/lib.rs` for the Tantivy schema and
-`crates/nova-storage-ring/src/fulltext.rs` for the compaction-time indexing
-glue.
+`crates/nova-storage-louds/src/fulltext.rs` for the compaction-time indexing
+glue (still reachable via the ring crate re-export for feature wiring).
 
 
 ## OWL 2 RL reasoning (opt-in)

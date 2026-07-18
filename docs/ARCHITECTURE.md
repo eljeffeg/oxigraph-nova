@@ -13,7 +13,8 @@ embedding the HTTP server into a larger application — start here.
 nova-core              (vocabulary + trait definitions; no storage/query logic)
   ├── nova-storage-common   (shared WAL / manifest / dict-snapshot persistence plumbing)
   │     ├── nova-storage-memory  (MemoryStore: simple reference QuadStore impl)
-  │     └── nova-storage-ring    (RingStore: LOUDS/CLTJ QuadStore impl, WAL + delta + compaction)
+  │     ├── nova-storage-louds   (production RingStore: six-order LOUDS/CLTJ + WAL/delta)
+  │     └── nova-storage-ring    (Braided Ring pilot + temporary re-export of louds)
   ├── nova-fulltext         (Tantivy-backed TextSearch impl)
   ├── nova-reasoning        (LftjFixpointEngine: OWL 2 RL forward-chaining reasoner)
   └── nova-query            (Dataset trait, SPARQL evaluator, LFTJ/WCOJ join engine,
@@ -80,8 +81,9 @@ implementations without touching (or forking) `nova-storage-ring` or
 | `oxigraph-nova-query` | SPARQL 1.2 evaluator, `Dataset` trait, Leapfrog Triejoin (`lftj.rs`), `ExtensionRegistry` |
 | `oxigraph-nova-storage-memory` | In-memory backend — `Vec`-based linear scan; testing and development |
 | `oxigraph-nova-storage-common` | Backend-agnostic WAL + MANIFEST + dictionary-persistence machinery, reusable by any `QuadStore` that wants crash-safe durability |
-| `oxigraph-nova-storage-ring` | CompactLTJ LOUDS trie index (6 orderings, O(1) navigation) + `BTreeMap<u128>` LSM delta + Leapfrog Triejoin; live-write, WAL-backed persistent storage engine with mmap'd ε-serde snapshot loading |
-| `oxigraph-nova-fulltext` | Tantivy-backed full-text index — opt-in via the `fulltext` cargo feature on `oxigraph-nova-storage-ring`; indexed incrementally on the compaction cycle |
+| `oxigraph-nova-storage-louds` | Production CompactLTJ LOUDS trie index (6 orderings) + LSM delta + WAL/snapshot `RingStore` |
+| `oxigraph-nova-storage-ring` | Braided Ring pilot (cyclic QWT / `NOVARNG1` / D2) + temporary re-export of `storage-louds` so existing `RingStore` imports stay green |
+| `oxigraph-nova-fulltext` | Tantivy-backed full-text index — opt-in via the `fulltext` cargo feature (forwarded through `storage-ring` → `storage-louds`); indexed incrementally on the compaction cycle |
 | `oxigraph-nova-reasoning` | OWL 2 RL forward-chaining reasoner — LFTJ-native semi-naive fixpoint driver (`LftjFixpointEngine`), `ReasoningDataset` in-memory overlay decorator, opt-in via `--reasoning` on the server |
 | `oxigraph-nova-shacl` | SHACL Core validation — `ShaclValidator` trait seam, Nova-owned `ValidationReport`/`ValidationResult` types, `NativeValidator` (dependency-free default implementation); always compiled in, not cargo-feature-gated |
 | `oxigraph-nova-server` | SPARQL 1.2 HTTP endpoint (`axum`), SPARQL Query/Update, Graph Store Protocol |
@@ -90,9 +92,10 @@ implementations without touching (or forking) `nova-storage-ring` or
 
 ## Storage engine: the Ring
 
-The main algorithmic contribution is `oxigraph-nova-storage-ring`'s compact
-storage engine, which replaces the simple in-memory backend with a succinct
-structure from recent research:
+The main algorithmic contribution is production CompactLTJ LOUDS in
+`oxigraph-nova-storage-louds` (re-exported from `oxigraph-nova-storage-ring`
+for dependent compatibility). It replaces the simple in-memory backend with a
+succinct structure from recent research:
 
 **CompactLTJ** (Arroyuelo, Navarro, Gómez-Brandón et al., "CompactLTJ: Space
 and Time Efficient Leapfrog Triejoin on Graph Databases", VLDB Journal 2025)
@@ -208,7 +211,7 @@ correct, but with no batching benefit. Backends with their own internal lock
 and/or write-ahead log (like `RingStore`) should override it to acquire the
 lock once, write every resulting WAL record in a single `fsync`, then apply
 each op in-memory — see `RingStore`'s `apply_batch` override in
-`nova-storage-ring/src/store.rs` (it mirrors the same single-lock,
+`nova-storage-louds/src/store.rs` (it mirrors the same single-lock,
 single-batched-write pattern already used by its bulk-insert `extend_boxed`
 override, generalized to mixed insert/remove ops).
 
@@ -306,7 +309,7 @@ joins, reused rather than duplicated by a from-scratch triple-scan reasoner).
 Defined in `nova-core/src/text_search.rs`. Backs the `text:query`/
 `text:contains` SPARQL extension functions. `nova-fulltext`'s Tantivy-backed
 `FulltextIndex` is the only current implementation (wired into `RingStore`
-behind the `fulltext` cargo feature — see `nova-storage-ring/src/fulltext.rs`),
+behind the `fulltext` cargo feature — see `nova-storage-louds/src/fulltext.rs`),
 but any backend (Meilisearch, Elasticsearch, a custom inverted index) can
 implement this trait and be wired in the same way.
 

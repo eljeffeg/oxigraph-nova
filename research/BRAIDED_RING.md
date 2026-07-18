@@ -1,7 +1,7 @@
 # Braided Ring — product status
 
 **Date:** 2026-07-17  
-**Status:** F0 product surface frozen (Phase 0 hygiene). **Not** the default SPARQL backend.
+**Status:** Phase 0–3 done on `braided-ring-productize` (F0 freeze, path extract, LOUDS split + re-export, research archive + Ring B/URing diagnostics gate). **Not** the default SPARQL backend.
 
 ---
 
@@ -84,8 +84,8 @@ See [`BRAIDED_RING_CLEANUP.md`](./BRAIDED_RING_CLEANUP.md):
 0. **Done:** diagnostics gating, deprecation comments, status docs  
 1. **Done:** extract winners onto clean branch `braided-ring-productize` from `main`  
 2. **Done (compat re-export):** split `nova-storage-louds` (production LOUDS) vs `nova-storage-ring` (Braided Ring + temporary re-export of LOUDS so dependents stay green)  
-3. Upstream qwt patches in parallel  
-4. Store facade + differential tests **before** SPARQL cutover  
+3. **Done (research ballast):** archive e4x/e5x probe bins under `benches/archive/`; gate Ring B builders + URing behind `#[cfg(any(test, feature = "diagnostics"))]`; docs point LOUDS paths at `storage-louds`  
+4. **Next (Phase 4):** store facade + differential tests **before** SPARQL cutover; upstream qwt patches in parallel  
 
 **Do not** wire Braided Ring into default query until facade + differentials are green.  
 **Do not** redesign StarView until a measurement microbench with hard KEEP/DROP gates.

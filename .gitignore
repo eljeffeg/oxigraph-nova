@@ -44,3 +44,4 @@ profile.json.gz
 /crates/nova-js/pkg/
 
 /benches/src
+/benches/archive

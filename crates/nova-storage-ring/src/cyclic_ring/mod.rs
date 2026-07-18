@@ -12,9 +12,9 @@
 //! A_o, A_p, A_s cumulative arrays
 //! ```
 //!
-//! Ring B / URing are E5.8 **speed-oracle only** (feature-gated).
+//! Ring B / URing are E5.8 **DROP** speed-oracle only (`diagnostics` feature).
 //! E5.10: [`mapped_qwt`] — `NOVAQWT1` flatten / open (W0); no RingStore cutover.
-//! No SPARQL, no production RingStore replacement.
+//! No SPARQL, no production RingStore replacement. Product path is Ring A + D2.
 
 //! # Indexing convention
 //!
@@ -328,6 +328,8 @@ impl CyclicRing {
     /// Same shared-alphabet remap as [`Self::build_from_role_local`].
     ///
     /// Cyclic class: OPS → SOP → PSO (last columns C_s, C_p, C_o).
+    /// DROP (E5.8): research/oracle only — requires `diagnostics` feature.
+    #[cfg(any(test, feature = "diagnostics"))]
     pub fn build_ring_b_from_role_local(triples: &[[u32; 3]], ns: u32, np: u32, no: u32) -> Self {
         let s_base = 0u32;
         let p_base = ns;
@@ -352,6 +354,8 @@ impl CyclicRing {
     /// - `lead_range(S)` partitions T_sop by s (after F_s from OPS)
     /// - `lead_range(P)` partitions T_pso by p
     /// - `lead_range(O)` partitions T_ops by o
+    /// DROP (E5.8): research/oracle only — requires `diagnostics` feature.
+    #[cfg(any(test, feature = "diagnostics"))]
     pub fn build_ring_b_shared(triples: &[[u32; 3]], universe: u32) -> Self {
         let n = triples.len() as u32;
         // T_ops: (o, p, s)
@@ -810,7 +814,10 @@ impl CyclicRing {
     }
 }
 
-// ── URing speed oracle (E5.8) ────────────────────────────────────────────────
+// ── URing speed oracle (E5.8) — DROP; research/oracle only ───────────────
+#[cfg(any(test, feature = "diagnostics"))]
+mod uring_oracle {
+    use super::*;
 
 /// Which physical cyclic orientation served a navigation step.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -920,6 +927,11 @@ impl URing {
         }
     }
 }
+
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+pub use uring_oracle::{Orientation, OrientationCounters, URing};
 
 // ── Stateful distinct iterator wrapper (E5.7C / E5.9A) ───────────────────────
 
