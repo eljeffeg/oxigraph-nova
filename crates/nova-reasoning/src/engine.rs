@@ -21,7 +21,7 @@
 //! [`Dataset`]'s LFTJ capability methods (`lftj_intern_term`/
 //! `lftj_join_scan`/`lftj_decode_term`). It only produces useful results
 //! over an LFTJ-capable dataset (i.e. [`oxigraph_nova_query::StoreDataset`]
-//! wrapping an `oxigraph_nova_storage_ring::RingStore`) — a plain
+//! wrapping an `oxigraph_nova_storage_ring::LoudsStore`) — a plain
 //! [`oxigraph_nova_query::InMemoryDataset`] has no LFTJ support and yields
 //! an empty closure, by design (this engine's whole reason to exist is to
 //! reuse the WCOJ machinery, not to duplicate a from-scratch triple-scan
@@ -804,7 +804,7 @@ mod tests {
     use super::*;
     use oxigraph_nova_core::{BlankNode, GraphName as CoreGraphName, QuadStore};
     use oxigraph_nova_query::StoreDataset;
-    use oxigraph_nova_storage_ring::RingStore;
+    use oxigraph_nova_storage_ring::LoudsStore;
     use std::sync::Arc;
 
     fn nn(s: &str) -> NamedNode {
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn infers_subclass_transitivity_and_type_propagation() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -884,7 +884,7 @@ mod tests {
     /// reasoned over via `GraphSelector::Union`).
     #[test]
     fn infers_subproperty_propagation() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -941,7 +941,7 @@ mod tests {
     /// domain/range rules must still fire.
     #[test]
     fn infers_domain_and_range() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -998,7 +998,7 @@ mod tests {
     /// `alice hasFather bob` — it must not appear in `inferred`.
     #[test]
     fn does_not_report_a_base_fact_re_derived_by_a_rule_as_inferred() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1054,7 +1054,7 @@ mod tests {
     /// transitive a-ancestorOf-c edge.
     #[test]
     fn infers_generic_transitive_property() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1111,7 +1111,7 @@ mod tests {
     /// derive the reverse edge for every asserted `knows` triple.
     #[test]
     fn infers_generic_symmetric_property() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1152,7 +1152,7 @@ mod tests {
     /// `A rdfs:subClassOf B` and `B rdfs:subClassOf A`.
     #[test]
     fn infers_equivalent_class_expands_both_directions() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         store
             .insert(&Quad::new(
@@ -1184,7 +1184,7 @@ mod tests {
     /// `p1 rdfs:subPropertyOf p2` and `p2 rdfs:subPropertyOf p1`.
     #[test]
     fn infers_equivalent_property_expands_both_directions() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         store
             .insert(&Quad::new(
@@ -1219,7 +1219,7 @@ mod tests {
     /// cross-contaminating each other's edges.
     #[test]
     fn infers_inverse_of_both_directions() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1272,7 +1272,7 @@ mod tests {
     /// producing an empty closure with no explanation.
     #[test]
     fn diagnostic_emitted_for_non_iri_transitive_property_subject() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         store
             .insert(&Quad::new(
@@ -1298,7 +1298,7 @@ mod tests {
     /// [`Diagnostic::violation`] with rule `"prp-asyp"`.
     #[test]
     fn detects_asymmetric_property_violation() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1340,7 +1340,7 @@ mod tests {
     /// (only one direction asserted) must produce no `prp-asyp` diagnostic.
     #[test]
     fn no_asymmetric_property_violation_when_only_one_direction_asserted() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1369,7 +1369,7 @@ mod tests {
     /// with rule `"prp-irp"`.
     #[test]
     fn detects_irreflexive_property_violation() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1403,7 +1403,7 @@ mod tests {
     /// must produce no `prp-irp` diagnostic.
     #[test]
     fn no_irreflexive_property_violation_when_no_self_relation() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1432,7 +1432,7 @@ mod tests {
     /// rule `"cax-dw"`.
     #[test]
     fn detects_disjoint_class_violation() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1464,7 +1464,7 @@ mod tests {
     /// disjoint classes must produce no `cax-dw` diagnostic.
     #[test]
     fn no_disjoint_class_violation_when_only_one_class_asserted() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1485,7 +1485,7 @@ mod tests {
     /// must produce a [`Diagnostic::violation`] with rule `"eq-diff"`.
     #[test]
     fn detects_same_as_different_from_clash() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();
@@ -1519,7 +1519,7 @@ mod tests {
     /// `eq-diff` diagnostic.
     #[test]
     fn no_same_as_different_from_clash_when_unrelated() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let insert = |s: NamedNode, p: NamedNode, o: Term| {
             store.insert(&Quad::new(s, p, o, g.clone())).unwrap();

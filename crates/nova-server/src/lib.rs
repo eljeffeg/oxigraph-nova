@@ -102,7 +102,7 @@
 //! a multi-row Update partially applied.
 //!
 //! This is an accepted, documented limitation of the current
-//! single-`Mutex<RingStoreInner>` design (see
+//! single-`Mutex<LoudsStoreInner>` design (see
 //! `oxigraph_nova_storage_ring`'s `store.rs` module doc comment, "Isolation
 //! semantics", for the storage-level explanation), demonstrated directly by
 //! `crates/nova-server/tests/isolation.rs`'s two integration tests.
@@ -111,7 +111,7 @@ mod service_description;
 
 /// mimalloc purge tuning (bulk-load/compaction transient-memory fix).
 ///
-/// `RingStore::bulk_load()`/`compact_locked()` build the Ring's 6 LOUDS
+/// `LoudsStore::bulk_load()`/`compact_locked()` build the Ring's 6 LOUDS
 /// tries via a paired-construction algorithm (`cltj::build_cltj_data`) that
 /// allocates several large (tens-to-hundreds-of-MiB, at multi-million-triple
 /// scale) transient `Vec<[u32;3]>` sort/dedup scratch buffers. mimalloc —
@@ -131,7 +131,7 @@ mod service_description;
 /// `memory_breakdown()`'s self-reported ~494 MiB of real, live data).
 ///
 /// This module provides the two-part fix, shared by both `nova_serve` and
-/// `oxigraph` (nova-cli), so it's applied uniformly wherever a `RingStore`
+/// `oxigraph` (nova-cli), so it's applied uniformly wherever a `LoudsStore`
 /// can be bulk-loaded:
 ///
 ///   1. [`tune_mimalloc_purge_delay`] — sets `mi_option_purge_delay` to 0
@@ -402,7 +402,7 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
     /// concurrently. A request arriving while `max` evaluations are already
     /// in flight is rejected immediately with `503 Service Unavailable`
     /// rather than being queued, so a burst of expensive queries can't pile
-    /// up unboundedly waiting on the single `Mutex<RingStoreInner>`.
+    /// up unboundedly waiting on the single `Mutex<LoudsStoreInner>`.
     pub fn with_max_parallel_queries(mut self, max: usize) -> Self {
         self.max_parallel_queries = Some(max);
         self
@@ -411,8 +411,8 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
     /// Attach a full-text search backend (see `oxigraph_nova_core::TextSearch`),
     /// enabling `text:query`/`text:contains` extension-function dispatch for
     /// every query this server evaluates. Typically `store.clone() as
-    /// Arc<dyn TextSearch>` when `S` is `RingStore` built with the
-    /// `fulltext` cargo feature and `RingStore::enable_fulltext` has been
+    /// Arc<dyn TextSearch>` when `S` is `LoudsStore` built with the
+    /// `fulltext` cargo feature and `LoudsStore::enable_fulltext` has been
     /// called — see `--fulltext` in `nova_serve`/`oxigraph serve`.
     pub fn with_text_search(mut self, ts: Arc<dyn TextSearch>) -> Self {
         self.text_search = Some(ts);
@@ -448,8 +448,8 @@ impl<S: QuadStore + Send + Sync + 'static> Server<S> {
     ///
     /// **Important caveat**: this only guarantees that *this server
     /// process* will never write to the store — it is an HTTP-layer gate,
-    /// not a storage-level guarantee. `RingStore` still uses a
-    /// single-`Mutex<RingStoreInner>`, single-writer WAL design (see
+    /// not a storage-level guarantee. `LoudsStore` still uses a
+    /// single-`Mutex<LoudsStoreInner>`, single-writer WAL design (see
     /// `oxigraph_nova_storage_ring::store`'s module doc, "Isolation
     /// semantics"); this flag does **not** by itself make it safe to run
     /// this server concurrently against a `--location` directory that
@@ -4007,7 +4007,7 @@ mod tests {
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("nova_server_metrics_test_{pid}"));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(oxigraph_nova_storage_ring::RingStore::open(&dir).unwrap());
+        let store = Arc::new(oxigraph_nova_storage_ring::LoudsStore::open(&dir).unwrap());
         let router = Server::new(store).into_router();
 
         let req = Request::builder()
@@ -4025,7 +4025,7 @@ mod tests {
         ] {
             assert!(
                 text.contains(&format!("# TYPE {name} ")),
-                "missing metric {name} for RingStore in:\n{text}"
+                "missing metric {name} for LoudsStore in:\n{text}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

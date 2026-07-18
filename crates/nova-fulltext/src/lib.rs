@@ -92,7 +92,7 @@ pub struct FulltextIndex {
 }
 
 impl FulltextIndex {
-    /// Create a fresh, purely in-memory index (mirrors `RingStore::new()` —
+    /// Create a fresh, purely in-memory index (mirrors `LoudsStore::new()` —
     /// no disk persistence).
     pub fn create_in_ram() -> anyhow::Result<Self> {
         let (schema, fields) = build_schema();
@@ -101,7 +101,7 @@ impl FulltextIndex {
     }
 
     /// Open (or create) a persistent index rooted at `dir` (created if it
-    /// doesn't exist). Mirrors `RingStore::open`'s `<data_dir>/fulltext/`
+    /// doesn't exist). Mirrors `LoudsStore::open`'s `<data_dir>/fulltext/`
     /// convention — callers pass that subdirectory directly.
     pub fn open_or_create(dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
@@ -191,7 +191,7 @@ impl FulltextIndex {
     /// Delete every document currently in the index (buffered, like
     /// `add_literal`/`remove_by_key` -- not visible to `search` until the
     /// next [`Self::commit`]). Used by a full rebuild (e.g.
-    /// `RingStore::enable_fulltext`'s stale-marker path) to guarantee a
+    /// `LoudsStore::enable_fulltext`'s stale-marker path) to guarantee a
     /// clean slate before re-indexing every literal object, so a rebuild
     /// over an index that already has *some* documents (e.g. a previous
     /// partial/aborted rebuild, or `enable_fulltext` being called again

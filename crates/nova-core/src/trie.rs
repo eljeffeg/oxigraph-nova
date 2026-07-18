@@ -124,7 +124,7 @@ pub trait TrieIterator: Send {
 
 /// Always-exhausted [`TrieIterator`] sentinel.
 ///
-/// Returned by `RingStore::lftj_join_scan` when a graph exists in the
+/// Returned by `LoudsStore::lftj_join_scan` when a graph exists in the
 /// dictionary but has no compacted Ring entries (no triples have been
 /// flushed via `compact()` for that graph yet). Using an empty iterator
 /// rather than `None` lets the LFTJ evaluator treat it uniformly with

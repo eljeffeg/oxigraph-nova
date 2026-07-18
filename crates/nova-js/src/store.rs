@@ -302,7 +302,7 @@ impl JsStore {
         // iterator of chunks) so the same parse-then-insert code path below can
         // be shared by both the transactional and bulk-load branches. Nova's
         // `Store::load` facade doesn't expose `lenient`, so we bypass it here
-        // and drive `RdfParser`/`self.store.inner()` (the raw `Arc<RingStore>`,
+        // and drive `RdfParser`/`self.store.inner()` (the raw `Arc<LoudsStore>`,
         // which implements `QuadStore`) directly, matching `Store::load`'s own
         // internal one-quad-at-a-time insert loop for the transactional path.
         let quads: Vec<Quad> = if let Some(buffer) = buffer_from_js_value(data) {

@@ -28,7 +28,7 @@
 //!   high-water-mark.
 //!
 //! - **"Always mapped".**  [`StoreSnapshot::round_trip_and_maybe_save`] is
-//!   used by `RingStore::compact()` (and `bulk_load()`) to replace the
+//!   used by `LoudsStore::compact()` (and `bulk_load()`) to replace the
 //!   freshly-built `Arc<GraphRing>` map with the result of serializing it
 //!   and immediately deserializing it back — so the servable representation
 //!   is always literally "what ε-serde deserialized", matching what will
@@ -43,7 +43,7 @@
 //!   clear the delta and swap in the new `Ring` exactly as before; writing
 //!   the snapshot file (for persistent stores) and doing the in-memory
 //!   round-trip (for all stores) are both side effects layered on top with
-//!   no behavioural change to `RingStore`'s query or write semantics.
+//!   no behavioural change to `LoudsStore`'s query or write semantics.
 //!
 //! ## On-disk format
 //!
@@ -87,7 +87,7 @@ pub(crate) struct StoreSnapshot<Rings = Vec<RingSnapshot>> {
 impl StoreSnapshot {
     /// Build a snapshot from a per-graph `Arc<GraphRing>` map, consuming each
     /// `Arc` (requires unique ownership — true for a freshly-built `graphs`
-    /// map that has not yet been installed into `RingStoreInner`/shared).
+    /// map that has not yet been installed into `LoudsStoreInner`/shared).
     ///
     /// `pub(crate)` (rather than private) so that `ring.rs`'s
     /// `MappedGraphRing` tests can drive the exact same snapshot-construction
@@ -121,7 +121,7 @@ impl StoreSnapshot {
     /// 2. Deserialize the same buffer back into a fresh `Arc<GraphRing>` map
     ///    ("always mapped" — see module docs) and return it.
     ///
-    /// Used by `RingStore::compact()`/`bulk_load()` right after building a
+    /// Used by `LoudsStore::compact()`/`bulk_load()` right after building a
     /// fresh `new_graphs` map.
     pub(crate) fn round_trip_and_maybe_save(
         graphs: HashMap<GraphId, Arc<GraphRing>>,
@@ -162,7 +162,7 @@ impl StoreSnapshot {
     /// been compacted).
     ///
     /// Retained (alongside `load_mmap_from_file` below, which is what
-    /// `RingStore::open`/`commit_compaction` actually use now) as a
+    /// `LoudsStore::open`/`commit_compaction` actually use now) as a
     /// full-heap-copy alternative and for its existing regression test
     /// coverage.
     #[allow(dead_code)]
@@ -191,17 +191,17 @@ impl StoreSnapshot {
     /// exist (fresh store, or a persistent store that has never been
     /// compacted).
     ///
-    /// Used by `RingStore::open()` (so a reopened persistent store's rings
+    /// Used by `LoudsStore::open()` (so a reopened persistent store's rings
     /// are zero-copy mapped from the moment they're loaded, not just after
     /// the next `compact()`) and by [`Self::write_and_load_mmap`] (right
     /// after writing a fresh snapshot generation during `commit_compaction`).
     ///
     /// Requires the `mmap` cargo feature (default-on; disabled for the
     /// wasm32 build, see this crate's `Cargo.toml`). Disk-backed persistence
-    /// (`RingStore::open`) is unavailable without it — see the `not(feature
+    /// (`LoudsStore::open`) is unavailable without it — see the `not(feature
     /// = "mmap")` fallback below, which returns an error rather than failing
     /// to compile, since wasm32 builds never call this path at runtime
-    /// (in-memory `RingStore::new()` only).
+    /// (in-memory `LoudsStore::new()` only).
     #[cfg(feature = "mmap")]
     pub(crate) fn load_mmap_from_file(
         path: &Path,

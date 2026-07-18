@@ -1,6 +1,6 @@
 [package]
 name        = "oxigraph-nova-storage-louds"
-description = "Production six-order LOUDS RingStore (CompactLTJ) for Oxigraph Nova"
+description = "Production six-order LOUDS LoudsStore (CompactLTJ) for Oxigraph Nova"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -9,15 +9,15 @@ repository.workspace = true
 [features]
 default = ["mmap"]
 # Opt-in Tantivy-backed full-text search (see `crates/nova-fulltext`),
-# indexed incrementally on RingStore's compaction cycle. Zero-cost when
+# indexed incrementally on LoudsStore's compaction cycle. Zero-cost when
 # disabled: no tantivy dependency is even compiled in.
 fulltext = ["dep:oxigraph-nova-fulltext"]
 # See `oxigraph-nova-core`'s `mmap` feature doc comment. Gates
-# `snapshot.rs`'s `load_mmap`-based functions, used by `RingStore::open`'s
+# `snapshot.rs`'s `load_mmap`-based functions, used by `LoudsStore::open`'s
 # disk-backed recovery path and `commit_compaction`'s persistent-store
 # branch. Disabled (via `default-features = false`) for the wasm32 build
 # (`oxigraph-nova-js`), which is in-memory-only and never calls
-# `RingStore::open`.
+# `LoudsStore::open`.
 mmap = ["epserde/mmap", "sux/mmap", "oxigraph-nova-core/mmap", "oxigraph-nova-storage-common/mmap"]
 
 [dependencies]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Disk-backed comparative benchmark harness: Nova (--location, WAL-backed
-# RingStore) vs Oxigraph (--location, RocksDB-backed) vs QLever (mmap disk
+# LoudsStore) vs Oxigraph (--location, RocksDB-backed) vs QLever (mmap disk
 # index, unchanged from the in-memory comparison since QLever has no other
 # mode). This is the disk/persistent-storage sibling of run_comparison.sh
 # (which compares all three engines in their *pure in-memory* configuration).
@@ -13,7 +13,7 @@
 # documented in README.md for the in-memory comparison.
 #
 # Methodology:
-#   - Nova:      RingStore::open(dir) — every insert() is WAL-logged
+#   - Nova:      LoudsStore::open(dir) — every insert() is WAL-logged
 #                (fsync-per-write) before being applied in memory.
 #   - Oxigraph:  `serve --location <dir>` -> RocksDB-backed (oxigraph's own
 #                default/production persistent mode, oxrocksdb-sys via Docker
@@ -141,8 +141,8 @@ wait_ready() {
   return 1
 }
 
-# --- Nova: persistent WAL-backed RingStore via --location ---
-# NOTE: Nova's --location --file load path now calls RingStore::bulk_load(),
+# --- Nova: persistent WAL-backed LoudsStore via --location ---
+# NOTE: Nova's --location --file load path now calls LoudsStore::bulk_load(),
 # which bypasses the WAL entirely and commits via a single atomic snapshot +
 # MANIFEST swap (see benches/external/README.md's "Resolved" section) — this
 # is now fast (~1.3s for 1.25M triples, measured). The generous readiness

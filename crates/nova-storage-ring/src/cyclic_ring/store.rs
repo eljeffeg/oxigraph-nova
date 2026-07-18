@@ -1,4 +1,4 @@
-//! In-memory Braided Ring `QuadStore` (Phase 5).
+//! In-memory cyclic QWT [`RingStore`] `QuadStore` (Phase 5).
 //!
 //! Wires term dictionary + live LSM delta + per-graph
 //! [`BraidedGraphImage`] into [`QuadStore`] / [`LftjSource`].
@@ -6,8 +6,8 @@
 //! ## Scope
 //!
 //! - **In-memory only** — no WAL / MANIFEST / snapshot reopen.
-//! - **Not** the default SPARQL backend (`nova-store` still pins LOUDS
-//!   `RingStore`).
+//! - **Not** the default SPARQL backend (`nova-store` still pins
+//!   `LoudsStore`).
 //! - Compaction rebuilds each graph as a heap Braided Ring image from
 //!   external `TermId` triples (dense remap via [`BraidedGraphImage`]).
 //! - LFTJ is supported **only when the delta is empty** (same contract as
@@ -15,6 +15,9 @@
 //!
 //! Pattern scans always merge ring ∪ delta \ tombstones and are correct
 //! with a non-empty delta.
+//!
+//! "Braided" in related types/docs is the D2 intersection algorithm, not
+//! this store's product name.
 
 use super::image::BraidedGraphImage;
 use oxigraph_nova_core::{
@@ -62,7 +65,7 @@ fn decode_stored_quad(
 
 // ── Inner state ───────────────────────────────────────────────────────────────
 
-struct BraidedStoreInner {
+struct RingStoreInner {
     dict: Dictionary,
     /// Per-graph compacted Braided Ring images (external TermId coordinates).
     graphs: HashMap<GraphId, Arc<BraidedGraphImage>>,
@@ -71,7 +74,7 @@ struct BraidedStoreInner {
     compaction_count: u64,
 }
 
-impl BraidedStoreInner {
+impl RingStoreInner {
     fn new() -> Self {
         Self {
             dict: Dictionary::new(),
@@ -219,26 +222,26 @@ fn image_match_triples(
 
 // ── Public store ──────────────────────────────────────────────────────────────
 
-/// In-memory Braided Ring store: Dictionary + Delta + per-graph
+/// In-memory cyclic QWT Ring store: Dictionary + Delta + per-graph
 /// [`BraidedGraphImage`].
 ///
 /// Feature `cyclic-ring-pilot`. Not wired into `nova-store` as the default
-/// backend.
-pub struct BraidedStore {
-    inner: Mutex<BraidedStoreInner>,
+/// backend (that remains `LoudsStore`).
+pub struct RingStore {
+    inner: Mutex<RingStoreInner>,
 }
 
-impl Default for BraidedStore {
+impl Default for RingStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl BraidedStore {
+impl RingStore {
     /// Empty in-memory store.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(BraidedStoreInner::new()),
+            inner: Mutex::new(RingStoreInner::new()),
         }
     }
 
@@ -266,11 +269,35 @@ impl BraidedStore {
             .map(|g| g.n() as usize)
             .sum()
     }
+
+    /// Total live triple count (ring ∪ delta, same as [`QuadStore::len`]).
+    pub fn triple_count(&self) -> usize {
+        self.len().unwrap_or(0)
+    }
+
+    /// Bulk-insert quads into the delta, then compact into Braided images.
+    ///
+    /// Returns the number of newly inserted quads (duplicates skipped).
+    /// Intended for `nova_serve --file` / external harness loads.
+    pub fn bulk_load(&self, quads: impl IntoIterator<Item = Quad>) -> Result<usize, Oxigraph> {
+        let mut inner = self.inner.lock();
+        let mut count = 0usize;
+        for quad in quads {
+            if inner.apply_insert(&quad)? {
+                count += 1;
+            }
+        }
+        if count > 0 || !inner.delta.is_empty() {
+            inner.compact_locked()?;
+        }
+        Ok(count)
+    }
 }
+
 
 // ── LftjSource ────────────────────────────────────────────────────────────────
 
-impl LftjSource for BraidedStore {
+impl LftjSource for RingStore {
     fn supports_lftj(&self) -> bool {
         true
     }
@@ -409,13 +436,13 @@ impl TrieIterator for BraidedExternalScan {
 
 // ── QuadStore ─────────────────────────────────────────────────────────────────
 
-impl QuadStore for BraidedStore {
+impl QuadStore for RingStore {
     fn delta_len(&self) -> Option<usize> {
-        Some(BraidedStore::delta_len(self))
+        Some(RingStore::delta_len(self))
     }
 
     fn compaction_count(&self) -> Option<u64> {
-        Some(BraidedStore::compaction_count(self))
+        Some(RingStore::compaction_count(self))
     }
 
     fn insert(&self, quad: &Quad) -> Result<bool, Oxigraph> {
@@ -685,7 +712,7 @@ mod tests {
 
     #[test]
     fn insert_and_contains_delta_only() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let q = make_quad("http://s", "http://p", "o1", dg());
         assert!(store.insert(&q).unwrap());
         assert!(!store.insert(&q).unwrap());
@@ -697,7 +724,7 @@ mod tests {
 
     #[test]
     fn remove_from_delta() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let q = make_quad("http://s", "http://p", "o1", dg());
         store.insert(&q).unwrap();
         assert!(store.remove(&q).unwrap());
@@ -707,7 +734,7 @@ mod tests {
 
     #[test]
     fn insert_compact_contains_ring() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let q1 = make_quad("http://s1", "http://p", "a", dg());
         let q2 = make_quad("http://s1", "http://p", "b", dg());
         let q3 = make_quad("http://s2", "http://p", "a", dg());
@@ -727,7 +754,7 @@ mod tests {
 
     #[test]
     fn remove_from_ring_via_tombstone() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let q = make_quad("http://s", "http://p", "o", dg());
         store.insert(&q).unwrap();
         store.compact().unwrap();
@@ -743,7 +770,7 @@ mod tests {
 
     #[test]
     fn re_insert_after_remove() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let q = make_quad("http://s", "http://p", "o", dg());
         store.insert(&q).unwrap();
         store.compact().unwrap();
@@ -757,7 +784,7 @@ mod tests {
 
     #[test]
     fn quads_for_pattern_wildcard_and_bound() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let q1 = make_quad("http://s1", "http://p1", "a", dg());
         let q2 = make_quad("http://s1", "http://p2", "b", dg());
         let q3 = make_quad("http://s2", "http://p1", "c", dg());
@@ -792,7 +819,7 @@ mod tests {
 
     #[test]
     fn quads_mixed_ring_and_delta() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let q1 = make_quad("http://s", "http://p", "ring", dg());
         let q2 = make_quad("http://s", "http://p", "delta", dg());
         store.insert(&q1).unwrap();
@@ -809,7 +836,7 @@ mod tests {
 
     #[test]
     fn named_graphs_tracked() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let g = ng("http://g");
         store.register_named_graph(&g).unwrap();
         let known: Vec<_> = store
@@ -831,7 +858,7 @@ mod tests {
 
     #[test]
     fn lftj_disabled_while_delta_nonempty() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let q = make_quad("http://s", "http://p", "o", dg());
         store.insert(&q).unwrap();
         assert!(store.lftj_has_delta());
@@ -848,7 +875,7 @@ mod tests {
 
     #[test]
     fn lftj_join_scan_after_compact() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         store
             .insert(&make_quad("http://s1", "http://p", "a", dg()))
             .unwrap();
@@ -888,7 +915,7 @@ mod tests {
 
     #[test]
     fn apply_batch_mixed() {
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let q1 = make_quad("http://s", "http://p", "a", dg());
         let q2 = make_quad("http://s", "http://p", "b", dg());
         let (ins, rem) = store
@@ -906,7 +933,7 @@ mod tests {
     #[test]
     fn differential_pattern_vs_sorted_oracle() {
         // Ground truth: sorted SPO multiset after insert+compact.
-        let store = BraidedStore::new();
+        let store = RingStore::new();
         let quads = [
             make_quad("http://a", "http://p1", "x", dg()),
             make_quad("http://a", "http://p1", "y", dg()),

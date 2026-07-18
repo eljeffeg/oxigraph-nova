@@ -1,6 +1,6 @@
 //! End-to-end spike: two interacting rules — `rdfs:subClassOf` transitivity
 //! plus `rdf:type` propagation through the subclass hierarchy — evaluated
-//! directly over a real, compacted `RingStore`'s LOUDS index via
+//! directly over a real, compacted `LoudsStore`'s LOUDS index via
 //! [`StoreAtomSource`], not copied `Vec` fixtures.
 //!
 //! This is the increment beyond `transitivity_spike.rs` that actually
@@ -17,7 +17,7 @@
 //! 1. `RuleSet` correctly dispatches two interacting rules (`transitive` +
 //!    `type_propagation`) sharing one semi-naive fixpoint loop.
 //! 2. `StoreAtomSource` correctly answers rule-body scans against a real
-//!    compacted `RingStore` (three-level S/P/O LOUDS descent via
+//!    compacted `LoudsStore` (three-level S/P/O LOUDS descent via
 //!    `lftj_join_scan`), not a copied fixture.
 //! 3. A type fact only reachable through a **derived** (not asserted)
 //!    subClassOf edge (`Dog ⊑ Animal`, itself only derivable from `Dog ⊑
@@ -28,7 +28,7 @@
 use oxigraph_nova_core::{GraphName, LftjSource, NamedNode, Quad, QuadStore, Term};
 use oxigraph_nova_reasoning::rule::{Rule, RuleSet};
 use oxigraph_nova_reasoning::{StoreAtomSource, fixpoint};
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 
 const NS: &str = "http://example.org/";
 
@@ -44,7 +44,7 @@ fn rdf_type() -> NamedNode {
     NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type").unwrap()
 }
 
-fn assert_subclass(store: &RingStore, sub: &str, sup: &str) {
+fn assert_subclass(store: &LoudsStore, sub: &str, sup: &str) {
     store
         .insert(&Quad::new(
             iri(sub),
@@ -55,7 +55,7 @@ fn assert_subclass(store: &RingStore, sub: &str, sup: &str) {
         .unwrap();
 }
 
-fn assert_type(store: &RingStore, instance: &str, class: &str) {
+fn assert_type(store: &LoudsStore, instance: &str, class: &str) {
     store
         .insert(&Quad::new(
             iri(instance),
@@ -68,7 +68,7 @@ fn assert_type(store: &RingStore, instance: &str, class: &str) {
 
 #[test]
 fn type_propagation_through_transitive_subclass_over_ringstore() {
-    let store = RingStore::new();
+    let store = LoudsStore::new();
 
     // Animal <- Mammal <- Dog (Dog ⊑ Animal is derivable only via the
     // transitive closure of the two asserted edges, never asserted
@@ -151,7 +151,7 @@ fn type_propagation_through_transitive_subclass_over_ringstore() {
 
     assert_eq!(
         closure, expected,
-        "closure computed via StoreAtomSource over a real compacted RingStore must match \
+        "closure computed via StoreAtomSource over a real compacted LoudsStore must match \
          the hand-computed expected closure exactly"
     );
 

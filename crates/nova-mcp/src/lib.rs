@@ -3,7 +3,7 @@
 //!
 //! This is the "database" toolset that reserves but does not
 //! implement, since it needs a running store's state. [`NovaMcpService`]
-//! wraps a shared `Arc<RingStore>` — the same store handle a `nova-server`
+//! wraps a shared `Arc<LoudsStore>` — the same store handle a `nova-server`
 //! HTTP process or the `oxigraph` CLI would use — and exposes four tools
 //! over the official Rust MCP SDK (`rmcp`):
 //!
@@ -25,10 +25,10 @@
 //!
 //! ## Concurrency
 //!
-//! The stdio server opens its own `RingStore` handle in its own OS
+//! The stdio server opens its own `LoudsStore` handle in its own OS
 //! process. **Do not** point it at a `--location` directory that is
 //! concurrently open in a `nova_serve`/`oxigraph serve` process —
-//! `RingStore` is a single-writer-WAL design (see
+//! `LoudsStore` is a single-writer-WAL design (see
 //! `oxigraph_nova_storage_ring::store`'s module doc, "Isolation
 //! semantics").
 
@@ -36,7 +36,7 @@ use anyhow::Result as AnyResult;
 use oxigraph_nova_core::{GraphName, QuadStore, Term, TextSearch};
 use oxigraph_nova_query::{Evaluator, QueryOptions, QueryResult, StoreDataset, execute_update};
 use oxigraph_nova_reasoning::ReasoningState;
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use oxrdfio::{RdfFormat, RdfSerializer};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -88,8 +88,8 @@ pub struct CypherUpdateRequest {
 /// full tool list and the concurrency caveat.
 #[derive(Clone)]
 pub struct NovaMcpService {
-    store: Arc<RingStore>,
-    reasoning: Option<Arc<ReasoningState<RingStore>>>,
+    store: Arc<LoudsStore>,
+    reasoning: Option<Arc<ReasoningState<LoudsStore>>>,
     text_search: Option<Arc<dyn TextSearch>>,
     max_results: Option<usize>,
     // Read by the `#[tool_handler]`-generated `ServerHandler::list_tools`/
@@ -100,7 +100,7 @@ pub struct NovaMcpService {
 }
 
 impl NovaMcpService {
-    pub fn new(store: Arc<RingStore>) -> Self {
+    pub fn new(store: Arc<LoudsStore>) -> Self {
         Self {
             store,
             reasoning: None,
@@ -113,7 +113,7 @@ impl NovaMcpService {
     /// Attach an OWL 2 RL reasoning overlay: `sparql_query` will then
     /// evaluate against `reasoning.current(&store)` instead of the raw
     /// store, mirroring `nova-server`'s own `--reasoning` wiring.
-    pub fn with_reasoning(mut self, reasoning: Arc<ReasoningState<RingStore>>) -> Self {
+    pub fn with_reasoning(mut self, reasoning: Arc<ReasoningState<LoudsStore>>) -> Self {
         self.reasoning = Some(reasoning);
         self
     }
@@ -181,7 +181,7 @@ fn serialize_query_result(query: &spargebra::Query, result: QueryResult) -> AnyR
 /// classes, and a total triple count — computed via a single scan pass
 /// over the whole store (one `HashSet` each for graphs/predicates/classes)
 /// rather than three separate scans.
-fn build_data_model_summary(store: &Arc<RingStore>) -> AnyResult<String> {
+fn build_data_model_summary(store: &Arc<LoudsStore>) -> AnyResult<String> {
     let mut graphs: HashSet<String> = HashSet::new();
     let mut predicates: HashSet<String> = HashSet::new();
     let mut classes: HashSet<String> = HashSet::new();
@@ -232,7 +232,7 @@ fn build_data_model_summary(store: &Arc<RingStore>) -> AnyResult<String> {
 
 /// Cheap subset of [`build_data_model_summary`]: named graphs + triple
 /// count only, no full-store scan.
-fn build_graph_list(store: &Arc<RingStore>) -> AnyResult<String> {
+fn build_graph_list(store: &Arc<LoudsStore>) -> AnyResult<String> {
     let mut graphs: Vec<String> = store
         .known_named_graphs()
         .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -536,7 +536,7 @@ mod tests {
     use oxigraph_nova_core::{NamedNode, Quad};
 
     fn service() -> NovaMcpService {
-        NovaMcpService::new(Arc::new(RingStore::new()))
+        NovaMcpService::new(Arc::new(LoudsStore::new()))
     }
 
     #[test]
@@ -564,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_insert_query_describe() {
-        let store = Arc::new(RingStore::new());
+        let store = Arc::new(LoudsStore::new());
         let svc = NovaMcpService::new(Arc::clone(&store));
 
         // Insert directly, bypassing the tool layer, to seed the store.
@@ -607,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn cypher_round_trip_create_query() {
-        let store = Arc::new(RingStore::new());
+        let store = Arc::new(LoudsStore::new());
         let svc = NovaMcpService::new(Arc::clone(&store));
 
         let result = svc

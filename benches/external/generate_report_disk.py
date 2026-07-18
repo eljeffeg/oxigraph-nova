@@ -4,7 +4,7 @@ run_comparison_disk.sh.
 
 Same shape as generate_report.py (the in-memory comparison), but for the
 disk-backed/persistent configuration of each engine: Nova (`--location`,
-WAL-backed RingStore), Oxigraph (`--location`, RocksDB-backed), and QLever
+WAL-backed LoudsStore), Oxigraph (`--location`, RocksDB-backed), and QLever
 (memory-mapped disk index, unchanged — it has no other mode). Adds an
 on-disk-footprint table alongside the existing memory/CPU/latency tables.
 
@@ -112,7 +112,7 @@ def main():
         "**Storage model per engine** (this matters — see below):\n\n"
         "| Engine | Storage model | Notes |\n"
         "|---|---|---|\n"
-        "| **Nova** | `RingStore::open(dir)` — WAL-backed | Every "
+        "| **Nova** | `LoudsStore::open(dir)` — WAL-backed | Every "
         "`insert()` is durably logged (fsync-per-write) to a "
         "write-ahead log before being applied in memory; periodic "
         "`compact()` merges the delta into an ε-serde snapshot on disk. |\n"

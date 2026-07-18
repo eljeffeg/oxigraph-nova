@@ -13,7 +13,7 @@
 //! **W4 scope:** `enumerate_spo` / `range_s|o|p`; full product-format gate
 //! (tuple differential, bytes, residency, star/triangle vs heap + LOUDS).
 
-//! **Not** on the RingStore path. Feature `cyclic-ring-pilot` only.
+//! **Not** on the LoudsStore path. Feature `cyclic-ring-pilot` only.
 //!
 //! Platform: little-endian only (v1). Substrate: **QWT256** (E5.9B locked).
 //!

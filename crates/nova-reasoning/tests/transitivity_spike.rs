@@ -1,4 +1,4 @@
-//! End-to-end spike: `rdfs:subClassOf` transitivity over a real `RingStore`.
+//! End-to-end spike: `rdfs:subClassOf` transitivity over a real `LoudsStore`.
 //!
 //! This is the integration test that de-risks the whole
 //! `SortedVecTrie` + heterogeneous-source `leapfrog_join` + semi-naive
@@ -10,7 +10,7 @@
 //!
 //! ## What this proves
 //!
-//! 1. Base facts loaded into a `RingStore` and compacted can be read back
+//! 1. Base facts loaded into a `LoudsStore` and compacted can be read back
 //!    out as `TermId`s via `LftjSource::lftj_intern_term` (the same
 //!    interning path the real LFTJ evaluator uses).
 //! 2. `fixpoint::transitive_closure` computes the exact expected transitive
@@ -35,7 +35,7 @@
 use oxigraph_nova_core::{GraphName, LftjSource, NamedNode, Quad, QuadStore, Term};
 use oxigraph_nova_reasoning::fixpoint::transitive_closure;
 use oxigraph_nova_reasoning::rule::Rule;
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 
 const NS: &str = "http://example.org/";
 
@@ -53,7 +53,7 @@ fn inference_graph() -> GraphName {
 
 /// Insert `sub ⊑ sup` (`sub rdfs:subClassOf sup`) into the store's default
 /// graph.
-fn assert_subclass(store: &RingStore, sub: &str, sup: &str) {
+fn assert_subclass(store: &LoudsStore, sub: &str, sup: &str) {
     let quad = Quad::new(
         class(sub),
         sub_class_of(),
@@ -65,7 +65,7 @@ fn assert_subclass(store: &RingStore, sub: &str, sup: &str) {
 
 #[test]
 fn subclassof_transitivity_end_to_end_over_ringstore() {
-    let store = RingStore::new();
+    let store = LoudsStore::new();
 
     // A ⊑ B ⊑ C ⊑ D chain, plus a disjoint E ⊑ F edge that must not
     // cross-pollinate into the A..D closure.
@@ -119,7 +119,7 @@ fn subclassof_transitivity_end_to_end_over_ringstore() {
     expected.sort();
     assert_eq!(
         closure, expected,
-        "transitive closure over RingStore-interned ids must match hand-computed closure exactly"
+        "transitive closure over LoudsStore-interned ids must match hand-computed closure exactly"
     );
 
     // ── Decode the *newly derived* triples (closure minus base) and write

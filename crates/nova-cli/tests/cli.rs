@@ -5,7 +5,7 @@
 //! `serve-read-only` — by actually spawning the compiled `oxigraph` binary
 //! (via `CARGO_BIN_EXE_oxigraph`, the same mechanism `nova-server`'s
 //! `tests/crash_recovery.rs` uses for `nova_serve`) against a real temporary
-//! `RingStore` directory, rather than calling any internal function
+//! `LoudsStore` directory, rather than calling any internal function
 //! directly. This is deliberate: it validates the actual argument-parsing
 //! (`cli.rs`) and process wiring (`main.rs`) end to end, the same surface a
 //! human operator or script actually touches.

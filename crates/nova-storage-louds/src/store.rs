@@ -1,8 +1,8 @@
-//! `RingStore` — `QuadStore` implementation backed by the Ring index + LSM delta.
+//! `LoudsStore` — `QuadStore` implementation backed by the Ring index + LSM delta.
 //!
 //! ## Concurrency model
 //!
-//! A single `Mutex<RingStoreInner>` serialises all reads and writes.  This is
+//! A single `Mutex<LoudsStoreInner>` serialises all reads and writes.  This is
 //! intentionally simple — the POC goal is correctness and memory efficiency, not
 //! maximum write throughput.  The mutex is held only while working with in-memory
 //! data structures (dictionary lookups, delta writes, Ring scans), and released
@@ -24,12 +24,12 @@
 //! ## Isolation semantics
 //!
 //! Every **single** `QuadStore` call (`insert`, `remove`, `contains`,
-//! `quads_for_pattern`, ...) is atomic: it acquires `Mutex<RingStoreInner>`
+//! `quads_for_pattern`, ...) is atomic: it acquires `Mutex<LoudsStoreInner>`
 //! exactly once and computes its entire result under that one critical
 //! section, so no other thread's write can be observed "half-applied" within
 //! one call.
 //!
-//! However, `RingStore` does **not** provide "repeatable read"/fixed-snapshot
+//! However, `LoudsStore` does **not** provide "repeatable read"/fixed-snapshot
 //! isolation across *multiple* calls that together implement one logical
 //! SPARQL operation:
 //!
@@ -85,12 +85,12 @@ use std::time::Duration;
 use std::time::Instant;
 
 /// Default delta-size threshold (number of live entries) that triggers an
-/// automatic inline compaction for a persistent (`RingStore::open`) store.
-/// See `maybe_auto_compact`. In-memory (`RingStore::new`) stores never
+/// automatic inline compaction for a persistent (`LoudsStore::open`) store.
+/// See `maybe_auto_compact`. In-memory (`LoudsStore::new`) stores never
 /// auto-compact (no `data_dir` to persist to).
 const DEFAULT_AUTO_COMPACT_THRESHOLD: usize = 1_000_000;
 
-/// How many quads `RingStore::bulk_load_with_progress` interns between each
+/// How many quads `LoudsStore::bulk_load_with_progress` interns between each
 /// `on_progress` callback invocation. Matches the order of magnitude of
 /// upstream Oxigraph's own `BulkLoader` progress cadence — frequent enough
 /// to give a caller a meaningful sense of throughput on a large load,
@@ -101,12 +101,12 @@ const PROGRESS_REPORT_INTERVAL: usize = 1_000_000;
 // ── Compaction metrics (process-wide) ──────────────────────────────────────────
 //
 // Global counters tracking how many times `compact_locked` has run (manual
-// `RingStore::compact()` calls plus automatic threshold-triggered
+// `LoudsStore::compact()` calls plus automatic threshold-triggered
 // compactions via `maybe_auto_compact`) and the cumulative wall-clock time
 // spent inside it. Read by `nova-server`'s `/metrics`
-// endpoint. Process-wide (not per-`RingStore`) for the same reason as
+// endpoint. Process-wide (not per-`LoudsStore`) for the same reason as
 // `nova_query::lftj`'s counters: simplicity, and there is normally exactly
-// one `RingStore` per process.
+// one `LoudsStore` per process.
 static COMPACTION_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static COMPACTION_DURATION_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -154,7 +154,7 @@ pub enum SyncPolicy {
 /// 500 milliseconds rather than on every single write. This is the
 /// optimized, recommended default for both library callers and
 /// `nova_serve`; see the module docs above for the trade-off. Use
-/// `RingStore::set_sync_policy(SyncPolicy::Always)` to opt into per-write
+/// `LoudsStore::set_sync_policy(SyncPolicy::Always)` to opt into per-write
 /// fsync durability instead.
 impl Default for SyncPolicy {
     fn default() -> Self {
@@ -164,13 +164,13 @@ impl Default for SyncPolicy {
 
 /// Background flusher thread for `SyncPolicy::Interval`: periodically calls
 /// `fsync` (`File::sync_data`) on a cloned handle of the currently-active
-/// WAL file. Runs independently of the `Mutex<RingStoreInner>` — `fsync`
+/// WAL file. Runs independently of the `Mutex<LoudsStoreInner>` — `fsync`
 /// from one thread while another thread concurrently `write`s to the same
 /// fd is safe (the kernel serializes them), so the flusher never needs to
 /// acquire the store's lock.
 ///
 /// A new `Flusher` is spawned every time the active WAL file changes (WAL
-/// rotation during `commit_compaction`, or initial `RingStore::open`), and
+/// rotation during `commit_compaction`, or initial `LoudsStore::open`), and
 /// the previous one is stopped (via `stop`) and joined on `Drop`.
 struct Flusher {
     stop: Arc<AtomicBool>,
@@ -211,7 +211,7 @@ impl Drop for Flusher {
 
 // ── Inner state ───────────────────────────────────────────────────────────────
 
-struct RingStoreInner {
+struct LoudsStoreInner {
     /// Bidirectional Term ↔ TermId / GraphName ↔ GraphId mapping.
     dict: Dictionary,
     /// Per-graph Ring indexes (built by `compact()`), each either the owned
@@ -224,13 +224,13 @@ struct RingStoreInner {
     /// Named-graph IDs that have been explicitly registered (tracks empty graphs).
     named_graph_ids: HashSet<GraphId>,
     /// WAL writer for the *currently active* segment, present only for
-    /// persistent stores opened via [`RingStore::open`]. `None` for
-    /// `RingStore::new()` (pure in-memory, used by unit tests and
+    /// persistent stores opened via [`LoudsStore::open`]. `None` for
+    /// `LoudsStore::new()` (pure in-memory, used by unit tests and
     /// benchmarks that must not touch disk).
     wal: Option<WalWriter>,
 
     /// Data directory root, present only for persistent stores opened via
-    /// [`RingStore::open`] (see `crate::manifest`). `None` for `RingStore::new()`.
+    /// [`LoudsStore::open`] (see `crate::manifest`). `None` for `LoudsStore::new()`.
     data_dir: Option<PathBuf>,
     /// Generation number of the currently-installed snapshot
     /// (`nova.snapshot.<snapshot_gen>`), `0` if none has been committed yet.
@@ -254,14 +254,14 @@ struct RingStoreInner {
 
     /// Opt-in Tantivy full-text index (see `crate::fulltext`), present only
     /// when the `fulltext` cargo feature is enabled AND
-    /// `RingStore::enable_fulltext` has been called. `None` means either the
+    /// `LoudsStore::enable_fulltext` has been called. `None` means either the
     /// feature is compiled out, or it simply hasn't been turned on for this
     /// store — `text:query`/`text:contains` then have nothing to search.
     #[cfg(feature = "fulltext")]
     fulltext: Option<Arc<FulltextIndex>>,
 }
 
-impl RingStoreInner {
+impl LoudsStoreInner {
     fn new() -> Self {
         Self {
             dict: Dictionary::new(),
@@ -299,7 +299,7 @@ impl RingStoreInner {
     }
 
     /// Append a batch of records with a single `fsync` (or none, under
-    /// `Interval` policy) — used by `RingStore::extend` for multi-quad bulk
+    /// `Interval` policy) — used by `LoudsStore::extend` for multi-quad bulk
     /// inserts / SPARQL `INSERT DATA` with many triples.
     fn wal_append_batch<'a>(
         &mut self,
@@ -417,9 +417,9 @@ impl RingStoreInner {
     }
 
     /// Build the merged `new_graphs` map (Ring ∪ delta_inserts \ tombstones)
-    /// and commit it — used by `RingStore::compact()` and by
+    /// and commit it — used by `LoudsStore::compact()` and by
     /// `maybe_auto_compact`. Assumes `self` is already locked (called with
-    /// `&mut self` from inside the single `Mutex<RingStoreInner>` critical
+    /// `&mut self` from inside the single `Mutex<LoudsStoreInner>` critical
     /// section — never re-enters the lock).
     #[tracing::instrument(name = "compact", skip_all, fields(delta_len = self.delta.len()))]
     fn compact_locked(&mut self) -> Result<(), Oxigraph> {
@@ -536,7 +536,7 @@ impl RingStoreInner {
     /// Commit the pending Tantivy writer (making this compaction's
     /// add/remove calls visible to `search`), and — for a persistent store —
     /// record the now-current `snapshot_gen` in the generation marker so a
-    /// future `RingStore::open` + `enable_fulltext` knows this index is
+    /// future `LoudsStore::open` + `enable_fulltext` knows this index is
     /// caught up. No-op if fulltext isn't enabled.
     #[cfg(feature = "fulltext")]
     fn finalize_fulltext_commit(&self) -> Result<(), Oxigraph> {
@@ -556,7 +556,7 @@ impl RingStoreInner {
     /// "stalls writers" trade-off this accepts). No-op otherwise (including
     /// always for in-memory stores, since `data_dir == None`). Auto-compaction
     /// cannot be disabled for a persistent store — only its threshold is
-    /// configurable (see `RingStore::set_auto_compact_threshold`) — so that
+    /// configurable (see `LoudsStore::set_auto_compact_threshold`) — so that
     /// memory-efficient defaults can't be accidentally left off.
     fn maybe_auto_compact(&mut self) -> Result<(), Oxigraph> {
         if self.data_dir.is_some() && self.delta.len() >= self.auto_compact_threshold {
@@ -677,7 +677,7 @@ fn build_graphs_from_triples(
     new_graphs
 }
 
-// ── RingStore ─────────────────────────────────────────────────────────────────
+// ── LoudsStore ─────────────────────────────────────────────────────────────────
 
 /// A `QuadStore` implementation backed by:
 ///
@@ -689,10 +689,10 @@ fn build_graphs_from_triples(
 ///
 /// ```rust,no_run
 /// use oxigraph_nova_core::{GraphName, Literal, NamedNode, Quad, QuadStore, Term};
-/// use oxigraph_nova_storage_ring::RingStore;
+/// use oxigraph_nova_storage_ring::LoudsStore;
 /// use std::sync::Arc;
 ///
-/// let store = Arc::new(RingStore::new());
+/// let store = Arc::new(LoudsStore::new());
 ///
 /// // Inserts go into the delta BTreeMap.
 /// let quad = Quad::new(
@@ -706,21 +706,21 @@ fn build_graphs_from_triples(
 /// // Optional: compact the delta into the Ring for better scan performance.
 /// store.compact().unwrap();
 /// ```
-pub struct RingStore {
-    inner: Mutex<RingStoreInner>,
+pub struct LoudsStore {
+    inner: Mutex<LoudsStoreInner>,
 }
 
-impl RingStore {
-    /// Create an empty, purely in-memory `RingStore` with **no** WAL/disk
+impl LoudsStore {
+    /// Create an empty, purely in-memory `LoudsStore` with **no** WAL/disk
     /// persistence — writes are never logged to disk. Used by unit tests,
     /// benchmarks, and any caller that explicitly wants an ephemeral store.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(RingStoreInner::new()),
+            inner: Mutex::new(LoudsStoreInner::new()),
         }
     }
 
-    /// Open (or create) a persistent `RingStore` rooted at `dir` (created if
+    /// Open (or create) a persistent `LoudsStore` rooted at `dir` (created if
     /// it doesn't exist), using the MANIFEST + generation-numbered
     /// snapshot + segment-numbered WAL scheme.
     ///
@@ -750,7 +750,7 @@ impl RingStore {
         let manifest_path = dir.join(manifest::MANIFEST_FILE_NAME);
         let m = Manifest::load(&manifest_path, dir)?;
 
-        let mut inner = RingStoreInner::new();
+        let mut inner = LoudsStoreInner::new();
         if m.snapshot_gen > 0 {
             let snap_path = manifest::snapshot_path(dir, m.snapshot_gen);
             inner.graphs = StoreSnapshot::load_mmap_from_file(&snap_path)?;
@@ -795,7 +795,7 @@ impl RingStore {
                     WalRecord::RegisterGraph(g) => inner.apply_register_graph(g),
                 };
                 if let Err(e) = result {
-                    eprintln!("[RingStore::open] WAL replay: skipping record due to error: {e}");
+                    eprintln!("[LoudsStore::open] WAL replay: skipping record due to error: {e}");
                 }
             })
             .map_err(|e| Oxigraph::Storage(format!("WAL replay I/O error: {e}")))?;
@@ -926,18 +926,18 @@ impl RingStore {
     /// into `destination` (created if it doesn't exist).
     ///
     /// Mirrors upstream Oxigraph's `Store::backup(destination)`: after this
-    /// call returns, `RingStore::open(destination)` recovers exactly the
+    /// call returns, `LoudsStore::open(destination)` recovers exactly the
     /// same data as the source store had at the moment `backup` was called,
     /// and the backup is a fully independent store thereafter (no shared
     /// file handles or further coupling to the source).
     ///
-    /// Only valid for a **persistent** store (opened via [`RingStore::open`]);
-    /// returns an error for an in-memory (`RingStore::new()`) store, since
+    /// Only valid for a **persistent** store (opened via [`LoudsStore::open`]);
+    /// returns an error for an in-memory (`LoudsStore::new()`) store, since
     /// there is no on-disk state to copy.
     ///
     /// ## Consistency
     ///
-    /// The entire operation runs under the single `Mutex<RingStoreInner>`
+    /// The entire operation runs under the single `Mutex<LoudsStoreInner>`
     /// lock (the same lock every read/write already serialises through), so
     /// no concurrent write or compaction can rotate the snapshot/WAL-segment
     /// files out from under the copy. Before copying, the active WAL
@@ -956,8 +956,8 @@ impl RingStore {
 
         let dir = inner.data_dir.clone().ok_or_else(|| {
             Oxigraph::Storage(
-                "RingStore::backup requires a persistent store (opened via RingStore::open); \
-                 an in-memory store (RingStore::new()) has no on-disk state to copy"
+                "LoudsStore::backup requires a persistent store (opened via LoudsStore::open); \
+                 an in-memory store (LoudsStore::new()) has no on-disk state to copy"
                     .to_string(),
             )
         })?;
@@ -1028,7 +1028,7 @@ impl RingStore {
 
     /// Configure the delta-size threshold (number of live entries) that
     /// triggers automatic inline compaction for a persistent store. Default
-    /// is 1,000,000. Has no effect on in-memory (`RingStore::new()`) stores.
+    /// is 1,000,000. Has no effect on in-memory (`LoudsStore::new()`) stores.
     pub fn set_auto_compact_threshold(&self, threshold: usize) {
         {
             let mut inner = self.inner.lock();
@@ -1061,7 +1061,7 @@ impl RingStore {
         self.bulk_load_with_progress(quads, None)
     }
 
-    /// Same as [`RingStore::bulk_load`], additionally invoking `on_progress`
+    /// Same as [`LoudsStore::bulk_load`], additionally invoking `on_progress`
     /// (if given) periodically with the number of quads interned so far —
     /// mirroring upstream Oxigraph's `BulkLoader::on_progress` callback,
     /// which reports progress against the same "quads consumed from the
@@ -1226,7 +1226,7 @@ impl RingStore {
 
 /// Per-ordering memory breakdown across all graphs.
 ///
-/// See [`RingStore::per_ordering_breakdown`].
+/// See [`LoudsStore::per_ordering_breakdown`].
 #[derive(Clone, Debug)]
 pub struct PerOrderingBreakdown {
     /// The six orderings, in fixed order (index-aligned with `per_order` and
@@ -1249,9 +1249,9 @@ pub struct PerOrderingBreakdown {
     pub vocab_deduped_total: usize,
 }
 
-/// Real, measured per-component memory breakdown for a [`RingStore`].
+/// Real, measured per-component memory breakdown for a [`LoudsStore`].
 ///
-/// See [`RingStore::memory_breakdown`].
+/// See [`LoudsStore::memory_breakdown`].
 #[derive(Copy, Clone, Debug)]
 pub struct MemoryBreakdown {
     /// Total bytes across all graphs' `GraphRing` indexes (six-LOUDS-trie
@@ -1283,14 +1283,14 @@ impl MemoryBreakdown {
     }
 }
 
-impl Default for RingStore {
+impl Default for LoudsStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[cfg(feature = "fulltext")]
-impl oxigraph_nova_core::TextSearch for RingStore {
+impl oxigraph_nova_core::TextSearch for LoudsStore {
     fn search(
         &self,
         query: &str,
@@ -1364,13 +1364,13 @@ fn decode_stored_quad(
 // `oxigraph_nova_core::LftjSource`'s doc comment for why this lives in its
 // own supertrait rather than being folded directly into `QuadStore`).
 
-impl LftjSource for RingStore {
+impl LftjSource for LoudsStore {
     fn supports_lftj(&self) -> bool {
         true
     }
 
     fn supports_veo_estimates(&self) -> bool {
-        // RingStore provides vocab-size estimates (non-u64::MAX) via
+        // LoudsStore provides vocab-size estimates (non-u64::MAX) via
         // GraphRing::estimate_count → CltjData::vocab_size_for_field.
         // This gates the VEO sort in lftj_step so it only fires for CLTJ backends.
         true
@@ -1433,11 +1433,11 @@ impl LftjSource for RingStore {
 
 // ── QuadStore impl ────────────────────────────────────────────────────────────
 
-impl QuadStore for RingStore {
+impl QuadStore for LoudsStore {
     // ── Observability ─────────────────────────────────────────────────────────
 
     fn delta_len(&self) -> Option<usize> {
-        Some(RingStore::delta_len(self))
+        Some(LoudsStore::delta_len(self))
     }
 
     fn compaction_count(&self) -> Option<u64> {
@@ -1799,7 +1799,7 @@ mod tests {
 
         #[test]
         fn in_memory_search_after_compact() {
-            let store = RingStore::new();
+            let store = LoudsStore::new();
             store.enable_fulltext().unwrap();
 
             let p = pred("http://ex/p");
@@ -1831,7 +1831,7 @@ mod tests {
 
         #[test]
         fn tombstone_removed_on_next_compact() {
-            let store = RingStore::new();
+            let store = LoudsStore::new();
             store.enable_fulltext().unwrap();
             let p = pred("http://ex/p");
             let q = Quad::new(nn("http://ex/s"), p.clone(), lit("hello world"), dg());
@@ -1850,7 +1850,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
 
             {
-                let store = RingStore::open(&dir).unwrap();
+                let store = LoudsStore::open(&dir).unwrap();
                 store.enable_fulltext().unwrap();
                 let p = pred("http://ex/p");
                 store
@@ -1868,7 +1868,7 @@ mod tests {
             // Reopen: marker matches snapshot_gen, so this is the fast path
             // (no rebuild needed) — the index must already have the content.
             {
-                let store = RingStore::open(&dir).unwrap();
+                let store = LoudsStore::open(&dir).unwrap();
                 store.enable_fulltext().unwrap();
                 assert_eq!(store.search("persistent", None, 10).len(), 1);
             }
@@ -1883,7 +1883,7 @@ mod tests {
 
             {
                 // Populate + compact WITHOUT ever enabling fulltext.
-                let store = RingStore::open(&dir).unwrap();
+                let store = LoudsStore::open(&dir).unwrap();
                 let p = pred("http://ex/p");
                 store
                     .insert(&Quad::new(
@@ -1900,7 +1900,7 @@ mod tests {
                 // Now enable fulltext for the first time on this pre-existing
                 // store — the marker is absent (stale), so a full rebuild via
                 // spo_triples() must occur automatically.
-                let store = RingStore::open(&dir).unwrap();
+                let store = LoudsStore::open(&dir).unwrap();
                 store.enable_fulltext().unwrap();
                 assert_eq!(store.search("preexisting", None, 10).len(), 1);
             }
@@ -1910,7 +1910,7 @@ mod tests {
 
         #[test]
         fn predicate_filter_narrows_results() {
-            let store = RingStore::new();
+            let store = LoudsStore::new();
             store.enable_fulltext().unwrap();
             let p1 = pred("http://ex/p1");
             let p2 = pred("http://ex/p2");
@@ -1941,7 +1941,7 @@ mod tests {
 
         #[test]
         fn enable_fulltext_is_idempotent() {
-            let store = RingStore::new();
+            let store = LoudsStore::new();
             store.enable_fulltext().unwrap();
             store.enable_fulltext().unwrap(); // must not error or reset state
             assert!(store.text_search_ready());
@@ -1963,7 +1963,7 @@ mod tests {
             let dir = temp_dir("fulltext_degrade");
             let _ = std::fs::remove_dir_all(&dir);
 
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             store.enable_fulltext().unwrap();
             let p = pred("http://ex/p");
             store
@@ -2041,7 +2041,7 @@ mod tests {
 
     #[test]
     fn insert_and_contains_delta_only() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let q = make_quad("http://ex/s", "http://ex/p", "hello", dg());
         assert!(store.insert(&q).unwrap());
         assert!(!store.insert(&q).unwrap()); // duplicate
@@ -2051,7 +2051,7 @@ mod tests {
 
     #[test]
     fn remove_from_delta() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let q = make_quad("http://ex/s", "http://ex/p", "hello", dg());
         store.insert(&q).unwrap();
         assert!(store.remove(&q).unwrap());
@@ -2062,7 +2062,7 @@ mod tests {
 
     #[test]
     fn insert_compact_contains_ring() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let q = make_quad("http://ex/s", "http://ex/p", "hello", dg());
         store.insert(&q).unwrap();
         store.compact().unwrap();
@@ -2073,7 +2073,7 @@ mod tests {
 
     #[test]
     fn remove_from_ring_via_tombstone() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let q = make_quad("http://ex/s", "http://ex/p", "hello", dg());
         store.insert(&q).unwrap();
         store.compact().unwrap();
@@ -2084,7 +2084,7 @@ mod tests {
 
     #[test]
     fn re_insert_after_remove() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let q = make_quad("http://ex/s", "http://ex/p", "v", dg());
         store.insert(&q).unwrap();
         store.compact().unwrap();
@@ -2095,7 +2095,7 @@ mod tests {
 
     #[test]
     fn quads_for_pattern_wildcard() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let p = pred("http://ex/p");
         store
             .insert(&Quad::new(nn("http://ex/s1"), p.clone(), lit("a"), dg()))
@@ -2114,7 +2114,7 @@ mod tests {
 
     #[test]
     fn quads_mixed_ring_and_delta() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let p = pred("http://ex/p");
         store
             .insert(&Quad::new(nn("http://ex/s1"), p.clone(), lit("a"), dg()))
@@ -2133,7 +2133,7 @@ mod tests {
 
     #[test]
     fn named_graphs_tracked() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = ng("http://ex/g");
         store
             .insert(&Quad::new(
@@ -2153,7 +2153,7 @@ mod tests {
 
     #[test]
     fn quads_for_pattern_named_graph() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = ng("http://ex/g");
         let p = pred("http://ex/p");
         store
@@ -2185,7 +2185,7 @@ mod tests {
 
     #[test]
     fn is_empty_and_len() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         assert!(store.is_empty().unwrap());
         let q = make_quad("http://ex/s", "http://ex/p", "v", dg());
         store.insert(&q).unwrap();
@@ -2195,7 +2195,7 @@ mod tests {
 
     #[test]
     fn compact_multiple_graphs() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let p = pred("http://ex/p");
         let g1 = ng("http://ex/g1");
         let g2 = ng("http://ex/g2");
@@ -2225,7 +2225,7 @@ mod tests {
         assert_eq!(res.len(), 2);
     }
 
-    // ── RingStore::open() persistence round-trip ────────────────────────────
+    // ── LoudsStore::open() persistence round-trip ────────────────────────────
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2244,7 +2244,7 @@ mod tests {
         let q2 = make_quad("http://ex/s2", "http://ex/p", "b", g.clone());
 
         {
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             store.insert(&q1).unwrap();
             store.insert(&q2).unwrap();
             store.remove(&q1).unwrap();
@@ -2253,7 +2253,7 @@ mod tests {
         } // store dropped — WAL file remains on disk
 
         {
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             assert_eq!(store.len().unwrap(), 2);
             assert!(store.contains(&q1).unwrap());
             assert!(store.contains(&q2).unwrap());
@@ -2265,7 +2265,7 @@ mod tests {
         }
 
         {
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             assert_eq!(store.len().unwrap(), 3);
         }
 
@@ -2276,9 +2276,9 @@ mod tests {
     fn open_fresh_dir_is_empty() {
         let dir = temp_dir("fresh");
         let _ = std::fs::remove_dir_all(&dir);
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         assert!(store.is_empty().unwrap());
-        assert!(RingStore::wal_path(&dir).exists());
+        assert!(LoudsStore::wal_path(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2293,7 +2293,7 @@ mod tests {
         let q3 = make_quad("http://ex/s3", "http://ex/p", "c", dg());
 
         {
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             store.insert(&q1).unwrap();
             store.insert(&q2).unwrap();
             store.compact().unwrap(); // writes nova.snapshot.1, rotates WAL, commits MANIFEST
@@ -2309,7 +2309,7 @@ mod tests {
         {
             // Reopen: loads snapshot gen 1 (q1, q2) then replays only the
             // post-compaction segment (q3) — not the whole WAL history.
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             assert_eq!(store.len().unwrap(), 3);
             assert!(store.contains(&q1).unwrap());
             assert!(store.contains(&q2).unwrap());
@@ -2325,7 +2325,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let q1 = make_quad("http://ex/s1", "http://ex/p", "a", dg());
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         store.insert(&q1).unwrap();
 
         let old_segment = manifest::wal_segment_path(&dir, 1);
@@ -2347,7 +2347,7 @@ mod tests {
         let dir = temp_dir("multi_compact");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         for i in 0..5 {
             let q = make_quad(&format!("http://ex/s{i}"), "http://ex/p", "v", dg());
             store.insert(&q).unwrap();
@@ -2370,7 +2370,7 @@ mod tests {
 
         // Reopen must still see all 5 triples via just the latest snapshot.
         drop(store);
-        let store2 = RingStore::open(&dir).unwrap();
+        let store2 = LoudsStore::open(&dir).unwrap();
         assert_eq!(store2.len().unwrap(), 5);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2381,7 +2381,7 @@ mod tests {
         let dir = temp_dir("auto_compact");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         store.set_auto_compact_threshold(3);
 
         for i in 0..3 {
@@ -2403,7 +2403,7 @@ mod tests {
         let dir = temp_dir("extend_batch");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         let quads: Vec<Quad> = (0..50)
             .map(|i| make_quad(&format!("http://ex/s{i}"), "http://ex/p", "v", dg()))
             .collect();
@@ -2412,7 +2412,7 @@ mod tests {
         assert_eq!(store.len().unwrap(), 50);
 
         drop(store);
-        let store2 = RingStore::open(&dir).unwrap();
+        let store2 = LoudsStore::open(&dir).unwrap();
         assert_eq!(store2.len().unwrap(), 50);
         for q in &quads {
             assert!(store2.contains(q).unwrap());
@@ -2426,7 +2426,7 @@ mod tests {
         let dir = temp_dir("interval_policy");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         store.set_sync_policy(SyncPolicy::Interval(Duration::from_millis(20)));
 
         let q = make_quad("http://ex/s", "http://ex/p", "v", dg());
@@ -2439,7 +2439,7 @@ mod tests {
         store.flush_wal().unwrap();
         drop(store);
 
-        let store2 = RingStore::open(&dir).unwrap();
+        let store2 = LoudsStore::open(&dir).unwrap();
         assert!(store2.contains(&q).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2447,8 +2447,8 @@ mod tests {
 
     // ── Isolation semantics ──────────────────────────────────────────────────
     //
-    // `RingStore` gives per-call atomicity for free (each `insert`/`remove`/
-    // `quads_for_pattern` call takes the single `Mutex<RingStoreInner>` once
+    // `LoudsStore` gives per-call atomicity for free (each `insert`/`remove`/
+    // `quads_for_pattern` call takes the single `Mutex<LoudsStoreInner>` once
     // and returns a result computed entirely under that one lock
     // acquisition), but it does **not** give "repeatable read" isolation
     // across *multiple* calls that together make up one logical
@@ -2461,7 +2461,7 @@ mod tests {
     // of why this is an accepted, documented limitation rather than a bug.
     #[test]
     fn multi_call_scan_does_not_get_a_whole_query_repeatable_read_snapshot() {
-        let store = Arc::new(RingStore::new());
+        let store = Arc::new(LoudsStore::new());
         let p = pred("http://ex/p");
         let quad_a = Quad::new(nn("http://ex/a"), p.clone(), lit("a"), dg());
         let quad_b = Quad::new(nn("http://ex/b"), p.clone(), lit("b"), dg());
@@ -2503,7 +2503,7 @@ mod tests {
             result2.len(),
             1,
             "quad_b, inserted strictly between the two scans, is visible to the second \
-             scan — proving RingStore does NOT provide a repeatable-read/fixed-snapshot \
+             scan — proving LoudsStore does NOT provide a repeatable-read/fixed-snapshot \
              guarantee across multiple store calls belonging to one logical query or Update"
         );
     }
@@ -2517,14 +2517,14 @@ mod tests {
         let q2 = make_quad("http://ex/s2", "http://ex/p", "b", dg());
 
         {
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             store.insert(&q1).unwrap();
             store.insert(&q2).unwrap();
         }
 
         // Simulate a crash mid-write: truncate the last few bytes of the
         // (still-fresh, un-rotated) WAL segment.
-        let wal_path = RingStore::wal_path(&dir);
+        let wal_path = LoudsStore::wal_path(&dir);
         let full_len = std::fs::metadata(&wal_path).unwrap().len();
         {
             let file = std::fs::OpenOptions::new()
@@ -2534,7 +2534,7 @@ mod tests {
             file.set_len(full_len - 5).unwrap();
         }
 
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         assert_eq!(store.len().unwrap(), 1);
         assert!(store.contains(&q1).unwrap());
         assert!(!store.contains(&q2).unwrap());
@@ -2553,7 +2553,7 @@ mod tests {
         let q1 = make_quad("http://ex/s1", "http://ex/p", "a", dg());
         let q2 = make_quad("http://ex/s2", "http://ex/p", "b", g.clone());
 
-        let store = RingStore::open(&src_dir).unwrap();
+        let store = LoudsStore::open(&src_dir).unwrap();
         store.insert(&q1).unwrap();
         store.insert(&q2).unwrap();
         store.compact().unwrap();
@@ -2564,7 +2564,7 @@ mod tests {
         store.backup(&dst_dir).unwrap();
 
         // Backup must be independently openable and contain everything.
-        let restored = RingStore::open(&dst_dir).unwrap();
+        let restored = LoudsStore::open(&dst_dir).unwrap();
         assert_eq!(restored.len().unwrap(), 3);
         assert!(restored.contains(&q1).unwrap());
         assert!(restored.contains(&q2).unwrap());
@@ -2582,7 +2582,7 @@ mod tests {
 
     #[test]
     fn backup_of_in_memory_store_errors() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let dst_dir = temp_dir("backup_in_memory_dst");
         let _ = std::fs::remove_dir_all(&dst_dir);
         assert!(store.backup(&dst_dir).is_err());
@@ -2593,7 +2593,7 @@ mod tests {
         let dir = temp_dir("apply_batch");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         let q1 = make_quad("http://ex/s1", "http://ex/p", "v", dg());
         store.insert(&q1).unwrap();
         assert_eq!(store.len().unwrap(), 1);
@@ -2615,7 +2615,7 @@ mod tests {
         assert_eq!(store.len().unwrap(), 2);
 
         drop(store);
-        let store2 = RingStore::open(&dir).unwrap();
+        let store2 = LoudsStore::open(&dir).unwrap();
         assert!(!store2.contains(&q1).unwrap());
         assert!(store2.contains(&q2).unwrap());
         assert!(store2.contains(&q3).unwrap());
@@ -2626,7 +2626,7 @@ mod tests {
 
     #[test]
     fn apply_batch_empty_is_noop() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         store.apply_batch(&[]).unwrap();
         assert_eq!(store.len().unwrap(), 0);
     }
@@ -2644,21 +2644,21 @@ mod tests {
 
         let q_before = make_quad("http://ex/before", "http://ex/p", "v", dg());
         {
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             store.insert(&q_before).unwrap();
         }
 
-        let before_len = std::fs::metadata(RingStore::wal_path(&dir)).unwrap().len();
+        let before_len = std::fs::metadata(LoudsStore::wal_path(&dir)).unwrap().len();
 
         {
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             let quads: Vec<Quad> = (0..10)
                 .map(|i| make_quad(&format!("http://ex/batch{i}"), "http://ex/p", "v", dg()))
                 .collect();
             store.extend(quads).unwrap();
         }
 
-        let full_len = std::fs::metadata(RingStore::wal_path(&dir)).unwrap().len();
+        let full_len = std::fs::metadata(LoudsStore::wal_path(&dir)).unwrap().len();
         assert!(full_len > before_len);
 
         // Truncate everything the batch wrote, minus a few bytes, so the
@@ -2666,12 +2666,12 @@ mod tests {
         {
             let file = std::fs::OpenOptions::new()
                 .write(true)
-                .open(RingStore::wal_path(&dir))
+                .open(LoudsStore::wal_path(&dir))
                 .unwrap();
             file.set_len(before_len + 5).unwrap();
         }
 
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         assert!(store.contains(&q_before).unwrap());
         assert_eq!(
             store.len().unwrap(),
@@ -2687,7 +2687,7 @@ mod tests {
         // Same shape as `extend_torn_batch_tail_replays_none_of_the_batch`,
         // but exercises `apply_batch`'s *mixed* insert/remove path instead of
         // `extend`'s all-insert path — `apply_batch` writes its `WalRecord`s
-        // via a separate `wal_append_batch` call (see `RingStore`'s
+        // via a separate `wal_append_batch` call (see `LoudsStore`'s
         // `impl QuadStore::apply_batch` override), so it's worth confirming
         // independently that a torn tail after a mixed batch is handled the
         // same way: replay stops at the first bad frame, and since every
@@ -2700,15 +2700,15 @@ mod tests {
         let q_before = make_quad("http://ex/before", "http://ex/p", "v", dg());
         let q_to_remove = make_quad("http://ex/toremove", "http://ex/p", "v", dg());
         {
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             store.insert(&q_before).unwrap();
             store.insert(&q_to_remove).unwrap();
         }
 
-        let before_len = std::fs::metadata(RingStore::wal_path(&dir)).unwrap().len();
+        let before_len = std::fs::metadata(LoudsStore::wal_path(&dir)).unwrap().len();
 
         {
-            let store = RingStore::open(&dir).unwrap();
+            let store = LoudsStore::open(&dir).unwrap();
             let ops = vec![
                 QuadOp::Remove(q_to_remove.clone()),
                 QuadOp::Insert(make_quad("http://ex/batch0", "http://ex/p", "v", dg())),
@@ -2719,7 +2719,7 @@ mod tests {
             assert_eq!(removed, 1);
         }
 
-        let full_len = std::fs::metadata(RingStore::wal_path(&dir)).unwrap().len();
+        let full_len = std::fs::metadata(LoudsStore::wal_path(&dir)).unwrap().len();
         assert!(full_len > before_len);
 
         // Truncate everything the batch wrote, minus a few bytes, so the
@@ -2727,12 +2727,12 @@ mod tests {
         {
             let file = std::fs::OpenOptions::new()
                 .write(true)
-                .open(RingStore::wal_path(&dir))
+                .open(LoudsStore::wal_path(&dir))
                 .unwrap();
             file.set_len(before_len + 5).unwrap();
         }
 
-        let store = RingStore::open(&dir).unwrap();
+        let store = LoudsStore::open(&dir).unwrap();
         assert!(store.contains(&q_before).unwrap());
         assert!(
             store.contains(&q_to_remove).unwrap(),

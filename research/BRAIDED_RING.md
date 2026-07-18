@@ -1,7 +1,7 @@
 # Braided Ring — product status
 
 **Date:** 2026-07-17  
-**Status:** Phase 0–5 done on `braided-ring-productize` (ID facade + `join_scan` + image adapter + in-memory `BraidedStore` QuadStore/LFTJ). **Not** the default SPARQL backend (`nova-store` still pins LOUDS).
+**Status:** Phase 0–5 done on `braided-ring-productize` (ID facade + `join_scan` + image adapter + in-memory `RingStore` QuadStore/LFTJ). **Not** the default SPARQL backend (`nova-store` still pins LOUDS).
 
 
 
@@ -19,7 +19,7 @@
 | RDI / RNV | Distinct-symbol scan + range successor |
 | **D2** `intersection_next_value3` | **Product triangle** (braided multi-range QWT) |
 
-It is **not** six-order LOUDS `RingStore` (still production SPARQL/LFTJ).  
+It is **not** six-order LOUDS `LoudsStore` (still production SPARQL/LFTJ).  
 It is **not** PRISM (FOR / page-touch footprint program — failed).
 
 Feature: `cyclic-ring-pilot` on `oxigraph-nova-storage-ring`.
@@ -90,9 +90,9 @@ See [`BRAIDED_RING_CLEANUP.md`](./BRAIDED_RING_CLEANUP.md):
 3. **Done (research ballast):** archive e4x/e5x probe bins under `benches/archive/`; gate Ring B builders + URing behind `#[cfg(any(test, feature = "diagnostics"))]`; docs point LOUDS paths at `storage-louds`  
 4. **Done (ID facade + diffs):** `cyclic_ring::facade::BraidedRingIndex` (heap + optional `NOVARNG1` mmap); differentials for enumerate / lead-range / D2 vs dual_rnv + sorted-list oracle.  
 4b. **Done (ID LFTJ seam + image adapter):** `BraidedRingIndex::join_scan` → `TrieIterator`; `BraidedGraphImage` / `IdRemap` for external↔dense remap, dedup, mmap, SPO round-trip; multi-scan leapfrog + D2 differentials.  
-5. **Done (in-memory store seam):** `cyclic_ring::store::BraidedStore` — `Dictionary` + LOUDS-style `Delta` + per-graph `BraidedGraphImage`; `QuadStore` + `LftjSource` (LFTJ only when delta empty); insert/remove/compact/pattern/LFTJ tests. **No WAL/snapshot.** **Not** default SPARQL.
+5. **Done (in-memory store seam):** `cyclic_ring::store::RingStore` — `Dictionary` + LOUDS-style `Delta` + per-graph `BraidedGraphImage`; `QuadStore` + `LftjSource` (LFTJ only when delta empty); insert/remove/compact/pattern/LFTJ tests. **No WAL/snapshot.** **Not** default SPARQL.
 
-**Still open before SPARQL cutover:** wire `BraidedStore` into `nova-store` (feature-gated, non-default); WAL/persistence if needed; G1 polish if required; upstream qwt patches in parallel.
+**Still open before SPARQL cutover:** wire `RingStore` into `nova-store` (feature-gated, non-default); WAL/persistence if needed; G1 polish if required; upstream qwt patches in parallel.
 
 **Do not** wire Braided Ring into default query until those integration gates are green.  
 **Do not** redesign StarView until a measurement microbench with hard KEEP/DROP gates.

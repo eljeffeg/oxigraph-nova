@@ -338,7 +338,7 @@ mod tests {
     use crate::engine::LftjFixpointEngine;
     use oxigraph_nova_core::{GraphName as CoreGraphName, NamedNode, Quad, QuadStore};
     use oxigraph_nova_query::StoreDataset;
-    use oxigraph_nova_storage_ring::RingStore;
+    use oxigraph_nova_storage_ring::LoudsStore;
     use std::sync::Arc;
 
     fn nn(s: &str) -> NamedNode {
@@ -357,8 +357,8 @@ mod tests {
         nn("http://www.w3.org/2002/07/owl#sameAs")
     }
 
-    fn build_store() -> RingStore {
-        let store = RingStore::new();
+    fn build_store() -> LoudsStore {
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         store
             .insert(&Quad::new(
@@ -458,7 +458,7 @@ mod tests {
     /// before lookup).
     #[test]
     fn same_as_canonicalizes_and_expands_across_equivalence_class() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         let g = CoreGraphName::DefaultGraph;
         let knows = nn("http://ex/knows");
         store

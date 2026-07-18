@@ -17,9 +17,9 @@
 //! atomic: concurrent readers/writers against the same store may observe
 //! partial progress of an in-flight Update, and a later statement in the same
 //! request that errors will leave earlier statements' effects applied.
-//! `RingStore`'s single-`Mutex<RingStoreInner>` design does not currently
+//! `LoudsStore`'s single-`Mutex<LoudsStoreInner>` design does not currently
 //! expose a way to hold the lock across multiple calls, and adding that is a
-//! larger architectural change (see `RingStore`'s module doc comment on its
+//! larger architectural change (see `LoudsStore`'s module doc comment on its
 //! "production evolution path"). This is an accepted, documented limitation.
 //!
 //! # CLEAR / DROP / CREATE
@@ -226,7 +226,7 @@ fn do_load<S: QuadStore + 'static>(
 fn insert_data<S: QuadStore>(store: &Arc<S>, data: &[spargebra::term::Quad]) -> Result<()> {
     // All-insert batch: `QuadStoreExt::extend` boxes the iterator and hands
     // it to `QuadStore::extend_boxed`, which backends with a WAL/lock (e.g.
-    // `RingStore`) override to append the whole batch in one `fsync` instead
+    // `LoudsStore`) override to append the whole batch in one `fsync` instead
     // of one per quad — see `QuadStore::apply_batch`'s doc comment for the
     // same rationale applied to mixed insert/remove batches below.
     let quads = data.iter().map(|q| {

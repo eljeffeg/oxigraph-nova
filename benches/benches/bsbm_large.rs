@@ -81,7 +81,7 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Subject, Term};
 use oxigraph_nova_query::{Dataset, Evaluator, QueryResult, StoreDataset};
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use spargebra::SparqlParser;
 use std::hint::black_box;
 use std::sync::{Arc, OnceLock};
@@ -280,16 +280,16 @@ fn load_quads_from_nt(path: &str) -> Result<Vec<Quad>, Box<dyn std::error::Error
 // Using OnceLock ensures we pay this cost once per benchmark binary invocation,
 // not once per benchmark group.
 
-static LARGE_STORE: OnceLock<Arc<RingStore>> = OnceLock::new();
+static LARGE_STORE: OnceLock<Arc<LoudsStore>> = OnceLock::new();
 
-fn get_large_store() -> Arc<RingStore> {
+fn get_large_store() -> Arc<LoudsStore> {
     Arc::clone(LARGE_STORE.get_or_init(|| {
         eprintln!(
             "[bsbm_large] Building large store: {LARGE_N} entities \
              ({LARGE_TRIPLE_COUNT} synthetic triples) …"
         );
         let quads = generate_quads_large(LARGE_N);
-        let store = Arc::new(RingStore::new());
+        let store = Arc::new(LoudsStore::new());
         for q in &quads {
             store.insert(q).unwrap();
         }
@@ -318,7 +318,7 @@ fn count_solutions<D: Dataset>(dataset: &D, sparql: &str) -> usize {
 
 // ── Benchmark 1: Large compact ────────────────────────────────────────────────
 //
-// Measures RingStore::compact() on LARGE_TRIPLE_COUNT=1.25M triples.
+// Measures LoudsStore::compact() on LARGE_TRIPLE_COUNT=1.25M triples.
 // If BSBM_NT_FILE is set, uses that dataset instead (for scale comparison).
 //
 // compact() sorts, deduplicates, and builds 6 LOUDS CLTJ tries.
@@ -338,7 +338,7 @@ fn bench_large_compact(c: &mut Criterion) {
         b.iter_batched(
             || {
                 // Setup (not timed): insert all triples into a fresh store.
-                let store = RingStore::new();
+                let store = LoudsStore::new();
                 for q in &quads {
                     store.insert(q).unwrap();
                 }
@@ -373,7 +373,7 @@ fn bench_large_ingest(c: &mut Criterion) {
 
     group.bench_function("ring", |b| {
         b.iter(|| {
-            let store = RingStore::new();
+            let store = LoudsStore::new();
             for q in &quads {
                 store.insert(q).unwrap();
             }
@@ -661,7 +661,7 @@ fn bench_degree_sweep(c: &mut Criterion) {
         // Build + compact a dedicated store for this degree level.
         // Not timed — setup cost is outside the measurement window.
         let quads = generate_quads_sweep(SWEEP_N, SWEEP_FANOUT, pool_size);
-        let store = Arc::new(RingStore::new());
+        let store = Arc::new(LoudsStore::new());
         for q in &quads {
             store.insert(q).unwrap();
         }

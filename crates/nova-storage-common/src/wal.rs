@@ -59,7 +59,7 @@
 //! much higher write throughput:
 //!
 //! - [`WalWriter::append_batch`] writes an entire batch of records with a
-//!   **single** `fsync` at the end — used by `RingStore::extend` (and thus
+//!   **single** `fsync` at the end — used by `LoudsStore::extend` (and thus
 //!   any multi-quad bulk insert / SPARQL `INSERT DATA` with many triples) so
 //!   that every record in the batch is either fully durable or the whole
 //!   batch is torn identically to a single-record torn write (see [`replay`]

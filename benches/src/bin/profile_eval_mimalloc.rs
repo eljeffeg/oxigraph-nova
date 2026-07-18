@@ -13,7 +13,7 @@
 use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, Quad};
 use oxigraph_nova_query::{Evaluator, QueryResult, StoreDataset};
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use oxttl::NTriplesParser;
 use serde::Deserialize;
 use spargebra::SparqlParser;
@@ -55,7 +55,7 @@ fn main() {
         let t = r.expect("parse error");
         Quad::new(t.subject, t.predicate, t.object, GraphName::DefaultGraph)
     });
-    let store = RingStore::new();
+    let store = LoudsStore::new();
     let count = store.bulk_load(quads).expect("bulk_load failed");
     eprintln!(
         "[profile_eval_mimalloc] Loaded + compacted {count} triples in {:.2}s.",

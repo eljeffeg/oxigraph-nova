@@ -115,7 +115,7 @@ fn choose_array_for_lftj(bound_fields: &[usize], target_field: usize) -> SortOrd
 
 /// The Ring index for a single named graph (or the default graph).
 ///
-/// Immutable after construction.  `RingStore` wraps it in `Arc` so it can be
+/// Immutable after construction.  `LoudsStore` wraps it in `Arc` so it can be
 /// swapped out atomically during an LSM merge without blocking readers.
 ///
 /// Generic over the vocab representation `V` (defaulted to owned `Vec<u64>`)
@@ -385,7 +385,7 @@ impl GraphRing {
     ///
     /// Used by the persistent snapshot format.  Requires unique ownership of the underlying
     /// `Arc<RingData>` (true for a freshly built `GraphRing` that has not yet
-    /// been shared, per the "always mapped" design — see `RingStore::compact`);
+    /// been shared, per the "always mapped" design — see `LoudsStore::compact`);
     /// panics via `expect` otherwise.
     ///
     /// Only defined for the owned `Vec<u64>` form (`V`'s default) — a fresh
@@ -609,7 +609,7 @@ impl MappedGraphRing {
 /// A per-graph Ring handle that is either the owned in-memory form (built
 /// directly by `RingBuilder`/`build_graphs_from_triples`, or round-tripped
 /// through ε-serde for an in-memory store) or a zero-copy `load_mmap`'d form
-/// (installed by `commit_compaction`/`RingStore::open` for a persistent
+/// (installed by `commit_compaction`/`LoudsStore::open` for a persistent
 /// store, once its snapshot generation has been written to disk).
 ///
 /// Both variants expose the same read-only method surface — `GraphRing<Louds,
@@ -621,7 +621,7 @@ impl MappedGraphRing {
 pub(crate) enum GraphRingHandle {
     Owned(Arc<GraphRing>),
     /// Only constructed when the `mmap` cargo feature is enabled (see
-    /// `RingStore::open`/`commit_compaction`'s persistent branch); on builds
+    /// `LoudsStore::open`/`commit_compaction`'s persistent branch); on builds
     /// with `mmap` disabled (e.g. the wasm32 `oxigraph-nova-js` target, which
     /// is in-memory-only), this variant is never constructed, hence the
     /// `cfg_attr`-gated `allow(dead_code)` below.

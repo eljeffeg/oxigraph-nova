@@ -321,7 +321,7 @@ mod tests {
         BlankNode, GraphName as CoreGraphName, Literal, NamedOrBlankNode, QuadStore,
     };
     use oxigraph_nova_query::StoreDataset;
-    use oxigraph_nova_storage_ring::RingStore;
+    use oxigraph_nova_storage_ring::LoudsStore;
     use std::sync::Arc;
 
     fn nn(s: &str) -> NamedNode {
@@ -334,8 +334,8 @@ mod tests {
         Quad::new(s, p, o, CoreGraphName::DefaultGraph)
     }
 
-    fn build_store(quads: Vec<Quad>) -> RingStore {
-        let store = RingStore::new();
+    fn build_store(quads: Vec<Quad>) -> LoudsStore {
+        let store = LoudsStore::new();
         for q in quads {
             store.insert(&q).unwrap();
         }

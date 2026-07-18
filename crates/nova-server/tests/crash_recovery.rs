@@ -1,7 +1,7 @@
 //! Crash-recovery integration test.
 //!
 //! Spawns a real `nova_serve` subprocess backed by a persistent
-//! (`--location`) `RingStore`, hammers it with a burst of `INSERT DATA`
+//! (`--location`) `LoudsStore`, hammers it with a burst of `INSERT DATA`
 //! updates over HTTP from a background thread, `kill -9`s the process
 //! *while that burst is still in flight* (simulating a real crash, not a
 //! graceful shutdown), restarts a fresh `nova_serve` process pointed at the
@@ -204,7 +204,7 @@ fn kill_nine_mid_burst_then_restart_recovers_exactly_acknowledged_writes() {
     );
 
     // Restart against the same data directory — this is the real recovery
-    // path (`RingStore::open` replaying the WAL / loading the snapshot).
+    // path (`LoudsStore::open` replaying the WAL / loading the snapshot).
     let mut restarted = spawn_server(&dir, port);
     let mut recovered = recovered_indices(port);
     recovered.sort_unstable();

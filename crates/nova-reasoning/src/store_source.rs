@@ -53,7 +53,7 @@ impl<S: LftjSource> AtomSource for StoreAtomSource<'_, S> {
 mod tests {
     use super::*;
     use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Term};
-    use oxigraph_nova_storage_ring::RingStore;
+    use oxigraph_nova_storage_ring::LoudsStore;
 
     fn nn(s: &str) -> NamedNode {
         NamedNode::new(s).unwrap()
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn scans_compacted_ringstore_graph() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         store
             .insert(&Quad::new(
                 nn("http://example.org/a"),
@@ -94,12 +94,12 @@ mod tests {
 
     #[test]
     fn scans_empty_graph_as_exhausted() {
-        let store = RingStore::new();
+        let store = LoudsStore::new();
         store.compact().unwrap();
         // No graph registered yet — lftj_graph_id would return None for an
         // unregistered graph, so exercise the "graph exists but has no Ring
         // entry" path via the default graph instead (registered implicitly
-        // by RingStore::new(), always compacted-empty here).
+        // by LoudsStore::new(), always compacted-empty here).
         let default_graph_id = store.lftj_graph_id(&GraphName::DefaultGraph).unwrap();
         let src = StoreAtomSource::new(&store, default_graph_id);
         let scan = src.scan(None, None, None, 0);

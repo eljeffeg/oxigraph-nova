@@ -1,7 +1,7 @@
 # Braided Ring cleanup summary
 
 **Date:** 2026-07-17
-**Status:** Phase 0–5 **executed** on `braided-ring-productize` (through in-memory `BraidedStore` QuadStore/LFTJ). Default SPARQL cutover still **not** done.
+**Status:** Phase 0–5 **executed** on `braided-ring-productize` (through in-memory `RingStore` QuadStore/LFTJ). Default SPARQL cutover still **not** done.
 
 
 
@@ -16,14 +16,14 @@ Research waves (E0–E5.11 / F0) mixed three different things in one crate:
 
 | Thing | Reality today | Product fate |
 |---|---|---|
-| **Six-order LOUDS `RingStore`** | Default production index (`louds`, `ring`, `cltj`, `store`, `delta`, `snapshot`) | Keep as baseline; move to **`nova-storage-louds`** |
+| **Six-order LOUDS `LoudsStore`** | Default production index (`louds`, `ring`, `cltj`, `store`, `delta`, `snapshot`) | Keep as baseline; move to **`nova-storage-louds`** |
 | **Cyclic / braided Ring A** | Feature-gated pilot (`cyclic_ring`, `NOVARNG1`, D2 triangle) | Product candidate; **own `nova-storage-ring`** |
 | **Research dead ends** | `prism-pilot`, `ultra-pi`, `hybrid-l2`, URing oracles, E1/D3/D4 diagnostics | Archive or delete; not product |
 
 Calling everything “PRISM” or “Ring” is now misleading:
 
 - **PRISM** was a residency / page-touch program + FOR pilot that **failed** as the footprint strategy.
-- **Ring** currently means both LOUDS `RingStore` and paper cyclic Ring A.
+- **Ring** currently means both LOUDS `LoudsStore` and paper cyclic Ring A.
 - The winning triangle primitive is **braided multi-range QWT intersection** (`intersection_next_value3` / D2), not a PRISM accelerator.
 
 **Proposed product name:** **Braided Ring** (implementation crate still `nova-storage-ring`).
@@ -37,7 +37,7 @@ crates/
   nova-storage-common/     # WAL / MANIFEST / dict persistence (unchanged)
   nova-storage-memory/     # MemoryStore (unchanged)
   nova-storage-louds/      # NEW (or rename of current production path)
-    louds, GraphRing, CLTJ, RingStore, delta, snapshot
+    louds, GraphRing, CLTJ, LoudsStore, delta, snapshot
   nova-storage-ring/       # REFOCUS: Braided Ring only
     CyclicRing, MappedRingA, NOVARNG1/NOVAQWT1, RDI/RNV/D2
   nova-store/              # facade: choose backend
@@ -52,14 +52,14 @@ crates/
 | `louds.rs` | LOUDS trie (~1.2k LOC) |
 | `ring.rs` | six-order `GraphRing` |
 | `cltj.rs` | CLTJ / LFTJ over LOUDS |
-| `store.rs` | `RingStore` (consider rename → `LoudsStore` later) |
+| `store.rs` | `LoudsStore` (consider rename → `LoudsStore` later) |
 | `delta.rs`, `snapshot.rs` | LSM + mmap reopen |
 | `fulltext` feature glue | if still LOUDS-store-bound |
 
 **Public identity (near-term):**
 
 - Crate: `oxigraph-nova-storage-louds`
-- Keep `RingStore` type alias or re-export for one release if needed
+- Keep `LoudsStore` type alias or re-export for one release if needed
 - Docs: “six-order LOUDS CompactLTJ backend”
 
 **Do not carry into louds crate:** `cyclic_ring`, `prism`, `ultra_pi` product wiring (except temporary re-exports during split).
@@ -272,7 +272,7 @@ Path-extract KEEP only (no hybrid/PRISM/ultra) from `main` + research freeze sur
 1. ~~ID-level parallel type: `cyclic_ring::facade::BraidedRingIndex` (heap + optional mmap).~~
 2. ~~Differentials: enumerate vs sorted multiset; lead-range lens vs counts; heap↔mmap parity; D2 vs dual_rnv + subject-range object intersection oracle.~~
 3. ~~**Phase 4b:** ID-level `join_scan` → `TrieIterator` (`cyclic_ring/scan.rs`); multi-pattern leapfrog + D2 product-path diffs; `BraidedGraphImage`/`IdRemap` (`cyclic_ring/image.rs`) for external↔dense remap, dedup, mmap, SPO round-trip.~~
-4. ~~**Phase 5:** in-memory `cyclic_ring::store::BraidedStore` — `Dictionary` + LOUDS `Delta` + per-graph `BraidedGraphImage`; `QuadStore` + `LftjSource` (LFTJ when delta empty); insert/remove/compact/pattern/LFTJ tests. No WAL.~~
+4. ~~**Phase 5:** in-memory `cyclic_ring::store::RingStore` — `Dictionary` + LOUDS `Delta` + per-graph `BraidedGraphImage`; `QuadStore` + `LftjSource` (LFTJ when delta empty); insert/remove/compact/pattern/LFTJ tests. No WAL.~~
 5. **Still open for cutover:** feature-gated `nova-store` wiring (non-default); WAL/persistence optional; G1 polish if required; upstream qwt.
 
 
@@ -323,7 +323,7 @@ Path-extract KEEP only (no hybrid/PRISM/ultra) from `main` + research freeze sur
 
 **Risks**
 
-- `RingStore` name collision after split — need aliases / migration note.
+- `LoudsStore` name collision after split — need aliases / migration note.
 - `cltj.rs` is tangled with `ultra-pi` / `hybrid-l2` cfg — extract carefully.
 - Benches package lists many bins — archiving must update `benches/Cargo.toml`.
 - Docs/README still say LOUDS-only for `storage-ring`.

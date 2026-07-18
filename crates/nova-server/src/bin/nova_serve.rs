@@ -1,4 +1,4 @@
-//! Standalone Nova SPARQL server binary backed by `RingStore` (Ring + LFTJ).
+//! Standalone Nova SPARQL server binary backed by `LoudsStore` (Ring + LFTJ).
 //!
 //! Loads an RDF file into memory, builds the Ring index (via
 //! `compact()`), then serves the SPARQL 1.1 HTTP Protocol on the given
@@ -41,23 +41,25 @@
 //! it and only to plain-triple formats (see `resolve_format`'s doc comment
 //! for format detection and `--graph`'s interaction with dataset formats).
 //!
-//! Storage model note: without `--location`, `RingStore` is always fully
+//! Storage model note: without `--location`, `LoudsStore` is always fully
 //! in-process heap memory — there is no disk persistence at all, so the
 //! entire dataset plus index must fit in RAM (matches Oxigraph's `serve` run
 //! without `--location`, for a fair memory-vs-memory comparison). With
 //! `--location <dir>`, every `insert`/`remove`/`register_named_graph` call is
 //! first durably logged to a write-ahead log (WAL) file in `<dir>` before
 //! being applied in memory — see `oxigraph_nova_storage_ring::wal` and
-//! `RingStore::open` for details of the overall persistent-storage design.
+//! `LoudsStore::open` for details of the overall persistent-storage design.
 
 use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, NamedNode, Quad};
+
 use oxigraph_nova_reasoning::{LftjFixpointEngine, ReasoningEngine};
 use oxigraph_nova_server::Server;
-use oxigraph_nova_storage_ring::{RingStore, SyncPolicy};
+use oxigraph_nova_storage_ring::{LoudsStore, SyncPolicy};
 use oxrdfio::{RdfFormat, RdfParser};
 use std::env;
 use std::fs::File;
+
 
 // Large SELECT result sets (hundreds of thousands of rows) allocate and free
 // many large (multi-KiB–multi-MiB) buffers in quick succession while
@@ -135,12 +137,19 @@ async fn main() {
     let mut fulltext = false;
     let mut reasoning = false;
     let mut union_default_graph = false;
+    // "louds" (default) | "ring" (cyclic QWT pilot; requires --features ring-backend)
+    let mut backend = "louds".to_string();
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--backend" => {
+                i += 1;
+                backend = args[i].clone();
+            }
             "--file" | "-f" => {
+
                 i += 1;
                 files.push(FileLoad {
                     path: PathBuf::from(&args[i]),
@@ -228,12 +237,12 @@ async fn main() {
                      `--file ontology.ttl --graph http://example.org/ontology`.\n\
                      \n\
                      --location <dir> (matching `oxigraph serve --location`): persistent\n\
-                     WAL-backed RingStore rooted at <dir>. Short form: -l.\n\
+                     WAL-backed LoudsStore rooted at <dir>. Short form: -l.\n\
                      --bind <addr> (matching `oxigraph serve --bind`), default 0.0.0.0:3030.\n\
                      Short form: -b.\n\
                      \n\
-                     Without --location: purely in-memory RingStore, --file is required.\n\
-                     With --location <dir>: persistent WAL-backed RingStore rooted at <dir>.\n\
+                     Without --location: purely in-memory LoudsStore, --file is required.\n\
+                     With --location <dir>: persistent WAL-backed LoudsStore rooted at <dir>.\n\
                      If <dir> already has a WAL, it is replayed and --file is ignored.\n\
                      If <dir> is empty/fresh and --file is given, the dataset is\n\
                      bulk-loaded and then persisted (each triple logged to the WAL) for\n\
@@ -292,14 +301,55 @@ async fn main() {
         i += 1;
     }
 
+    // Pilot cyclic-QWT RingStore path (feature ring-backend). In-memory only.
+    if backend == "ring" {
+        #[cfg(feature = "ring-backend")]
+        {
+            run_ring(
+                files,
+                location,
+                bind,
+                query_timeout_s,
+                max_results,
+                max_parallel_queries,
+                reasoning,
+                union_default_graph,
+                fulltext,
+            )
+            .await;
+            return;
+        }
+        #[cfg(not(feature = "ring-backend"))]
+        {
+            let _ = (
+                files,
+                location,
+                bind,
+                query_timeout_s,
+                max_results,
+                max_parallel_queries,
+                reasoning,
+                union_default_graph,
+                fulltext,
+            );
+            panic!(
+                "--backend ring requires building with --features ring-backend \
+                 (enables cyclic-ring-pilot RingStore). Disk --location is not supported."
+            );
+        }
+    } else if backend != "louds" {
+        panic!("unknown --backend {backend:?}; expected louds (default) or ring");
+    }
+
     // ── Construct the store: persistent (--location) or in-memory ──────────
     let store = match &location {
+
         Some(dir) => {
             eprintln!(
                 "[nova_serve] Opening persistent store at {} ...",
                 dir.display()
             );
-            let store = RingStore::open(dir).expect("RingStore::open failed");
+            let store = LoudsStore::open(dir).expect("LoudsStore::open failed");
             if let Some(threshold) = compact_threshold {
                 store.set_auto_compact_threshold(threshold);
                 eprintln!("[nova_serve] Auto-compact threshold set to {threshold}.");
@@ -318,7 +368,7 @@ async fn main() {
             );
             store
         }
-        None => RingStore::new(),
+        None => LoudsStore::new(),
     };
 
     // Bulk-load from --file only if the store came up empty (a fresh
@@ -378,7 +428,7 @@ async fn main() {
             // entirely: it builds the Ring directly in memory, then commits
             // via `commit_compaction`, which — for a persistent store — does
             // a single atomic snapshot + dictionary + WAL-segment-rotation +
-            // MANIFEST commit (see `RingStore::commit_compaction`). This
+            // MANIFEST commit (see `LoudsStore::commit_compaction`). This
             // matters enormously for `--location --file`: the old path went
             // through `extend()` → `insert()`, WAL-logging **and
             // `fsync`-ing every single triple individually** (~4.2 ms/triple
@@ -477,7 +527,7 @@ async fn main() {
         eprintln!("[nova_serve] Enabling full-text search (text:query/text:contains) ...");
         store
             .enable_fulltext()
-            .expect("RingStore::enable_fulltext failed");
+            .expect("LoudsStore::enable_fulltext failed");
         Some(Arc::clone(&store) as Arc<dyn oxigraph_nova_core::TextSearch>)
     } else {
         None
@@ -517,3 +567,114 @@ async fn main() {
     }
     server.run(&bind).await.expect("server failed");
 }
+
+/// In-memory RingStore pilot path (`--backend ring`, feature `ring-backend`).
+///
+/// No WAL / `--location`. No LOUDS memory-breakdown diagnostics. Used by the
+/// external mem harness via `NOVA_BACKEND=ring`.
+#[cfg(feature = "ring-backend")]
+async fn run_ring(
+    files: Vec<FileLoad>,
+    location: Option<PathBuf>,
+    bind: String,
+    query_timeout_s: Option<u64>,
+    max_results: Option<usize>,
+    max_parallel_queries: Option<usize>,
+    reasoning: bool,
+    union_default_graph: bool,
+    fulltext: bool,
+) {
+    use oxigraph_nova_storage_ring::cyclic_ring::RingStore;
+
+    if location.is_some() {
+        panic!(
+            "--backend ring is in-memory only; --location is not supported yet \
+             (no WAL on RingStore)"
+        );
+    }
+    if fulltext {
+        panic!("--fulltext is not supported with --backend ring");
+    }
+    if files.is_empty() {
+        panic!("--backend ring requires --file <dataset>");
+    }
+
+    eprintln!("[nova_serve] Backend: RingStore (cyclic QWT pilot, in-memory)");
+    let store = RingStore::new();
+
+    let mut all_quads: Vec<Quad> = Vec::new();
+    for fl in &files {
+        let fmt = resolve_format(&fl.path);
+        if fmt.supports_datasets() && fl.graph.is_some() {
+            eprintln!(
+                "[nova_serve] warning: --graph is ignored for dataset formats \
+                 (N-Quads/TriG/JSON-LD) — {}'s own per-quad graph is used instead.",
+                fl.path.display()
+            );
+        }
+        let target_graph = fl.graph.clone().unwrap_or(GraphName::DefaultGraph);
+        eprintln!("[nova_serve] Loading {} ...", fl.path.display());
+        let t0 = Instant::now();
+        let f = File::open(&fl.path).expect("failed to open dataset file");
+        let reader = BufReader::new(f);
+        let mut parsed: usize = 0;
+        let quads: Vec<Quad> = RdfParser::from_format(fmt)
+            .with_default_graph(target_graph)
+            .for_reader(reader)
+            .map(|result| {
+                let quad = result.unwrap_or_else(|e| panic!("{} parse error: {e}", fmt.name()));
+                parsed += 1;
+                if parsed.is_multiple_of(200_000) {
+                    eprintln!("[nova_serve]   ... {parsed} triples parsed");
+                }
+                quad
+            })
+            .collect();
+        eprintln!(
+            "[nova_serve]   ... parsed {} in {:.2}s.",
+            quads.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        all_quads.extend(quads);
+    }
+
+    let t0 = Instant::now();
+    let count = store
+        .bulk_load(all_quads.into_iter())
+        .expect("RingStore::bulk_load failed");
+    eprintln!(
+        "[nova_serve] Loaded + compacted {count} triples into RingStore in {:.2}s.",
+        t0.elapsed().as_secs_f64()
+    );
+    mimalloc_tuning::mimalloc_collect_now();
+
+    eprintln!(
+        "[nova_serve] Ring triple_count={} (ring={})",
+        store.triple_count(),
+        store.ring_triple_count()
+    );
+    eprintln!("[nova_serve] Ready. Serving on http://{bind}/sparql");
+
+    let store = Arc::new(store);
+    let mut server = Server::new(store);
+    if let Some(secs) = query_timeout_s {
+        server = server.with_query_timeout(Duration::from_secs(secs));
+    }
+    if let Some(n) = max_results {
+        server = server.with_max_results(n);
+    }
+    if let Some(n) = max_parallel_queries {
+        server = server.with_max_parallel_queries(n);
+    }
+    if reasoning {
+        eprintln!("[nova_serve] Enabling OWL 2 RL reasoning (LftjFixpointEngine) ...");
+        let engine: Arc<dyn ReasoningEngine> = Arc::new(LftjFixpointEngine::new());
+        server = server.with_reasoning(engine);
+    }
+    if union_default_graph {
+        eprintln!("[nova_serve] Enabling server-wide union-default-graph ...");
+        server = server.with_union_default_graph(true);
+    }
+    server.run(&bind).await.expect("server failed");
+}
+

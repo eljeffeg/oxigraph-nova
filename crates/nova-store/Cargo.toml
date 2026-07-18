@@ -1,6 +1,6 @@
 [package]
 name        = "oxigraph-nova-store"
-description = "Monolithic Store facade over RingStore + the SPARQL evaluator — an oxigraph::store::Store-shaped embedding API for Rust callers and language bindings"
+description = "Monolithic Store facade over LoudsStore + the SPARQL evaluator — an oxigraph::store::Store-shaped embedding API for Rust callers and language bindings"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true

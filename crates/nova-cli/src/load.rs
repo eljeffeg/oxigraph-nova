@@ -16,7 +16,7 @@
 //! ## Streaming bulk-load (single source)
 //!
 //! [`load_sources_into_store`] never collects the parsed quads into a
-//! `Vec` first: `RingStore::bulk_load` already accepts `impl
+//! `Vec` first: `LoudsStore::bulk_load` already accepts `impl
 //! IntoIterator<Item = Quad>` and consumes it lazily (see its doc comment
 //! in `oxigraph_nova_storage_ring::store`), so for a single input source
 //! (one file, or stdin) the parser's iterator is fed directly into
@@ -41,7 +41,7 @@
 
 use anyhow::{Context, Result};
 use oxigraph_nova_core::{GraphName, Quad};
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use oxrdfio::{RdfFormat, RdfParseError, RdfParser};
 use parking_lot::Mutex;
 use std::fs::File;
@@ -121,7 +121,7 @@ fn warn_if_graph_ignored(fmt: RdfFormat, graph: Option<&GraphName>) {
 }
 
 /// Stream `files` (or stdin, if `files` is empty) into `store` via a single
-/// `RingStore::bulk_load` call, returning the number of quads loaded.
+/// `LoudsStore::bulk_load` call, returning the number of quads loaded.
 ///
 /// - Zero files: reads from stdin. `format` must be given explicitly (no
 ///   extension to guess from).
@@ -131,7 +131,7 @@ fn warn_if_graph_ignored(fmt: RdfFormat, graph: Option<&GraphName>) {
 ///   output through a bounded channel into a single `bulk_load` call (see
 ///   this module's doc comment for the full rationale).
 pub fn load_sources_into_store(
-    store: &RingStore,
+    store: &LoudsStore,
     files: &[PathBuf],
     format: Option<&str>,
     graph: Option<&GraphName>,
@@ -151,7 +151,7 @@ pub fn load_sources_into_store(
 const CHANNEL_BOUND: usize = 4096;
 
 fn load_stdin(
-    store: &RingStore,
+    store: &LoudsStore,
     format: Option<&str>,
     graph: Option<&GraphName>,
     base: Option<&str>,
@@ -175,7 +175,7 @@ fn load_stdin(
 }
 
 fn load_single_file(
-    store: &RingStore,
+    store: &LoudsStore,
     path: &Path,
     format: Option<&str>,
     graph: Option<&GraphName>,
@@ -195,7 +195,7 @@ fn load_single_file(
 /// terminates the iterator early (via [`ErrorCapturingIter`]) and is
 /// surfaced afterward, once `bulk_load` has returned.
 fn stream_into_store(
-    store: &RingStore,
+    store: &LoudsStore,
     parser: RdfParser,
     reader: impl Read,
     fmt: RdfFormat,
@@ -217,7 +217,7 @@ fn stream_into_store(
 }
 
 /// Adapts a `Result<Quad, RdfParseError>` iterator into a plain `Quad`
-/// iterator suitable for `RingStore::bulk_load` (which wants `impl
+/// iterator suitable for `LoudsStore::bulk_load` (which wants `impl
 /// IntoIterator<Item = Quad>`, not `Item = Result<Quad, _>`): stashes the
 /// first error it encounters into `error_slot` and then ends the iterator,
 /// so `bulk_load` stops cleanly at the point parsing failed. The caller
@@ -246,7 +246,7 @@ impl<I: Iterator<Item = Result<Quad, RdfParseError>>> Iterator for ErrorCapturin
 /// Parse `files` in parallel (one thread per file), merging their quads
 /// through a single bounded channel into one `bulk_load` call.
 fn load_multiple_files(
-    store: &RingStore,
+    store: &LoudsStore,
     files: &[PathBuf],
     format: Option<&str>,
     graph: Option<&GraphName>,

@@ -20,6 +20,11 @@ http-client = ["oxigraph-nova-query/http-client"]
 # forwarded straight through to `oxigraph-nova-query`'s own `geosparql`
 # feature. Advertised in the SPARQL Service Description document.
 geosparql = ["oxigraph-nova-query/geosparql", "dep:spargeo"]
+# Pilot: in-memory RingStore backend for nova_serve (`--backend ring`).
+# Enables cyclic-ring-pilot; NOT the default SPARQL path. In-memory only
+# (no --location). Used by benches/external mem harness with NOVA_BACKEND=ring.
+ring-backend = ["oxigraph-nova-storage-ring/cyclic-ring-pilot"]
+
 
 
 

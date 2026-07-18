@@ -2,7 +2,7 @@
 # Comparative benchmark harness: Nova (Ring+LFTJ) vs Oxigraph vs QLever.
 #
 # Methodology (see README.md in this directory for full rationale):
-#   - Nova:      RingStore, always pure in-process heap memory (no disk option exists).
+#   - Nova:      LoudsStore, always pure in-process heap memory (no disk option exists).
 #   - Oxigraph:  `serve` run WITHOUT --location -> pure in-memory storage,
 #                matching Nova's memory model exactly.
 #   - QLever:    index is inherently memory-mapped disk files (no in-memory-only
@@ -102,9 +102,21 @@ measure_footprint_kb() {
   ps -o rss= -p "$pid" 2>/dev/null | tr -d ' '
 }
 
-echo "=== [1/6] Building Nova binaries (release) ==="
+# NOVA_BACKEND=louds (default) | ring
+# ring = in-memory RingStore pilot; builds nova_serve with --features ring-backend
+# and passes --backend ring. Disk harness cannot use ring (no WAL yet).
+NOVA_BACKEND="${NOVA_BACKEND:-louds}"
+
+echo "=== [1/6] Building Nova binaries (release) [NOVA_BACKEND=$NOVA_BACKEND] ==="
 cd "$ROOT"
-cargo build --release -p oxigraph-nova-bench --bin gen_dataset -p oxigraph-nova-server --bin nova_serve
+if [ "$NOVA_BACKEND" = "ring" ]; then
+  cargo build --release -p oxigraph-nova-bench --bin gen_dataset \
+    -p oxigraph-nova-server --features ring-backend --bin nova_serve
+else
+  cargo build --release -p oxigraph-nova-bench --bin gen_dataset \
+    -p oxigraph-nova-server --bin nova_serve
+fi
+
 
 echo "=== [2/6] Generating dataset (N=$ENTITIES entities) ==="
 "$ROOT/target/release/gen_dataset" --entities "$ENTITIES" --out "$DATA"
@@ -144,13 +156,21 @@ wait_ready() {
   return 1
 }
 
-# --- Nova: pure in-memory RingStore (load time = parse + compact into Ring index) ---
+# --- Nova: pure in-memory store (load time = parse + compact into index) ---
+# LOUDS LoudsStore by default; RingStore when NOVA_BACKEND=ring.
 NOVA_LOAD_START=$(date +%s.%N)
-"$ROOT/target/release/nova_serve" --file "$DATA" --bind "127.0.0.1:$NOVA_PORT" > /tmp/nova_serve_bench.log 2>&1 &
+if [ "$NOVA_BACKEND" = "ring" ]; then
+  "$ROOT/target/release/nova_serve" --backend ring --file "$DATA" \
+    --bind "127.0.0.1:$NOVA_PORT" > /tmp/nova_serve_bench.log 2>&1 &
+else
+  "$ROOT/target/release/nova_serve" --file "$DATA" \
+    --bind "127.0.0.1:$NOVA_PORT" > /tmp/nova_serve_bench.log 2>&1 &
+fi
 NOVA_PID=$!
 wait_ready "http://127.0.0.1:$NOVA_PORT/sparql"
 NOVA_LOAD_END=$(date +%s.%N)
 NOVA_LOAD_S=$(awk -v a="$NOVA_LOAD_START" -v b="$NOVA_LOAD_END" 'BEGIN{printf "%.2f", b-a}')
+
 
 # --- Oxigraph: serve WITHOUT --location => pure in-memory storage ---
 # (load time = container start + HTTP bulk-load POST of the dataset)

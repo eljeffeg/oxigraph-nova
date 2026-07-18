@@ -1,6 +1,6 @@
 [package]
 name        = "oxigraph-nova-storage-ring"
-description = "Braided Ring pilot (cyclic QWT / NOVARNG1 / D2) + temporary re-export of production LOUDS RingStore"
+description = "Braided Ring pilot (cyclic QWT / NOVARNG1 / D2) + temporary re-export of production LOUDS LoudsStore"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -9,32 +9,32 @@ repository.workspace = true
 [features]
 default = ["mmap"]
 # Opt-in Tantivy-backed full-text search — forwarded to the LOUDS crate
-# (production RingStore). Zero-cost when disabled.
+# (production LoudsStore). Zero-cost when disabled.
 fulltext     = ["oxigraph-nova-storage-louds/fulltext"]
 # Research-only DROP-branch APIs (D3/D4/E1 counters, C1/prefetch mutation knobs)
 # for the Braided Ring pilot.
 diagnostics  = []
-# Braided Ring pilot: cyclic QWT + NOVARNG1 + D2. Not on RingStore SPARQL path.
+# Braided Ring pilot: cyclic QWT + NOVARNG1 + D2. Not on LoudsStore SPARQL path.
 cyclic-ring-pilot = ["dep:qwt", "dep:memmap2"]
-# Forwarded to LOUDS + common + core for RingStore::open / snapshot mmap path.
+# Forwarded to LOUDS + common + core for LoudsStore::open / snapshot mmap path.
 # Disabled (via `default-features = false`) for the wasm32 build
 # (`oxigraph-nova-js`), which is in-memory-only and never calls
-# `RingStore::open`.
+# `LoudsStore::open`.
 mmap = ["oxigraph-nova-storage-louds/mmap"]
 
 [dependencies]
-# Production LOUDS RingStore — re-exported from lib.rs for dependent compatibility.
-# Also used by Phase 5 BraidedStore for `delta::Delta` reuse.
+# Production LOUDS LoudsStore — re-exported from lib.rs for dependent compatibility.
+# Also used by Phase 5 RingStore for `delta::Delta` reuse.
 oxigraph-nova-storage-louds = { path = "../nova-storage-louds", default-features = false }
 
-# Dictionary / QuadStore / TrieIterator for Phase 4b join_scan + Phase 5 BraidedStore
+# Dictionary / QuadStore / TrieIterator for Phase 4b join_scan + Phase 5 RingStore
 # (cyclic-ring-pilot only; not default SPARQL cutover).
 oxigraph-nova-core = { path = "../nova-core", default-features = false }
 
 # Used by cyclic_ring mmap error types (`MappedQwtError` / `MappedRingError`).
 thiserror = { workspace = true }
 
-# BraidedStore Mutex (Phase 5). Same lock style as LOUDS RingStore.
+# RingStore Mutex (Phase 5). Same lock style as LOUDS LoudsStore.
 parking_lot = { workspace = true }
 
 # Braided Ring substrate (optional; feature `cyclic-ring-pilot`).

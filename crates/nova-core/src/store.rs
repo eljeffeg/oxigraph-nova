@@ -24,11 +24,11 @@ use crate::{GraphName, NamedNode, Oxigraph, Quad, StoredQuad, Term};
 /// `QuadStore` implementor can opt out entirely with an empty
 /// `impl LftjSource for MyStore {}` block. Only Ring-backed (CLTJ) stores
 /// currently override these to enable the accelerated join path — see
-/// `oxigraph_nova_storage_ring::RingStore`'s `impl LftjSource` block.
+/// `oxigraph_nova_storage_ring::LoudsStore`'s `impl LftjSource` block.
 pub trait LftjSource: Send + Sync {
     /// Returns `true` if this store supports Leapfrog Triejoin acceleration.
     ///
-    /// Only `RingStore` (and future Ring-backed stores) return `true`.
+    /// Only `LoudsStore` (and future Ring-backed stores) return `true`.
     /// The default is `false`; the SPARQL evaluator falls back to nested-loop
     /// when this returns false.
     fn supports_lftj(&self) -> bool {
@@ -199,7 +199,7 @@ pub trait QuadStore: Send + Sync + LftjSource {
     /// named graph context).
     ///
     /// The default implementation is a no-op; backends that track named-graph
-    /// membership (e.g. `MemoryStore`, `RingStore`) should override this.
+    /// membership (e.g. `MemoryStore`, `LoudsStore`) should override this.
     fn register_named_graph(&self, _graph: &GraphName) -> Result<(), Oxigraph> {
         Ok(())
     }
@@ -213,7 +213,7 @@ pub trait QuadStore: Send + Sync + LftjSource {
     /// generic method on a trait prevents that trait from being used as
     /// `dyn QuadStore`/`Box<dyn QuadStore>`, which is otherwise a completely
     /// reasonable way to select a storage backend at runtime (e.g. a
-    /// downstream project switching between `MemoryStore` and `RingStore`
+    /// downstream project switching between `MemoryStore` and `LoudsStore`
     /// based on a config flag). Call sites that have a concrete iterator
     /// type can still pass it directly via `Box::new(iter)`; see
     /// [`QuadStoreExt::extend`] for an ergonomic generic wrapper that
@@ -252,7 +252,7 @@ pub trait QuadStore: Send + Sync + LftjSource {
     /// means N lock acquisitions and (worst case) N fsyncs — no different
     /// from the caller doing the loop itself.
     ///
-    /// ## Backends with a WAL/lock (e.g. `RingStore`)
+    /// ## Backends with a WAL/lock (e.g. `LoudsStore`)
     ///
     /// Should override this method to:
     /// 1. Acquire their internal lock **once** for the whole batch.
@@ -313,7 +313,7 @@ pub trait QuadStore: Send + Sync + LftjSource {
     // `oxigraph_nova_server`). Every method here defaults to `None`,
     // meaning "this backend doesn't track that metric" — `nova-server`
     // simply omits the corresponding line from its Prometheus-text-format
-    // output rather than reporting a misleading `0`. Only `RingStore`
+    // output rather than reporting a misleading `0`. Only `LoudsStore`
     // currently overrides these (see its `QuadStore` impl); `MemoryStore`
     // and any other backend inherit the defaults.
 

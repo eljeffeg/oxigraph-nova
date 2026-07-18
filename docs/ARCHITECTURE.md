@@ -13,7 +13,7 @@ embedding the HTTP server into a larger application — start here.
 nova-core              (vocabulary + trait definitions; no storage/query logic)
   ├── nova-storage-common   (shared WAL / manifest / dict-snapshot persistence plumbing)
   │     ├── nova-storage-memory  (MemoryStore: simple reference QuadStore impl)
-  │     ├── nova-storage-louds   (production RingStore: six-order LOUDS/CLTJ + WAL/delta)
+  │     ├── nova-storage-louds   (production LoudsStore: six-order LOUDS/CLTJ + WAL/delta)
   │     └── nova-storage-ring    (Braided Ring pilot + temporary re-export of louds)
   ├── nova-fulltext         (Tantivy-backed TextSearch impl)
   ├── nova-reasoning        (LftjFixpointEngine: OWL 2 RL forward-chaining reasoner)
@@ -21,7 +21,7 @@ nova-core              (vocabulary + trait definitions; no storage/query logic)
                               extension registry, SERVICE federation)
         ├── nova-shacl       (ShaclValidator trait, NativeValidator: SHACL Core validation)
         └── nova-server      (axum HTTP SPARQL 1.1 Protocol server, generic over QuadStore)
-              └── nova-cli    (binary: wires RingStore + Server together)
+              └── nova-cli    (binary: wires LoudsStore + Server together)
 ```
 
 Dependency direction is strictly top-to-bottom: `nova-core` depends on
@@ -29,7 +29,7 @@ nothing else in the workspace; `nova-query` depends only on `nova-core`;
 storage backends depend on `nova-core` (+ `nova-storage-common` for the
 persistent ones); `nova-server` depends on `nova-core` + `nova-query` but is
 **generic** over the storage backend (`Server<S: QuadStore>`) rather than
-hardcoding `RingStore`. `nova-cli` is the only crate that picks a concrete
+hardcoding `LoudsStore`. `nova-cli` is the only crate that picks a concrete
 storage backend.
 
 This layering is what makes each seam below reusable: a downstream crate can
@@ -81,8 +81,8 @@ implementations without touching (or forking) `nova-storage-ring` or
 | `oxigraph-nova-query` | SPARQL 1.2 evaluator, `Dataset` trait, Leapfrog Triejoin (`lftj.rs`), `ExtensionRegistry` |
 | `oxigraph-nova-storage-memory` | In-memory backend — `Vec`-based linear scan; testing and development |
 | `oxigraph-nova-storage-common` | Backend-agnostic WAL + MANIFEST + dictionary-persistence machinery, reusable by any `QuadStore` that wants crash-safe durability |
-| `oxigraph-nova-storage-louds` | Production CompactLTJ LOUDS trie index (6 orderings) + LSM delta + WAL/snapshot `RingStore` |
-| `oxigraph-nova-storage-ring` | Braided Ring pilot (cyclic QWT / `NOVARNG1` / D2) + temporary re-export of `storage-louds` so existing `RingStore` imports stay green |
+| `oxigraph-nova-storage-louds` | Production CompactLTJ LOUDS trie index (6 orderings) + LSM delta + WAL/snapshot `LoudsStore` |
+| `oxigraph-nova-storage-ring` | Braided Ring pilot (cyclic QWT / `NOVARNG1` / D2) + temporary re-export of `storage-louds` so existing `LoudsStore` imports stay green |
 | `oxigraph-nova-fulltext` | Tantivy-backed full-text index — opt-in via the `fulltext` cargo feature (forwarded through `storage-ring` → `storage-louds`); indexed incrementally on the compaction cycle |
 | `oxigraph-nova-reasoning` | OWL 2 RL forward-chaining reasoner — LFTJ-native semi-naive fixpoint driver (`LftjFixpointEngine`), `ReasoningDataset` in-memory overlay decorator, opt-in via `--reasoning` on the server |
 | `oxigraph-nova-shacl` | SHACL Core validation — `ShaclValidator` trait seam, Nova-owned `ValidationReport`/`ValidationResult` types, `NativeValidator` (dependency-free default implementation); always compiled in, not cargo-feature-gated |
@@ -177,7 +177,7 @@ pub trait QuadStore: Send + Sync + LftjSource {
 
 **Object safety.** `QuadStore` is deliberately object-safe (usable as
 `dyn QuadStore` / `Box<dyn QuadStore>`), which lets a caller select a backend
-at runtime (e.g. switch between `MemoryStore` and `RingStore` behind a config
+at runtime (e.g. switch between `MemoryStore` and `LoudsStore` behind a config
 flag). This is why `extend_boxed` takes a `Box<dyn Iterator<...>>` instead of
 a generic `impl IntoIterator` parameter — a generic method would make the
 trait non-object-safe. The ergonomic generic wrapper lives on a separate,
@@ -208,9 +208,9 @@ pub enum QuadOp { Insert(Quad), Remove(Quad) }
 
 The default implementation just loops calling `insert`/`remove` per op — always
 correct, but with no batching benefit. Backends with their own internal lock
-and/or write-ahead log (like `RingStore`) should override it to acquire the
+and/or write-ahead log (like `LoudsStore`) should override it to acquire the
 lock once, write every resulting WAL record in a single `fsync`, then apply
-each op in-memory — see `RingStore`'s `apply_batch` override in
+each op in-memory — see `LoudsStore`'s `apply_batch` override in
 `nova-storage-louds/src/store.rs` (it mirrors the same single-lock,
 single-batched-write pattern already used by its bulk-insert `extend_boxed`
 override, generalized to mixed insert/remove ops).
@@ -243,7 +243,7 @@ pub trait LftjSource: Send + Sync {
 Every method defaults to "unsupported", so a brand-new `QuadStore`
 implementor only ever needs one extra line — `impl LftjSource for MyStore
 {}` — and the SPARQL evaluator transparently falls back to nested-loop joins.
-Only `RingStore`'s LOUDS/CLTJ index overrides these to enable the
+Only `LoudsStore`'s LOUDS/CLTJ index overrides these to enable the
 Leapfrog-Triejoin / Worst-Case-Optimal-Join accelerated path. This is kept as
 a **named, separate trait** (rather than inline methods on `QuadStore`) so
 the 9-method acceleration surface is documented and discoverable as one
@@ -308,7 +308,7 @@ joins, reused rather than duplicated by a from-scratch triple-scan reasoner).
 
 Defined in `nova-core/src/text_search.rs`. Backs the `text:query`/
 `text:contains` SPARQL extension functions. `nova-fulltext`'s Tantivy-backed
-`FulltextIndex` is the only current implementation (wired into `RingStore`
+`FulltextIndex` is the only current implementation (wired into `LoudsStore`
 behind the `fulltext` cargo feature — see `nova-storage-louds/src/fulltext.rs`),
 but any backend (Meilisearch, Elasticsearch, a custom inverted index) can
 implement this trait and be wired in the same way.
@@ -363,7 +363,7 @@ anything else — the evaluator has no built-in networking and treats every
 ### 7. `Server<S: QuadStore>` — embedding/composition seam
 
 Defined in `nova-server/src/lib.rs`. Generic over any `QuadStore`
-implementation, so it is not tied to `RingStore`:
+implementation, so it is not tied to `LoudsStore`:
 
 ```rust
 pub struct Server<S: QuadStore + 'static> { ... }

@@ -1,5 +1,5 @@
 //! Integration tests: parse → lower → evaluate, against a real
-//! `RingStore`/`StoreDataset`/`Evaluator` — confirms lowered Cypher queries
+//! `LoudsStore`/`StoreDataset`/`Evaluator` — confirms lowered Cypher queries
 //! actually run end-to-end and return correct results, not just that they
 //! produce a structurally-plausible `spargebra::Query`.
 
@@ -7,7 +7,7 @@ use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Term};
 use oxigraph_nova_cypher::{LABEL_NS, PROP_NS, REL_NS, parse_and_lower, parse_and_lower_update};
 use oxigraph_nova_query::update::execute_update;
 use oxigraph_nova_query::{Evaluator, StoreDataset};
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use std::sync::Arc;
 
 fn nn(s: &str) -> NamedNode {
@@ -26,8 +26,8 @@ fn rel(name: &str) -> NamedNode {
     nn(&format!("{REL_NS}{name}"))
 }
 
-fn build_store(quads: Vec<Quad>) -> Arc<RingStore> {
-    let store = RingStore::new();
+fn build_store(quads: Vec<Quad>) -> Arc<LoudsStore> {
+    let store = LoudsStore::new();
     for q in quads {
         store.insert(&q).unwrap();
     }
@@ -35,7 +35,7 @@ fn build_store(quads: Vec<Quad>) -> Arc<RingStore> {
     Arc::new(store)
 }
 
-fn run(store: &Arc<RingStore>, cypher: &str) -> (Vec<String>, Vec<Vec<Option<Term>>>) {
+fn run(store: &Arc<LoudsStore>, cypher: &str) -> (Vec<String>, Vec<Vec<Option<Term>>>) {
     let query = parse_and_lower(cypher).unwrap_or_else(|e| panic!("lowering failed: {e}"));
     let dataset = StoreDataset::new(Arc::clone(store));
     let evaluator = Evaluator::new(&dataset);
@@ -211,7 +211,7 @@ fn variable_length_relationship_one_or_more() {
 
 // ── Write statements ────────────────────────────────────────────
 
-fn run_update(store: &Arc<RingStore>, cypher: &str) {
+fn run_update(store: &Arc<LoudsStore>, cypher: &str) {
     let update = parse_and_lower_update(cypher).unwrap_or_else(|e| panic!("lowering failed: {e}"));
     execute_update(store, &update).unwrap_or_else(|e| panic!("execution failed: {e}"));
 }

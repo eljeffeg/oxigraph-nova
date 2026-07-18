@@ -152,7 +152,7 @@ impl CltjTrie {
     /// of the trie (i.e. the
     /// enclosing `Arc<CltjTrie>` must have refcount 1) — true for a freshly
     /// built [`CltjData`] that has not yet been shared, per the "always
-    /// mapped" design (see `RingStore::compact`).
+    /// mapped" design (see `LoudsStore::compact`).
     ///
     /// Only defined for the owned `LoudsTrie` form (`Louds`'s default) — a
     /// fresh build always starts from an owned trie.
@@ -368,7 +368,7 @@ impl CltjData {
     /// Used by the persistent snapshot format.  Requires that no other
     /// `Arc<CltjTrie>` clones exist
     /// (true for a freshly built `CltjData` per the "always mapped" design —
-    /// see `RingStore::compact`); panics otherwise via `expect`.
+    /// see `LoudsStore::compact`); panics otherwise via `expect`.
     ///
     /// The three vocab arrays are read from the SPO trie (index 0, whose
     /// `vocab` is `[orig_s, orig_p, orig_o]` — see [`build_cltj_data`]) before

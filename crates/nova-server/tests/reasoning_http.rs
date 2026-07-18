@@ -8,7 +8,7 @@
 //! Description) must advertise the OWL-RL entailment regime — all only
 //! when `Server::with_reasoning` was actually configured.
 //!
-//! Uses a real `RingStore` (not `MemoryStore`) since
+//! Uses a real `LoudsStore` (not `MemoryStore`) since
 //! `oxigraph_nova_reasoning::LftjFixpointEngine` only produces useful
 //! results over an LFTJ-capable dataset (see `engine.rs`'s module doc
 //! comment, "Rule coverage") — a plain in-memory store has no LFTJ support
@@ -21,7 +21,7 @@ use axum::http::{Request, StatusCode, header};
 use oxigraph_nova_core::{GraphName, QuadStore};
 use oxigraph_nova_reasoning::{LftjFixpointEngine, ReasoningEngine};
 use oxigraph_nova_server::Server;
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use oxrdf::{NamedNode, Quad, Term};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -42,8 +42,8 @@ fn rdfs_sub_class_of() -> NamedNode {
 /// subClassOf Animal` — `fido rdf:type Animal` is derivable but never
 /// asserted, requiring two rounds of the reasoner's fixpoint (subclass
 /// transitivity, then type propagation) to surface.
-fn make_reasoning_store() -> Arc<RingStore> {
-    let store = RingStore::new();
+fn make_reasoning_store() -> Arc<LoudsStore> {
+    let store = LoudsStore::new();
     let dg = GraphName::DefaultGraph;
 
     store

@@ -38,7 +38,7 @@
 use oxigraph_nova_core::{GraphName as CoreGraphName, NamedNode, Quad, QuadStore, Term};
 use oxigraph_nova_query::StoreDataset;
 use oxigraph_nova_reasoning::{LftjFixpointEngine, ReasoningEngine};
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use oxrdf::{
     NamedNode as OxNamedNode, NamedOrBlankNode as OxSubject, Term as OxTerm, Triple as OxTriple,
 };
@@ -100,11 +100,11 @@ fn t(s: impl Into<String>, p: impl Into<String>, o: impl Into<String>) -> Fixt {
     (s.into(), p.into(), o.into())
 }
 
-/// Loads `triples` into a fresh, compacted `RingStore` and returns Nova's
+/// Loads `triples` into a fresh, compacted `LoudsStore` and returns Nova's
 /// `LftjFixpointEngine`-inferred closure as a set of (s, p, o) IRI-string
 /// triples.
 fn nova_inferred(triples: &[Fixt]) -> HashSet<(String, String, String)> {
-    let store = RingStore::new();
+    let store = LoudsStore::new();
     let g = CoreGraphName::DefaultGraph;
     for (s, p, o) in triples {
         store

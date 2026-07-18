@@ -1,7 +1,7 @@
 
 # External Comparative Benchmark: Nova vs Oxigraph vs QLever
 
-This directory contains a harness that benchmarks Nova's `RingStore`
+This directory contains a harness that benchmarks Nova's `LoudsStore`
 (Ring + LFTJ) against two external, independently-developed SPARQL engines
 — [Oxigraph](https://github.com/oxigraph/oxigraph) and
 [QLever](https://github.com/ad-freiburg/qlever) — on an identical synthetic
@@ -15,7 +15,7 @@ storage) variant.
 
 
 Nova's internal Criterion benchmarks (`benches/bsbm_large.rs`,
-`benches/wikidata_slice.rs`) only compare Nova's own `RingStore` against its
+`benches/wikidata_slice.rs`) only compare Nova's own `LoudsStore` against its
 own `MemoryStore` baseline — there's no external system in the loop. This
 harness closes that gap by running the *same* dataset and *same* query text
 against real, independently maintained engines over the standard SPARQL 1.1
@@ -122,7 +122,7 @@ durability matters. Results are written to
 
 | Engine   | Storage model in this benchmark |
 |----------|----------------------------------|
-| Nova     | `nova_serve --location <dir>` — persistent `RingStore`, WAL + generation-numbered snapshot on disk (see `crates/nova-storage-common/src/wal.rs`) |
+| Nova     | `nova_serve --location <dir>` — persistent `LoudsStore`, WAL + generation-numbered snapshot on disk (see `crates/nova-storage-common/src/wal.rs`) |
 | Oxigraph | `serve --location <dir>` — its default/production RocksDB-backed mode |
 | QLever   | Memory-mapped disk index, unchanged from the in-memory comparison (QLever has no other mode) |
 

@@ -16,7 +16,7 @@
 //! ## Merge policy
 //!
 //! When the delta exceeds a threshold (default: 1 M triples), a background
-//! thread can call `RingStore::compact()` which:
+//! thread can call `LoudsStore::compact()` which:
 //! 1. Merges Ring ∪ delta_inserts \ tombstones.
 //! 2. Rebuilds Ring via `RingBuilder::build()`.
 //! 3. Clears this delta.

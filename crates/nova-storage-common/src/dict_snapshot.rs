@@ -91,11 +91,11 @@ pub fn write_and_load_mmap(dict: &Dictionary, path: &Path) -> Result<Dictionary,
 /// Returns a fresh, empty `Dictionary::new()` if `path` doesn't exist
 /// (fresh store, or a persistent store that has never been compacted).
 ///
-/// Used by `RingStore::open()` and by [`write_and_load_mmap`].
+/// Used by `LoudsStore::open()` and by [`write_and_load_mmap`].
 ///
 /// Requires the `mmap` cargo feature (default-on; disabled for the wasm32
 /// build, see this crate's `Cargo.toml`). Disk-backed persistence
-/// (`RingStore::open`) is unavailable without it — see the `not(feature =
+/// (`LoudsStore::open`) is unavailable without it — see the `not(feature =
 /// "mmap")` fallback below.
 #[cfg(feature = "mmap")]
 pub fn load_mmap_from_file(path: &Path) -> Result<Dictionary, Oxigraph> {

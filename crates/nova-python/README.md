@@ -2,7 +2,7 @@
 
 Python bindings for Oxigraph Nova, exposing the same API surface as
 upstream [pyoxigraph](https://github.com/oxigraph/oxigraph/tree/main/python)
-but backed by `oxigraph-nova-store`'s `RingStore` + Leapfrog Triejoin
+but backed by `oxigraph-nova-store`'s `LoudsStore` + Leapfrog Triejoin
 evaluator instead of `oxigraph::store::Store`/RocksDB. The Rust source
 (`model.rs`, `io.rs`, `sparql.rs`, `store.rs`) and the `tests/` directory
 were vendored from upstream pyoxigraph (MIT/Apache-2.0, see `LICENSE-MIT`/
@@ -56,7 +56,7 @@ and, where relevant, which Nova source file is responsible.
 ## Unsupported features
 
 Because `oxigraph-nova-store`'s `Store` facade is deliberately a thin
-wrapper around Nova's `RingStore` + `nova-query` evaluator (see
+wrapper around Nova's `LoudsStore` + `nova-query` evaluator (see
 `crates/nova-store/src/lib.rs`) rather than a reimplementation of
 `oxigraph::store::Store`'s full surface, a handful of upstream pyoxigraph
 `Store` features have no Nova-backed equivalent yet and raise
@@ -111,5 +111,5 @@ one.
 `PyStore` in `store.rs` holds a single `oxigraph_nova_store::Store` and
 translates each pyoxigraph `Store` method 1:1 onto it — see
 `crates/nova-store/src/lib.rs` for the facade this binding sits on top of,
-and `ARCHITECTURE.md` for how that facade composes `RingStore` +
+and `ARCHITECTURE.md` for how that facade composes `LoudsStore` +
 `StoreDataset`/`Evaluator` + `execute_update` + `spargebra::SparqlParser`.

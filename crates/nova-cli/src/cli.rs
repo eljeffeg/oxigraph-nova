@@ -17,7 +17,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(about, version, name = "oxigraph")]
 /// Oxigraph Nova offline CLI tooling: bulk-load, backup, query, update,
-/// dump, convert, optimize, and serve a persistent `RingStore` without
+/// dump, convert, optimize, and serve a persistent `LoudsStore` without
 /// necessarily going through HTTP.
 pub struct Args {
     #[command(subcommand)]
@@ -30,7 +30,7 @@ pub enum Command {
     /// store
     ///
     /// Bypasses the HTTP Graph Store Protocol entirely — reads the
-    /// file(s), parses them, and calls `RingStore::bulk_load` directly,
+    /// file(s), parses them, and calls `LoudsStore::bulk_load` directly,
     /// which is much faster than sending it through `nova-server`'s
     /// `/store` endpoint for very large datasets. Multiple `--file`s are
     /// parsed in parallel (one thread per file) and merged into a single
@@ -91,7 +91,7 @@ pub enum Command {
     /// Create a database backup into a target directory
     ///
     /// After creation, the backup is usable as a fully independent Nova
-    /// store, decoupled from the original (see `RingStore::backup`).
+    /// store, decoupled from the original (see `LoudsStore::backup`).
     Backup {
         /// Directory in which Nova data is persisted
         #[arg(short, long, value_hint = ValueHint::DirPath)]
@@ -255,7 +255,7 @@ pub enum Command {
     /// `/store`) at the HTTP layer with `403 Forbidden`, so this server
     /// process can never mutate `--location`. **This is not the same as
     /// storage-level concurrent-multi-process read isolation** —
-    /// `RingStore` still uses a single-writer WAL design (see
+    /// `LoudsStore` still uses a single-writer WAL design (see
     /// `oxigraph_nova_storage_ring::store`'s module doc, "Isolation
     /// semantics"); running this against a `--location` directory that
     /// another process is concurrently writing to is not guaranteed safe.
@@ -484,7 +484,7 @@ pub enum McpCommand {
     ///
     /// **Concurrency**: do not point `--location` at a directory that is
     /// concurrently open in another `oxigraph serve`/`nova_serve` process —
-    /// `RingStore` is a single-writer-WAL design (see
+    /// `LoudsStore` is a single-writer-WAL design (see
     /// `oxigraph_nova_storage_ring::store`'s module doc, "Isolation
     /// semantics").
     Serve {

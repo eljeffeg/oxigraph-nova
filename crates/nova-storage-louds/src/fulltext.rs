@@ -11,7 +11,7 @@
 //! ## Consistency model
 //!
 //! See [`oxigraph_nova_core::TextSearch`]'s module docs. In short: the
-//! index is updated incrementally, once per [`crate::store::RingStoreInner::compact_locked`]
+//! index is updated incrementally, once per [`crate::store::LoudsStoreInner::compact_locked`]
 //! call, by walking exactly the delta entries that compaction is already
 //! merging into the Ring — never on the write hot path.
 //!
@@ -20,7 +20,7 @@
 //! For a persistent store, `<data_dir>/fulltext/GENERATION` records the
 //! `snapshot_gen` the Tantivy index was last brought up to date with. If it
 //! doesn't match the store's current `snapshot_gen` at
-//! [`crate::store::RingStore::enable_fulltext`] time (e.g. the feature is
+//! [`crate::store::LoudsStore::enable_fulltext`] time (e.g. the feature is
 //! being turned on for a pre-existing database, or a crash happened between
 //! the Ring snapshot commit and the Tantivy `.commit()`), a one-time full
 //! rebuild is triggered by walking every graph's `spo_triples()` rather than

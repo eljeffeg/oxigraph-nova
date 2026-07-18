@@ -3,7 +3,7 @@
 //! This crate exists for two audiences:
 //!
 //! - A Rust caller who wants to embed Nova directly and would rather call
-//!   `store.query(...)`/`store.insert(...)` than hand-wire `RingStore` +
+//!   `store.query(...)`/`store.insert(...)` than hand-wire `LoudsStore` +
 //!   `StoreDataset` + `Evaluator` + `execute_update` itself.
 //! - A language binding (Python/JS/etc.) whose `store.rs` glue code is
 //!   written against `oxigraph::store::Store`'s method surface: `Store`
@@ -14,7 +14,7 @@
 //! construct a `StoreDataset`/`Evaluator` (or call `execute_update`)
 //! per-call exactly the way `oxigraph`'s own CLI tooling already does
 //! inline; `insert`/`remove`/`contains`/`quads_for_pattern`/`len` are
-//! direct passthroughs to the wrapped `RingStore`'s `QuadStore` impl;
+//! direct passthroughs to the wrapped `LoudsStore`'s `QuadStore` impl;
 //! `load`/`dump` stream through `oxrdfio`.
 //!
 //! ```
@@ -49,7 +49,7 @@ use oxigraph_nova_query::{
     projected_variables,
 };
 use oxigraph_nova_reasoning::{ReasoningEngine, ReasoningState};
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use oxrdf::{QuadRef, TripleRef, Variable};
 use oxrdfio::{RdfFormat, RdfParser, RdfSerializer};
 use spargebra::SparqlParser;
@@ -97,15 +97,15 @@ pub fn collect_query_result(result: QueryResult) -> anyhow::Result<QueryResults>
     }
 }
 
-/// A monolithic, embeddable RDF store: `RingStore` (storage) + the SPARQL
+/// A monolithic, embeddable RDF store: `LoudsStore` (storage) + the SPARQL
 /// evaluator + `execute_update`, wrapped behind one type with an
 /// `oxigraph::store::Store`-shaped method surface.
 ///
-/// Cheaply cloneable (an `Arc<RingStore>` handle internally) — clones share
+/// Cheaply cloneable (an `Arc<LoudsStore>` handle internally) — clones share
 /// the same underlying store, exactly like `oxigraph::store::Store`.
 #[derive(Clone)]
 pub struct Store {
-    store: Arc<RingStore>,
+    store: Arc<LoudsStore>,
     /// Opt-in OWL 2 RL reasoning overlay cache, configured via
     /// [`Store::with_reasoning`]. When present, [`Store::query`] evaluates
     /// every query over the cached
@@ -113,7 +113,7 @@ pub struct Store {
     /// when the store's compaction generation advances — see
     /// `oxigraph_nova_reasoning::ReasoningState`'s module doc comment)
     /// instead of the raw store.
-    reasoning: Option<Arc<ReasoningState<RingStore>>>,
+    reasoning: Option<Arc<ReasoningState<LoudsStore>>>,
 }
 
 impl Default for Store {
@@ -126,16 +126,16 @@ impl Store {
     /// Create a new, purely in-memory store with no on-disk persistence.
     pub fn new() -> Self {
         Self {
-            store: Arc::new(RingStore::new()),
+            store: Arc::new(LoudsStore::new()),
             reasoning: None,
         }
     }
 
     /// Open (or create) a persistent store rooted at `path`, recovering any
     /// previously-committed data via the WAL + snapshot scheme (see
-    /// `RingStore::open`).
+    /// `LoudsStore::open`).
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let store = RingStore::open(path.as_ref()).map_err(storage_err)?;
+        let store = LoudsStore::open(path.as_ref()).map_err(storage_err)?;
         Ok(Self {
             store: Arc::new(store),
             reasoning: None,
@@ -227,7 +227,7 @@ impl Store {
     ///
     /// Applied via [`QuadStore::apply_batch`] rather than one `insert` call
     /// per quad: on a backend that overrides `apply_batch` (e.g.
-    /// `RingStore`, which acquires its internal lock once and writes every
+    /// `LoudsStore`, which acquires its internal lock once and writes every
     /// resulting WAL record in a single `append_batch` call), this means
     /// one lock acquisition and one `fsync` for the whole batch instead of
     /// one per quad, and the batch becomes visible to concurrent readers
@@ -280,14 +280,14 @@ impl Store {
         Ok(iter.map(|r| r.map_err(storage_err)))
     }
 
-    /// Direct access to the underlying `RingStore`, for callers (e.g. a
+    /// Direct access to the underlying `LoudsStore`, for callers (e.g. a
     /// language binding's `query`/`update` glue) that need to bypass this
     /// facade's own `query`/`update` — for instance to parse with a custom
     /// base IRI/prefixes via `spargebra::SparqlParser` directly, or to
     /// reconstruct a parsed `Query`'s `dataset` field before evaluating —
     /// neither of which this facade's `query`/`update` methods expose
     /// parameters for.
-    pub fn inner(&self) -> Arc<RingStore> {
+    pub fn inner(&self) -> Arc<LoudsStore> {
         Arc::clone(&self.store)
     }
 
@@ -421,7 +421,7 @@ impl Store {
         Ok(())
     }
 
-    /// A thin wrapper over `RingStore::bulk_load`, for loading large,
+    /// A thin wrapper over `LoudsStore::bulk_load`, for loading large,
     /// known-fresh datasets without going through per-quad `insert` calls.
     pub fn bulk_loader(&self) -> BulkLoader {
         BulkLoader {
@@ -448,7 +448,7 @@ impl Store {
     // ── Full-text search (opt-in via the `fulltext` cargo feature) ──────
 
     /// Turn on Tantivy-backed full-text indexing for this store (see
-    /// `RingStore::enable_fulltext`). Once enabled, literal objects are
+    /// `LoudsStore::enable_fulltext`). Once enabled, literal objects are
     /// indexed incrementally on every compaction. Call
     /// [`Store::text_search`] to obtain a handle usable with
     /// `QueryOptions::with_text_search` for `text:query`/`text:contains`
@@ -478,10 +478,10 @@ fn stored_subject(sq: &StoredQuad) -> Option<NamedOrBlankNode> {
     }
 }
 
-/// A thin wrapper over [`RingStore::bulk_load`], returned by
+/// A thin wrapper over [`LoudsStore::bulk_load`], returned by
 /// [`Store::bulk_loader`].
 pub struct BulkLoader {
-    store: Arc<RingStore>,
+    store: Arc<LoudsStore>,
     on_progress: Option<Box<dyn FnMut(u64)>>,
 }
 
@@ -489,7 +489,7 @@ impl BulkLoader {
     /// Register a callback invoked periodically during [`BulkLoader::load`]
     /// with the number of quads consumed from the input so far — mirrors
     /// upstream Oxigraph's `BulkLoader::on_progress`. See
-    /// `RingStore::bulk_load_with_progress`'s doc comment for the exact
+    /// `LoudsStore::bulk_load_with_progress`'s doc comment for the exact
     /// reporting cadence and the "keep it cheap" caveat (the callback runs
     /// while the store's internal lock is held).
     #[must_use]
@@ -501,7 +501,7 @@ impl BulkLoader {
     /// Bulk-insert `quads` directly into the compacted index, bypassing the
     /// per-write delta buffer. Returns the number of quads loaded. Intended
     /// for initial dataset loads where every quad is known to be fresh —
-    /// see `RingStore::bulk_load`'s doc comment for the full rationale.
+    /// see `LoudsStore::bulk_load`'s doc comment for the full rationale.
     pub fn load(mut self, quads: impl IntoIterator<Item = Quad>) -> anyhow::Result<usize> {
         let store = Arc::clone(&self.store);
         let result = match &mut self.on_progress {
@@ -859,7 +859,7 @@ mod tests {
             .unwrap();
         // Force a compaction so the delta-buffered insert above gets folded
         // into the compacted index and indexed by the full-text backend
-        // (see `RingStore`'s fulltext module doc comment: indexing happens
+        // (see `LoudsStore`'s fulltext module doc comment: indexing happens
         // incrementally on compaction).
         store.optimize().unwrap();
 

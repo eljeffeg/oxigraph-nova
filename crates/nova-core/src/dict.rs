@@ -159,7 +159,7 @@ impl GraphId {
 /// ## Thread safety
 ///
 /// `Dictionary` is `!Sync` by design — callers are expected to wrap it in a
-/// `Mutex<RingStoreInner>` (as `RingStore` does) rather than using separate locks.
+/// `Mutex<LoudsStoreInner>` (as `LoudsStore` does) rather than using separate locks.
 pub struct Dictionary {
     // ── Term ↔ TermId (delta tier) ─────────────────────────────────────────
     /// Reverse: `id_to_term[id.as_u64()]` → `Term`, for terms still
@@ -186,7 +186,7 @@ pub struct Dictionary {
     /// hot terms (e.g. a repeated `rdf:type` object matched by thousands of
     /// LFTJ rows). `RefCell`-wrapped since `get_term_arc` takes `&self` —
     /// safe because `Dictionary` is always accessed through the single
-    /// `Mutex<RingStoreInner>` (no concurrent access to guard against).
+    /// `Mutex<LoudsStoreInner>` (no concurrent access to guard against).
     /// Cleared on every `compact()` call, since ranks/block offsets shift.
     decode_cache: RefCell<lru::LruCache<TermId, Arc<Term>>>,
 
@@ -531,7 +531,7 @@ impl Dictionary {
     /// step; `TermId`s are never reassigned, only the internal sorted-rank
     /// permutation.
     ///
-    /// Called from `RingStore::commit_compaction`, on the same cadence that
+    /// Called from `LoudsStore::commit_compaction`, on the same cadence that
     /// already rebuilds all 6 Ring tries.
     pub fn compact(&mut self) -> Result<(), Oxigraph> {
         let high_water = self.id_to_term.len() as u64;
@@ -663,7 +663,7 @@ impl Dictionary {
     ///
     /// Requires that `self.compacted` currently holds a freshly-built
     /// **owned** tier (true immediately after [`Self::compact`] — the exact
-    /// call sequence `RingStore::commit_compaction` always uses: `dict.compact()`
+    /// call sequence `LoudsStore::commit_compaction` always uses: `dict.compact()`
     /// then persist); panics otherwise, mirroring the "Arc is shared"
     /// panics used by the analogous `into_snapshot` methods in
     /// `oxigraph_nova_storage_ring`.

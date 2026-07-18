@@ -4,7 +4,7 @@
 //!
 //! Two ways of storing and querying knowledge-graph triples:
 //!
-//! - **RingStore + LFTJ** — the new backend: data is stored in sorted arrays and
+//! - **LoudsStore + LFTJ** — the new backend: data is stored in sorted arrays and
 //!   queries use a "Leapfrog TrieJoin" (LFTJ) algorithm that seeks through sorted
 //!   data rather than scanning everything.
 //!
@@ -31,7 +31,7 @@
 //! | Group | What it measures | Expected result rows |
 //! |---|---|---|
 //! | `ingest` | How fast triples can be inserted into the delta write buffer | — |
-//! | `compact_build_index` | How fast RingStore builds 6 LOUDS height-3 tries from the delta buffer — the one-time cost after bulk loading that enables O(log ℓ) LFTJ seeks | — |
+//! | `compact_build_index` | How fast LoudsStore builds 6 LOUDS height-3 tries from the delta buffer — the one-time cost after bulk loading that enables O(log ℓ) LFTJ seeks | — |
 //! | `query/scan` | Simple lookup: all entities and their class | N |
 //! | `query/2join` | Two-condition filter: class-0 entities with their region | N/10 |
 //! | `query/star` | Three properties of every entity at once | 3×N |
@@ -44,14 +44,14 @@
 //! engines because every candidate must be checked against *all three* edges.
 //!
 //! - **MemoryStore** checks each candidate with a linear scan: O(N²) total work.
-//! - **RingStore + LFTJ** seeks to the right position in sorted arrays: O(N · log N).
+//! - **LoudsStore + LFTJ** seeks to the right position in sorted arrays: O(N · log N).
 //!
 //! At N = 10,000 that is a theoretical ~770× speed advantage for LFTJ.
 //! The benchmark makes this gap visible and measurable.
 //!
 //! # Dataset sizes used
 //!
-//! RingStore is fast enough to benchmark at N = 10,000 (50,000 triples).
+//! LoudsStore is fast enough to benchmark at N = 10,000 (50,000 triples).
 //! MemoryStore's quadratic scaling makes N = 10,000 impractical for multi-join
 //! queries (each iteration would take > 2 seconds), so it is capped at N = 1,000
 //! for query benchmarks. The single data point is enough to confirm the trend.
@@ -73,7 +73,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Subject, Term};
 use oxigraph_nova_query::{Dataset, Evaluator, QueryResult, StoreDataset};
 use oxigraph_nova_storage_memory::MemoryStore;
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use spargebra::SparqlParser;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -171,13 +171,13 @@ pub fn generate_quads(n: usize) -> Vec<Quad> {
 
 // ── Store construction helpers ────────────────────────────────────────────────
 
-/// Insert `quads` into a fresh `RingStore`, then compact.
+/// Insert `quads` into a fresh `LoudsStore`, then compact.
 ///
 /// Compact builds **6 LOUDS height-3 tries** (one per SPO ordering: SPO, SOP, PSO,
 /// POS, OPS, OSP) from the mutable delta BTreeMap.  After compaction, the Ring
 /// index is immutable and every LFTJ seek is O(1) navigation + O(log ℓ) leap search.
-fn build_ring_store(quads: &[Quad]) -> Arc<RingStore> {
-    let store = Arc::new(RingStore::new());
+fn build_ring_store(quads: &[Quad]) -> Arc<LoudsStore> {
+    let store = Arc::new(LoudsStore::new());
     for q in quads {
         store.insert(q).unwrap();
     }
@@ -216,11 +216,11 @@ fn count_solutions<D: Dataset>(dataset: &D, sparql: &str) -> usize {
 //
 // How fast can each backend insert triples from scratch?
 //
-// RingStore appends into a write buffer (O(log N) dictionary lookup + BTreeMap
+// LoudsStore appends into a write buffer (O(log N) dictionary lookup + BTreeMap
 // insert), so it scales well even at N = 50,000.
 //
 // MemoryStore does a full linear duplicate scan on every insert — O(N²) total.
-// At N = 1,000 it is already ~27× slower than RingStore; at N = 10,000 a single
+// At N = 1,000 it is already ~27× slower than LoudsStore; at N = 10,000 a single
 // benchmark iteration takes ~2.8 s (completely impractical for Criterion).
 // MemoryStore is therefore only measured at N = 1,000. The scaling gap is already
 // obvious from that one data point.
@@ -228,13 +228,13 @@ fn count_solutions<D: Dataset>(dataset: &D, sparql: &str) -> usize {
 fn bench_ingest(c: &mut Criterion) {
     let mut group = c.benchmark_group("ingest");
 
-    // RingStore scales well — benchmark all three sizes.
+    // LoudsStore scales well — benchmark all three sizes.
     for &n in &[1_000usize, 10_000, 50_000] {
         let quads = generate_quads(n);
         group.throughput(Throughput::Elements(quads.len() as u64));
         group.bench_with_input(BenchmarkId::new("ring", n), &quads, |b, quads| {
             b.iter(|| {
-                let store = RingStore::new();
+                let store = LoudsStore::new();
                 for q in quads {
                     store.insert(q).unwrap();
                 }
@@ -264,7 +264,7 @@ fn bench_ingest(c: &mut Criterion) {
 
 // ── Benchmark 2: Index build (compact) ───────────────────────────────────────
 //
-// RingStore writes accumulate in a mutable BTreeMap delta buffer first.
+// LoudsStore writes accumulate in a mutable BTreeMap delta buffer first.
 // `compact()` is the "flush" step — like an LSM-tree compaction — that:
 //   1. Sorts and deduplicates all triples
 //   2. Builds compact local-ID vocabularies (S, P, O)
@@ -288,7 +288,7 @@ fn bench_compact(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     // Setup (not timed): insert all triples into a fresh store.
-                    let store = RingStore::new();
+                    let store = LoudsStore::new();
                     for q in quads {
                         store.insert(q).unwrap();
                     }
@@ -308,7 +308,7 @@ fn bench_compact(c: &mut Criterion) {
 
 // ── Query benchmark sizes ─────────────────────────────────────────────────────
 //
-// RingStore + LFTJ is O(N · log N) on join queries, so N = 10,000 runs quickly
+// LoudsStore + LFTJ is O(N · log N) on join queries, so N = 10,000 runs quickly
 // and gives a clear signal.
 //
 // MemoryStore uses nested-loop evaluation; multi-join queries are O(N²). At
@@ -319,7 +319,7 @@ fn bench_compact(c: &mut Criterion) {
 // Datasets are built once outside the timing loop; the timed region is query
 // evaluation only. `count_solutions` forces full result materialization.
 
-/// RingStore query benchmark: 10,000 entities → 50,000 triples.
+/// LoudsStore query benchmark: 10,000 entities → 50,000 triples.
 const RING_QUERY_N: usize = 10_000;
 
 /// MemoryStore query benchmark: 1,000 entities → 5,000 triples.
@@ -465,7 +465,7 @@ fn bench_query_path(c: &mut Criterion) {
 //
 // Performance comparison (out-degree d = 3):
 //   MemoryStore: checks every (A,B,C) candidate against the full triple list  → O(N²)
-//   RingStore + LFTJ: seeks directly to matching positions in sorted arrays   → O(N · log N)
+//   LoudsStore + LFTJ: seeks directly to matching positions in sorted arrays   → O(N · log N)
 //
 // At N = 10,000, the theoretical advantage is ~770×. This benchmark makes that
 // gap concrete and measurable.

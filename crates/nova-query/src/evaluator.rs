@@ -3997,11 +3997,11 @@ mod tests {
         use crate::dataset::StoreDataset;
         use crate::options::QueryOptions;
         use oxigraph_nova_core::QuadStore;
-        use oxigraph_nova_storage_ring::RingStore;
+        use oxigraph_nova_storage_ring::LoudsStore;
         use std::sync::Arc;
 
-        fn make_store_with_text() -> Arc<RingStore> {
-            let store = Arc::new(RingStore::new());
+        fn make_store_with_text() -> Arc<LoudsStore> {
+            let store = Arc::new(LoudsStore::new());
             store.enable_fulltext().unwrap();
             store
                 .insert(&oxrdf::Quad::new(

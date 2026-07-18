@@ -1,7 +1,7 @@
 //! E5.7 — Paper-faithful **cyclic Ring A** primitive spike.
 //!
 //! Feature-gated: compile with `--features cyclic-ring-pilot`.
-//! **Not** on the default `RingStore` execution path.
+//! **Not** on the default `LoudsStore` execution path.
 //!
 //! # Structure (Ring A only)
 //!
@@ -13,8 +13,8 @@
 //! ```
 //!
 //! Ring B / URing are E5.8 **DROP** speed-oracle only (`diagnostics` feature).
-//! E5.10: [`mapped_qwt`] — `NOVAQWT1` flatten / open (W0); no RingStore cutover.
-//! No SPARQL, no production RingStore replacement. Product path is Ring A + D2.
+//! E5.10: [`mapped_qwt`] — `NOVAQWT1` flatten / open (W0); no LoudsStore cutover.
+//! No SPARQL, no production LoudsStore replacement. Product path is Ring A + D2.
 
 //! # Indexing convention
 //!
@@ -79,7 +79,7 @@ pub use mapped_ring::{
     MappedRingA, MappedRingError, open_novarng1_mmap, write_novarng1_file, write_novarng1_v1,
 };
 pub use scan::BraidedJoinScan;
-pub use store::BraidedStore;
+pub use store::RingStore;
 
 
 

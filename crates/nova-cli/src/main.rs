@@ -1,7 +1,7 @@
 //! `oxigraph` — standalone offline CLI tooling for Oxigraph Nova.
 //!
 //! Mirrors a subset of `oxigraph-cli`'s subcommands (see
-//! `./research/oxigraph/cli`), adapted to Nova's own `RingStore`/`Server`
+//! `./research/oxigraph/cli`), adapted to Nova's own `LoudsStore`/`Server`
 //! API surface, and shipped under
 //! the same binary name (`oxigraph`) so scripts/muscle memory written
 //! against upstream `oxigraph-cli` work unchanged. Nine subcommands total:
@@ -12,7 +12,7 @@
 //!   in parallel, merged into a single bulk-load pass) or, if `--file` is
 //!   omitted entirely, reads from stdin (`--format` then required).
 //! - `oxigraph backup --location <dir> --destination <dir>` — mirrors
-//!   `oxigraph backup` 1:1 (see `RingStore::backup`).
+//!   `oxigraph backup` 1:1 (see `LoudsStore::backup`).
 //! - `oxigraph query --location <dir> (--query Q | --query-file F) ...` —
 //!   run a SPARQL query against a persistent store, offline (no HTTP),
 //!   with results format-negotiated the same way as `/sparql`.
@@ -42,7 +42,7 @@ use oxigraph_nova_core::{GraphName, NamedOrBlankNode, QuadStore, Term};
 use oxigraph_nova_query::{Evaluator, QueryResult, StoreDataset, execute_update};
 use oxigraph_nova_server::{Server, mimalloc_tuning};
 use oxigraph_nova_shacl::{NativeValidator, ShaclValidator};
-use oxigraph_nova_storage_ring::{RingStore, SyncPolicy};
+use oxigraph_nova_storage_ring::{LoudsStore, SyncPolicy};
 use oxrdfio::{RdfFormat, RdfParser, RdfSerializer};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use spargebra::SparqlParser;
@@ -253,7 +253,7 @@ fn run_load(
         "[oxigraph load] Opening persistent store at {} ...",
         location.display()
     );
-    let store = RingStore::open(location)?;
+    let store = LoudsStore::open(location)?;
 
     match files {
         [] => println!("[oxigraph load] Reading from stdin ..."),
@@ -287,7 +287,7 @@ fn run_backup(location: &std::path::Path, destination: &std::path::Path) -> anyh
         "[oxigraph backup] Opening store at {} ...",
         location.display()
     );
-    let store = RingStore::open(location)?;
+    let store = LoudsStore::open(location)?;
     println!(
         "[oxigraph backup] Backing up to {} ...",
         destination.display()
@@ -402,7 +402,7 @@ fn run_query(
         "[oxigraph query] Opening persistent store at {} ...",
         location.display()
     );
-    let store = Arc::new(RingStore::open(location)?);
+    let store = Arc::new(LoudsStore::open(location)?);
 
     let parsed = SparqlParser::new().parse_query(&query_text)?;
     let dataset = StoreDataset::new(Arc::clone(&store));
@@ -474,7 +474,7 @@ fn run_update(
         "[oxigraph update] Opening persistent store at {} ...",
         location.display()
     );
-    let store = Arc::new(RingStore::open(location)?);
+    let store = Arc::new(LoudsStore::open(location)?);
 
     let parsed = SparqlParser::new().parse_update(&update_text)?;
     execute_update(&store, &parsed)?;
@@ -504,7 +504,7 @@ fn run_cypher_query(
         "[oxigraph cypher query] Opening persistent store at {} ...",
         location.display()
     );
-    let store = Arc::new(RingStore::open(location)?);
+    let store = Arc::new(LoudsStore::open(location)?);
 
     let parsed = oxigraph_nova_cypher::parse_and_lower(&query_text)?;
     let dataset = StoreDataset::new(Arc::clone(&store));
@@ -569,7 +569,7 @@ fn run_cypher_update(
         "[oxigraph cypher update] Opening persistent store at {} ...",
         location.display()
     );
-    let store = Arc::new(RingStore::open(location)?);
+    let store = Arc::new(LoudsStore::open(location)?);
 
     let parsed = oxigraph_nova_cypher::parse_and_lower_update(&update_text)?;
     execute_update(&store, &parsed)?;
@@ -592,7 +592,7 @@ fn run_dump(
         "[oxigraph dump] Opening persistent store at {} ...",
         location.display()
     );
-    let store = RingStore::open(location)?;
+    let store = LoudsStore::open(location)?;
 
     let fmt = load::resolve_format_opt(format, file)?;
 
@@ -750,7 +750,7 @@ fn run_optimize(location: &std::path::Path) -> anyhow::Result<()> {
         "[oxigraph optimize] Opening persistent store at {} ...",
         location.display()
     );
-    let store = RingStore::open(location)?;
+    let store = LoudsStore::open(location)?;
     println!("[oxigraph optimize] Compacting ...");
     let t0 = Instant::now();
     store.compact()?;
@@ -779,7 +779,7 @@ async fn run_serve_read_only(
         "[oxigraph serve-read-only] Opening persistent store at {} ...",
         location.display()
     );
-    let store = RingStore::open(&location)?;
+    let store = LoudsStore::open(&location)?;
     println!(
         "[oxigraph serve-read-only] Recovered {} triples from WAL.",
         store.triple_count()
@@ -849,7 +849,7 @@ async fn run_serve(
                 "[oxigraph serve] Opening persistent store at {} ...",
                 dir.display()
             );
-            let store = RingStore::open(dir)?;
+            let store = LoudsStore::open(dir)?;
             if let Some(threshold) = compact_threshold {
                 store.set_auto_compact_threshold(threshold);
                 println!("[oxigraph serve] Auto-compact threshold set to {threshold}.");
@@ -864,7 +864,7 @@ async fn run_serve(
             );
             store
         }
-        None => RingStore::new(),
+        None => LoudsStore::new(),
     };
 
     if let Some(file) = &file {
@@ -984,7 +984,7 @@ fn run_validate(
         "[oxigraph validate] Opening persistent store at {} ...",
         location.display()
     );
-    let store = Arc::new(RingStore::open(location)?);
+    let store = Arc::new(LoudsStore::open(location)?);
 
     let fmt = load::resolve_format_opt(shapes_format, Some(shapes_path))?;
     eprintln!(
@@ -1051,7 +1051,7 @@ async fn run_mcp_serve(
                 "[oxigraph mcp serve] Opening persistent store at {} ...",
                 dir.display()
             );
-            let store = RingStore::open(dir)?;
+            let store = LoudsStore::open(dir)?;
             eprintln!(
                 "[oxigraph mcp serve] Recovered {} triples from WAL.",
                 store.triple_count()
@@ -1060,7 +1060,7 @@ async fn run_mcp_serve(
         }
         None => {
             eprintln!("[oxigraph mcp serve] Using an in-memory store (no --location given).");
-            RingStore::new()
+            LoudsStore::new()
         }
     };
     let store = Arc::new(store);

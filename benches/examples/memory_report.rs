@@ -1,4 +1,4 @@
-//! Memory footprint estimator: RingStore vs CLTJ vs MemoryStore.
+//! Memory footprint estimator: LoudsStore vs CLTJ vs MemoryStore.
 //!
 //! Prints a table showing how much memory each backend uses at various dataset
 //! sizes, along with the memory savings achieved by the CLTJ implementation.
@@ -74,7 +74,7 @@
 
 use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Subject, Term};
 use oxigraph_nova_storage_memory::MemoryStore;
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use std::sync::Arc;
 
 // -- Data generation ----------------------------------------------------------
@@ -248,7 +248,7 @@ fn main() {
 
     {
         let quads = generate_quads(100);
-        let rs = Arc::new(RingStore::new());
+        let rs = Arc::new(LoudsStore::new());
         for q in &quads {
             rs.insert(q).unwrap();
         }
@@ -256,7 +256,7 @@ fn main() {
         assert_eq!(
             rs.triple_count(),
             500,
-            "unexpected triple count in RingStore"
+            "unexpected triple count in LoudsStore"
         );
         let ms = Arc::new(MemoryStore::new());
         for q in &quads {

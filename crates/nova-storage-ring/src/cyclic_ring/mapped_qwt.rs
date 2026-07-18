@@ -5,7 +5,7 @@
 //! `rank_all` + full-symbol `rank` / `select` (W2) + native RNV + fixed-stack
 //! RDI (W3) with the same arithmetic as qwt block size 256 / E5.9A.
 
-//! **Not** on the RingStore path. Feature `cyclic-ring-pilot` only.
+//! **Not** on the LoudsStore path. Feature `cyclic-ring-pilot` only.
 //!
 //! Platform: little-endian only (v1).
 //!

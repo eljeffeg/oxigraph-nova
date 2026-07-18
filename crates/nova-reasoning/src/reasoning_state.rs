@@ -30,7 +30,7 @@
 //! `ReasoningDataset`'s own base "wrap once" contract (a caller who mutates
 //! such a store after enabling reasoning won't see updated inferences until
 //! a new `ReasoningState` is constructed). This mirrors exactly how
-//! `RingStore::enable_fulltext`'s generation-marker staleness check works
+//! `LoudsStore::enable_fulltext`'s generation-marker staleness check works
 //! (see its doc comment) — both are "eventually consistent, recompute keyed
 //! to the compaction cycle" designs.
 //!

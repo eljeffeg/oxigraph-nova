@@ -3,9 +3,9 @@
 //! Upstream Oxigraph documents a "repeatable read" isolation guarantee: any
 //! single read operation, or read/write operation, observes a fixed snapshot
 //! of the store for its *entire* duration, and only fully-committed changes
-//! are ever visible. `oxigraph_nova_storage_ring::RingStore` gives per-call
+//! are ever visible. `oxigraph_nova_storage_ring::LoudsStore` gives per-call
 //! atomicity for free (each individual `QuadStore` method call takes its
-//! single `Mutex<RingStoreInner>` exactly once), but does **not** implement
+//! single `Mutex<LoudsStoreInner>` exactly once), but does **not** implement
 //! that stronger whole-operation snapshot guarantee: a multi-statement
 //! `Update` (or a multi-triple-pattern query) is really a *sequence* of
 //! independent lock acquisitions, so a concurrent write that lands between
@@ -25,7 +25,7 @@
 //! doc comment ("Atomicity") for the corresponding design documentation.
 
 use oxigraph_nova_core::QuadStore;
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_storage_ring::LoudsStore;
 use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -45,7 +45,7 @@ fn quad(s: &str, o: &str) -> Quad {
 
 #[test]
 fn concurrent_update_is_visible_mid_multi_pattern_query_no_repeatable_read() {
-    let store = Arc::new(RingStore::new());
+    let store = Arc::new(LoudsStore::new());
     store.insert(&quad("http://ex/existing", "e")).unwrap();
 
     // Two rendezvous channels give us a deterministic happens-before
@@ -99,7 +99,7 @@ fn concurrent_update_is_visible_mid_multi_pattern_query_no_repeatable_read() {
         "second scan (of the SAME logical multi-pattern query) observes the quad \
          inserted after the query began — this is the absence of a repeatable-read/ \
          fixed-snapshot guarantee across multiple store calls, documented in \
-         RingStore's module doc comment. A true repeatable-read \
+         LoudsStore's module doc comment. A true repeatable-read \
          guarantee would require `second_count == first_count == 1`."
     );
 }
@@ -114,7 +114,7 @@ fn concurrent_reader_can_observe_update_partially_applied() {
     use oxigraph_nova_query::update::execute_update;
     use spargebra::SparqlParser;
 
-    let store = Arc::new(RingStore::new());
+    let store = Arc::new(LoudsStore::new());
     // Seed 50 quads that a DELETE/INSERT ... WHERE will rewrite one-by-one.
     for i in 0..50 {
         store

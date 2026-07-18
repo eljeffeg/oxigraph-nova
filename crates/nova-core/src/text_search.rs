@@ -8,7 +8,7 @@
 //! implementation — so `nova-core` and `nova-query` stay free of any
 //! full-text-search dependency, and the feature is entirely opt-in.
 //!
-//! `oxigraph-nova-storage-ring` implements this trait for `RingStore` behind
+//! `oxigraph-nova-storage-ring` implements this trait for `LoudsStore` behind
 //! its `fulltext` cargo feature (see `crates/nova-fulltext` for the actual
 //! Tantivy-backed implementation it delegates to).
 //!
