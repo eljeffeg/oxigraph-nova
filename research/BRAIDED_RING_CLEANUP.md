@@ -1,8 +1,8 @@
 # Braided Ring cleanup summary
 
-**Date:** 2026-07-17  
-**Status:** Phase 0 **executed** on `research_branch` (diagnostics gating + status docs). Phases 1–4 still planned.  
-**Active status page:** [`BRAIDED_RING.md`](./BRAIDED_RING.md)  
+**Date:** 2026-07-17
+**Status:** Phase 0–2 **executed** on `braided-ring-productize` (diagnostics freeze, path extract, crate split with LOUDS re-export). Phases 3–4 still planned.
+**Active status page:** [`BRAIDED_RING.md`](./BRAIDED_RING.md)
 **Goal:** stop calling the product path “PRISM,” land the cyclic/braided index as `nova-storage-ring`, isolate the production LOUDS backend as `nova-storage-louds`, and strip research/test ballast.
 
 ---
@@ -236,23 +236,23 @@ Do **not** rewrite history in notes; add a header: “Superseded by Braided Ring
 4. ~~Trim `e511` default path: no E1/D3/D4 matrices unless `--full-campaign` + `diagnostics`.~~
 5. ~~README note: LOUDS production + Braided Ring pilot.~~
 
-### Phase 1 — extract `nova-storage-louds` (mechanical)
+### Phase 1 — extract winners onto clean branch — **DONE** (`braided-ring-productize`)
 
-1. `git mv` LOUDS modules into new crate.
-2. Workspace member + fix imports (`nova-server`, `nova-store`, `nova-cli`, tests).
-3. Temporary re-export from old paths if needed:
+Path-extract KEEP only (no hybrid/PRISM/ultra) from `main` + research freeze surface.
+
+### Phase 2 — crate split LOUDS vs Braided Ring — **DONE** (compat re-export)
+
+1. ~~`git mv` LOUDS modules into `crates/nova-storage-louds`.~~
+2. ~~Workspace member + louds `Cargo.toml` / `lib.rs`.~~
+3. ~~`nova-storage-ring` owns Braided Ring + temporary re-export:~~
    ```rust
    // oxigraph_nova_storage_ring (compat)
    pub use oxigraph_nova_storage_louds::*;
    ```
-4. Green: W3C / store tests / server smoke.
+4. ~~Features: `fulltext`/`mmap` forward to louds; `cyclic-ring-pilot`/`diagnostics` stay on ring.~~
+5. ~~Green: louds 83 tests, cyclic_ring 39 tests, store 17 tests, server + e511 check.~~
 
-### Phase 2 — refocus `nova-storage-ring`
-
-1. Remove LOUDS modules from braided crate (or leave thin re-export one release).
-2. Enable braided path without `cyclic-ring-pilot` name (feature `default = ["mmap"]` sufficient).
-3. Rename modules in docs: `cyclic_ring` → `braided` (optional code rename later).
-4. Product tests only; research benches archived.
+**Remaining Phase-2 polish (optional, not blocking):** drop re-export and migrate dependents to `oxigraph-nova-storage-louds`; rename `cyclic-ring-pilot` → `braided-ring`.
 
 ### Phase 3 — delete / archive research code
 

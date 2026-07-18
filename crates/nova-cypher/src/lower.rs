@@ -1,4 +1,4 @@
-//! Lowering pass: Cypher Phase 1 AST → `spargebra::Query`.
+//! Lowering pass: Cypher AST → `spargebra::Query`.
 //!
 //! ## RDF ↔ property-graph (LPG) mapping
 //!
@@ -48,8 +48,8 @@
 //!
 //! `-[:KNOWS*1..3]->` (an explicit upper bound) cannot be losslessly
 //! represented: SPARQL 1.1/1.2 property paths only support unbounded
-//! repetition (`*`, `+`), not bounded `{min,max}` repetition. Phase 1
-//! therefore only supports the *unbounded* forms — bare `*` and `*1..`
+//! repetition (`*`, `+`), not bounded `{min,max}` repetition. 
+//! Only supports the *unbounded* forms — bare `*` and `*1..`
 //! both lower to one-or-more (matching openCypher's own default range of
 //! `1..` for a bare `*`), and `*0..` lowers to zero-or-more — and rejects
 //! any pattern with an explicit maximum, or an explicit minimum other than
@@ -62,13 +62,13 @@
 //! — `ORDER BY` wraps the raw (filtered) pattern *before* projection,
 //! `DISTINCT` wraps the projection, and `SKIP`/`LIMIT` wrap everything last.
 //!
-//! ## Phase 2: write statements
+//! ## write statements
 //!
 //! [`lower_statement`] lowers a [`CypherStatement`] (optional `MATCH`/`WHERE`
 //! plus one or more [`WriteClause`]s) into a `spargebra::Update` — a `Vec` of
 //! `GraphUpdateOperation`s, one *or more* per write clause, each a
 //! `DeleteInsert { delete, insert, using: None, pattern }` reusing the same
-//! `MATCH`/`WHERE` lowering machinery (`lower_pattern`/`lower_expr`) Phase 1
+//! `MATCH`/`WHERE` lowering machinery (`lower_pattern`/`lower_expr`) 
 //! already has. All operations for one statement share the same base
 //! (`MATCH`/`WHERE`) pattern, extended per-clause as needed (see below);
 //! operations execute in clause order, matching both Cypher's own
@@ -172,7 +172,7 @@ struct LowerCtx {
     rel_vars: HashMap<String, RelBinding>,
     /// `(subject_var, object_var)` recorded for every *named* relationship
     /// pattern lowered from a `MATCH`, direction already resolved — lets
-    /// Phase 2's `DELETE`/`DETACH DELETE` on a relationship variable rebuild
+    /// `DELETE`/`DETACH DELETE` on a relationship variable rebuild
     /// exactly the one triple that relationship was matched from.
     rel_endpoints: HashMap<String, (Variable, Variable)>,
     prop_vars: HashMap<(String, String), Variable>,
@@ -190,7 +190,7 @@ impl LowerCtx {
         Variable::new_unchecked(format!("_{prefix}{n}"))
     }
 
-    /// Mints a fresh blank-node label for use in a Phase 2 `CREATE` INSERT
+    /// Mints a fresh blank-node label for use in `CREATE` INSERT
     /// template (see [`lower_create`]) — distinct from [`Self::fresh_var`],
     /// which mints SPARQL variables for already/to-be-bound query results.
     fn fresh_create_bnode(&mut self) -> BlankNode {
@@ -210,7 +210,7 @@ impl LowerCtx {
     }
 }
 
-/// Lowers a full Cypher Phase 1 query into a `spargebra::Query::Select`.
+/// Lowers a full Cypher query into a `spargebra::Query::Select`.
 pub fn lower(query: &CypherQuery) -> Result<Query, String> {
     let mut ctx = LowerCtx::default();
 
@@ -353,8 +353,8 @@ fn lower_rel_pattern(
     to: &Variable,
 ) -> Result<(), String> {
     let (subject, object) = match rel.direction.0 {
-        // `Either` (undirected, `-[...]-`) is treated the same as `Right` in
-        // Phase 1 — plain RDF triples have no undirected-edge concept, and
+        // `Either` (undirected, `-[...]-`) is treated the same as `Right`
+        // — plain RDF triples have no undirected-edge concept, and
         // representing `Either` correctly would require unioning both
         // directions. Documented simplification; may be revisited later.
         RelDirection::Right | RelDirection::Either => (from.clone(), to.clone()),
@@ -364,7 +364,7 @@ fn lower_rel_pattern(
     if let Some(var_length) = rel.var_length {
         if rel.variable.is_some() {
             return Err(
-                "cannot bind a variable to a variable-length relationship path in Phase 1"
+                "cannot bind a variable to a variable-length relationship path"
                     .to_string(),
             );
         }
@@ -376,13 +376,13 @@ fn lower_rel_pattern(
         }
         let Some(rel_type) = &rel.rel_type else {
             return Err(
-                "variable-length relationships must specify a single relationship type in Phase 1 (e.g. `-[:KNOWS*]->`)"
+                "variable-length relationships must specify a single relationship type (e.g. `-[:KNOWS*]->`)"
                     .to_string(),
             );
         };
         if var_length.max.is_some() {
             return Err(
-                "bounded variable-length relationships (`*min..max` with an explicit max) are not supported in Phase 1 — SPARQL property paths only support unbounded `*`/`+` repetition".to_string(),
+                "bounded variable-length relationships (`*min..max` with an explicit max) are not supported — SPARQL property paths only support unbounded `*`/`+` repetition".to_string(),
             );
         }
         let iri = PropertyPathExpression::NamedNode(NamedNode::new_unchecked(format!(
@@ -396,7 +396,7 @@ fn lower_rel_pattern(
             Some(0) => PropertyPathExpression::ZeroOrMore(Box::new(iri)),
             Some(_) => {
                 return Err(
-                    "variable-length relationships with an explicit minimum > 1 and no maximum are not supported in Phase 1 (only `*`, `*0..`, and `*1..`/`+` are supported)".to_string(),
+                    "variable-length relationships with an explicit minimum > 1 and no maximum are not supported (only `*`, `*0..`, and `*1..`/`+` are supported)".to_string(),
                 );
             }
         };
@@ -430,7 +430,7 @@ fn lower_rel_pattern(
             unreachable!("predicate is always Variable when rel_type is None")
         };
         ctx.rel_vars.insert(name.clone(), binding);
-        // Recorded so Phase 2's `DELETE`/`DETACH DELETE` on a relationship
+        // Recorded so `DELETE`/`DETACH DELETE` on a relationship
         // variable can rebuild exactly the one triple it was matched from.
         ctx.rel_endpoints
             .insert(name.clone(), (subject.clone(), object.clone()));
@@ -487,7 +487,7 @@ fn lower_return_item(
     let name = match &item.alias {
         Some(a) => a.clone(),
         None => implied_name(&item.expr).ok_or_else(|| {
-            "an explicit `AS` alias is required for computed expressions in RETURN (Phase 1)"
+            "an explicit `AS` alias is required for computed expressions in RETURN"
                 .to_string()
         })?,
     };
@@ -583,13 +583,13 @@ fn lower_variable_ref(ctx: &mut LowerCtx, name: &str) -> Result<Expression, Stri
 fn lower_property_ref(ctx: &mut LowerCtx, base: &Expr, prop: &str) -> Result<Expression, String> {
     let Expr::Variable(var_name) = base else {
         return Err(
-            "chained property access (e.g. `a.b.c`) is not supported in Phase 1".to_string(),
+            "chained property access (e.g. `a.b.c`) is not supported".to_string(),
         );
     };
 
     if ctx.rel_vars.contains_key(var_name) {
         return Err(format!(
-            "property access on relationship variable `{var_name}` is not supported in Phase 1 (relationship properties have no RDF mapping — see crate docs)"
+            "property access on relationship variable `{var_name}` is not supported (relationship properties have no RDF mapping — see crate docs)"
         ));
     }
     if !ctx.node_vars.contains_key(var_name) {
@@ -625,7 +625,7 @@ fn lower_literal(lit: &Literal) -> Result<RdfLiteral, String> {
         Literal::Float(f) => RdfLiteral::from(*f),
         Literal::Bool(b) => RdfLiteral::from(*b),
         Literal::Null => {
-            return Err("the `NULL` literal is not supported in Phase 1".to_string());
+            return Err("the `NULL` literal is not supported".to_string());
         }
     })
 }
@@ -634,10 +634,10 @@ fn lower_literal_term(lit: &Literal) -> Result<TermPattern, String> {
     Ok(TermPattern::Literal(lower_literal(lit)?))
 }
 
-// ── Phase 2: write statement lowering ─────────────────────────────────────
+// ── write statement lowering ─────────────────────────────────────
 
-/// Lowers a full Cypher Phase 2 write statement into a `spargebra::Update`.
-/// See the module-level "Phase 2" doc section above for the full design
+/// Lowers a full Cypher write statement into a `spargebra::Update`.
+/// See the module-level doc section above for the full design
 /// rationale behind each `WriteClause` variant's lowering.
 pub fn lower_statement(stmt: &CypherStatement) -> Result<Update, String> {
     let mut ctx = LowerCtx::default();
@@ -695,7 +695,7 @@ pub fn lower_statement(stmt: &CypherStatement) -> Result<Update, String> {
                 detach: _,
             } => {
                 // `DELETE` and `DETACH DELETE` are lowered identically — see
-                // the module-level "Phase 2" doc section for why.
+                // the module-level doc section for why.
                 operations.extend(lower_delete(&mut ctx, variables, &base)?);
             }
             WriteClause::RemoveProperty { variable, property } => {
@@ -832,7 +832,7 @@ fn lower_create_rel(
     Ok(())
 }
 
-/// Looks up a node variable that a Phase 2 write clause (`SET`/`REMOVE`/
+/// Looks up a node variable that a write clause (`SET`/`REMOVE`/
 /// `DELETE`) is targeting, erroring clearly if it wasn't bound by a
 /// preceding `MATCH` (see module docs on why a `CREATE`-introduced variable
 /// can't be targeted this way).
@@ -1269,7 +1269,7 @@ mod tests {
         assert!(lower(&ast).is_err());
     }
 
-    // ── Phase 2 lowering tests ────────────────────────────────────────────
+    // ── lowering tests ────────────────────────────────────────────
 
     #[test]
     fn lowers_bare_create() {

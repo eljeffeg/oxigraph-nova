@@ -1,6 +1,6 @@
 [package]
 name        = "oxigraph-nova-storage-ring"
-description = "Production six-order LOUDS RingStore + Braided Ring pilot (cyclic QWT / NOVARNG1 / D2)"
+description = "Braided Ring pilot (cyclic QWT / NOVARNG1 / D2) + temporary re-export of production LOUDS RingStore"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -8,39 +8,26 @@ repository.workspace = true
 
 [features]
 default = ["mmap"]
-# Opt-in Tantivy-backed full-text search (see `crates/nova-fulltext`),
-
-# indexed incrementally on RingStore's compaction cycle. Zero-cost when
-# disabled: no tantivy dependency is even compiled in.
-fulltext     = ["dep:oxigraph-nova-fulltext"]
-# Research-only DROP-branch APIs (D3/D4/E1 counters, C1/prefetch mutation knobs).
+# Opt-in Tantivy-backed full-text search — forwarded to the LOUDS crate
+# (production RingStore). Zero-cost when disabled.
+fulltext     = ["oxigraph-nova-storage-louds/fulltext"]
+# Research-only DROP-branch APIs (D3/D4/E1 counters, C1/prefetch mutation knobs)
+# for the Braided Ring pilot.
 diagnostics  = []
 # Braided Ring pilot: cyclic QWT + NOVARNG1 + D2. Not on RingStore SPARQL path.
 cyclic-ring-pilot = ["dep:qwt", "dep:memmap2"]
-# See `oxigraph-nova-core`'s `mmap` feature doc comment. Gates
-# `snapshot.rs`'s `load_mmap`-based functions, used by `RingStore::open`'s
-# disk-backed recovery path and `commit_compaction`'s persistent-store
-# branch. Disabled (via `default-features = false`) for the wasm32 build
+# Forwarded to LOUDS + common + core for RingStore::open / snapshot mmap path.
+# Disabled (via `default-features = false`) for the wasm32 build
 # (`oxigraph-nova-js`), which is in-memory-only and never calls
 # `RingStore::open`.
-mmap = ["epserde/mmap", "sux/mmap", "oxigraph-nova-core/mmap", "oxigraph-nova-storage-common/mmap"]
+mmap = ["oxigraph-nova-storage-louds/mmap"]
 
 [dependencies]
-oxigraph-nova-core = { path = "../nova-core", default-features = false }
-oxigraph-nova-storage-common = { path = "../nova-storage-common", default-features = false } # generic WAL/MANIFEST/dict-persistence machinery (backend-agnostic)
-oxigraph-nova-fulltext = { path = "../nova-fulltext", optional = true }
-oxrdf         = { workspace = true }
-anyhow        = { workspace = true }
-thiserror     = { workspace = true }
-tracing       = { workspace = true }
-parking_lot   = { workspace = true }
-sux           = { version = "0.14", default-features = false, features = ["epserde"] } # T backend (Rank9+SelectAdapt), L array (BitFieldVec); epserde+mmap for mmap-based snapshot persistence
+# Production LOUDS RingStore — re-exported from lib.rs for dependent compatibility.
+oxigraph-nova-storage-louds = { path = "../nova-storage-louds", default-features = false }
 
-value-traits  = "0.2.0"  # SliceByValue::index_value for safe BitFieldVec reads
-mem_dbg       = "0.4"     # MemSize trait — sux's Rank9/SelectAdapt/BitFieldVec already derive it;
-                           # used for real per-component memory-breakdown diagnostics.
-epserde       = { version = "0.12.5", default-features = false, features = ["derive", "std"] } # mmap snapshot format for LoudsTrie T/L arrays; see `mmap` feature above
-
+# Used by cyclic_ring mmap error types (`MappedQwtError` / `MappedRingError`).
+thiserror = { workspace = true }
 
 # Braided Ring substrate (optional; feature `cyclic-ring-pilot`).
 qwt     = { version = "0.4.0", optional = true }

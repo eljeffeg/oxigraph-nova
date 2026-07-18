@@ -52,7 +52,7 @@
 //! use oxigraph_nova_cypher::parse_and_lower;
 //!
 //! let query = parse_and_lower("MATCH (n:Person) WHERE n.age > 30 RETURN n.name AS name")
-//!     .expect("valid Cypher Phase 1 query");
+//!     .expect("valid Cypher query");
 //! // `query` is a `spargebra::Query::Select` ready for
 //! // `oxigraph_nova_query::Evaluator::evaluate`.
 //! ```
@@ -61,7 +61,7 @@
 //! use oxigraph_nova_cypher::parse_and_lower_update;
 //!
 //! let update = parse_and_lower_update("CREATE (n:Person {name: \"Alice\"})")
-//!     .expect("valid Cypher Phase 2 write statement");
+//!     .expect("valid Cypher write statement");
 //! // `update` is a `spargebra::Update` ready for
 //! // `oxigraph_nova_query::update::execute_update`.
 //! ```
@@ -74,7 +74,7 @@ mod parser;
 pub use ast::{CypherQuery, CypherStatement};
 pub use lower::{LABEL_NS, PROP_NS, REL_NS};
 
-/// Parses and lowers a Cypher Phase 1 query string directly into a
+/// Parses and lowers a Cypher query string directly into a
 /// `spargebra::Query`, ready to be evaluated by
 /// `oxigraph_nova_query::Evaluator::evaluate`.
 ///
@@ -86,14 +86,14 @@ pub fn parse_and_lower(cypher: &str) -> anyhow::Result<spargebra::Query> {
     lower::lower(&ast).map_err(anyhow::Error::msg)
 }
 
-/// Parses a Cypher Phase 1 query string into its AST without lowering it.
+/// Parses a Cypher query string into its AST without lowering it.
 /// Exposed mainly for testing/tooling; most callers should use
 /// [`parse_and_lower`] instead.
 pub fn parse(cypher: &str) -> anyhow::Result<CypherQuery> {
     parser::parse(cypher).map_err(anyhow::Error::msg)
 }
 
-/// Parses and lowers a Cypher Phase 2 write statement directly into a
+/// Parses and lowers a Cypher write statement directly into a
 /// `spargebra::Update`, ready to be executed by
 /// `oxigraph_nova_query::update::execute_update`.
 ///
@@ -105,7 +105,7 @@ pub fn parse_and_lower_update(cypher: &str) -> anyhow::Result<spargebra::Update>
     lower::lower_statement(&ast).map_err(anyhow::Error::msg)
 }
 
-/// Parses a Cypher Phase 2 write statement into its AST without lowering
+/// Parses a Cypher write statement into its AST without lowering
 /// it. Exposed mainly for testing/tooling; most callers should use
 /// [`parse_and_lower_update`] instead.
 pub fn parse_statement(cypher: &str) -> anyhow::Result<CypherStatement> {

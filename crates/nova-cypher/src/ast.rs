@@ -1,11 +1,11 @@
 //! Cypher AST — pure data, no storage/evaluation dependency.
 //!
-//! Covers the openCypher read-only subset (Phase 1):
+//! Covers the openCypher read-only subset:
 //! `MATCH` (node + relationship patterns) / `WHERE` / `RETURN` (with
 //! optional `AS` aliases) / `ORDER BY` / `SKIP` / `LIMIT` / `DISTINCT` — see
 //! [`CypherQuery`].
 //!
-//! Also covers the openCypher write subset (Phase 2): `CREATE` / `SET` /
+//! Also covers the openCypher write subset: `CREATE` / `SET` /
 //! `DELETE` / `DETACH DELETE` / `REMOVE` — see [`CypherStatement`] and
 //! [`WriteClause`]. `MERGE` is not yet covered (its match-or-create upsert
 //! semantics don't map onto a single SPARQL Update operation the way the
@@ -141,8 +141,6 @@ pub enum Expr {
     Div(Box<Expr>, Box<Expr>),
     Neg(Box<Expr>),
 }
-
-// ── Phase 2: write statements ────────────────────────────────────────────
 
 /// A parsed Cypher write statement: an optional `MATCH`/`WHERE` followed by
 /// one or more write clauses ([`WriteClause`]).

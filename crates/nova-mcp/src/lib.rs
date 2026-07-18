@@ -510,8 +510,7 @@ impl ServerHandler for NovaMcpService {
 // ── stdio transport entry point ─────────────────────────────────────────────
 
 /// Serve `service` over stdio until the client disconnects (or the process
-/// receives a shutdown signal), per Phase A of the MCP transport plan (see
-/// the module doc comment). This is the async fn `oxigraph_nova_cli`'s `mcp
+/// receives a shutdown signal). This is the async fn `oxigraph_nova_cli`'s `mcp
 /// serve` subcommand calls after constructing a [`NovaMcpService`].
 ///
 /// **Important**: the stdio transport uses stdout for the JSON-RPC protocol

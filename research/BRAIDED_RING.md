@@ -81,13 +81,13 @@ and, for the e511 matrix harness, CLI `--full-campaign`.
 
 See [`BRAIDED_RING_CLEANUP.md`](./BRAIDED_RING_CLEANUP.md):
 
-0. **Done (this freeze):** diagnostics gating, deprecation comments, status docs  
-1. Extract winners onto a clean branch from `main` (path copy, not giant cherry-pick)  
-2. Split `nova-storage-louds` (production LOUDS) vs `nova-storage-ring` (Braided Ring)  
+0. **Done:** diagnostics gating, deprecation comments, status docs  
+1. **Done:** extract winners onto clean branch `braided-ring-productize` from `main`  
+2. **Done (compat re-export):** split `nova-storage-louds` (production LOUDS) vs `nova-storage-ring` (Braided Ring + temporary re-export of LOUDS so dependents stay green)  
 3. Upstream qwt patches in parallel  
 4. Store facade + differential tests **before** SPARQL cutover  
 
-**Do not** wire Braided Ring into default query until crate split + facade + differentials are green.  
+**Do not** wire Braided Ring into default query until facade + differentials are green.  
 **Do not** redesign StarView until a measurement microbench with hard KEEP/DROP gates.
 
 ---

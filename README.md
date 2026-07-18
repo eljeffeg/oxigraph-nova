@@ -352,8 +352,8 @@ are exposed on all three query surfaces (HTTP, CLI, MCP).
 
 | Clause | Notes |
 |---|---|
-| `MATCH` / `WHERE` / `RETURN` / `ORDER BY` / `SKIP` / `LIMIT` / `DISTINCT` | Phase 1 reads |
-| `CREATE` / `SET` / `DELETE` / `DETACH DELETE` / `REMOVE` | Phase 2 writes (optional preceding `MATCH`/`WHERE`) |
+| `MATCH` / `WHERE` / `RETURN` / `ORDER BY` / `SKIP` / `LIMIT` / `DISTINCT` | reads |
+| `CREATE` / `SET` / `DELETE` / `DETACH DELETE` / `REMOVE` | writes (optional preceding `MATCH`/`WHERE`) |
 | Variable-length relationships | Unbounded forms only: `-[:TYPE*]->`, `-[:TYPE*0..]->`, `-[:TYPE*1..]->` (SPARQL property paths have no bounded `{min,max}`) |
 | Relationship properties on `MATCH` | `-[r:KNOWS {since: 2020}]->` lowers to RDF 1.2 quoted-triple annotations (`<< ?from :TYPE ?to >> :since 2020`) |
 

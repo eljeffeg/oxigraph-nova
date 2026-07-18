@@ -6,6 +6,7 @@ members = [
     "crates/nova-query",
     "crates/nova-storage-memory",
     "crates/nova-storage-common",
+    "crates/nova-storage-louds",
     "crates/nova-storage-ring",
     "crates/nova-fulltext",
     "crates/nova-reasoning",
