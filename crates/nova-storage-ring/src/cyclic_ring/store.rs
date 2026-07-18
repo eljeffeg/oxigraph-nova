@@ -343,13 +343,19 @@ impl LftjSource for RingStore {
         target_field: usize,
         graph_id: u8,
     ) -> Option<Box<dyn TrieIterator>> {
-        let inner = self.inner.lock();
-        // LFTJ only on fully compacted state (delta must be empty).
-        if !inner.delta.is_empty() {
-            return None;
-        }
-        let g_id = GraphId(graph_id);
-        match inner.graphs.get(&g_id) {
+        // Short-lock snapshot: clone Arc under the mutex, then scan off-lock so
+        // concurrent LFTJ opens / decode don't serialize on O(|range|) work.
+        let img = {
+            let inner = self.inner.lock();
+            // LFTJ only on fully compacted state (delta must be empty).
+            if !inner.delta.is_empty() {
+                return None;
+            }
+            let g_id = GraphId(graph_id);
+            inner.graphs.get(&g_id).map(Arc::clone)
+        };
+        // Mutex released before any ring navigation.
+        match img {
             None => Some(Box::new(EmptyTrieIter)),
             Some(img) => {
                 let vals = img.join_scan_external(s, p, o, target_field);
@@ -370,16 +376,17 @@ impl LftjSource for RingStore {
         target_field: usize,
         graph_id: u8,
     ) -> Option<u64> {
-        let inner = self.inner.lock();
-        if !inner.delta.is_empty() {
-            return None;
-        }
-        let g_id = GraphId(graph_id);
-        match inner.graphs.get(&g_id) {
-            None => Some(0),
-            Some(img) => {
-                Some(img.join_scan_external(s, p, o, target_field).len() as u64)
+        let img = {
+            let inner = self.inner.lock();
+            if !inner.delta.is_empty() {
+                return None;
             }
+            let g_id = GraphId(graph_id);
+            inner.graphs.get(&g_id).map(Arc::clone)
+        };
+        match img {
+            None => Some(0),
+            Some(img) => Some(img.join_scan_external(s, p, o, target_field).len() as u64),
         }
     }
 
@@ -387,6 +394,7 @@ impl LftjSource for RingStore {
         !self.inner.lock().delta.is_empty()
     }
 }
+
 
 /// Flat external-ID scan for store-level LFTJ (same shape as Phase 4b).
 struct BraidedExternalScan {

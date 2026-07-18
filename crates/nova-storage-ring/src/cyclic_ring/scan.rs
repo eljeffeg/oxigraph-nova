@@ -1,4 +1,4 @@
-//! ID-level LFTJ join/scan seam for Braided Ring (Phase 4b).
+//! ID-level LFTJ join/scan seam for Braided Ring (Phase 4b / native fix).
 //!
 //! Provides a [`TrieIterator`]-compatible `join_scan` over shared-alphabet
 //! `u32` triples **without** dictionary, delta, or `QuadStore`.
@@ -15,19 +15,27 @@
 //! target field under the optional bound-field filters. `open()` returns
 //! [`EmptyTrieIter`] (same as the path-stub / SortedVecTrie filtered path).
 //!
-//! ## Correctness strategy
+//! ## Correctness strategy (native navigation)
 //!
-//! Values are collected by filtering the shared-alphabet SPO enumeration
-//! (heap or mmap), then sort+dedup. That matches the semantic contract of
-//! `LftjSource::lftj_join_scan` and the oracle used by differentials. A later
-//! phase can replace the materialize step with native RNV/RDI navigation
-//! without changing this public API.
+//! Prefer **lead-range + RDI / range-restricted walks** over the cyclic Ring A
+//! last columns — never full-graph [`BraidedRingIndex::enumerate_spo`] on the
+//! LFTJ hot path (that was O(N) per open and melted real SPARQL loads).
 //!
-//! Multi-range D2 intersection is exercised separately via
-//! [`crate::cyclic_ring::facade::BraidedRingIndex::collect_intersection3`] —
-//! it is the product triangle primitive, not the per-pattern scan.
+//! Ring A tables / last columns:
+//! - T_spo ordered (s,p,o), last = C_o, lead(S) partitions by subject
+//! - T_osp ordered (o,s,p), last = C_p, lead(O) partitions by object
+//! - T_pos ordered (p,o,s), last = C_s, lead(P) partitions by predicate
+//!
+//! When the target field is the **last column** of the table whose lead is a
+//! bound attribute, use [`CyclicRing::range_distinct_iter`] (RDI). Middle
+//! attributes are recovered via one LF step (`F` + `access`) over the lead
+//! range only (O(|range| log σ), not O(N)).
+//!
+//! Multi-range D2 intersection is separate via
+//! [`crate::cyclic_ring::facade::BraidedRingIndex::collect_intersection3`].
 
 use super::facade::BraidedRingIndex;
+use super::{Col, CyclicRing, RowRange};
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 
 /// Flat distinct-value iterator over one target field of a join scan.
@@ -84,6 +92,274 @@ impl TrieIterator for BraidedJoinScan {
     }
 }
 
+// ── Native collection helpers (heap Ring A) ───────────────────────────────────
+
+#[inline]
+fn as_u32(id: Option<u64>) -> Option<u32> {
+    id.map(|v| v as u32)
+}
+
+/// Collect distinct symbols via RDI over a row range on a last column.
+fn rdi_distinct(ring: &CyclicRing, col: Col, r: RowRange) -> Vec<u64> {
+    if r.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut it = ring.range_distinct_iter(col, r);
+    while let Some((sym, _cnt)) = it.next() {
+        out.push(u64::from(sym));
+    }
+    // RDI yields sorted ascending already.
+    out
+}
+
+/// Distinct values of the middle field under a lead-range, via one LF step.
+///
+/// For T_spo lead(S)=R: middle p = C_p[F_o(i)] for i ∈ R.
+/// For T_osp lead(O)=R: middle s = C_s[F_p(i)] for i ∈ R.
+/// For T_pos lead(P)=R: middle o = C_o[F_s(i)] for i ∈ R.
+fn middle_via_lf(
+    ring: &CyclicRing,
+    lead_last_col: Col,
+    middle_last_col: Col,
+    r: RowRange,
+) -> Vec<u64> {
+    if r.is_empty() {
+        return Vec::new();
+    }
+    let mut vals: Vec<u64> = Vec::with_capacity(r.len() as usize);
+    for i in r.start..r.end {
+        let i_next = ring.f(lead_last_col, i);
+        let mid = ring.access(middle_last_col, i_next);
+        vals.push(u64::from(mid));
+    }
+    vals.sort_unstable();
+    vals.dedup();
+    vals
+}
+
+/// Distinct last-column values under lead range, filtered by a middle bind.
+///
+/// e.g. bound s + bound p → objects: for i in lead(S,s), keep o=C_o[i] where
+/// C_p[F_o(i)] == p.
+fn last_col_filtered_by_middle(
+    ring: &CyclicRing,
+    lead_last_col: Col,
+    middle_last_col: Col,
+    middle_bind: u32,
+    r: RowRange,
+) -> Vec<u64> {
+    if r.is_empty() {
+        return Vec::new();
+    }
+    let mut vals: Vec<u64> = Vec::new();
+    for i in r.start..r.end {
+        let i_next = ring.f(lead_last_col, i);
+        let mid = ring.access(middle_last_col, i_next);
+        if mid == middle_bind {
+            let last = ring.access(lead_last_col, i);
+            vals.push(u64::from(last));
+        }
+    }
+    vals.sort_unstable();
+    vals.dedup();
+    vals
+}
+
+/// Native join_scan collection on heap Ring A.
+///
+/// Returns sorted distinct target-field values in dense shared-alphabet IDs.
+fn collect_join_scan_native(
+    ring: &CyclicRing,
+    s: Option<u32>,
+    p: Option<u32>,
+    o: Option<u32>,
+    target_field: usize,
+) -> Vec<u64> {
+    let n = ring.n();
+    if n == 0 {
+        return Vec::new();
+    }
+    let full = RowRange::full(n);
+
+    // Reject out-of-universe binds early.
+    let universe = ring.universe;
+    let ok = |v: Option<u32>| v.is_none_or(|x| x < universe);
+    if !ok(s) || !ok(p) || !ok(o) {
+        return Vec::new();
+    }
+
+    match (s, p, o, target_field) {
+        // ── Fully unbound: distinct values of one role via lead partitions ──
+        // lead(S) non-empty ⇒ symbol appears as subject, etc.
+        (None, None, None, 0) => {
+            // Distinct subjects: symbols with non-empty lead_range(S, ·).
+            // Equivalent to distinct first-column of T_spo = A_s partitions.
+            // Cheapest: RDI over full T_pos last column C_s? C_s is last of T_pos
+            // (p,o,s) so full range of C_s = all s multiset → distinct subjects.
+            rdi_distinct(ring, Col::S, full)
+        }
+        (None, None, None, 1) => rdi_distinct(ring, Col::P, full),
+        (None, None, None, 2) => rdi_distinct(ring, Col::O, full),
+
+        // ── Single bind ─────────────────────────────────────────────────────
+        // Bound S, target O: RDI on C_o over lead(S,s)
+        (Some(sv), None, None, 2) => rdi_distinct(ring, Col::O, ring.range_s(sv)),
+        // Bound S, target P: middle via LF
+        (Some(sv), None, None, 1) => middle_via_lf(ring, Col::O, Col::P, ring.range_s(sv)),
+        // Bound S, target S: either empty or {s}
+        (Some(sv), None, None, 0) => {
+            if ring.range_s(sv).is_empty() {
+                Vec::new()
+            } else {
+                vec![u64::from(sv)]
+            }
+        }
+
+        // Bound P, target S: RDI on C_s over lead(P,p)
+        (None, Some(pv), None, 0) => rdi_distinct(ring, Col::S, ring.range_p(pv)),
+        // Bound P, target O: middle via LF on T_pos (last C_s, middle o via F_s → C_o)
+        (None, Some(pv), None, 2) => middle_via_lf(ring, Col::S, Col::O, ring.range_p(pv)),
+        (None, Some(pv), None, 1) => {
+            if ring.range_p(pv).is_empty() {
+                Vec::new()
+            } else {
+                vec![u64::from(pv)]
+            }
+        }
+
+        // Bound O, target P: RDI on C_p over lead(O,o)
+        (None, None, Some(ov), 1) => rdi_distinct(ring, Col::P, ring.range_o(ov)),
+        // Bound O, target S: middle via LF on T_osp (last C_p, middle s via F_p → C_s)
+        (None, None, Some(ov), 0) => middle_via_lf(ring, Col::P, Col::S, ring.range_o(ov)),
+        (None, None, Some(ov), 2) => {
+            if ring.range_o(ov).is_empty() {
+                Vec::new()
+            } else {
+                vec![u64::from(ov)]
+            }
+        }
+
+        // ── Two binds ───────────────────────────────────────────────────────
+        // Bound S+P, target O: last col C_o filtered by middle p under lead(S)
+        (Some(sv), Some(pv), None, 2) => {
+            last_col_filtered_by_middle(ring, Col::O, Col::P, pv, ring.range_s(sv))
+        }
+        // Bound S+O, target P: for i in lead(S,s) with C_o[i]==o, p = C_p[F_o(i)]
+        (Some(sv), None, Some(ov), 1) => {
+            let r = ring.range_s(sv);
+            if r.is_empty() {
+                return Vec::new();
+            }
+            let mut vals = Vec::new();
+            for i in r.start..r.end {
+                if ring.access(Col::O, i) == ov {
+                    let i_osp = ring.f(Col::O, i);
+                    vals.push(u64::from(ring.access(Col::P, i_osp)));
+                }
+            }
+            vals.sort_unstable();
+            vals.dedup();
+            vals
+        }
+        // Bound P+O, target S: RDI on C_s over lead(P), filter by middle o
+        (None, Some(pv), Some(ov), 0) => {
+            last_col_filtered_by_middle(ring, Col::S, Col::O, ov, ring.range_p(pv))
+        }
+
+        // Bound S+P, target S/P — existence check
+        (Some(sv), Some(pv), None, 0) => {
+            if last_col_filtered_by_middle(ring, Col::O, Col::P, pv, ring.range_s(sv)).is_empty() {
+                Vec::new()
+            } else {
+                vec![u64::from(sv)]
+            }
+        }
+        (Some(sv), Some(pv), None, 1) => {
+            if last_col_filtered_by_middle(ring, Col::O, Col::P, pv, ring.range_s(sv)).is_empty() {
+                Vec::new()
+            } else {
+                vec![u64::from(pv)]
+            }
+        }
+
+        // Bound S+O target S/O
+        (Some(sv), None, Some(ov), 0) => {
+            let r = ring.range_s(sv);
+            let mut hit = false;
+            for i in r.start..r.end {
+                if ring.access(Col::O, i) == ov {
+                    hit = true;
+                    break;
+                }
+            }
+            if hit {
+                vec![u64::from(sv)]
+            } else {
+                Vec::new()
+            }
+        }
+        (Some(sv), None, Some(ov), 2) => {
+            let r = ring.range_s(sv);
+            let mut hit = false;
+            for i in r.start..r.end {
+                if ring.access(Col::O, i) == ov {
+                    hit = true;
+                    break;
+                }
+            }
+            if hit {
+                vec![u64::from(ov)]
+            } else {
+                Vec::new()
+            }
+        }
+
+        // Bound P+O target P/O
+        (None, Some(pv), Some(ov), 1) => {
+            if last_col_filtered_by_middle(ring, Col::S, Col::O, ov, ring.range_p(pv)).is_empty() {
+                Vec::new()
+            } else {
+                vec![u64::from(pv)]
+            }
+        }
+        (None, Some(pv), Some(ov), 2) => {
+            if last_col_filtered_by_middle(ring, Col::S, Col::O, ov, ring.range_p(pv)).is_empty() {
+                Vec::new()
+            } else {
+                vec![u64::from(ov)]
+            }
+        }
+
+        // ── Three binds: existence only ─────────────────────────────────────
+        (Some(sv), Some(pv), Some(ov), tf) => {
+            let r = ring.range_s(sv);
+            let mut hit = false;
+            for i in r.start..r.end {
+                if ring.access(Col::O, i) != ov {
+                    continue;
+                }
+                let i_osp = ring.f(Col::O, i);
+                if ring.access(Col::P, i_osp) == pv {
+                    hit = true;
+                    break;
+                }
+            }
+            if !hit {
+                return Vec::new();
+            }
+            match tf {
+                0 => vec![u64::from(sv)],
+                1 => vec![u64::from(pv)],
+                _ => vec![u64::from(ov)],
+            }
+        }
+
+        // Unreachable if target_field always 0/1/2
+        _ => Vec::new(),
+    }
+}
+
 impl BraidedRingIndex {
     /// ID-level `join_scan` equivalent of
     /// [`oxigraph_nova_core::LftjSource::lftj_join_scan`].
@@ -91,6 +367,8 @@ impl BraidedRingIndex {
     /// `s` / `p` / `o`: `Some(id)` binds that field (shared-alphabet `u32`
     /// promoted to `u64` for the `TrieIterator` contract). `target_field`:
     /// 0=S, 1=P, 2=O — the field whose distinct values are iterated.
+    ///
+    /// Uses native lead-range + RDI / LF walks — **not** full-graph enumerate.
     ///
     /// Returns an always-exhausted iterator when no triples match (never
     /// `None`; callers that need "unsupported" use a higher-level store).
@@ -103,20 +381,13 @@ impl BraidedRingIndex {
     ) -> Box<dyn TrieIterator> {
         debug_assert!(target_field < 3, "target_field must be 0/1/2");
         let target_field = target_field.min(2);
-
-        let triples = self.enumerate_spo();
-        let mut vals: Vec<u64> = triples
-            .iter()
-            .filter(|t| {
-                s.is_none_or(|sv| u64::from(t[0]) == sv)
-                    && p.is_none_or(|pv| u64::from(t[1]) == pv)
-                    && o.is_none_or(|ov| u64::from(t[2]) == ov)
-            })
-            .map(|t| u64::from(t[target_field]))
-            .collect();
-        vals.sort_unstable();
-        vals.dedup();
-
+        let vals = collect_join_scan_native(
+            self.heap(),
+            as_u32(s),
+            as_u32(p),
+            as_u32(o),
+            target_field,
+        );
         if vals.is_empty() {
             return Box::new(EmptyTrieIter);
         }
@@ -124,8 +395,6 @@ impl BraidedRingIndex {
     }
 
     /// Collect all distinct target-field values from [`Self::join_scan`].
-    ///
-    /// Convenience for differentials / oracles (not on the LFTJ hot path).
     pub fn collect_join_scan(
         &self,
         s: Option<u64>,
@@ -133,18 +402,17 @@ impl BraidedRingIndex {
         o: Option<u64>,
         target_field: usize,
     ) -> Vec<u64> {
-        let mut it = self.join_scan(s, p, o, target_field);
-        let mut out = Vec::new();
-        while !it.at_end() {
-            out.push(it.key());
-            it.advance();
-        }
-        out
+        let target_field = target_field.min(2);
+        collect_join_scan_native(
+            self.heap(),
+            as_u32(s),
+            as_u32(p),
+            as_u32(o),
+            target_field,
+        )
     }
 
     /// Exact distinct count for the same filters as [`Self::join_scan`].
-    ///
-    /// Mirrors `LftjSource::lftj_real_count` semantics at the ID level.
     pub fn real_count(
         &self,
         s: Option<u64>,
@@ -286,15 +554,21 @@ mod tests {
         ];
         for &(s, p, o, tf) in cases {
             let heap_vals = {
-                // Build heap-only twin for comparison of filter semantics
-                // (both paths use enumerate_spo which prefers mmap when set).
                 let h = BraidedRingIndex::from_shared_triples(&t, 3);
                 h.collect_join_scan(s, p, o, tf)
             };
+            // Mapped image present: join_scan still uses heap native path
+            // (heap is source of truth for navigation; mmap for D2).
             let mapped_vals = idx.collect_join_scan(s, p, o, tf);
             let oracle = oracle_join_scan(&t, s, p, o, tf);
-            assert_eq!(mapped_vals, oracle, "mapped vs oracle s={s:?} p={p:?} o={o:?} tf={tf}");
-            assert_eq!(heap_vals, oracle, "heap vs oracle s={s:?} p={p:?} o={o:?} tf={tf}");
+            assert_eq!(
+                mapped_vals, oracle,
+                "mapped vs oracle s={s:?} p={p:?} o={o:?} tf={tf}"
+            );
+            assert_eq!(
+                heap_vals, oracle,
+                "heap vs oracle s={s:?} p={p:?} o={o:?} tf={tf}"
+            );
         }
     }
 
