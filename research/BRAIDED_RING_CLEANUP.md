@@ -1,7 +1,8 @@
 # Braided Ring cleanup summary
 
 **Date:** 2026-07-17
-**Status:** Phase 0–4 **executed** on `braided-ring-productize` (through ID-level `BraidedRingIndex` facade + differentials). SPARQL/LFTJ cutover still **not** done.
+**Status:** Phase 0–4b **executed** on `braided-ring-productize` (ID facade + `join_scan` seam + `BraidedGraphImage`). SPARQL/`QuadStore` cutover still **not** done.
+
 
 **Active status page:** [`BRAIDED_RING.md`](./BRAIDED_RING.md)
 **Goal:** stop calling the product path “PRISM,” land the cyclic/braided index as `nova-storage-ring`, isolate the production LOUDS backend as `nova-storage-louds`, and strip research/test ballast.
@@ -265,12 +266,14 @@ Path-extract KEEP only (no hybrid/PRISM/ultra) from `main` + research freeze sur
 6. ~~Green: cyclic_ring 39, louds 83, store check, bench bins check.~~
 
 
-### Phase 4 — optional productization — **PARTIAL** (ID facade done; no SPARQL)
+### Phase 4 — optional productization — **PARTIAL** (ID facade + 4b seam; no SPARQL)
 
 1. ~~ID-level parallel type: `cyclic_ring::facade::BraidedRingIndex` (heap + optional mmap).~~
 2. ~~Differentials: enumerate vs sorted multiset; lead-range lens vs counts; heap↔mmap parity; D2 vs dual_rnv + subject-range object intersection oracle.~~
-3. **Still open:** term dictionary + delta + full `QuadStore` / LFTJ seam; SPARQL cutover **only after** those gates.
-4. G1 polish (star mmap/heap ≤1.10× at N=200k) if cutover requires it.
+3. ~~**Phase 4b:** ID-level `join_scan` → `TrieIterator` (`cyclic_ring/scan.rs`); multi-pattern leapfrog + D2 product-path diffs; `BraidedGraphImage`/`IdRemap` (`cyclic_ring/image.rs`) for external↔dense remap, dedup, mmap, SPO round-trip.~~
+4. **Still open:** term dictionary + live delta + full `QuadStore` / store-level LFTJ wiring; SPARQL cutover **only after** those gates.
+5. G1 polish (star mmap/heap ≤1.10× at N=200k) if cutover requires it.
+
 
 ---
 

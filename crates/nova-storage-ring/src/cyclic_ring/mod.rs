@@ -66,11 +66,18 @@ pub mod mapped_qwt;
 pub mod mapped_ring;
 /// Phase 4 ID-level facade + differential oracles (not QuadStore / not SPARQL).
 pub mod facade;
+/// Phase 4b ID-level LFTJ join/scan seam (`TrieIterator`, not QuadStore).
+pub mod scan;
+/// Phase 4b per-graph read-only canonical-ID image adapter.
+pub mod image;
 
 pub use facade::BraidedRingIndex;
+pub use image::{BraidedGraphImage, IdRemap};
 pub use mapped_ring::{
     MappedRingA, MappedRingError, open_novarng1_mmap, write_novarng1_file, write_novarng1_v1,
 };
+pub use scan::BraidedJoinScan;
+
 
 // ── Column / range ────────────────────────────────────────────────────────────
 

@@ -26,12 +26,17 @@ mmap = ["oxigraph-nova-storage-louds/mmap"]
 # Production LOUDS RingStore — re-exported from lib.rs for dependent compatibility.
 oxigraph-nova-storage-louds = { path = "../nova-storage-louds", default-features = false }
 
+# TrieIterator / EmptyTrieIter for the Phase 4b ID-level join_scan seam
+# (cyclic-ring-pilot only; not a QuadStore cutover).
+oxigraph-nova-core = { path = "../nova-core", default-features = false }
+
 # Used by cyclic_ring mmap error types (`MappedQwtError` / `MappedRingError`).
 thiserror = { workspace = true }
 
 # Braided Ring substrate (optional; feature `cyclic-ring-pilot`).
 qwt     = { version = "0.4.0", optional = true }
 memmap2 = { version = "0.9", optional = true }
+
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

@@ -1,7 +1,8 @@
 # Braided Ring — product status
 
 **Date:** 2026-07-17  
-**Status:** Phase 0–4 done on `braided-ring-productize` (through ID-level `BraidedRingIndex` facade + enumerate/lead/D2 differentials). **Not** the default SPARQL backend.
+**Status:** Phase 0–4b done on `braided-ring-productize` (ID facade + `join_scan` TrieIterator seam + canonical-ID image adapter). **Not** the default SPARQL backend.
+
 
 
 ---
@@ -87,11 +88,13 @@ See [`BRAIDED_RING_CLEANUP.md`](./BRAIDED_RING_CLEANUP.md):
 2. **Done (compat re-export):** split `nova-storage-louds` (production LOUDS) vs `nova-storage-ring` (Braided Ring + temporary re-export of LOUDS so dependents stay green)  
 3. **Done (research ballast):** archive e4x/e5x probe bins under `benches/archive/`; gate Ring B builders + URing behind `#[cfg(any(test, feature = "diagnostics"))]`; docs point LOUDS paths at `storage-louds`  
 4. **Done (ID facade + diffs):** `cyclic_ring::facade::BraidedRingIndex` (heap + optional `NOVARNG1` mmap); differentials for enumerate / lead-range / D2 vs dual_rnv + sorted-list oracle. **Not** `QuadStore` / SPARQL.  
+4b. **Done (ID LFTJ seam + image adapter):** `BraidedRingIndex::join_scan` → `TrieIterator` (flat target-field scan, LFTJ contract); `BraidedGraphImage` / `IdRemap` for external↔dense remap, dedup, mmap materialize, external SPO round-trip; multi-scan leapfrog + D2 product-path differentials. Still **not** `QuadStore` / SPARQL / dictionary / live delta.
 
-**Still open before SPARQL cutover:** term dictionary + live delta + LFTJ seam over Braided Ring; G1 polish if required; upstream qwt patches in parallel.  
+**Still open before SPARQL cutover:** term dictionary + live delta + full `QuadStore` / store-level LFTJ wiring; G1 polish if required; upstream qwt patches in parallel.
 
 **Do not** wire Braided Ring into default query until those integration gates are green.  
 **Do not** redesign StarView until a measurement microbench with hard KEEP/DROP gates.
+
 
 ---
 

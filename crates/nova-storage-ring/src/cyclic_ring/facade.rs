@@ -1,12 +1,17 @@
-//! ID-level Braided Ring facade (Phase 4).
+//! ID-level Braided Ring facade (Phase 4 / 4b).
 //!
 //! Thin ownership wrapper over heap [`CyclicRing`] and optional mmap
 //! [`MappedRingA`]. This is **not** a [`oxigraph_nova_core::QuadStore`]: no
-//! dictionary, no SPARQL/LFTJ cutover, no live writes. Callers build from
+//! dictionary, no SPARQL cutover, no live writes. Callers build from
 //! shared-alphabet `u32` triples and use navigation / D2 primitives.
+//!
+//! Phase 4b adds [`BraidedRingIndex::join_scan`] (see `scan` module) — an
+//! ID-level `TrieIterator` seam matching `LftjSource::lftj_join_scan`
+//! semantics, still without dictionary/delta/`QuadStore`.
 //!
 //! Differential tests in this module compare enumerate / lead-range / D2
 //! results against a sorted triple-list oracle and heap↔mmap parity.
+
 
 use super::{
     Col, CyclicRing, MappedRingA, MappedRingError, RowRange, open_novarng1_mmap, write_novarng1_file,
