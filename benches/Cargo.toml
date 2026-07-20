@@ -111,5 +111,14 @@ name = "e59b_huff_cp_ring_gate"
 path = "src/bin/e59b_huff_cp_ring_gate.rs"
 required-features = ["ring-huffman-cp"]
 
+# Phase 0: Ring mem/CPU regression card (component breakdown + dual residency).
+[[bin]]
+name = "ring_regression_card"
+path = "src/bin/ring_regression_card.rs"
+required-features = ["cyclic-ring-pilot"]
 
-
+# E5.11 fair LOUDS + D2 product gates (G1/G2/G3).
+[[bin]]
+name = "e511_ring_perf_profile"
+path = "src/bin/e511_ring_perf_profile.rs"
+required-features = ["cyclic-ring-pilot"]

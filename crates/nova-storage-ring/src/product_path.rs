@@ -8,6 +8,7 @@
 //!   path_2hop opens millions of scans and I/O will dominate latency.
 //! - `NOVA_RING_VEO_OLD_HEURISTIC=1` — A/B only: MiddleRuns VEO uses row-span
 //!   heuristic (pre-exact-run fix). Default **off** (exact distinct-run with budget).
+//! - `NOVA_RING_KEEP_HEAP=1` — keep heap after mmap (default **off**; Phase 1A).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -135,6 +136,20 @@ pub fn ring_mmap_enabled() -> bool {
 #[inline]
 pub fn ring_d2_enabled() -> bool {
     env_flag_default_on("NOVA_RING_D2")
+}
+
+/// `NOVA_RING_KEEP_HEAP` — default **off**. When on, `materialize_mapped` retains
+/// the heap CyclicRing alongside mmap (differentials / A/B). Product default
+/// drops heap after successful mmap (Phase 1A single residency).
+#[inline]
+pub fn ring_keep_heap() -> bool {
+    match std::env::var("NOVA_RING_KEEP_HEAP") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
 }
 
 /// Optional verbose counter logging.

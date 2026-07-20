@@ -47,6 +47,9 @@ pub mod mapped_ring;
 /// Phase 4 ID-level facade + differential oracles (not QuadStore / not SPARQL).
 #[cfg(feature = "cyclic-ring-pilot")]
 pub mod facade;
+/// Unified heap/mmap navigation view (Phase 1A single residency).
+#[cfg(feature = "cyclic-ring-pilot")]
+pub mod ring_nav;
 /// Phase 4b ID-level LFTJ join/scan seam (`TrieIterator`, not QuadStore).
 #[cfg(feature = "cyclic-ring-pilot")]
 pub mod scan;
@@ -85,12 +88,14 @@ pub use mapped_ring::{
     MappedColDistinctIter, MappedRingA, MappedRingError, open_novarng1_mmap, parse_header, write_novarng1_file, write_novarng1_v1,
 };
 #[cfg(feature = "cyclic-ring-pilot")]
-pub use product_path::{SPARQL_PATH, SparqlPathCounters, SparqlPathSnapshot};
+pub use product_path::{SPARQL_PATH, SparqlPathCounters, SparqlPathSnapshot, ring_keep_heap, ring_mmap_enabled};
 #[cfg(feature = "cyclic-ring-pilot")]
 pub use cyclic::{
     Col, CounterSnapshot, CyclicRangeDistinctIter, CyclicRing, GlobalCounters, PredicateColumn,
-    RowRange,
+    RingMemBreakdown, RowRange,
 };
+#[cfg(feature = "cyclic-ring-pilot")]
+pub use ring_nav::RingRef;
 #[cfg(all(feature = "cyclic-ring-pilot", any(test, feature = "diagnostics")))]
 pub use cyclic::{Orientation, OrientationCounters, URing};
 #[cfg(feature = "cyclic-ring-pilot")]

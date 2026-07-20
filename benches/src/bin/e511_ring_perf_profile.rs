@@ -223,6 +223,8 @@ fn main() {
                 black_box(x);
             }
             m_c.opens += 1;
+            // Counters live on the Qwt RDI arm (Col::O is always Qwt).
+            let it = it.as_qwt().expect("Col::O RDI is Qwt");
             m_c.symbols += it.symbols_yielded;
             m_c.rank_probes += it.rank_probes;
             m_c.frames += it.frames_popped;

@@ -31,7 +31,8 @@ use crate::facade::BraidedRingIndex;
 use crate::image::BraidedGraphImage;
 use crate::mapped_qwt::{HotQwtColumn, MappedRangeDistinctIter};
 use crate::product_path::SPARQL_PATH;
-use crate::{Col, CyclicRing, RowRange};
+use crate::ring_nav::RingRef;
+use crate::{Col, RowRange};
 use oxigraph_nova_core::{EmptyTrieIter, TrieIterator};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -45,29 +46,29 @@ fn as_u32(id: Option<u64>) -> Option<u32> {
 
 /// Middle p under T_spo row i: C_p[F_o(i)].
 #[inline]
-fn middle_p_spo(ring: &CyclicRing, i: u32) -> u32 {
+fn middle_p_spo(ring: RingRef<'_>, i: u32) -> u32 {
     ring.access(Col::P, ring.f(Col::O, i))
 }
 
 /// Middle s under T_osp row i: C_s[F_p(i)].
 #[inline]
-fn middle_s_osp(ring: &CyclicRing, i: u32) -> u32 {
+fn middle_s_osp(ring: RingRef<'_>, i: u32) -> u32 {
     ring.access(Col::S, ring.f(Col::P, i))
 }
 
 /// Middle o under T_pos row i: C_o[F_s(i)].
 #[inline]
-fn middle_o_pos(ring: &CyclicRing, i: u32) -> u32 {
+fn middle_o_pos(ring: RingRef<'_>, i: u32) -> u32 {
     ring.access(Col::O, ring.f(Col::S, i))
 }
 
 /// First index in `[lo, hi)` where `mid(i) >= target`, or `hi` if none.
 fn lower_bound_middle(
-    ring: &CyclicRing,
+    ring: RingRef<'_>,
     lo: u32,
     hi: u32,
     target: u32,
-    mid: fn(&CyclicRing, u32) -> u32,
+    mid: fn(RingRef<'_>, u32) -> u32,
 ) -> u32 {
     let mut lo = lo;
     let mut hi = hi;
@@ -83,7 +84,7 @@ fn lower_bound_middle(
 }
 
 /// Contiguous (s,p) row range on T_spo (sorted by s,p,o).
-fn range_sp(ring: &CyclicRing, s: u32, p: u32) -> RowRange {
+fn range_sp(ring: RingRef<'_>, s: u32, p: u32) -> RowRange {
     let r = ring.range_s(s);
     if r.is_empty() {
         return r;
@@ -98,7 +99,7 @@ fn range_sp(ring: &CyclicRing, s: u32, p: u32) -> RowRange {
 }
 
 /// Contiguous (o,s) row range on T_osp (sorted by o,s,p).
-fn range_os(ring: &CyclicRing, o: u32, s: u32) -> RowRange {
+fn range_os(ring: RingRef<'_>, o: u32, s: u32) -> RowRange {
     let r = ring.range_o(o);
     if r.is_empty() {
         return r;
@@ -113,7 +114,7 @@ fn range_os(ring: &CyclicRing, o: u32, s: u32) -> RowRange {
 }
 
 /// Contiguous (p,o) row range on T_pos (sorted by p,o,s).
-fn range_po(ring: &CyclicRing, p: u32, o: u32) -> RowRange {
+fn range_po(ring: RingRef<'_>, p: u32, o: u32) -> RowRange {
     let r = ring.range_p(p);
     if r.is_empty() {
         return r;
@@ -142,7 +143,7 @@ fn range_po(ring: &CyclicRing, p: u32, o: u32) -> RowRange {
 
 /// Recover (s,p,o) from a T_spo row index.
 #[inline]
-fn triple_at_spo(ring: &CyclicRing, i: u32) -> [u32; 3] {
+fn triple_at_spo(ring: RingRef<'_>, i: u32) -> [u32; 3] {
     let o = ring.access(Col::O, i);
     let i_osp = ring.f(Col::O, i);
     let p = ring.access(Col::P, i_osp);
@@ -153,7 +154,7 @@ fn triple_at_spo(ring: &CyclicRing, i: u32) -> [u32; 3] {
 
 /// Recover (s,p,o) from a T_osp row index (lead = O).
 #[inline]
-fn triple_at_osp(ring: &CyclicRing, k: u32) -> [u32; 3] {
+fn triple_at_osp(ring: RingRef<'_>, k: u32) -> [u32; 3] {
     let p = ring.access(Col::P, k);
     let i_pos = ring.f(Col::P, k);
     let s = ring.access(Col::S, i_pos);
@@ -164,7 +165,7 @@ fn triple_at_osp(ring: &CyclicRing, k: u32) -> [u32; 3] {
 
 /// Recover (s,p,o) from a T_pos row index (lead = P).
 #[inline]
-fn triple_at_pos(ring: &CyclicRing, j: u32) -> [u32; 3] {
+fn triple_at_pos(ring: RingRef<'_>, j: u32) -> [u32; 3] {
     let s = ring.access(Col::S, j);
     let i_spo = ring.f(Col::S, j);
     let o = ring.access(Col::O, i_spo);
@@ -176,9 +177,9 @@ fn triple_at_pos(ring: &CyclicRing, j: u32) -> [u32; 3] {
 /// Push every triple in a contiguous row range, recovering via `at`.
 #[inline]
 fn push_range(
-    ring: &CyclicRing,
+    ring: RingRef<'_>,
     r: RowRange,
-    at: fn(&CyclicRing, u32) -> [u32; 3],
+    at: fn(RingRef<'_>, u32) -> [u32; 3],
     out: &mut Vec<[u32; 3]>,
 ) {
     if r.is_empty() {
@@ -192,7 +193,7 @@ fn push_range(
 
 /// Indexed dense pattern match — O(|matches|) row walks, not O(n) full enum.
 pub fn match_triples_dense(
-    ring: &CyclicRing,
+    ring: RingRef<'_>,
     s: Option<u32>,
     p: Option<u32>,
     o: Option<u32>,
@@ -201,7 +202,7 @@ pub fn match_triples_dense(
     if n == 0 {
         return Vec::new();
     }
-    let universe = ring.universe;
+    let universe = ring.universe();
     let ok = |v: Option<u32>| v.is_none_or(|x| x < universe);
     if !ok(s) || !ok(p) || !ok(o) {
         return Vec::new();
@@ -255,8 +256,8 @@ pub fn match_triples_dense(
 }
 
 /// Exact (s,p,o) membership via SP range + O RNV — O(log σ), not O(n).
-pub fn contains_dense(ring: &CyclicRing, s: u32, p: u32, o: u32) -> bool {
-    if s >= ring.universe || p >= ring.universe || o >= ring.universe {
+pub fn contains_dense(ring: RingRef<'_>, s: u32, p: u32, o: u32) -> bool {
+    if s >= ring.universe() || p >= ring.universe() || o >= ring.universe() {
         return false;
     }
     let r = range_sp(ring, s, p);
@@ -298,7 +299,7 @@ enum MiddleKind {
 
 /// Build the dense scan kind for (s,p,o,target_field) on Ring A.
 fn dense_scan_kind(
-    ring: &CyclicRing,
+    ring: RingRef<'_>,
     s: Option<u32>,
     p: Option<u32>,
     o: Option<u32>,
@@ -309,7 +310,7 @@ fn dense_scan_kind(
         return DenseScanKind::Empty;
     }
     let full = RowRange::full(n);
-    let universe = ring.universe;
+    let universe = ring.universe();
     let ok = |v: Option<u32>| v.is_none_or(|x| x < universe);
     if !ok(s) || !ok(p) || !ok(o) {
         return DenseScanKind::Empty;
@@ -535,7 +536,7 @@ fn dense_scan_kind(
 }
 
 /// First dense value ≥ `target` for this scan kind (None ⇒ exhausted).
-fn dense_seek(ring: &CyclicRing, kind: DenseScanKind, target: u32) -> Option<u32> {
+fn dense_seek(ring: RingRef<'_>, kind: DenseScanKind, target: u32) -> Option<u32> {
     match kind {
         DenseScanKind::Empty => None,
         DenseScanKind::Singleton(v) => {
@@ -556,7 +557,7 @@ fn dense_seek(ring: &CyclicRing, kind: DenseScanKind, target: u32) -> Option<u32
             if range.is_empty() {
                 return None;
             }
-            let mid_fn: fn(&CyclicRing, u32) -> u32 = match mid {
+            let mid_fn: fn(RingRef<'_>, u32) -> u32 = match mid {
                 MiddleKind::PUnderS => middle_p_spo,
                 MiddleKind::SUnderO => middle_s_osp,
                 MiddleKind::OUnderP => middle_o_pos,
@@ -573,7 +574,7 @@ fn dense_seek(ring: &CyclicRing, kind: DenseScanKind, target: u32) -> Option<u32
 }
 
 /// Successor after `current` (exclusive).
-fn dense_advance(ring: &CyclicRing, kind: DenseScanKind, current: u32) -> Option<u32> {
+fn dense_advance(ring: RingRef<'_>, kind: DenseScanKind, current: u32) -> Option<u32> {
     if current == u32::MAX {
         return None;
     }
@@ -589,7 +590,7 @@ fn dense_advance(ring: &CyclicRing, kind: DenseScanKind, current: u32) -> Option
 /// `MiddleRuns` with ~50 distinct classes, while target S is LastCol with
 /// ~50k subjects. Using `rows` for both made VEO bind S first → 50k SP opens.
 fn count_middle_runs_budgeted(
-    ring: &CyclicRing,
+    ring: RingRef<'_>,
     range: RowRange,
     mid: MiddleKind,
     budget: u64,
@@ -600,7 +601,7 @@ fn count_middle_runs_budgeted(
     if budget == 0 {
         return (0, false);
     }
-    let mid_fn: fn(&CyclicRing, u32) -> u32 = match mid {
+    let mid_fn: fn(RingRef<'_>, u32) -> u32 = match mid {
         MiddleKind::PUnderS => middle_p_spo,
         MiddleKind::SUnderO => middle_s_osp,
         MiddleKind::OUnderP => middle_o_pos,
@@ -642,9 +643,9 @@ fn count_middle_runs_budgeted(
 }
 
 #[inline]
-fn middle_rows_heuristic(ring: &CyclicRing, range: RowRange, n_bound: u64) -> u64 {
+fn middle_rows_heuristic(ring: RingRef<'_>, range: RowRange, n_bound: u64) -> u64 {
     let rows = u64::from(range.len().max(1));
-    let vocab = u64::from(ring.universe.max(1)) / (n_bound + 1);
+    let vocab = u64::from(ring.universe().max(1)) / (n_bound + 1);
     rows.min(vocab).max(1)
 }
 
@@ -711,7 +712,7 @@ const VEO_MIDDLE_CACHE_CAP: usize = 4096;
 ///
 /// Planning time is accumulated in `SPARQL_PATH.veo_plan_ns` (not query exec).
 pub fn estimate_join_count(
-    ring: &CyclicRing,
+    ring: RingRef<'_>,
     s: Option<u32>,
     p: Option<u32>,
     o: Option<u32>,
@@ -732,13 +733,13 @@ pub fn estimate_join_count(
         DenseScanKind::Singleton(_) => 1,
         DenseScanKind::LastCol { range, .. } => {
             let rows = u64::from(range.len().max(1));
-            let vocab = u64::from(ring.universe.max(1)) / (n_bound + 1);
+            let vocab = u64::from(ring.universe().max(1)) / (n_bound + 1);
             rows.min(vocab).max(1)
         }
         DenseScanKind::MiddleRuns { range, mid } => {
             let cache_key = VeoMiddleCacheKey {
                 n: ring.n(),
-                universe: ring.universe,
+                universe: ring.universe(),
                 start: range.start,
                 end: range.end,
                 mid: middle_kind_tag(mid),
@@ -796,7 +797,7 @@ pub struct BraidedStreamingScan {
 impl BraidedStreamingScan {
     fn new(img: Arc<BraidedGraphImage>, kind: DenseScanKind) -> Self {
         let current = {
-            let ring = img.index().heap();
+            let ring = img.index().ring_ref();
             dense_seek(ring, kind, 0)
         };
         Self {
@@ -807,8 +808,8 @@ impl BraidedStreamingScan {
     }
 
     #[inline]
-    fn ring(&self) -> &CyclicRing {
-        self.img.index().heap()
+    fn ring(&self) -> RingRef<'_> {
+        self.img.index().ring_ref()
     }
 
     /// Map dense → external for the iterator contract.
@@ -1364,7 +1365,7 @@ impl TrieIterator for BraidedJoinScan {
 }
 
 /// Collect all distinct dense values by streaming RNV/runs (tests / oracles).
-fn collect_dense(ring: &CyclicRing, kind: DenseScanKind) -> Vec<u64> {
+fn collect_dense(ring: RingRef<'_>, kind: DenseScanKind) -> Vec<u64> {
     let mut out = Vec::new();
     let mut cur = dense_seek(ring, kind, 0);
     while let Some(v) = cur {
@@ -1407,13 +1408,13 @@ impl BraidedRingIndex {
     ) -> Vec<u64> {
         let target_field = target_field.min(2);
         let kind = dense_scan_kind(
-            self.heap(),
+            self.ring_ref(),
             as_u32(s),
             as_u32(p),
             as_u32(o),
             target_field,
         );
-        collect_dense(self.heap(), kind)
+        collect_dense(self.ring_ref(), kind)
     }
 
     /// Exact distinct count via streaming walk (still O(|distinct|) RNV steps).
@@ -1436,7 +1437,7 @@ impl BraidedRingIndex {
         target_field: usize,
     ) -> u64 {
         estimate_join_count(
-            self.heap(),
+            self.ring_ref(),
             as_u32(s),
             as_u32(p),
             as_u32(o),
@@ -1468,7 +1469,7 @@ impl BraidedGraphImage {
         let (Some(sd), Some(pd), Some(od)) = (map_bound(s), map_bound(p), map_bound(o)) else {
             return Box::new(EmptyTrieIter);
         };
-        let kind = dense_scan_kind(img.index().heap(), sd, pd, od, target_field.min(2));
+        let kind = dense_scan_kind(img.index().ring_ref(), sd, pd, od, target_field.min(2));
         match kind {
             DenseScanKind::Empty => Box::new(EmptyTrieIter),
             // Small SP/PO/OS ranges (typical after binding S under bound P in
@@ -1633,7 +1634,7 @@ impl BraidedGraphImage {
         let (Some(sd), Some(pd), Some(od)) = (map_bound(s), map_bound(p), map_bound(o)) else {
             return 0;
         };
-        estimate_join_count(self.index().heap(), sd, pd, od, target_field)
+        estimate_join_count(self.index().ring_ref(), sd, pd, od, target_field)
     }
 
     /// Indexed pattern match in **external** TermId coordinates.
@@ -1655,7 +1656,7 @@ impl BraidedGraphImage {
         let (Some(sd), Some(pd), Some(od)) = (map_bound(s), map_bound(p), map_bound(o)) else {
             return Vec::new();
         };
-        match_triples_dense(self.index().heap(), sd, pd, od)
+        match_triples_dense(self.index().ring_ref(), sd, pd, od)
             .into_iter()
             .filter_map(|t| self.remap().unmap_triple(t))
             .collect()
@@ -1670,7 +1671,7 @@ impl BraidedGraphImage {
         ) else {
             return false;
         };
-        contains_dense(self.index().heap(), sd, pd, od)
+        contains_dense(self.index().ring_ref(), sd, pd, od)
     }
 }
 
@@ -2058,7 +2059,7 @@ mod tests {
     fn range_sp_restricts_to_matching_p() {
         let t = sample();
         let idx = BraidedRingIndex::from_shared_triples(&t, 3);
-        let ring = idx.heap();
+        let ring = idx.ring_ref();
         let r = range_sp(ring, 0, 0);
         // s=0,p=0 → objects 1,2
         let mut objs = Vec::new();
@@ -2088,7 +2089,7 @@ mod tests {
     fn match_triples_dense_matches_filter_oracle() {
         let t = sample();
         let idx = BraidedRingIndex::from_shared_triples(&t, 3);
-        let ring = idx.heap();
+        let ring = idx.ring_ref();
         let cases: &[(Option<u32>, Option<u32>, Option<u32>)] = &[
             (None, None, None),
             (Some(0), None, None),

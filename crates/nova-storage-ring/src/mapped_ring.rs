@@ -751,7 +751,7 @@ pub enum MappedColDistinctIter<'a> {
     },
 }
 
-impl MappedColDistinctIter<'_> {
+impl<'a> MappedColDistinctIter<'a> {
     /// Next distinct symbol and its occurrence count in the range.
     #[inline]
     pub fn next_symbol(&mut self) -> Option<(u32, usize)> {
@@ -766,6 +766,16 @@ impl MappedColDistinctIter<'_> {
                 *idx += 1;
                 Some((s, c as usize))
             }
+        }
+    }
+
+    /// Borrow the inner Qwt RDI when present (e511 counter gates).
+    #[inline]
+    pub fn as_qwt(&self) -> Option<&crate::mapped_qwt::MappedRangeDistinctIter<'a>> {
+        match self {
+            Self::Qwt(it) => Some(it),
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::HuffScan { .. } => None,
         }
     }
 }

@@ -328,6 +328,54 @@ impl CounterSnapshot {
 
 // ── CyclicRing ───────────────────────────────────────────────────────────────
 
+/// Componentized Ring A footprint (E5.6 / Phase-0 regression card).
+///
+/// `total()` matches historical [`CyclicRing::mem_bytes`] (QWT MemSize + A + 136 shell).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RingMemBreakdown {
+    pub c_o: usize,
+    pub c_p: usize,
+    pub c_s: usize,
+    pub a_o: usize,
+    pub a_p: usize,
+    pub a_s: usize,
+    /// Struct shell / padding allowance (fixed 136 in E5.6 accounting).
+    pub shell: usize,
+    pub n: u32,
+    pub universe: u32,
+    pub ns: u32,
+    pub np: u32,
+    pub no: u32,
+    pub c_p_is_huff: bool,
+}
+
+impl RingMemBreakdown {
+    #[inline]
+    pub fn total(&self) -> usize {
+        self.c_o + self.c_p + self.c_s + self.a_o + self.a_p + self.a_s + self.shell
+    }
+
+    #[inline]
+    pub fn qwt_total(&self) -> usize {
+        self.c_o + self.c_p + self.c_s
+    }
+
+    #[inline]
+    pub fn a_total(&self) -> usize {
+        self.a_o + self.a_p + self.a_s
+    }
+
+    /// Bytes per triple (total / n); 0 if empty.
+    #[inline]
+    pub fn bytes_per_triple(&self) -> f64 {
+        if self.n == 0 {
+            0.0
+        } else {
+            self.total() as f64 / f64::from(self.n)
+        }
+    }
+}
+
 /// Paper-faithful Ring A: three cyclic last-columns + cumulative A arrays.
 ///
 /// Symbols are dense local ids in `[0, U)`. Construction densifies S/P/O
@@ -606,11 +654,32 @@ impl CyclicRing {
     /// Exact complete bytes (qwt MemSize + A arrays + shell), matching E5.6 accounting.
 
     pub fn mem_bytes(&self) -> usize {
-        let q = self.c_o.mem_size(SizeFlags::default())
-            + self.c_p.mem_bytes()
-            + self.c_s.mem_size(SizeFlags::default());
-        let a = (self.a_o.len() + self.a_p.len() + self.a_s.len()) * 4;
-        q + a + 136
+        self.mem_breakdown().total()
+    }
+
+    /// Componentized footprint (E5.6 / Phase-0 regression card discipline).
+    pub fn mem_breakdown(&self) -> RingMemBreakdown {
+        let c_o = self.c_o.mem_size(SizeFlags::default());
+        let c_p = self.c_p.mem_bytes();
+        let c_s = self.c_s.mem_size(SizeFlags::default());
+        let a_o = self.a_o.len() * 4;
+        let a_p = self.a_p.len() * 4;
+        let a_s = self.a_s.len() * 4;
+        RingMemBreakdown {
+            c_o,
+            c_p,
+            c_s,
+            a_o,
+            a_p,
+            a_s,
+            shell: 136,
+            n: self.n,
+            universe: self.universe,
+            ns: self.ns,
+            np: self.np,
+            no: self.no,
+            c_p_is_huff: self.c_p_is_huff(),
+        }
     }
 
     /// Whether C_p is the Huffman substrate (feature `ring-huffman-cp` only).

@@ -1,6 +1,6 @@
 //! ID-level Braided Ring facade (Phase 4 / 4b).
 //!
-//! Thin ownership wrapper over heap [`CyclicRing`] and optional mmap
+//! Thin ownership wrapper over optional heap [`CyclicRing`] and optional mmap
 //! [`MappedRingA`]. This is **not** a [`oxigraph_nova_core::QuadStore`]: no
 //! dictionary, no SPARQL cutover, no live writes. Callers build from
 //! shared-alphabet `u32` triples and use navigation / D2 primitives.
@@ -9,10 +9,19 @@
 //! ID-level `TrieIterator` seam matching `LftjSource::lftj_join_scan`
 //! semantics, still without dictionary/delta/`QuadStore`.
 //!
+//! ## Dual residency (Phase 1A)
+//!
+//! After a successful [`Self::materialize_mapped`], the product path **drops**
+//! the heap QWT/A payloads by default so process RSS is not charged twice for
+//! the same Ring A. Escape hatch: `NOVA_RING_KEEP_HEAP=1` (see
+//! [`crate::product_path::ring_keep_heap`]) keeps both for differentials.
+//! Navigation after drop uses mmap via [`crate::ring_nav::RingRef`].
+//!
 //! Differential tests in this module compare enumerate / lead-range / D2
 //! results against a sorted triple-list oracle and heap↔mmap parity.
 
-
+use crate::product_path::ring_keep_heap;
+use crate::ring_nav::RingRef;
 use crate::{
     Col, CyclicRing, MappedRingA, MappedRingError, RowRange, open_novarng1_mmap, write_novarng1_file,
     write_novarng1_v1,
@@ -24,25 +33,39 @@ use std::path::Path;
 /// Product triangle path is D2 via [`Self::intersection_next_value3`] when a
 /// mapped image is present (hot QWT columns). Heap-only instances still support
 /// enumerate / lead-range / RNV for oracle and build checks.
+///
+/// Invariant: at least one of `heap` / `mapped` is `Some` after a successful
+/// build (empty rings may have a zero-size heap only).
 pub struct BraidedRingIndex {
-    heap: CyclicRing,
-    /// Present after [`Self::materialize_mapped`] / [`Self::open_mapped`].
+    /// Heap pilot. Cleared after successful mmap materialize unless
+    /// `NOVA_RING_KEEP_HEAP=1`.
+    heap: Option<CyclicRing>,
+    /// Present after [`Self::materialize_mapped`] / product open.
     mapped: Option<MappedRingA>,
+    /// Cached dimensions so `n` / `universe` work after heap drop.
+    n: u32,
+    universe: u32,
 }
 
 impl BraidedRingIndex {
     /// Build Ring A from shared-alphabet triples (`[s,p,o]` with symbols in `0..universe`).
     pub fn from_shared_triples(triples: &[[u32; 3]], universe: u32) -> Self {
+        let heap = CyclicRing::build_shared(triples, universe);
         Self {
-            heap: CyclicRing::build_shared(triples, universe),
+            n: heap.n(),
+            universe: heap.universe,
+            heap: Some(heap),
             mapped: None,
         }
     }
 
     /// Build Ring A after remapping role-local S/P/O IDs into a shared alphabet.
     pub fn from_role_local(triples: &[[u32; 3]], ns: u32, np: u32, no: u32) -> Self {
+        let heap = CyclicRing::build_from_role_local(triples, ns, np, no);
         Self {
-            heap: CyclicRing::build_from_role_local(triples, ns, np, no),
+            n: heap.n(),
+            universe: heap.universe,
+            heap: Some(heap),
             mapped: None,
         }
     }
@@ -50,19 +73,37 @@ impl BraidedRingIndex {
     /// Triple count.
     #[inline]
     pub fn n(&self) -> u32 {
-        self.heap.n()
+        self.n
     }
 
     /// Shared alphabet size.
     #[inline]
     pub fn universe(&self) -> u32 {
-        self.heap.universe
+        self.universe
     }
 
-    /// Borrow the heap pilot (tests / oracles).
+    /// Borrow the heap pilot when still resident (tests / oracles / KEEP_HEAP).
     #[inline]
-    pub fn heap(&self) -> &CyclicRing {
-        &self.heap
+    pub fn heap(&self) -> Option<&CyclicRing> {
+        self.heap.as_ref()
+    }
+
+    /// Whether the heap QWT/A payload is still resident.
+    #[inline]
+    pub fn has_heap(&self) -> bool {
+        self.heap.is_some()
+    }
+
+    /// Unified nav view: prefer mmap when open, else heap.
+    #[inline]
+    pub fn ring_ref(&self) -> RingRef<'_> {
+        if let Some(m) = self.mapped.as_ref() {
+            RingRef::Mapped(m)
+        } else if let Some(h) = self.heap.as_ref() {
+            RingRef::Heap(h)
+        } else {
+            panic!("BraidedRingIndex has neither heap nor mapped residency");
+        }
     }
 
     /// Borrow the mmap image if materialised.
@@ -77,66 +118,78 @@ impl BraidedRingIndex {
         self.mapped.is_some()
     }
 
-    /// Flatten heap → `NOVARNG1` bytes, write to `path`, open mmap, and keep it.
+    /// Flatten heap → `NOVARNG1` bytes, write to `path`, open mmap.
+    ///
+    /// By default drops the heap payload after a successful open (Phase 1A).
+    /// Set `NOVA_RING_KEEP_HEAP=1` to retain both for differentials.
     pub fn materialize_mapped(&mut self, path: &Path) -> Result<(), MappedRingError> {
-        write_novarng1_file(path, &self.heap)?;
+        self.materialize_mapped_ex(path, ring_keep_heap())
+    }
+
+    /// Like [`Self::materialize_mapped`] with an explicit heap-retention flag
+    /// (avoids process-wide env races in parallel tests).
+    pub fn materialize_mapped_ex(
+        &mut self,
+        path: &Path,
+        keep_heap: bool,
+    ) -> Result<(), MappedRingError> {
+        let heap = self.heap.as_ref().ok_or(MappedRingError::Layout(
+            "materialize_mapped requires a resident heap CyclicRing (rebuild from triples)",
+        ))?;
+        write_novarng1_file(path, heap)?;
         self.mapped = Some(open_novarng1_mmap(path)?);
+        if !keep_heap {
+            self.heap = None;
+        }
         Ok(())
     }
 
     /// Open an existing `NOVARNG1` image (does not rebuild heap).
-    ///
-    /// Prefer [`Self::materialize_mapped`] when both heap and mmap are needed
-    /// for differentials; this is for open-only product paths.
     pub fn open_mapped(path: &Path) -> Result<MappedRingA, MappedRingError> {
         open_novarng1_mmap(path)
     }
 
     /// Encode heap as owned `NOVARNG1` image bytes (no file).
     pub fn write_image_bytes(&self) -> Result<Vec<u8>, MappedRingError> {
-        write_novarng1_v1(&self.heap)
+        let heap = self.heap.as_ref().ok_or(MappedRingError::Layout(
+            "write_image_bytes requires resident heap; rebuild or KEEP_HEAP",
+        ))?;
+        write_novarng1_v1(heap)
     }
 
     /// Full SPO enumeration (shared-alphabet). Prefers mmap when present.
     pub fn enumerate_spo(&self) -> Vec<[u32; 3]> {
-        if let Some(m) = &self.mapped {
-            m.enumerate_spo().unwrap_or_else(|| self.heap.enumerate_spo())
-        } else {
-            self.heap.enumerate_spo()
+        match (&self.mapped, &self.heap) {
+            (Some(m), _) => m
+                .enumerate_spo()
+                .or_else(|| self.heap.as_ref().map(|h| h.enumerate_spo()))
+                .unwrap_or_default(),
+            (None, Some(h)) => h.enumerate_spo(),
+            (None, None) => Vec::new(),
         }
     }
 
     /// Lead range for symbol on column `col`.
     pub fn lead_range(&self, col: Col, symbol: u32) -> RowRange {
-        if let Some(m) = &self.mapped {
-            m.lead_range(col, symbol)
-                .unwrap_or_else(|| self.heap.lead_range(col, symbol))
-        } else {
-            self.heap.lead_range(col, symbol)
-        }
+        self.ring_ref().lead_range(col, symbol)
     }
 
-    /// Subject prefix range on T_spo.
     #[inline]
     pub fn range_s(&self, s: u32) -> RowRange {
         self.lead_range(Col::S, s)
     }
 
-    /// Object prefix range.
     #[inline]
     pub fn range_o(&self, o: u32) -> RowRange {
         self.lead_range(Col::O, o)
     }
 
-    /// Predicate prefix range.
     #[inline]
     pub fn range_p(&self, p: u32) -> RowRange {
         self.lead_range(Col::P, p)
     }
 
     /// D1 braided two-range successor (requires mapped image).
-    ///
-    /// Product path for two subject ranges on a last column (typically Col::O).
     pub fn intersection_next_value2(
         &self,
         col: Col,
@@ -150,8 +203,6 @@ impl BraidedRingIndex {
     }
 
     /// Product triangle: D2 braided three-range successor (requires mapped image).
-    ///
-    /// Returns `None` if no mapped image is open or if no common symbol ≥ `target`.
     pub fn intersection_next_value3(
         &self,
         col: Col,
@@ -205,14 +256,12 @@ impl BraidedRingIndex {
 
 /// Ground-truth multiset helpers over sorted shared-alphabet triples.
 pub mod oracle {
-    /// Sort + dedup optional: returns sorted copy of triples as multiset.
     pub fn sorted_triples(triples: &[[u32; 3]]) -> Vec<[u32; 3]> {
         let mut v = triples.to_vec();
         v.sort_unstable();
         v
     }
 
-    /// Multiset equality after sorting both sides.
     pub fn multisets_equal(a: &[[u32; 3]], b: &[[u32; 3]]) -> bool {
         let mut aa = a.to_vec();
         let mut bb = b.to_vec();
@@ -221,27 +270,18 @@ pub mod oracle {
         aa == bb
     }
 
-    /// Count triples with subject `s` (shared alphabet).
     pub fn count_subject(triples: &[[u32; 3]], s: u32) -> u32 {
         triples.iter().filter(|t| t[0] == s).count() as u32
     }
 
-    /// Count triples with object `o`.
     pub fn count_object(triples: &[[u32; 3]], o: u32) -> u32 {
         triples.iter().filter(|t| t[2] == o).count() as u32
     }
 
-    /// Count triples with predicate `p`.
     pub fn count_predicate(triples: &[[u32; 3]], p: u32) -> u32 {
         triples.iter().filter(|t| t[1] == p).count() as u32
     }
 
-    /// Symbols present in all three filtered projections on column `col_idx`
-    /// (0=s, 1=p, 2=o), ordered ascending — naive set intersection oracle for D2.
-    ///
-    /// For product D2 tests we typically intersect three *row ranges* on one
-    /// QWT column; this helper instead intersects symbol sets from three
-    /// triple filters when the caller already has filtered triple lists.
     pub fn sorted_common_symbols(sets: &[Vec<u32>]) -> Vec<u32> {
         if sets.is_empty() {
             return Vec::new();
@@ -259,8 +299,8 @@ pub mod oracle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::oracle;
+    use super::*;
     use std::io::Write;
 
     fn sample_triples() -> Vec<[u32; 3]> {
@@ -281,10 +321,7 @@ mod tests {
         let t = sample_triples();
         let idx = BraidedRingIndex::from_shared_triples(&t, 3);
         let got = idx.enumerate_spo();
-        assert!(
-            oracle::multisets_equal(&got, &t),
-            "heap enumerate vs input multiset"
-        );
+        assert!(oracle::multisets_equal(&got, &t));
     }
 
     #[test]
@@ -292,25 +329,13 @@ mod tests {
         let t = sample_triples();
         let idx = BraidedRingIndex::from_shared_triples(&t, 3);
         for s in 0..3 {
-            assert_eq!(
-                idx.range_s(s).len(),
-                oracle::count_subject(&t, s),
-                "subject {s}"
-            );
+            assert_eq!(idx.range_s(s).len(), oracle::count_subject(&t, s));
         }
         for p in 0..2 {
-            assert_eq!(
-                idx.range_p(p).len(),
-                oracle::count_predicate(&t, p),
-                "pred {p}"
-            );
+            assert_eq!(idx.range_p(p).len(), oracle::count_predicate(&t, p));
         }
         for o in 0..3 {
-            assert_eq!(
-                idx.range_o(o).len(),
-                oracle::count_object(&t, o),
-                "object {o}"
-            );
+            assert_eq!(idx.range_o(o).len(), oracle::count_object(&t, o));
         }
     }
 
@@ -326,21 +351,41 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        idx.materialize_mapped(&path).expect("materialize");
+        idx.materialize_mapped_ex(&path, true).expect("materialize");
         let _ = std::fs::remove_file(&path);
-
         assert!(idx.has_mapped());
-        let heap_enum = idx.heap().enumerate_spo();
+        assert!(idx.has_heap());
+        let heap_enum = idx.heap().unwrap().enumerate_spo();
         let map_enum = idx.mapped().unwrap().enumerate_spo().expect("map enum");
         assert!(oracle::multisets_equal(&heap_enum, &map_enum));
-
         for col in [Col::S, Col::P, Col::O] {
             for sym in 0..idx.universe() {
-                let h = idx.heap().lead_range(col, sym);
+                let h = idx.heap().unwrap().lead_range(col, sym);
                 let m = idx.mapped().unwrap().lead_range(col, sym).unwrap();
-                assert_eq!(h, m, "lead_range {col:?} {sym}");
+                assert_eq!(h, m);
             }
         }
+    }
+
+    #[test]
+    fn materialize_drops_heap_by_default() {
+        let t = sample_triples();
+        let mut idx = BraidedRingIndex::from_shared_triples(&t, 3);
+        assert!(idx.has_heap());
+        let path = std::env::temp_dir().join(format!(
+            "braided_facade_drop_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        idx.materialize_mapped_ex(&path, false).expect("materialize");
+        let _ = std::fs::remove_file(&path);
+        assert!(idx.has_mapped());
+        assert!(!idx.has_heap());
+        assert!(oracle::multisets_equal(&idx.enumerate_spo(), &t));
+        assert_eq!(idx.range_s(0).len(), oracle::count_subject(&t, 0));
     }
 
     #[test]
@@ -362,21 +407,13 @@ mod tests {
         }
         idx.mapped = Some(open_novarng1_mmap(&path).unwrap());
         let _ = std::fs::remove_file(&path);
-
         let full = RowRange::full(idx.n());
-        // Three copies of full range → common symbols = all symbols that appear
-        // at least once in that column's last-column sequence; dual_rnv must match D2.
         for col in [Col::S, Col::P, Col::O] {
             let mut t = 0u32;
             loop {
-                let d2 = idx
-                    .intersection_next_value3(col, full, full, full, t)
-                    .or_else(|| {
-                        // empty product
-                        None
-                    });
+                let d2 = idx.intersection_next_value3(col, full, full, full, t);
                 let oracle = idx.intersection_next_value3_dual_rnv(col, full, full, full, t);
-                assert_eq!(d2, oracle, "D2 vs dual_rnv col={col:?} target={t}");
+                assert_eq!(d2, oracle);
                 match d2 {
                     Some(v) => {
                         if v == u32::MAX {
@@ -392,7 +429,6 @@ mod tests {
 
     #[test]
     fn d2_subject_range_intersection_matches_oracle_stream() {
-        // Three subject lead-ranges on Col::O (objects under those subjects).
         let t = sample_triples();
         let mut idx = BraidedRingIndex::from_shared_triples(&t, 3);
         let path = std::env::temp_dir().join(format!(
@@ -403,23 +439,16 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        idx.materialize_mapped(&path).expect("mmap");
+        idx.materialize_mapped_ex(&path, true).expect("mmap");
         let _ = std::fs::remove_file(&path);
-
         let r0 = idx.range_s(0);
         let r1 = idx.range_s(1);
         let r2 = idx.range_s(2);
-        // Objects under each subject (from oracle list).
         let objs = |s: u32| -> Vec<u32> {
-            t.iter()
-                .filter(|x| x[0] == s)
-                .map(|x| x[2])
-                .collect()
+            t.iter().filter(|x| x[0] == s).map(|x| x[2]).collect()
         };
         let common = oracle::sorted_common_symbols(&[objs(0), objs(1), objs(2)]);
-        let got = idx
-            .collect_intersection3(Col::O, r0, r1, r2)
-            .expect("mapped");
-        assert_eq!(got, common, "D2 common objects under s=0,1,2");
+        let got = idx.collect_intersection3(Col::O, r0, r1, r2).expect("mapped D2");
+        assert_eq!(got, common);
     }
 }
