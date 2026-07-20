@@ -15,14 +15,12 @@ fulltext     = ["oxigraph-nova-storage-louds/fulltext"]
 # for the Braided Ring pilot.
 diagnostics  = []
 # Braided Ring pilot: cyclic QWT + NOVARNG1 + D2. Not on LoudsStore SPARQL path.
-# Plain QWT256 C_p by default. Opt into Huffman C_p with `ring-huffman-cp`
-# (does not auto-enable; keep them independent for A/B size/latency).
+# Substrate only (qwt + memmap2). C_p encoding is selected by `ring-huffman-cp`.
 cyclic-ring-pilot = ["dep:qwt", "dep:memmap2"]
-# E5.9B Phase 2–4 (research/notes/e5.9b-qwt-substrate-matrix.md §7/§8):
-# Huffman C_p substrate (HuffColP / HQWA). Requires `cyclic-ring-pilot`.
-# When enabled, product build paths default C_p to PredicateColumn::Huff;
-# without it, C_p is plain QWT256. Enable explicitly for Huffman A/B:
-#   cargo run -p oxigraph-nova-bench --features ring-huffman-cp --example memory_report
+# E5.9B Phase 2–4: Huffman C_p (HuffColP / HQWA). Requires cyclic-ring-pilot.
+# Product default: nova-server `ring-backend` enables this feature so build_*
+# paths use PredicateColumn::Huff. Without it, C_p is plain QWT256
+# (`ring-backend-qwt` / explicit `*_qwt_cp` builders for A/B).
 #   cargo test -p oxigraph-nova-storage-ring --features cyclic-ring-pilot,ring-huffman-cp
 ring-huffman-cp = ["cyclic-ring-pilot"]
 

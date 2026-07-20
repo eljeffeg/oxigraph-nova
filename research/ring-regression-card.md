@@ -78,7 +78,7 @@ From `benches/external/RESULTS_MEM.md` (N=50k / 1.25M triples HTTP):
 
 1. ~~Phase 0~~ **done**
 2. ~~1A dual-residency drop~~ **done**
-3. **1D** Huff C_p on product `ring-backend` (feature still opt-in; measure RESULTS_MEM) — **next**
+3. ~~**1D** Huff C_p product default~~ **done** (`ring-backend` ⇒ `ring-huffman-cp`; A/B via `ring-backend-qwt`)
 4. **1B role-preserving alphabet — DEFER / NO-GO for product default** on realistic N=20k (increases U and total bytes)
 5. **1C** compact A: prefer paper bitvector / Elias-Fano on **shared** U (not role-segment depending on 1B); target stretch ≤ 3.5 MiB
 6. CPU 2A/2B only after memory gates stable
@@ -87,6 +87,31 @@ From `benches/external/RESULTS_MEM.md` (N=50k / 1.25M triples HTTP):
 
 Phase 0 counter probe deferred; live code has `get_or_prepare_wedge` / K11 cache. Next CPU slice should snapshot `SPARQL_PATH` under `nova_serve --backend ring` triangle HTTP.
 
+
+
+## Phase 1D — Huffman C_p product default (shipped)
+
+**Policy:** `nova-server` feature `ring-backend` now enables `ring-huffman-cp`.
+A/B plain QWT: `ring-backend-qwt`. Harness default Huffman; `NOVA_RING_HUFFMAN=0` for Qwt A/B.
+
+### Post-1D @ N=20k realistic (product shared-Σ + DROP heap)
+
+| Config | mmap-only accounted | B/tri |
+|--------|---------------------|-------|
+| Qwt C_p (pre-1D default) | 4.118 MiB | 7.70 |
+| **Huff C_p (1D default)** | **3.841 MiB** | **7.17** |
+
+Δ vs Qwt: **−0.28 MiB (−6.8%)** on Ring A; C_p 0.452 → 0.173 MiB.
+
+### Fair LOUDS (e511, Huff on via cyclic-ring-pilot)
+
+| Gate | Result | Status |
+|------|--------|--------|
+| G1 star mmap/heap | 0.991× | MET |
+| G2 star mmap/LOUDS | **0.613×** | MET — beats LOUDS |
+| G3 tri mmap/fair LOUDS | **0.608×** | MET — beats LOUDS |
+| Semantic mismatches | 0 | PASS |
+| D1/D2 KEEP | +83–85% | KEEP |
 
 ## Fair LOUDS gates (e511_ring_perf_profile @ N=20k realistic) — post-1A
 

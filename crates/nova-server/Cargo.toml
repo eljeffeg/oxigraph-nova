@@ -21,13 +21,18 @@ http-client = ["oxigraph-nova-query/http-client"]
 # feature. Advertised in the SPARQL Service Description document.
 geosparql = ["oxigraph-nova-query/geosparql", "dep:spargeo"]
 # Pilot: in-memory RingStore backend for nova_serve (`--backend ring`).
-# Enables cyclic-ring-pilot; NOT the default SPARQL path. In-memory only
-# (no --location). Used by benches/external mem harness with NOVA_BACKEND=ring.
-# Default C_p is plain QWT256. Opt into Huffman C_p with `ring-huffman-cp`.
-ring-backend = ["oxigraph-nova-storage-ring/cyclic-ring-pilot"]
-# A/B: Huffman C_p on RingStore (implies ring-backend / cyclic-ring-pilot).
-#   cargo build -p oxigraph-nova-server --release --features ring-huffman-cp --bin nova_serve
-ring-huffman-cp = ["ring-backend", "oxigraph-nova-storage-ring/ring-huffman-cp"]
+# Enables cyclic-ring-pilot + Huffman C_p (product default). NOT the default
+# SPARQL path. In-memory only (no --location). Used by benches/external with
+# NOVA_BACKEND=ring.
+ring-backend = [
+    "oxigraph-nova-storage-ring/cyclic-ring-pilot",
+    "oxigraph-nova-storage-ring/ring-huffman-cp",
+]
+# Alias: same as ring-backend (Huffman is product default as of Phase 1D).
+ring-huffman-cp = ["ring-backend"]
+# A/B only: RingStore with plain QWT256 C_p (no Huffman).
+#   cargo build -p oxigraph-nova-server --release --features ring-backend-qwt --bin nova_serve
+ring-backend-qwt = ["oxigraph-nova-storage-ring/cyclic-ring-pilot"]
 
 
 

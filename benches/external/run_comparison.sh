@@ -333,12 +333,13 @@ case "$NOVA_BACKENDS" in
   ring) NEED_RING=1 ;;
 esac
 if [ "$NEED_RING" = "1" ]; then
-  # Default: plain QWT256 C_p. Set NOVA_RING_HUFFMAN=1 to build Huffman C_p A/B.
-  if [ "${NOVA_RING_HUFFMAN:-0}" = "1" ]; then
-    echo "  Ring binary: features=ring-huffman-cp (Huffman C_p)"
-    cargo build --release -p oxigraph-nova-server --features ring-huffman-cp --bin nova_serve
+  # Product default: Huffman C_p via ring-backend. Set NOVA_RING_HUFFMAN=0 for
+  # plain QWT256 A/B (ring-backend-qwt).
+  if [ "${NOVA_RING_HUFFMAN:-1}" = "0" ]; then
+    echo "  Ring binary: features=ring-backend-qwt (plain QWT256 C_p A/B)"
+    cargo build --release -p oxigraph-nova-server --features ring-backend-qwt --bin nova_serve
   else
-    echo "  Ring binary: features=ring-backend (plain QWT256 C_p)"
+    echo "  Ring binary: features=ring-backend (Huffman C_p product default)"
     cargo build --release -p oxigraph-nova-server --features ring-backend --bin nova_serve
   fi
   cp -f "$ROOT/target/release/nova_serve" "$NOVA_RING_BIN"
@@ -347,10 +348,6 @@ fi
 if [ "$NEED_LOUDS" = "1" ]; then
   cargo build --release -p oxigraph-nova-server --bin nova_serve
   cp -f "$ROOT/target/release/nova_serve" "$NOVA_LOUDS_BIN"
-fi
-if [ "$NEED_RING" = "1" ]; then
-  cargo build --release -p oxigraph-nova-server --features ring-backend --bin nova_serve
-  cp -f "$ROOT/target/release/nova_serve" "$NOVA_RING_BIN"
 fi
 
 echo "=== [2/6] Dataset (N=$ENTITIES entities) ==="

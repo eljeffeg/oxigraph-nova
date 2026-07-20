@@ -166,7 +166,7 @@ fn main() {
 
     println!("=== Ring regression card (Phase 0) ===");
     println!("n={n} corpus={corpus}");
-    println!("ring-huffman-cp={}", cfg!(feature = "ring-huffman-cp"));
+    println!("ring-huffman-cp feature={}", cfg!(feature = "ring-huffman-cp"));
     println!();
 
     let quads = match corpus {

@@ -1,10 +1,9 @@
 //! E5.9B Phase 2 (research/notes/e5.9b-qwt-substrate-matrix.md §7/§8) —
 //! column-local Huffman substrate prototype for **C_p only**.
 //!
-//! Feature-gated: `ring-huffman-cp` (implies `cyclic-ring-pilot`). **Not**
-//! wired into [`crate::cyclic::CyclicRing`] or the product path — this is a
-//! standalone, differentially-tested column substrate used to validate the
-//! feasibility gate from §7.3 before any product integration is attempted.
+//! Feature-gated: `ring-huffman-cp` (implies `cyclic-ring-pilot`). Product
+//! `ring-backend` enables this by default (Phase 1D). Wired into
+//! [`crate::cyclic::CyclicRing`] as `PredicateColumn::Huff` and NOVARNG1 HQWA.
 //!
 //! # Why C_p only
 //!

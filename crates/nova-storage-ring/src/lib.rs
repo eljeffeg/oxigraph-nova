@@ -64,8 +64,9 @@ pub mod ring_store;
 pub mod product_path;
 /// E5.9B Phase 2/3 — column-local Huffman for C_p (`HuffColP`) +
 /// [`PredicateColumn`] substrate on in-memory [`CyclicRing::c_p`].
-/// Opt-in via `ring-huffman-cp` (not implied by `cyclic-ring-pilot`).
-/// Default C_p is plain QWT256; see e5.9b-qwt-substrate-matrix.md §10.
+/// Enabled by product `ring-backend` (Phase 1D default). Research builds may
+/// enable `ring-huffman-cp` alone. Without the feature, C_p is plain QWT256
+/// (`*_qwt_cp` builders / `ring-backend-qwt`). See e5.9b-qwt-substrate-matrix.md.
 
 #[cfg(feature = "ring-huffman-cp")]
 pub mod huff_cp;

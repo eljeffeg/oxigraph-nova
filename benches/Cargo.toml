@@ -10,11 +10,11 @@ publish      = false
 [features]
 default  = []
 # Braided Ring pilot (cyclic QWT / NOVARNG1 / D2).
-cyclic-ring-pilot = ["oxigraph-nova-storage-ring/cyclic-ring-pilot", "dep:qwt"]
+cyclic-ring-pilot = ["oxigraph-nova-storage-ring/cyclic-ring-pilot", "ring-huffman-cp", "dep:qwt"]
 # DROP-branch matrices for e511 --full-campaign.
 diagnostics = ["oxigraph-nova-storage-ring/diagnostics"]
-# E5.9B Phase 2: standalone column-local Huffman C_p prototype (HuffColP).
-ring-huffman-cp = ["oxigraph-nova-storage-ring/ring-huffman-cp", "cyclic-ring-pilot"]
+# Huffman C_p (product default; enabled by cyclic-ring-pilot). Standalone A/B name.
+ring-huffman-cp = ["oxigraph-nova-storage-ring/ring-huffman-cp"]
 
 
 # ── Runtime deps (needed by both [[bench]] and [[example]] targets) ──────────
@@ -23,7 +23,7 @@ ring-huffman-cp = ["oxigraph-nova-storage-ring/ring-huffman-cp", "cyclic-ring-pi
 oxigraph-nova-core           = { path = "../crates/nova-core" }
 oxigraph-nova-query          = { path = "../crates/nova-query" }
 oxigraph-nova-storage-memory = { path = "../crates/nova-storage-memory" }
-oxigraph-nova-storage-ring   = { path = "../crates/nova-storage-ring", features = ["cyclic-ring-pilot"] }
+oxigraph-nova-storage-ring   = { path = "../crates/nova-storage-ring", features = ["cyclic-ring-pilot", "ring-huffman-cp"] }
 oxrdf                   = { workspace = true }
 oxttl                   = { workspace = true }   # N-Triples parsing for optional BSBM file load
 spargebra               = { workspace = true }
