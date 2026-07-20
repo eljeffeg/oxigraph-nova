@@ -32,14 +32,14 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 
 | Engine | Load time |
 |---|---|
-| Nova (louds) | 2.16 s |
-| Nova (ring) | 2.18 s |
-| Oxigraph (in-memory) | 2.84 s |
-| QLever (mmap, warmed) | 3.41 s |
-| Fluree (ephemeral container) | 6.26 s |
-| RDFox (in-memory) | 1.22 s |
+| Nova (louds) | 2.18 s |
+| Nova (ring) | 2.17 s |
+| Oxigraph (in-memory) | 1.98 s |
+| QLever (mmap, warmed) | 3.11 s |
+| Fluree (ephemeral container) | 5.34 s |
+| RDFox (in-memory) | 1.27 s |
 
-![Dataset load time by engine (lower is better)](charts/mem/load_time.svg)
+
 
 ## Memory Usage (Physical Footprint)
 
@@ -48,86 +48,86 @@ Nova/QLever figures are macOS `vmmap -summary`'s "Physical footprint" (stable, a
 | Engine | Memory | Storage model |
 |---|---|---|
 | Nova (louds) | 103.6 MiB | Pure heap (LOUDS) |
-| Nova (ring) | 84.3 MiB | Pure heap (Ring) |
-| Oxigraph (in-memory) | 338.2MiB | Pure heap (in-memory mode) |
-| QLever (mmap, warmed) | 95.9 MiB | Incl. memory-mapped index pages |
-| Fluree (ephemeral container) | 4.917GiB | Ephemeral container FS |
+| Nova (ring) | 80.3 MiB | Pure heap (Ring) |
+| Oxigraph (in-memory) | 338.5MiB | Pure heap (in-memory mode) |
+| QLever (mmap, warmed) | 88.7 MiB | Incl. memory-mapped index pages |
+| Fluree (ephemeral container) | 6.294GiB | Ephemeral container FS |
 | RDFox (in-memory) | 69.3 MiB | Pure heap (RDFox) |
 
-![Memory usage by engine (lower is better)](charts/mem/memory.svg)
+
 
 ## CPU Usage (average % of one core during query phase)
 
 | Engine | Avg CPU % |
 |---|---|
-| Nova (louds) | 55.5% |
-| Nova (ring) | 75.2% |
-| Oxigraph (in-memory) | 83.5% |
-| QLever (mmap, warmed) | 60.0% |
-| Fluree (ephemeral container) | 92.5% |
-| RDFox (in-memory) | 57.0% |
+| Nova (louds) | 51.2% |
+| Nova (ring) | 66.2% |
+| Oxigraph (in-memory) | 84.6% |
+| QLever (mmap, warmed) | 58.8% |
+| Fluree (ephemeral container) | 94.0% |
+| RDFox (in-memory) | 60.0% |
 
-![CPU usage by engine (lower is better)](charts/mem/cpu.svg)
+
 
 ## Latency Results (milliseconds, HTTP round-trip via curl)
 
 One sub-section per query, with each engine as a column and each percentile (p50, p95) as a row. Charts use p50 latency (lower is better).
 
-![p50 latency by query and engine (lower is better)](charts/mem/latency_p50_overview.svg)
+
 
 ### scan
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 51.91 | 45.12 | 47.19 | 98.47 | 117.92 | 18.64 |
-| p95 (ms) | 54.12 | 52.96 | 51.01 | 100.21 | 121.40 | 19.25 |
+| p50 (ms) | 52.41 | 43.82 | 45.66 | 96.12 | 116.99 | 19.11 |
+| p95 (ms) | 56.11 | 47.62 | 49.54 | 97.58 | 123.95 | 19.41 |
 
-![scan p50 latency (lower is better)](charts/mem/latency_p50_scan.svg)
+
 
 ### 2join
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 1.74 | 4.02 | 3.41 | 2.86 | 6.35 | 0.85 |
-| p95 (ms) | 2.01 | 4.26 | 3.79 | 2.99 | 6.62 | 0.88 |
+| p50 (ms) | 1.96 | 1.71 | 3.28 | 2.93 | 6.50 | 0.87 |
+| p95 (ms) | 2.20 | 1.89 | 3.61 | 3.05 | 7.86 | 0.99 |
 
-![2join p50 latency (lower is better)](charts/mem/latency_p50_2join.svg)
+
 
 ### feature_lookup
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 0.74 | 0.93 | 2.69 | 1.27 | 2.39 | 0.55 |
-| p95 (ms) | 0.82 | 0.99 | 5.13 | 1.31 | 4.57 | 0.59 |
+| p50 (ms) | 0.84 | 1.11 | 3.52 | 1.29 | 3.17 | 0.55 |
+| p95 (ms) | 0.93 | 1.26 | 5.01 | 1.43 | 5.66 | 0.58 |
 
-![feature_lookup p50 latency (lower is better)](charts/mem/latency_p50_feature_lookup.svg)
+
 
 ### star_with_features
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 15.39 | 18.86 | 17.08 | 40.43 | 48.00 | 4.97 |
-| p95 (ms) | 16.20 | 19.21 | 17.97 | 40.95 | 49.44 | 5.12 |
+| p50 (ms) | 15.87 | 21.80 | 17.34 | 39.61 | 47.86 | 5.33 |
+| p95 (ms) | 17.46 | 24.63 | 18.00 | 44.20 | 51.80 | 5.55 |
 
-![star_with_features p50 latency (lower is better)](charts/mem/latency_p50_star_with_features.svg)
+
 
 ### path_2hop
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 566.17 | 1076.35 | 513.08 | 1320.73 | 1517.89 | 138.10 |
-| p95 (ms) | 576.40 | 1092.82 | 533.05 | 1327.96 | 1745.76 | 141.22 |
+| p50 (ms) | 515.95 | 636.03 | 505.87 | 1302.68 | 1512.16 | 140.84 |
+| p95 (ms) | 537.93 | 653.78 | 512.59 | 1317.21 | 2028.49 | 142.57 |
 
-![path_2hop p50 latency (lower is better)](charts/mem/latency_p50_path_2hop.svg)
+
 
 ### triangle
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 313.52 | 658.72 | 350.80 | 445.15 | 688.72 | 81.48 |
-| p95 (ms) | 315.33 | 668.71 | 354.38 | 453.32 | 704.06 | 82.19 |
+| p50 (ms) | 316.14 | 635.82 | 341.16 | 436.02 | 648.37 | 83.12 |
+| p95 (ms) | 349.08 | 650.21 | 342.85 | 445.51 | 699.44 | 85.78 |
 
-![triangle p50 latency (lower is better)](charts/mem/latency_p50_triangle.svg)
+
 
 ## Raw per-query summary (mean, stddev, n)
 
@@ -138,58 +138,58 @@ One sub-section per query, with each engine as a column and each statistic (n, m
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 52.27 | 46.27 | 47.74 | 98.68 | 118.38 | 18.62 |
-| stddev (ms) | 1.07 | 4.10 | 2.18 | 1.00 | 1.78 | 0.47 |
-| min (ms) | 51.32 | 43.27 | 46.03 | 97.65 | 115.94 | 17.90 |
-| max (ms) | 54.84 | 57.32 | 53.81 | 100.90 | 121.84 | 19.31 |
+| mean (ms) | 52.95 | 44.22 | 46.38 | 96.33 | 117.46 | 18.96 |
+| stddev (ms) | 1.94 | 1.98 | 2.05 | 0.85 | 4.10 | 0.45 |
+| min (ms) | 50.85 | 41.63 | 44.28 | 95.42 | 112.66 | 18.15 |
+| max (ms) | 56.65 | 47.99 | 49.91 | 97.58 | 127.72 | 19.51 |
 
 ### 2join
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 1.78 | 4.07 | 3.47 | 2.87 | 6.35 | 0.84 |
-| stddev (ms) | 0.15 | 0.15 | 0.19 | 0.08 | 0.17 | 0.04 |
-| min (ms) | 1.60 | 3.81 | 3.26 | 2.76 | 6.14 | 0.76 |
-| max (ms) | 2.04 | 4.26 | 3.95 | 3.03 | 6.62 | 0.89 |
+| mean (ms) | 1.99 | 1.73 | 3.31 | 2.91 | 6.70 | 0.85 |
+| stddev (ms) | 0.13 | 0.10 | 0.19 | 0.12 | 0.71 | 0.11 |
+| min (ms) | 1.77 | 1.54 | 3.12 | 2.65 | 6.18 | 0.67 |
+| max (ms) | 2.22 | 1.92 | 3.75 | 3.07 | 8.62 | 1.05 |
 
 ### feature_lookup
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 0.73 | 0.92 | 2.93 | 1.26 | 2.80 | 0.54 |
-| stddev (ms) | 0.08 | 0.07 | 1.33 | 0.04 | 0.93 | 0.04 |
-| min (ms) | 0.62 | 0.79 | 1.47 | 1.19 | 2.23 | 0.47 |
-| max (ms) | 0.83 | 0.99 | 5.37 | 1.32 | 4.62 | 0.60 |
+| mean (ms) | 0.85 | 1.13 | 3.25 | 1.29 | 3.58 | 0.53 |
+| stddev (ms) | 0.07 | 0.10 | 1.37 | 0.09 | 1.15 | 0.05 |
+| min (ms) | 0.71 | 0.96 | 1.38 | 1.17 | 2.55 | 0.47 |
+| max (ms) | 0.94 | 1.27 | 5.55 | 1.50 | 6.08 | 0.59 |
 
 ### star_with_features
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 15.45 | 18.86 | 17.12 | 40.47 | 48.02 | 4.99 |
-| stddev (ms) | 0.47 | 0.30 | 0.62 | 0.34 | 1.09 | 0.11 |
-| min (ms) | 14.72 | 18.37 | 15.98 | 40.04 | 46.09 | 4.83 |
-| max (ms) | 16.25 | 19.21 | 18.11 | 41.16 | 49.45 | 5.12 |
+| mean (ms) | 16.01 | 22.36 | 17.20 | 40.51 | 48.39 | 5.24 |
+| stddev (ms) | 0.82 | 1.42 | 0.72 | 2.05 | 2.01 | 0.29 |
+| min (ms) | 15.07 | 21.25 | 16.13 | 38.81 | 46.32 | 4.78 |
+| max (ms) | 17.77 | 25.90 | 18.12 | 45.30 | 52.90 | 5.60 |
 
 ### path_2hop
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 566.87 | 1074.72 | 515.24 | 1320.99 | 1538.82 | 138.46 |
-| stddev (ms) | 6.36 | 14.37 | 11.11 | 4.63 | 122.07 | 1.84 |
-| min (ms) | 557.77 | 1053.21 | 500.48 | 1316.19 | 1387.16 | 135.82 |
-| max (ms) | 578.29 | 1093.16 | 537.00 | 1330.77 | 1806.07 | 142.00 |
+| mean (ms) | 519.24 | 638.93 | 506.25 | 1303.97 | 1617.94 | 140.73 |
+| stddev (ms) | 10.96 | 8.48 | 4.90 | 8.23 | 248.02 | 1.42 |
+| min (ms) | 509.49 | 627.89 | 497.69 | 1294.71 | 1393.92 | 138.15 |
+| max (ms) | 544.98 | 656.85 | 513.23 | 1322.10 | 2163.04 | 142.75 |
 
 ### triangle
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph (in-memory) | QLever (mmap, warmed) | Fluree (ephemeral container) | RDFox (in-memory) |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 313.59 | 659.07 | 350.52 | 446.70 | 686.93 | 81.13 |
-| stddev (ms) | 1.26 | 6.31 | 3.18 | 4.47 | 13.74 | 1.07 |
-| min (ms) | 311.72 | 651.18 | 345.76 | 442.04 | 667.76 | 79.77 |
-| max (ms) | 315.71 | 673.98 | 354.80 | 453.77 | 706.84 | 82.22 |
+| mean (ms) | 321.58 | 637.32 | 341.01 | 437.85 | 657.99 | 82.99 |
+| stddev (ms) | 15.83 | 8.42 | 1.51 | 5.17 | 23.81 | 2.00 |
+| min (ms) | 311.27 | 631.70 | 338.81 | 432.72 | 641.06 | 79.95 |
+| max (ms) | 363.97 | 660.29 | 343.28 | 448.39 | 717.78 | 86.11 |
 

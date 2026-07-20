@@ -27,7 +27,9 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use oxigraph_nova_core::{PreparedPhysicalOperator, PreparedTwoHop, PreparedWedge};
+use oxigraph_nova_core::{
+    PreparedPhysicalOperator, PreparedSpExpansion, PreparedTwoHop, PreparedWedge,
+};
 use parking_lot::Mutex;
 
 use crate::image::BraidedGraphImage;
@@ -35,7 +37,10 @@ use crate::product_path::{
     add_timing_ns, effective_pred_adjacency_mode, effective_prepared_plan_cache_enabled,
     PredAdjacencyMode, TimingBucket, SPARQL_PATH,
 };
-use crate::scan::{PreparedTwoHopImpl, PreparedWedgeImpl};
+use crate::scan::{
+    PreparedSpExpansionImpl, PreparedSpObjectScanImpl, PreparedTwoHopImpl, PreparedWedgeImpl,
+    PredicateAdjacency,
+};
 
 /// Default LRU capacity (bounded; not a general prepared-statement framework).
 pub const PREPARED_PLAN_CACHE_CAP: usize = 32;
@@ -52,12 +57,19 @@ pub enum PhysicalOpKind {
     TwoHop { p1: u64, p2: u64 },
     /// Wedge / triangle: `?a P ?b . ?b P ?c . ?a P ?c` (K11).
     Wedge { pred: u64 },
+    /// SP-expansion / 2join: `?s P_filter O_filter . ?s P_expand ?o`.
+    SpExpansion {
+        p_filter: u64,
+        o_filter: u64,
+        p_expand: u64,
+    },
 }
 
 /// Concrete prepared bodies owned by the cache.
 pub enum PreparedPhysicalOp {
     TwoHop(PreparedTwoHopImpl),
     Wedge(PreparedWedgeImpl),
+    SpExpansion(PreparedSpExpansionImpl),
 }
 
 impl PreparedPhysicalOperator for PreparedPhysicalOp {
@@ -68,9 +80,11 @@ impl PreparedPhysicalOperator for PreparedPhysicalOp {
         match self {
             PreparedPhysicalOp::TwoHop(p) => p.execute(emit),
             PreparedPhysicalOp::Wedge(p) => p.execute(emit),
+            PreparedPhysicalOp::SpExpansion(p) => p.execute(emit),
         }
     }
 }
+
 
 // ── Cache key ────────────────────────────────────────────────────────────────
 
@@ -114,7 +128,29 @@ impl PhysicalOpPlanKey {
             adj_mode,
         }
     }
+
+    #[inline]
+    pub fn sp_expansion(
+        snapshot_version: u64,
+        graph_id: u8,
+        p_filter: u64,
+        o_filter: u64,
+        p_expand: u64,
+        adj_mode: u8,
+    ) -> Self {
+        Self {
+            snapshot_version,
+            graph_id,
+            kind: PhysicalOpKind::SpExpansion {
+                p_filter,
+                o_filter,
+                p_expand,
+            },
+            adj_mode,
+        }
+    }
 }
+
 
 /// Historical two-hop key shape (K10). Convertible to [`PhysicalOpPlanKey`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -378,3 +414,37 @@ pub fn get_or_prepare_wedge(
         PreparedWedgeImpl::prepare(img, predicate).map(PreparedPhysicalOp::Wedge)
     })
 }
+
+/// Resolve or prepare an SP-expansion / 2join plan via the product cache.
+///
+/// `expand_adj` is the optional shared K9.4 adjacency for `p_expand` (from the
+/// store-level SpAdjCache). When `None`, prepare builds adj once on cold miss.
+pub fn get_or_prepare_sp_expansion(
+    cache: &Arc<Mutex<PhysicalOpPreparedPlanCache>>,
+    snapshot_version: u64,
+    graph_id: u8,
+    img: Arc<BraidedGraphImage>,
+    p_filter: u64,
+    o_filter: u64,
+    p_expand: u64,
+    expand_adj: Option<Arc<PredicateAdjacency>>,
+) -> Option<Box<dyn PreparedSpExpansion>> {
+    let mode = effective_pred_adjacency_mode();
+    let key = PhysicalOpPlanKey::sp_expansion(
+        snapshot_version,
+        graph_id,
+        p_filter,
+        o_filter,
+        p_expand,
+        PhysicalOpPlanKey::adj_mode_tag(mode),
+    );
+    // Prefer shared adj from SpAdjCache; on cold miss also seed it via build.
+    let adj = expand_adj.or_else(|| {
+        PreparedSpObjectScanImpl::build_shared_adj(&img, p_expand)
+    });
+    cache_lookup_or_prepare(cache, key, || {
+        PreparedSpExpansionImpl::prepare(img, p_filter, o_filter, p_expand, adj)
+            .map(PreparedPhysicalOp::SpExpansion)
+    })
+}
+

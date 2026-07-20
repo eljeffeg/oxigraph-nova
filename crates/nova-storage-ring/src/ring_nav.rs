@@ -79,6 +79,18 @@ impl<'a> RingRef<'a> {
         }
     }
 
+    /// Cumulative A array for column `col` (length = universe+1).
+    ///
+    /// Used by Native predicate-adjacency build (K9.4) to walk subject partitions
+    /// without per-subject `lead_range` lookups.
+    #[inline]
+    pub fn col_a(self, col: Col) -> Option<&'a [u32]> {
+        match self {
+            Self::Heap(r) => Some(r.col_a_slice(col)),
+            Self::Mapped(m) => m.col_a(col).ok(),
+        }
+    }
+
     #[inline]
     pub fn as_heap(self) -> Option<&'a CyclicRing> {
         match self {

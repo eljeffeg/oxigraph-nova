@@ -122,3 +122,9 @@ required-features = ["cyclic-ring-pilot"]
 name = "e511_ring_perf_profile"
 path = "src/bin/e511_ring_perf_profile.rs"
 required-features = ["cyclic-ring-pilot"]
+
+# Phase 2A: path_2hop / triangle product-path audit (K10/K11 liveness).
+[[bin]]
+name = "phase_2a_path_triangle_audit"
+path = "src/bin/phase_2a_path_triangle_audit.rs"
+required-features = ["cyclic-ring-pilot"]

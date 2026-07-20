@@ -25,6 +25,108 @@ use crate::{GraphName, NamedNode, Oxigraph, Quad, StoredQuad, Term};
 /// `impl LftjSource for MyStore {}` block. Only Ring-backed (CLTJ) stores
 /// currently override these to enable the accelerated join path — see
 /// `oxigraph_nova_storage_ring::LoudsStore`'s `impl LftjSource` block.
+
+// ── K7.2 prepared fixed-P object intersection (product wedge) ────────────────
+
+/// Opaque prepared fixed-predicate context for multi-subject object ∩.
+///
+/// Built once per recognized wedge query. Implementations hold graph image +
+/// densified predicate so each `(a,b)` open skips predicate remap.
+pub trait PreparedPredObjectIntersect: Send {
+    /// Bind outer subject `a` once; reuses SP(a,P) across all right subjects.
+    fn bind_left(&self, subject_a: u64) -> Option<Box<dyn PreparedLeftIntersect>>;
+    /// One-shot D1 open under the prepared predicate (no left-range reuse).
+    fn intersect2(
+        &self,
+        subject_a: u64,
+        subject_b: u64,
+    ) -> Option<Box<dyn crate::trie::TrieIterator>>;
+}
+
+/// Outer-subject handle under a prepared fixed-P context.
+pub trait PreparedLeftIntersect: Send {
+    /// Intersect objects of the bound left subject with `subject_b` under P.
+    fn intersect_right(&self, subject_b: u64) -> Option<Box<dyn crate::trie::TrieIterator>>;
+}
+
+// ── K9 prepared SP→O scan + two-hop plan ─────────────────────────────────────
+
+/// Resettable subject-predicate → object scanner (K9.2).
+///
+/// Built once per fixed predicate. Each logical open becomes
+/// [`reset_to_subject`](Self::reset_to_subject) instead of a full
+/// `lftj_join_scan` adapter path:
+///
+/// - predicate densify / column lookup / policy dispatch: once at prepare
+/// - per reset: subject densify + SP range + cursor rebind only
+pub trait PreparedSpObjectScan: Send {
+    /// Rebind the cursor to objects of `subject` under the prepared predicate.
+    ///
+    /// Returns `false` when the subject is unmappable or the SP range is empty
+    /// (caller should skip). After `true`, [`key`](Self::key) /
+    /// [`advance`](Self::advance) / [`at_end`](Self::at_end) enumerate objects.
+    fn reset_to_subject(&mut self, subject: u64) -> bool;
+
+    /// Current object TermId. Panic if `at_end`.
+    fn key(&self) -> u64;
+
+    /// Advance to the next object under the current subject.
+    fn advance(&mut self);
+
+    /// `true` when the current subject has no more objects.
+    fn at_end(&self) -> bool;
+
+    /// Last SP range length after a successful reset (0 if empty / failed).
+    /// Used by harness degree stats; default 0.
+    fn last_range_len(&self) -> u64 {
+        0
+    }
+}
+
+// ── L: unified prepared physical operators ───────────────────────────────────
+//
+// Pipeline:
+//   BGP → shape recognizer → physical operator → prepared operator → reusable exec
+//
+// Two-hop (K9/K10) and wedge/triangle (K11) are instances of one abstraction.
+// Future stars, longer chains, diamonds extend the same trait + cache key space.
+
+/// Prepared physical operator for a specialized BGP shape (Phase L).
+///
+/// Built once per recognized motif (and optionally retained across requests via
+/// a store-scoped, snapshot-keyed cache). `execute` streams external TermId
+/// triples; the query engine decodes or counts as needed (id_only COUNT path).
+///
+/// Concrete product shapes today:
+/// - **two-hop** `?a P1 ?b . ?b P2 ?c` (K9/K10)
+/// - **wedge**   `?a P ?b . ?b P ?c . ?a P ?c` (K11)
+/// - **sp-expansion / 2join** `?s P1 O1 . ?s P2 ?o` — emit `(s, o, 0)`
+pub trait PreparedPhysicalOperator: Send {
+    /// Run the prepared physical plan.
+    ///
+    /// `emit(a, b, c)` is invoked once per result triple (TermIds).
+    /// For SP-expansion / 2join, `c` is unused (`0`) and `emit(s, o, 0)`.
+    /// Return `Err(())` from `emit` to abort early (cancellation).
+    ///
+    /// Returns the number of emitted triples, or `Err` if aborted.
+    fn execute(
+        &mut self,
+        emit: &mut dyn FnMut(u64, u64, u64) -> Result<(), ()>,
+    ) -> Result<u64, ()>;
+}
+
+/// Historical name for chain-path prepared ops (K9/K10). Same as
+/// [`PreparedPhysicalOperator`].
+pub use PreparedPhysicalOperator as PreparedTwoHop;
+
+/// Historical name for wedge/triangle prepared ops (K11). Same as
+/// [`PreparedPhysicalOperator`].
+pub use PreparedPhysicalOperator as PreparedWedge;
+
+/// SP-expansion / 2join prepared ops. Same as [`PreparedPhysicalOperator`]
+/// (`emit(s, o, 0)`).
+pub use PreparedPhysicalOperator as PreparedSpExpansion;
+
 pub trait LftjSource: Send + Sync {
     /// Returns `true` if this store supports Leapfrog Triejoin acceleration.
     ///
@@ -150,6 +252,73 @@ pub trait LftjSource: Send + Sync {
         _predicate: Option<u64>,
         _graph_id: u8,
     ) -> Option<Box<dyn crate::trie::TrieIterator>> {
+        None
+    }
+
+    /// K7.2: prepare fixed-P D1 context once per wedge query.
+    ///
+    /// Default `None` — only Ring (mmap) implements this. Callers fall back to
+    /// [`lftj_multi_subject_object_intersect`] per `(a,b)` pair.
+    fn lftj_prepare_pred_object_intersect(
+        &self,
+        _predicate: u64,
+        _graph_id: u8,
+    ) -> Option<Box<dyn PreparedPredObjectIntersect>> {
+        None
+    }
+
+    /// K9.2: prepare a resettable SP→O scanner for a fixed predicate.
+    ///
+    /// Default `None` — Ring implements this. Callers fall back to repeated
+    /// `lftj_join_scan(Some(s), Some(p), None, 2, …)`.
+    fn lftj_prepare_sp_object_scan(
+        &self,
+        _predicate: u64,
+        _graph_id: u8,
+    ) -> Option<Box<dyn PreparedSpObjectScan>> {
+        None
+    }
+
+    /// K9: prepare a two-hop path plan `?a P1 ?b . ?b P2 ?c`.
+    ///
+    /// Default `None` — Ring implements with resettable hop scanners.
+    /// The query engine falls back to generic LFTJ when unavailable.
+    fn lftj_prepare_two_hop(
+        &self,
+        _p1: u64,
+        _p2: u64,
+        _graph_id: u8,
+    ) -> Option<Box<dyn PreparedTwoHop>> {
+        None
+    }
+
+    /// K11: prepare a fixed-P wedge plan `?a P ?b . ?b P ?c . ?a P ?c`.
+    ///
+    /// Default `None` — Ring implements with predicate adjacency + D1.
+    /// The query engine falls back to the K7.2 bind_left / multi_subject path.
+    fn lftj_prepare_wedge(
+        &self,
+        _predicate: u64,
+        _graph_id: u8,
+    ) -> Option<Box<dyn PreparedWedge>> {
+        None
+    }
+
+    /// Prepare SP-expansion / 2join: `?s P_filter O_filter . ?s P_expand ?o`.
+    ///
+    /// Default `None` — Ring implements a dense-internal plan that:
+    /// - materializes outer subjects of (P_filter, O_filter) once (cached)
+    /// - expands each subject under P_expand via K9.4 adj + Singleton O access
+    /// - emits external `(s, o, 0)` without per-subject external↔dense remap
+    ///
+    /// Query engine falls back to `lftj_prepare_sp_object_scan` + outer join_scan.
+    fn lftj_prepare_sp_expansion(
+        &self,
+        _p_filter: u64,
+        _o_filter: u64,
+        _p_expand: u64,
+        _graph_id: u8,
+    ) -> Option<Box<dyn PreparedSpExpansion>> {
         None
     }
 }

@@ -242,7 +242,55 @@ pub trait DatasetLftjSource: Send + Sync {
     ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
         None
     }
+    /// K7.2: prepare fixed-P D1 context once per wedge query.
+    fn lftj_prepare_pred_object_intersect(
+        &self,
+        _predicate: u64,
+        _graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedPredObjectIntersect>> {
+        None
+    }
+
+    /// K9.2: prepare a resettable SP→O scanner for a fixed predicate.
+    fn lftj_prepare_sp_object_scan(
+        &self,
+        _predicate: u64,
+        _graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedSpObjectScan>> {
+        None
+    }
+
+    /// K9: prepare a two-hop path plan `?a P1 ?b . ?b P2 ?c`.
+    fn lftj_prepare_two_hop(
+        &self,
+        _p1: u64,
+        _p2: u64,
+        _graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedTwoHop>> {
+        None
+    }
+
+    /// K11: prepare a fixed-P wedge plan.
+    fn lftj_prepare_wedge(
+        &self,
+        _predicate: u64,
+        _graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedWedge>> {
+        None
+    }
+
+    /// Prepare SP-expansion / 2join: `?s P_filter O_filter . ?s P_expand ?o`.
+    fn lftj_prepare_sp_expansion(
+        &self,
+        _p_filter: u64,
+        _o_filter: u64,
+        _p_expand: u64,
+        _graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedSpExpansion>> {
+        None
+    }
 }
+
 
 // ── Dataset trait ─────────────────────────────────────────────────────────────
 
@@ -493,7 +541,78 @@ impl<S: QuadStore + 'static> DatasetLftjSource for StoreDataset<S> {
         self.store
             .lftj_multi_subject_object_intersect(subjects, predicate, graph_id)
     }
+
+    fn lftj_prepare_pred_object_intersect(
+        &self,
+        predicate: u64,
+        graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedPredObjectIntersect>> {
+        let graph_id: u8 = match graph {
+            GraphSelector::Default => 0u8,
+            GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
+            _ => return None,
+        };
+        self.store
+            .lftj_prepare_pred_object_intersect(predicate, graph_id)
+    }
+
+    fn lftj_prepare_sp_object_scan(
+        &self,
+        predicate: u64,
+        graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedSpObjectScan>> {
+        let graph_id: u8 = match graph {
+            GraphSelector::Default => 0u8,
+            GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
+            _ => return None,
+        };
+        self.store.lftj_prepare_sp_object_scan(predicate, graph_id)
+    }
+
+    fn lftj_prepare_two_hop(
+        &self,
+        p1: u64,
+        p2: u64,
+        graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedTwoHop>> {
+        let graph_id: u8 = match graph {
+            GraphSelector::Default => 0u8,
+            GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
+            _ => return None,
+        };
+        self.store.lftj_prepare_two_hop(p1, p2, graph_id)
+    }
+
+    fn lftj_prepare_wedge(
+        &self,
+        predicate: u64,
+        graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedWedge>> {
+        let graph_id: u8 = match graph {
+            GraphSelector::Default => 0u8,
+            GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
+            _ => return None,
+        };
+        self.store.lftj_prepare_wedge(predicate, graph_id)
+    }
+
+    fn lftj_prepare_sp_expansion(
+        &self,
+        p_filter: u64,
+        o_filter: u64,
+        p_expand: u64,
+        graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedSpExpansion>> {
+        let graph_id: u8 = match graph {
+            GraphSelector::Default => 0u8,
+            GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
+            _ => return None,
+        };
+        self.store
+            .lftj_prepare_sp_expansion(p_filter, o_filter, p_expand, graph_id)
+    }
 }
+
 
 impl<S: QuadStore + 'static> Dataset for StoreDataset<S> {
     fn find_quads<'a>(&'a self, pattern: &QuadPattern) -> Result<QuadIter<'a>> {

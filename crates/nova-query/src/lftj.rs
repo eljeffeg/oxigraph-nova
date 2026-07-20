@@ -71,10 +71,19 @@
 use crate::dataset::{Dataset, GraphSelector};
 use crate::options::CancellationToken;
 use crate::solution::{Solution, Solutions};
-use oxigraph_nova_core::{GraphName, Variable};
+use oxigraph_nova_core::{GraphName, Term, Variable};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// K9 path_2hop shape counters
+static TWO_HOP_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
+static TWO_HOP_SELECTED: AtomicU64 = AtomicU64::new(0);
+static TWO_HOP_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static SP_EXPANSION_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
+static SP_EXPANSION_SELECTED: AtomicU64 = AtomicU64::new(0);
+static SP_EXPANSION_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
 
 // ── LFTJ vs nested-loop fallback counters (process-wide) ──────────────────────
 //
@@ -834,6 +843,511 @@ fn lftj_step<D: Dataset>(
 /// - The graph selector is `AnyNamed` or `Union` (multi-graph iteration).
 /// - A pattern contains blank nodes (not internable).
 /// - A constant term in a pattern is not in the dictionary (returns empty directly).
+
+
+#[inline]
+fn field_as_join(f: &FieldSpec) -> Option<usize> {
+    match f {
+        FieldSpec::JoinVar(i) => Some(*i),
+        _ => None,
+    }
+}
+
+#[inline]
+fn field_as_const(f: &FieldSpec) -> Option<u64> {
+    match f {
+        FieldSpec::Const(v) => Some(*v),
+        _ => None,
+    }
+}
+
+
+// ── 2join / subject-star SP-expansion (RESULTS_MEM 2join shape) ──────────────
+//
+//   ?s P_filter O_const .   // A: bound P+O → distinct subjects
+//   ?s P_expand ?o          // B: for each s, SP→O under fixed P_expand
+//
+// Not a 3-var two-hop chain. Generic LFTJ opens a fresh LastCol RDI per subject
+// on pattern B; this plan reuses PreparedSpObjectScan (one prepare + cheap
+// reset_to_subject per s).
+
+struct SpExpansionPlan {
+    /// Bound predicate on the filter pattern (P31).
+    p_filter: u64,
+    /// Bound object on the filter pattern (class0).
+    o_filter: u64,
+    /// Bound predicate on the expansion pattern (P131).
+    p_expand: u64,
+    /// Join-var index of the shared subject (?s).
+    s_idx: usize,
+    /// Join-var index of the expansion object (?region).
+    o_idx: usize,
+}
+
+/// Recognize `?s P1 O1 . ?s P2 ?o` (or pattern order swapped).
+///
+/// Requires exactly 2 patterns and 2 join vars.
+fn try_recognize_sp_expansion(specs: &[PatternSpec], n_vars: usize) -> Option<SpExpansionPlan> {
+    if specs.len() != 2 || n_vars != 2 {
+        return None;
+    }
+    // Classify each pattern:
+    //   filter:  JoinVar(s) Const(P) Const(O)
+    //   expand:  JoinVar(s) Const(P) JoinVar(o)   with s != o
+    let mut filter: Option<(usize, u64, u64)> = None; // (s_idx, p, o)
+    let mut expand: Option<(usize, u64, usize)> = None; // (s_idx, p, o_idx)
+
+    for sp in specs {
+        let s = field_as_join(&sp.s)?;
+        let p = field_as_const(&sp.p)?;
+        match (&sp.o, field_as_join(&sp.o), field_as_const(&sp.o)) {
+            (_, Some(o_jv), _) if o_jv != s => {
+                // expand form
+                if expand.is_some() {
+                    return None;
+                }
+                expand = Some((s, p, o_jv));
+            }
+            (_, None, Some(o_c)) => {
+                if filter.is_some() {
+                    return None;
+                }
+                filter = Some((s, p, o_c));
+            }
+            _ => return None,
+        }
+    }
+    let (fs, p_filter, o_filter) = filter?;
+    let (es, p_expand, o_idx) = expand?;
+    if fs != es {
+        return None; // must share subject var
+    }
+    // Both join-var indices must appear (s and o).
+    if fs >= 2 || o_idx >= 2 || fs == o_idx {
+        return None;
+    }
+    Some(SpExpansionPlan {
+        p_filter,
+        o_filter,
+        p_expand,
+        s_idx: fs,
+        o_idx,
+    })
+}
+
+#[inline]
+fn emit_sp_expansion_solution<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    s_idx: usize,
+    o_idx: usize,
+    s: u64,
+    o: u64,
+    // Optional pre-decoded subject term (avoids re-decode per object row).
+    s_term: &Option<Term>,
+    results: &mut Solutions,
+) {
+    let mut values: Vec<Option<Term>> = vec![None; join_vars.len()];
+    values[s_idx] = s_term.clone().or_else(|| dataset.lftj_decode_term(s));
+    values[o_idx] = dataset.lftj_decode_term(o);
+    results.push(Solution::positional(Arc::clone(join_vars), values));
+}
+
+/// Physical 2join: subjects under (P_filter, O_filter), then prepared SP→O reset.
+fn eval_sp_expansion_walk<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    graph: &GraphSelector,
+    plan: &SpExpansionPlan,
+    cancellation: Option<&CancellationToken>,
+) -> anyhow::Result<Solutions> {
+    SP_EXPANSION_SHAPE_SEEN.fetch_add(1, Ordering::Relaxed);
+
+    let mut results: Solutions = Vec::new();
+    let mut step: u64 = 0;
+
+    // Prefer dense prepared SP-expansion (Ring): outer subjects cached,
+    // expand stays dense — no per-subject external↔dense remap.
+    if let Some(mut prepared) =
+        dataset.lftj_prepare_sp_expansion(plan.p_filter, plan.o_filter, plan.p_expand, graph)
+    {
+        SP_EXPANSION_SELECTED.fetch_add(1, Ordering::Relaxed);
+        let emit_result = prepared.execute(&mut |s, o, _| {
+            if let Some(tok) = cancellation {
+                if step.is_multiple_of(4096) && tok.is_cancelled() {
+                    return Err(());
+                }
+            }
+            step += 1;
+            LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+            let s_term = dataset.lftj_decode_term(s);
+            emit_sp_expansion_solution(
+                dataset,
+                join_vars,
+                plan.s_idx,
+                plan.o_idx,
+                s,
+                o,
+                &s_term,
+                &mut results,
+            );
+            Ok(())
+        });
+        return match emit_result {
+            Ok(_) => Ok(results),
+            Err(()) => Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            )),
+        };
+    }
+
+    // Fallback: prepared SP→O scanner + outer join_scan (external keys).
+    let mut prepared = dataset.lftj_prepare_sp_object_scan(plan.p_expand, graph);
+    if prepared.is_some() {
+        SP_EXPANSION_SELECTED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SP_EXPANSION_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Outer: subjects of pattern A (bound P+O → target S).
+    let mut s_scan = match dataset.lftj_join_scan(
+        None,
+        Some(plan.p_filter),
+        Some(plan.o_filter),
+        0,
+        graph,
+    ) {
+        Some(s) => s,
+        None => return Ok(results),
+    };
+    LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+
+    while !s_scan.at_end() {
+        if let Some(tok) = cancellation {
+            if step.is_multiple_of(4096) && tok.is_cancelled() {
+                return Err(anyhow::Error::from(
+                    crate::options::EvalLimitError::Cancelled,
+                ));
+            }
+        }
+        step += 1;
+        let s = s_scan.key();
+        // Decode subject once per s (shared across all objects of this s).
+        let s_term = dataset.lftj_decode_term(s);
+
+        if let Some(ref mut hop) = prepared {
+            if hop.reset_to_subject(s) {
+                while !hop.at_end() {
+                    let o = hop.key();
+                    LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+                    emit_sp_expansion_solution(
+                        dataset,
+                        join_vars,
+                        plan.s_idx,
+                        plan.o_idx,
+                        s,
+                        o,
+                        &s_term,
+                        &mut results,
+                    );
+                    hop.advance();
+                }
+            }
+        } else {
+            // Nested join_scan fallback (still fixed order, no VEO thrash).
+            if let Some(mut o_scan) =
+                dataset.lftj_join_scan(Some(s), Some(plan.p_expand), None, 2, graph)
+            {
+                LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+                while !o_scan.at_end() {
+                    let o = o_scan.key();
+                    LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+                    emit_sp_expansion_solution(
+                        dataset,
+                        join_vars,
+                        plan.s_idx,
+                        plan.o_idx,
+                        s,
+                        o,
+                        &s_term,
+                        &mut results,
+                    );
+                    o_scan.advance();
+                }
+            }
+        }
+        s_scan.advance();
+    }
+
+    Ok(results)
+}
+
+
+struct TwoHopPlan {
+    p1: u64,
+    p2: u64,
+    a: usize,
+    b: usize,
+    c: usize,
+}
+
+/// Try to recognize the two-hop chain BGP shape on classified specs.
+///
+/// Requires exactly 2 patterns, exactly 3 join vars, both patterns of the form
+/// `JoinVar(s) Const(P) JoinVar(o)`, directed edges forming a chain a→b→c
+/// (not a two-edge wedge or self-loop). P1 and P2 may be the same or different.
+fn try_recognize_two_hop(specs: &[PatternSpec], n_vars: usize) -> Option<TwoHopPlan> {
+    if specs.len() != 2 || n_vars != 3 {
+        return None;
+    }
+    let mut edges: Vec<(usize, usize, u64)> = Vec::with_capacity(2);
+    for sp in specs {
+        let s = field_as_join(&sp.s)?;
+        let p = field_as_const(&sp.p)?;
+        let o = field_as_join(&sp.o)?;
+        if s == o || s >= 3 || o >= 3 {
+            return None;
+        }
+        edges.push((s, o, p));
+    }
+    // Distinct directed edges.
+    if edges[0].0 == edges[1].0 && edges[0].1 == edges[1].1 {
+        return None;
+    }
+
+    // Find chain a→b→c: edge1 head = edge2 tail, three distinct vars.
+    for i in 0..2 {
+        let (a, b, p1) = edges[i];
+        let (b2, c, p2) = edges[1 - i];
+        if b != b2 {
+            continue;
+        }
+        if a == b || b == c || a == c {
+            continue;
+        }
+        // All three join-var indices must appear.
+        let mut seen = [false; 3];
+        seen[a] = true;
+        seen[b] = true;
+        seen[c] = true;
+        if !seen.iter().all(|&x| x) {
+            continue;
+        }
+        return Some(TwoHopPlan { p1, p2, a, b, c });
+    }
+    None
+}
+
+/// Emit one decoded solution from three bound TermIds (two-hop path).
+///
+/// Returns nanoseconds spent in decode+materialize for path timing.
+#[inline]
+fn emit_two_hop_solution<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    a_idx: usize,
+    b_idx: usize,
+    c_idx: usize,
+    a: u64,
+    b: u64,
+    c: u64,
+    results: &mut Solutions,
+) -> u64 {
+    let t_dec = std::time::Instant::now();
+    let mut values: Vec<Option<oxigraph_nova_core::Term>> = vec![None; join_vars.len()];
+    values[a_idx] = dataset.lftj_decode_term(a);
+    values[b_idx] = dataset.lftj_decode_term(b);
+    values[c_idx] = dataset.lftj_decode_term(c);
+    if values[a_idx].is_none() || values[b_idx].is_none() || values[c_idx].is_none() {
+        return t_dec.elapsed().as_nanos() as u64;
+    }
+    results.push(Solution::positional(Arc::clone(join_vars), values));
+    let ns = t_dec.elapsed().as_nanos() as u64;
+    #[cfg(feature = "ring-path-counters")]
+    oxigraph_nova_storage_ring::add_timing_ns(
+        oxigraph_nova_storage_ring::TimingBucket::DecodeMaterialize,
+        ns,
+    );
+    ns
+}
+
+/// K9 physical two-hop: prepared scanners when available, else nested join_scan.
+///
+/// Always returns `Some` once the shape is recognized (specialized nested
+/// fallback still beats generic VEO LFTJ on this shape).
+///
+/// Path timing: Execution = operator walk only; Decode = term materialize.
+/// The two buckets are non-overlapping (decode ns is subtracted from wall).
+fn eval_two_hop_walk<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    graph: &GraphSelector,
+    plan: &TwoHopPlan,
+    cancellation: Option<&CancellationToken>,
+    id_only: bool,
+) -> anyhow::Result<Solutions> {
+
+    TWO_HOP_SHAPE_SEEN.fetch_add(1, Ordering::Relaxed);
+
+    let empty_vals: Vec<Option<Term>> = vec![None; join_vars.len()];
+    let mut results: Solutions = Vec::new();
+    let mut step: u64 = 0;
+    let mut decode_ns: u64 = 0;
+
+    // Prefer prepared two-hop body (K9.1 + K9.2 resettable SP scanners).
+    if let Some(mut prepared) = dataset.lftj_prepare_two_hop(plan.p1, plan.p2, graph) {
+        TWO_HOP_SELECTED.fetch_add(1, Ordering::Relaxed);
+        let t_wall = std::time::Instant::now();
+        let emit_result = prepared.execute(&mut |a, b, c| {
+            if let Some(tok) = cancellation {
+                if step.is_multiple_of(4096) && tok.is_cancelled() {
+                    return Err(());
+                }
+            }
+            step += 1;
+            LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+            if id_only {
+                results.push(Solution::positional(
+                    Arc::clone(join_vars),
+                    empty_vals.clone(),
+                ));
+            } else {
+                decode_ns = decode_ns.saturating_add(emit_two_hop_solution(
+                    dataset,
+                    join_vars,
+                    plan.a,
+                    plan.b,
+                    plan.c,
+                    a,
+                    b,
+                    c,
+                    &mut results,
+                ));
+            }
+            Ok(())
+        });
+        match emit_result {
+            Ok(_) => {
+                let wall_ns = t_wall.elapsed().as_nanos() as u64;
+                let exec_ns = wall_ns.saturating_sub(decode_ns);
+                if decode_ns > 0 || !id_only {
+                } else {
+                }
+                #[cfg(feature = "ring-path-counters")]
+                oxigraph_nova_storage_ring::add_timing_ns(
+                    oxigraph_nova_storage_ring::TimingBucket::Execution,
+                    exec_ns,
+                );
+                return Ok(results);
+            }
+            Err(()) => {
+                return Err(anyhow::Error::from(
+                    crate::options::EvalLimitError::Cancelled,
+                ));
+            }
+        }
+    }
+
+    // Specialized nested join_scan fallback (fixed a→b→c order, no VEO).
+    TWO_HOP_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    let mut a_scan = match dataset.lftj_join_scan(None, Some(plan.p1), None, 0, graph) {
+        Some(s) => s,
+        None => return Ok(results),
+    };
+    LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+    let t_wall = std::time::Instant::now();
+
+    while !a_scan.at_end() {
+        if let Some(tok) = cancellation {
+            if step.is_multiple_of(4096) && tok.is_cancelled() {
+                return Err(anyhow::Error::from(
+                    crate::options::EvalLimitError::Cancelled,
+                ));
+            }
+        }
+        step += 1;
+        let a = a_scan.key();
+        let mut b_scan =
+            match dataset.lftj_join_scan(Some(a), Some(plan.p1), None, 2, graph) {
+                Some(s) => s,
+                None => {
+                    a_scan.advance();
+                    continue;
+                }
+            };
+        LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+        while !b_scan.at_end() {
+            step += 1;
+            let b = b_scan.key();
+            if let Some(mut c_scan) =
+                dataset.lftj_join_scan(Some(b), Some(plan.p2), None, 2, graph)
+            {
+                LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+                while !c_scan.at_end() {
+                    let c = c_scan.key();
+                    LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+                    if id_only {
+                        results.push(Solution::positional(
+                            Arc::clone(join_vars),
+                            empty_vals.clone(),
+                        ));
+                    } else {
+                        decode_ns = decode_ns.saturating_add(emit_two_hop_solution(
+                            dataset,
+                            join_vars,
+                            plan.a,
+                            plan.b,
+                            plan.c,
+                            a,
+                            b,
+                            c,
+                            &mut results,
+                        ));
+                    }
+                    c_scan.advance();
+                }
+            }
+            b_scan.advance();
+        }
+        a_scan.advance();
+    }
+
+    let wall_ns = t_wall.elapsed().as_nanos() as u64;
+    let exec_ns = wall_ns.saturating_sub(decode_ns);
+    if decode_ns > 0 || !id_only {
+    } else {
+    }
+
+    Ok(results)
+}
+
+
+// ── Public entry point ────────────────────────────────────────────────────────
+
+
+/// Try to evaluate a BGP using Leapfrog Triejoin with adaptive VEO.
+///
+/// Returns:
+/// - `None` — LFTJ is not applicable; caller should fall back to nested-loop.
+/// - `Some(Ok(solutions))` — LFTJ succeeded.
+/// - `Some(Err(e))` — unrecoverable error (reserved for future I/O errors).
+///
+/// ## Fallback conditions
+///
+/// LFTJ is skipped and `None` is returned when:
+/// - The dataset does not support LFTJ (`supports_lftj() == false`).
+/// - The delta is non-empty — Ring is stale and may be missing recent writes.
+/// - The graph selector is `AnyNamed` or `Union` (multi-graph iteration).
+/// - A pattern contains blank nodes (not internable).
+/// - A constant term in a pattern is not in the dictionary (returns empty directly).
+///
+/// ## K7.1 wedge fast path
+///
+/// When the BGP is the fixed-P undirected triangle
+/// (`?a P ?b . ?b P ?c . ?a P ?c`), evaluation uses a dedicated D1-walk plan
+/// (outer a→b, close via `lftj_multi_subject_object_intersect`) instead of
+/// generic 3-var LFTJ. Counters: `triangle_shape_seen`, `d1_selected`,
+/// `fallback_generic` on [`collapse_counters_snapshot`].
 pub fn eval_bgp_lftj<D: Dataset>(
     dataset: &D,
     patterns: &[TriplePattern],
@@ -899,6 +1413,31 @@ pub fn eval_bgp_lftj_cancellable<D: Dataset>(
     //
     // `bindings[var_idx]` = Some(val) once that variable is bound; None until then.
     // `unbound` starts as all var indices 0..k; VEO re-sorts at each depth.
+
+
+    // ── 2join SP-expansion (subject star) ───────────────────────────────────
+    if let Some(sp_exp) = try_recognize_sp_expansion(&specs, join_vars.len()) {
+        return Some(eval_sp_expansion_walk(
+            dataset,
+            &join_vars,
+            active_graph,
+            &sp_exp,
+            cancellation,
+        ));
+    }
+
+    // ── K9: two-hop chain → prepared / nested walk ───────────────────────────
+    if let Some(two_hop) = try_recognize_two_hop(&specs, join_vars.len()) {
+        return Some(eval_two_hop_walk(
+            dataset,
+            &join_vars,
+            active_graph,
+            &two_hop,
+            cancellation,
+            false,
+        ));
+    }
+
     let mut bindings: Vec<Option<u64>> = vec![None; join_vars.len()];
     let unbound: Vec<usize> = (0..join_vars.len()).collect();
     let mut results: Solutions = Vec::new();

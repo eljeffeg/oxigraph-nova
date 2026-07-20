@@ -62,6 +62,9 @@ pub mod ring_store;
 /// E5.11 → SPARQL product wire: env flags + path counters (W0).
 #[cfg(feature = "cyclic-ring-pilot")]
 pub mod product_path;
+/// Phase L — product prepared physical-operator cache (two-hop, wedge, …).
+#[cfg(feature = "cyclic-ring-pilot")]
+pub mod prepared_plan_cache;
 /// E5.9B Phase 2/3 — column-local Huffman for C_p (`HuffColP`) +
 /// [`PredicateColumn`] substrate on in-memory [`CyclicRing::c_p`].
 /// Enabled by product `ring-backend` (Phase 1D default). Research builds may
@@ -89,7 +92,22 @@ pub use mapped_ring::{
     MappedColDistinctIter, MappedRingA, MappedRingError, open_novarng1_mmap, parse_header, write_novarng1_file, write_novarng1_v1,
 };
 #[cfg(feature = "cyclic-ring-pilot")]
-pub use product_path::{SPARQL_PATH, SparqlPathCounters, SparqlPathSnapshot, ring_keep_heap, ring_mmap_enabled};
+pub use product_path::{SPARQL_PATH, SparqlPathCounters, SparqlPathSnapshot, ring_keep_heap, ring_mmap_enabled,
+    add_timing_ns, effective_pred_adjacency_mode, effective_prepared_plan_cache_enabled,
+    lastcol_policy_for_operation, lastcol_scan_policy, pred_adjacency_mode,
+    prepared_plan_cache_enabled, set_lastcol_scan_policy_override, set_pred_adjacency_mode_override,
+    set_prepared_plan_cache_override, D1AsymMode, LastColOperation, LastColScanPolicy,
+    PredAdjacencyMode, TimingBucket,
+};
+#[cfg(feature = "cyclic-ring-pilot")]
+pub use prepared_plan_cache::{
+    get_or_prepare_sp_expansion, get_or_prepare_two_hop, get_or_prepare_wedge,
+    CachedPhysicalOpGuard, CachedTwoHopGuard, CachedWedgeGuard, PhysicalOpKind,
+    PhysicalOpPlanKey, PhysicalOpPreparedPlanCache, PreparedPhysicalOp, TwoHopPlanKey,
+    TwoHopPreparedPlanCache, WedgePlanKey, WedgePreparedPlanCache, PREPARED_PLAN_CACHE_CAP,
+};
+
+
 #[cfg(feature = "cyclic-ring-pilot")]
 pub use cyclic::{
     Col, CounterSnapshot, CyclicRangeDistinctIter, CyclicRing, GlobalCounters, PredicateColumn,
@@ -100,7 +118,11 @@ pub use ring_nav::RingRef;
 #[cfg(all(feature = "cyclic-ring-pilot", any(test, feature = "diagnostics")))]
 pub use cyclic::{Orientation, OrientationCounters, URing};
 #[cfg(feature = "cyclic-ring-pilot")]
-pub use scan::BraidedJoinScan;
+pub use scan::{
+    BraidedJoinScan, PreparedPredD1, PreparedSpExpansionImpl, PreparedSpObjectScanImpl,
+    PreparedTwoHopImpl, PreparedWedgeImpl, WedgeOuterProfile, WedgeProfileOpts,
+};
+
 #[cfg(feature = "cyclic-ring-pilot")]
 pub use ring_store::RingStore;
 

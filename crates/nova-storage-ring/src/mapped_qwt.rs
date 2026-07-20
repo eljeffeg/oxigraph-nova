@@ -2887,6 +2887,62 @@ impl MappedRangeDistinctIter<'_> {
         }
     }
 
+    /// K9.3 R2: cheap in-place bounds reset for a live RDI cursor.
+    ///
+    /// Reuses existing iterator storage (stack / batch buffers / hot alias)
+    /// instead of constructing a fresh `MappedRangeDistinctIter`. Diagnostic
+    /// counters accumulate across resets (product path does not read them).
+    #[inline]
+    pub fn reset_bounds(&mut self, range: Range<usize>) {
+        self.sp = 0;
+        self.batch_n_out = 0;
+        self.batch_emit_i = 0;
+
+        let k = c1_batch_k();
+        let len = range.end.saturating_sub(range.start);
+        let try_batch = range.start < range.end
+            && range.end <= self.hot.n
+            && self.hot.n_levels > 0
+            && k > 0
+            && len <= k;
+
+        if try_batch {
+            self.batch_attempts += 1;
+            if let Some(res) = short_range_batch_decode(&self.hot, range.clone(), k) {
+                self.batch_hits += 1;
+                self.batch_n_out = res.n_out;
+                self.batch_sym = res.symbols;
+                self.batch_cnt = res.counts;
+                self.batch_rows_decoded += res.rows_decoded as u64;
+                self.batch_levels_processed += res.levels_processed as u64;
+                self.batch_data_line_loads += res.data_line_loads as u64;
+                self.batch_sort_comparisons += res.sort_comparisons as u64;
+                self.batch_dedup_merges += res.dedup_merges as u64;
+            } else {
+                self.batch_fallbacks += 1;
+                self.stack[0] = MappedRdiFrame {
+                    start: range.start,
+                    end: range.end,
+                    level: 0,
+                    bit_path: 0,
+                };
+                self.sp = 1;
+            }
+        } else if range.start < range.end && range.end <= self.hot.n && self.hot.n_levels > 0 {
+            if k > 0 && len > k {
+                self.batch_attempts += 1;
+                self.batch_fallbacks += 1;
+            }
+            self.stack[0] = MappedRdiFrame {
+                start: range.start,
+                end: range.end,
+                level: 0,
+                bit_path: 0,
+            };
+            self.sp = 1;
+        }
+    }
+
     /// Next distinct symbol and its occurrence count in the range (lex order).
     #[inline]
     pub fn next_symbol(&mut self) -> Option<(u32, usize)> {

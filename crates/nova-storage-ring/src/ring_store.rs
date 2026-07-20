@@ -21,10 +21,21 @@
 //! this store's product name.
 
 use crate::image::BraidedGraphImage;
+use crate::prepared_plan_cache::{
+    get_or_prepare_sp_expansion, get_or_prepare_two_hop, get_or_prepare_wedge,
+    PhysicalOpPreparedPlanCache, PREPARED_PLAN_CACHE_CAP,
+};
 use crate::product_path::{
     SPARQL_PATH, bump_mmap_ok, log_mmap_fail_once, ring_counters_log_enabled, ring_d2_enabled,
     ring_image_dir, ring_mmap_enabled,
 };
+use crate::scan::{PreparedPredD1, PreparedSpObjectScanImpl, PredicateAdjacency};
+use oxigraph_nova_core::{
+    PreparedPredObjectIntersect, PreparedSpExpansion, PreparedSpObjectScan, PreparedTwoHop,
+    PreparedWedge,
+};
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, LftjSource, NamedNode, Oxigraph,
     Quad, QuadOp, QuadStore, StoredQuad, Subject, Term, TermId, TrieIterator,
@@ -34,6 +45,51 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+/// Cross-request SP→O adjacency tables (K9.4), keyed by
+/// (snapshot_version, graph_id, predicate). Built once on cold miss; warm
+/// HTTP 2join reuses `Arc` without the ~50–100 ms universe walk.
+struct SpAdjCache {
+    /// Cap keeps memory bounded (one entry ≈ universe × sizeof Option<RowRange>).
+    cap: usize,
+    map: HashMap<(u64, u8, u64), Arc<PredicateAdjacency>>,
+    order: Vec<(u64, u8, u64)>,
+}
+
+impl SpAdjCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            map: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    fn get_or_insert(
+        &mut self,
+        key: (u64, u8, u64),
+        build: impl FnOnce() -> Option<Arc<PredicateAdjacency>>,
+    ) -> Option<Arc<PredicateAdjacency>> {
+        if let Some(a) = self.map.get(&key) {
+            return Some(Arc::clone(a));
+        }
+        let a = build()?;
+        if self.map.len() >= self.cap {
+            if let Some(old) = self.order.first().copied() {
+                self.order.remove(0);
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(key, Arc::clone(&a));
+        self.order.push(key);
+        Some(a)
+    }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -313,7 +369,14 @@ pub struct RingStore {
     decode_snap: RwLock<Option<DecodeSnapshot>>,
     /// B: compacted graphs when delta empty (None while dirty / pre-compact).
     graphs_snap: RwLock<Option<GraphsSnapshot>>,
+    /// Phase L: reusable prepared physical operators (two-hop, wedge, …).
+    physical_op_cache: Arc<Mutex<PhysicalOpPreparedPlanCache>>,
+    /// Cross-request SP→O K9.4 adjacency (warm HTTP 2join).
+    sp_adj_cache: Mutex<SpAdjCache>,
+    /// Bumped on write/compact so cache keys cannot outlive store identity.
+    snapshot_version: AtomicU64,
 }
+
 
 impl Default for RingStore {
     fn default() -> Self {
@@ -328,8 +391,15 @@ impl RingStore {
             inner: Mutex::new(RingStoreInner::new()),
             decode_snap: RwLock::new(None),
             graphs_snap: RwLock::new(None),
+            physical_op_cache: Arc::new(Mutex::new(PhysicalOpPreparedPlanCache::new(
+                PREPARED_PLAN_CACHE_CAP,
+            ))),
+            // A few fixed predicates (P131 / related / …) cover RESULTS_MEM shapes.
+            sp_adj_cache: Mutex::new(SpAdjCache::new(16)),
+            snapshot_version: AtomicU64::new(0),
         }
     }
+
 
     #[inline]
     fn publish_decode(&self, snap: Option<DecodeSnapshot>) {
@@ -356,13 +426,24 @@ impl RingStore {
     fn clear_compact_snaps(&self) {
         self.clear_decode();
         self.clear_graphs_snap();
+        // Phase L: drop prepared physical ops keyed by the prior snapshot generation.
+        self.physical_op_cache.lock().clear();
+        self.sp_adj_cache.lock().clear();
+        self.snapshot_version
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Publish decode + graphs snapshots after a successful compact.
     fn publish_after_compact(&self, decode: DecodeSnapshot, graphs: GraphsSnapshot) {
+        // Compact rebuilds images — invalidate any plans held against old images.
+        self.physical_op_cache.lock().clear();
+        self.sp_adj_cache.lock().clear();
+        self.snapshot_version
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.publish_decode(Some(decode));
         self.publish_graphs(Some(graphs));
     }
+
 
     /// Try to take a graph image from the lock-free snapshot (delta empty).
     #[inline]
@@ -607,7 +688,84 @@ impl LftjSource for RingStore {
         let img = self.graph_from_snap(graph_id)?;
         BraidedGraphImage::multi_subject_object_intersect(img, subjects)
     }
+
+    fn lftj_prepare_pred_object_intersect(
+        &self,
+        predicate: u64,
+        graph_id: u8,
+    ) -> Option<Box<dyn PreparedPredObjectIntersect>> {
+        let img = self.graph_from_snap(graph_id)?;
+        PreparedPredD1::prepare(img, predicate)
+            .map(|p| Box::new(p) as Box<dyn PreparedPredObjectIntersect>)
+    }
+
+    fn lftj_prepare_sp_object_scan(
+        &self,
+        predicate: u64,
+        graph_id: u8,
+    ) -> Option<Box<dyn PreparedSpObjectScan>> {
+        let img = self.graph_from_snap(graph_id)?;
+        let ver = self.snapshot_version.load(AtomicOrdering::Relaxed);
+        // Warm HTTP 2join: reuse K9.4 adj across requests. Cold miss builds once
+        // (amortized over warmup + timed iters). Never rebuild per evaluate.
+        let adj = self.sp_adj_cache.lock().get_or_insert((ver, graph_id, predicate), || {
+            PreparedSpObjectScanImpl::build_shared_adj(&img, predicate)
+        });
+        PreparedSpObjectScanImpl::prepare_with_shared_adj(img, predicate, adj)
+            .map(|p| Box::new(p) as Box<dyn PreparedSpObjectScan>)
+    }
+
+
+    fn lftj_prepare_two_hop(
+        &self,
+        p1: u64,
+        p2: u64,
+        graph_id: u8,
+    ) -> Option<Box<dyn PreparedTwoHop>> {
+        let img = self.graph_from_snap(graph_id)?;
+        let ver = self.snapshot_version.load(AtomicOrdering::Relaxed);
+        get_or_prepare_two_hop(&self.physical_op_cache, ver, graph_id, img, p1, p2)
+    }
+
+    fn lftj_prepare_wedge(
+        &self,
+        predicate: u64,
+        graph_id: u8,
+    ) -> Option<Box<dyn PreparedWedge>> {
+        let img = self.graph_from_snap(graph_id)?;
+        let ver = self.snapshot_version.load(AtomicOrdering::Relaxed);
+        get_or_prepare_wedge(&self.physical_op_cache, ver, graph_id, img, predicate)
+    }
+
+    fn lftj_prepare_sp_expansion(
+        &self,
+        p_filter: u64,
+        o_filter: u64,
+        p_expand: u64,
+        graph_id: u8,
+    ) -> Option<Box<dyn PreparedSpExpansion>> {
+        let img = self.graph_from_snap(graph_id)?;
+        let ver = self.snapshot_version.load(AtomicOrdering::Relaxed);
+        // Warm expand adj from SpAdjCache (same table as prepared SP scan).
+        let adj = self
+            .sp_adj_cache
+            .lock()
+            .get_or_insert((ver, graph_id, p_expand), || {
+                PreparedSpObjectScanImpl::build_shared_adj(&img, p_expand)
+            });
+        get_or_prepare_sp_expansion(
+            &self.physical_op_cache,
+            ver,
+            graph_id,
+            img,
+            p_filter,
+            o_filter,
+            p_expand,
+            adj,
+        )
+    }
 }
+
 
 // ── QuadStore ─────────────────────────────────────────────────────────────────
 

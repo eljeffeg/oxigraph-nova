@@ -109,15 +109,13 @@ done
 
 while [ $# -gt 0 ]; do _push_pos "$1"; shift; done
 
+ENTITIES="${P1:-50000}"
+ITERS="${P2:-10}"
+WARMUP="${P3:-3}"
+
 if [ "$MODE" = "disk" ]; then
-  ENTITIES="${P1:-500000}"
-  ITERS="${P2:-10}"
-  WARMUP="${P3:-3}"
   RESULT_FILE="${P4:-RESULTS_DISK.md}"
 else
-  ENTITIES="${P1:-50000}"
-  ITERS="${P2:-10}"
-  WARMUP="${P3:-3}"
   RESULT_FILE="${P4:-RESULTS_MEM.md}"
 fi
 
@@ -381,6 +379,7 @@ fi
 NOVA_PID=""
 QLEVER_PID=""
 RDFOX_PID=""
+RDFOX_KEEP_PID=""
 CPU_SAMPLER_PID=""
 
 OXIGRAPH_LOAD_S=""
@@ -398,20 +397,49 @@ RDFOX_LOAD_S=""
 RDFOX_RSS_KB=""
 RDFOX_CPU_PCT=""
 
+# Kill a pid (and briefly wait) without hanging the harness on EXIT.
+_kill_pid() {
+  local pid="${1:-}"
+  [ -z "$pid" ] && return 0
+  kill "$pid" 2>/dev/null || true
+  local i
+  for i in 1 2 3 4 5; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  # Non-blocking reaping only (don't hang EXIT trap on foreign/orphaned pids).
+  wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
+  # Avoid recursive cleanup if something in here fails under set -e.
+  set +e
   echo "=== Cleaning up servers ==="
-  [ -n "${CPU_SAMPLER_PID:-}" ] && kill "$CPU_SAMPLER_PID" 2>/dev/null || true
-  [ -n "${NOVA_PID:-}" ] && kill "$NOVA_PID" 2>/dev/null || true
-  [ -n "${QLEVER_PID:-}" ] && kill "$QLEVER_PID" 2>/dev/null || true
-  if [ -n "${RDFOX_PID:-}" ]; then
-    kill "$RDFOX_PID" 2>/dev/null || true
-    wait "$RDFOX_PID" 2>/dev/null || true
-    RDFOX_PID=""
+  _kill_pid "${CPU_SAMPLER_PID:-}"
+  CPU_SAMPLER_PID=""
+  _kill_pid "${NOVA_PID:-}"
+  NOVA_PID=""
+  _kill_pid "${QLEVER_PID:-}"
+  QLEVER_PID=""
+  # RDFox: kill binary + stdin keep-alive; also sweep leftovers on our port/workdir.
+  _kill_pid "${RDFOX_PID:-}"
+  RDFOX_PID=""
+  _kill_pid "${RDFOX_KEEP_PID:-}"
+  RDFOX_KEEP_PID=""
+  if [ -n "${RDFOX_PORT:-}" ]; then
+    free_port "$RDFOX_PORT" 2>/dev/null || true
   fi
+  if [ -n "${RDFOX_WORKDIR:-}" ]; then
+    pkill -f "RDFox.*${RDFOX_WORKDIR}" 2>/dev/null || true
+  fi
+  # Drop fifo keep-alive if present.
+  [ -n "${RDFOX_STDIN_FIFO:-}" ] && rm -f "$RDFOX_STDIN_FIFO" 2>/dev/null || true
   docker rm -f "$DOCKER_NAME" >/dev/null 2>&1 || true
   docker rm -f "$FLUREE_DOCKER_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
 
 
 wait_ready() {
@@ -526,11 +554,11 @@ start_cpu_sampler() {
 
 stop_cpu_sampler() {
   if [ -n "${CPU_SAMPLER_PID:-}" ]; then
-    kill "$CPU_SAMPLER_PID" 2>/dev/null || true
-    wait "$CPU_SAMPLER_PID" 2>/dev/null || true
+    _kill_pid "$CPU_SAMPLER_PID"
     CPU_SAMPLER_PID=""
   fi
 }
+
 
 # Start one Nova process. tag=louds|ring. disk_mode uses --location for louds only.
 start_nova() {
@@ -689,17 +717,28 @@ if [ "$RUN_RDFOX" = "1" ]; then
   # Stage dataset into workdir so relative import works under sandbox root.
   cp -f "$DATA" "$RDFOX_WORKDIR/dataset.nt"
 
-  # sandbox mode: process exits when stdin closes, so keep stdin open.
+  # Sweep leftover RDFox from prior interrupted runs (same port/workdir).
+  pkill -f "RDFox.*${RDFOX_WORKDIR}" 2>/dev/null || true
+  free_port "$RDFOX_PORT"
+
+  # sandbox mode exits when stdin closes. Hold stdin open via a named FIFO
+  # so cleanup can kill both RDFox and the keeper cleanly (no orphan sleeps).
+  RDFOX_STDIN_FIFO="/tmp/rdfox_${MODE}_stdin.fifo"
+  rm -f "$RDFOX_STDIN_FIFO"
+  mkfifo "$RDFOX_STDIN_FIFO"
+  # Writer side: block forever on the fifo (opened RDWR so open() doesn't block).
+  ( exec 3<>"$RDFOX_STDIN_FIFO"; while true; do sleep 3600; done ) &
+  RDFOX_KEEP_PID=$!
+
   # v7.6 params: -port (not -endpoint.port); store types: parallel-nn|nw|ww.
-  (
-    "$RDFOX_BIN" \
-      -port "$RDFOX_PORT" \
-      sandbox "$RDFOX_WORKDIR" \
-      "dstore create $RDFOX_DS type parallel-nn" \
-      "active $RDFOX_DS" \
-      "import dataset.nt" \
-      "endpoint start"
-  ) > "$RDFOX_LOG" 2>&1 < <(while true; do sleep 3600; done) &
+  "$RDFOX_BIN" \
+    -port "$RDFOX_PORT" \
+    sandbox "$RDFOX_WORKDIR" \
+    "dstore create $RDFOX_DS type parallel-nn" \
+    "active $RDFOX_DS" \
+    "import dataset.nt" \
+    "endpoint start" \
+    > "$RDFOX_LOG" 2>&1 < "$RDFOX_STDIN_FIFO" &
   RDFOX_PID=$!
 
   # wait_ready uses unauthenticated curl; RDFox needs basic auth — probe manually.
@@ -722,9 +761,11 @@ if [ "$RUN_RDFOX" = "1" ]; then
     echo "RDFox failed to become ready; log tail:" >&2
     tail -n 40 "$RDFOX_LOG" >&2 || true
     echo "Note: skipping RDFox for this run." >&2
-    kill "$RDFOX_PID" 2>/dev/null || true
-    wait "$RDFOX_PID" 2>/dev/null || true
+    _kill_pid "$RDFOX_PID"
+    _kill_pid "$RDFOX_KEEP_PID"
     RDFOX_PID=""
+    RDFOX_KEEP_PID=""
+    rm -f "$RDFOX_STDIN_FIFO" 2>/dev/null || true
     RUN_RDFOX=0
   else
     RDFOX_LOAD_END=$(date +%s.%N)
@@ -732,6 +773,7 @@ if [ "$RUN_RDFOX" = "1" ]; then
     echo "  RDFox load=${RDFOX_LOAD_S}s (license: $RDFOX_LICENSE)"
   fi
 fi
+
 
 
 # --- QLever ---
