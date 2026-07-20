@@ -29,9 +29,11 @@
 #   --disk                  Disk-backed / persistent comparison
 #   --backends=both|louds|ring   Nova backends (mem only; default both).
 #                           Ignored with --disk (always louds).
+#   --no-oxigraph           Skip Oxigraph
+#   --no-qlever             Skip QLever
 #   --no-fluree             Skip Fluree (default: include via Docker)
 #   --no-rdfox              Skip RDFox even if license is present
-#   --with-rdfox            Require RDFox (fail if no license/binary)
+#   --charts                Write/embed SVG charts (default: off)
 #   -h, --help              Show this help
 #
 # Env:
@@ -39,8 +41,9 @@
 #   QUERY_TIMEOUT_S=60
 #   QLEVER_BIN_DIR=/path/to/qlever/build
 #   RDFOX_BIN=path/to/RDFox         (default: research/rdfox/RDFox)
-#   RDFOX_LICENSE=path/to/RDFox.lic (default: ~/.RDFox/RDFox.lic)
+#   RDFOX_LICENSE=path/to/RDFox.lic (default: research/rdfox/RDFox.lic or ~/.RDFox/RDFox.lic)
 #   RDFOX_ROLE / RDFOX_PASSWORD     (default guest/guest for sandbox)
+
 
 
 #
@@ -51,8 +54,11 @@ set -euo pipefail
 
 MODE="mem"   # mem | disk
 BACKENDS_FLAG=""
+ENABLE_OXIGRAPH=1
+ENABLE_QLEVER=1
 ENABLE_FLUREE=1
-ENABLE_RDFOX="auto"   # auto | 1 | 0
+ENABLE_RDFOX=1   # on by default when license/binary present; use --no-rdfox to skip
+ENABLE_CHARTS=0
 # Positional args collected without empty-array indexing under bash 3.2 + set -u.
 P1=""
 P2=""
@@ -83,9 +89,11 @@ while [ $# -gt 0 ]; do
       BACKENDS_FLAG="${2:-}"
       shift 2
       ;;
+    --no-oxigraph) ENABLE_OXIGRAPH=0; shift ;;
+    --no-qlever) ENABLE_QLEVER=0; shift ;;
     --no-fluree) ENABLE_FLUREE=0; shift ;;
     --no-rdfox) ENABLE_RDFOX=0; shift ;;
-    --with-rdfox) ENABLE_RDFOX=1; shift ;;
+    --charts) ENABLE_CHARTS=1; shift ;;
     -h|--help) usage ;;
     --) shift; break ;;
     -*)
@@ -189,6 +197,8 @@ RDFOX_DS="bench"
 RDFOX_LOG="/tmp/rdfox_${MODE}_bench.log"
 RDFOX_WORKDIR="/tmp/rdfox_${MODE}_workdir"
 RDFOX_PID=""
+RUN_OXIGRAPH=0
+RUN_QLEVER=0
 RUN_FLUREE=0
 RUN_RDFOX=0
 
@@ -203,13 +213,24 @@ NOVA_RING_CPU_LOG="/tmp/nova_${MODE}_ring_cpu_samples.txt"
 QLEVER_CPU_LOG="/tmp/qlever_${MODE}_cpu_samples.txt"
 OXIGRAPH_CPU_LOG="/tmp/oxigraph_${MODE}_cpu_samples.txt"
 
-mkdir -p "$BENCH_DIR" "$QLEVER_DIR" "$OUT_DIR"
-if [ "$MODE" = "disk" ]; then
-  rm -rf "$NOVA_LOCATION" "$OXIGRAPH_LOCATION_HOST" "$FLUREE_LOCATION_HOST"
-  mkdir -p "$NOVA_LOCATION" "$OXIGRAPH_LOCATION_HOST" "$FLUREE_LOCATION_HOST"
+# Resolve engines up-front so logs are honest before long builds.
+if [ "$ENABLE_OXIGRAPH" = "1" ]; then
+  if command -v docker >/dev/null 2>&1; then
+    RUN_OXIGRAPH=1
+  else
+    echo "Note: Docker not found; skipping Oxigraph." >&2
+  fi
 fi
 
-# Resolve optional engines up-front so logs are honest before long builds.
+if [ "$ENABLE_QLEVER" = "1" ]; then
+  if [ -x "$QLEVER_BIN/qlever-index" ] && [ -x "$QLEVER_BIN/qlever-server" ]; then
+    RUN_QLEVER=1
+  else
+    echo "Note: QLever binaries not found under $QLEVER_BIN; skipping QLever." >&2
+    echo "      Set QLEVER_BIN_DIR to the directory containing qlever-index/qlever-server." >&2
+  fi
+fi
+
 if [ "$ENABLE_FLUREE" = "1" ]; then
   if command -v docker >/dev/null 2>&1; then
     RUN_FLUREE=1
@@ -219,45 +240,44 @@ if [ "$ENABLE_FLUREE" = "1" ]; then
 fi
 
 if [ "$MODE" = "disk" ]; then
-  # RDFox path in this harness is in-memory sandbox/daemon only.
+  # RDFox path in this harness is in-memory sandbox only.
   if [ "$ENABLE_RDFOX" = "1" ]; then
     echo "Note: RDFox is skipped in --disk mode (mem-only in this harness)." >&2
   fi
   RUN_RDFOX=0
-else
-  case "$ENABLE_RDFOX" in
-    0) RUN_RDFOX=0 ;;
-    1|auto)
-      if [ -x "$RDFOX_BIN" ] && [ -f "$RDFOX_LICENSE" ]; then
-        # evaluation_license.txt is NOT a valid key; require a real .lic file.
-        if grep -qi 'END USER LICENCE AGREEMENT\|EVALUATION LICENCE' "$RDFOX_LICENSE" 2>/dev/null; then
-          if [ "$ENABLE_RDFOX" = "1" ]; then
-            echo "ERROR: RDFOX_LICENSE looks like EULA text, not a license key: $RDFOX_LICENSE" >&2
-            exit 1
-          fi
-          echo "Note: RDFox license at $RDFOX_LICENSE is EULA text, not a key; skipping RDFox." >&2
-          RUN_RDFOX=0
-        else
-          RUN_RDFOX=1
-        fi
-      else
-        if [ "$ENABLE_RDFOX" = "1" ]; then
-          echo "ERROR: --with-rdfox requires executable RDFOX_BIN ($RDFOX_BIN) and RDFOX_LICENSE ($RDFOX_LICENSE)" >&2
-          exit 1
-        fi
-        if [ ! -x "$RDFOX_BIN" ]; then
-          echo "Note: RDFox binary not found at $RDFOX_BIN; skipping RDFox." >&2
-        elif [ ! -f "$RDFOX_LICENSE" ]; then
-          echo "Note: RDFox license not found at $RDFOX_LICENSE; skipping RDFox." >&2
-          echo "      Place a valid RDFox.lic at ~/.RDFox/RDFox.lic (not evaluation_license.txt)." >&2
-        fi
-        RUN_RDFOX=0
-      fi
-      ;;
-  esac
+elif [ "$ENABLE_RDFOX" = "1" ]; then
+  if [ -x "$RDFOX_BIN" ] && [ -f "$RDFOX_LICENSE" ]; then
+    # evaluation_license.txt is NOT a valid key; require a real .lic file.
+    if grep -qi 'END USER LICENCE AGREEMENT\|EVALUATION LICENCE' "$RDFOX_LICENSE" 2>/dev/null; then
+      echo "Note: RDFox license at $RDFOX_LICENSE is EULA text, not a key; skipping RDFox." >&2
+      RUN_RDFOX=0
+    else
+      RUN_RDFOX=1
+    fi
+  else
+    if [ ! -x "$RDFOX_BIN" ]; then
+      echo "Note: RDFox binary not found at $RDFOX_BIN; skipping RDFox." >&2
+    elif [ ! -f "$RDFOX_LICENSE" ]; then
+      echo "Note: RDFox license not found at $RDFOX_LICENSE; skipping RDFox." >&2
+      echo "      Place a valid RDFox.lic at research/rdfox/RDFox.lic or ~/.RDFox/RDFox.lic." >&2
+    fi
+    RUN_RDFOX=0
+  fi
 fi
 
-echo "Optional engines: Fluree=$RUN_FLUREE RDFox=$RUN_RDFOX (mode=$MODE)"
+echo "Engines: Oxigraph=$RUN_OXIGRAPH QLever=$RUN_QLEVER Fluree=$RUN_FLUREE RDFox=$RUN_RDFOX Nova=$NOVA_BACKENDS (mode=$MODE)"
+
+mkdir -p "$BENCH_DIR" "$OUT_DIR"
+if [ "$RUN_QLEVER" = "1" ] || [ "$ENABLE_QLEVER" = "1" ]; then
+  mkdir -p "$QLEVER_DIR"
+fi
+if [ "$MODE" = "disk" ]; then
+  rm -rf "$NOVA_LOCATION" "$OXIGRAPH_LOCATION_HOST" "$FLUREE_LOCATION_HOST"
+  mkdir -p "$NOVA_LOCATION"
+  [ "$ENABLE_OXIGRAPH" = "1" ] && mkdir -p "$OXIGRAPH_LOCATION_HOST"
+  [ "$ENABLE_FLUREE" = "1" ] && mkdir -p "$FLUREE_LOCATION_HOST"
+fi
+
 
 
 _footprint_str_to_kb() {
@@ -312,6 +332,17 @@ case "$NOVA_BACKENDS" in
   louds) NEED_LOUDS=1 ;;
   ring) NEED_RING=1 ;;
 esac
+if [ "$NEED_RING" = "1" ]; then
+  # Default: plain QWT256 C_p. Set NOVA_RING_HUFFMAN=1 to build Huffman C_p A/B.
+  if [ "${NOVA_RING_HUFFMAN:-0}" = "1" ]; then
+    echo "  Ring binary: features=ring-huffman-cp (Huffman C_p)"
+    cargo build --release -p oxigraph-nova-server --features ring-huffman-cp --bin nova_serve
+  else
+    echo "  Ring binary: features=ring-backend (plain QWT256 C_p)"
+    cargo build --release -p oxigraph-nova-server --features ring-backend --bin nova_serve
+  fi
+  cp -f "$ROOT/target/release/nova_serve" "$NOVA_RING_BIN"
+fi
 
 if [ "$NEED_LOUDS" = "1" ]; then
   cargo build --release -p oxigraph-nova-server --bin nova_serve
@@ -329,18 +360,30 @@ else
   "$ROOT/target/release/gen_dataset" --entities "$ENTITIES" --out "$DATA"
 fi
 
-echo "=== [3/6] Building QLever index ==="
-rm -f "$QLEVER_DIR"/bench.* 2>/dev/null || true
-QLEVER_LOAD_START=$(date +%s.%N)
-( cd "$QLEVER_DIR" && "$QLEVER_BIN/qlever-index" -i bench -f "$DATA" -F nt )
-QLEVER_LOAD_END=$(date +%s.%N)
-QLEVER_LOAD_S=$(awk -v a="$QLEVER_LOAD_START" -v b="$QLEVER_LOAD_END" 'BEGIN{printf "%.2f", b-a}')
+QLEVER_LOAD_S=""
+if [ "$RUN_QLEVER" = "1" ]; then
+  echo "=== [3/6] Building QLever index ==="
+  rm -f "$QLEVER_DIR"/bench.* 2>/dev/null || true
+  QLEVER_LOAD_START=$(date +%s.%N)
+  ( cd "$QLEVER_DIR" && "$QLEVER_BIN/qlever-index" -i bench -f "$DATA" -F nt )
+  QLEVER_LOAD_END=$(date +%s.%N)
+  QLEVER_LOAD_S=$(awk -v a="$QLEVER_LOAD_START" -v b="$QLEVER_LOAD_END" 'BEGIN{printf "%.2f", b-a}')
+else
+  echo "=== [3/6] Skipping QLever index (disabled) ==="
+fi
 
 NOVA_PID=""
 QLEVER_PID=""
 RDFOX_PID=""
 CPU_SAMPLER_PID=""
 
+OXIGRAPH_LOAD_S=""
+OXIGRAPH_MEM=""
+OXIGRAPH_CPU_PCT=""
+OXIGRAPH_DISK_KB=""
+QLEVER_RSS_KB=""
+QLEVER_CPU_PCT=""
+QLEVER_DISK_KB=""
 FLUREE_LOAD_S=""
 FLUREE_MEM=""
 FLUREE_CPU_PCT=""
@@ -566,29 +609,31 @@ NOVA_RING_LOAD_S=""
 NOVA_RING_RSS_KB=""
 NOVA_RING_CPU_PCT=""
 
-echo "=== [4/6] Starting Oxigraph + QLever (+ Fluree/RDFox if enabled) ==="
+echo "=== [4/6] Starting external engines ==="
 
 # --- Oxigraph ---
-OXIGRAPH_LOAD_START=$(date +%s.%N)
-docker rm -f "$DOCKER_NAME" >/dev/null 2>&1 || true
-if [ "$MODE" = "disk" ]; then
-  docker run -d --name "$DOCKER_NAME" -p "$OXIGRAPH_PORT:7878" \
-    -v "$OXIGRAPH_LOCATION_HOST:/data" oxigraph/oxigraph:latest \
-    serve --location /data --bind 0.0.0.0:7878 >/dev/null
-else
-  docker run -d --name "$DOCKER_NAME" -p "$OXIGRAPH_PORT:7878" oxigraph/oxigraph:latest \
-    serve --bind 0.0.0.0:7878 >/dev/null
+if [ "$RUN_OXIGRAPH" = "1" ]; then
+  OXIGRAPH_LOAD_START=$(date +%s.%N)
+  docker rm -f "$DOCKER_NAME" >/dev/null 2>&1 || true
+  if [ "$MODE" = "disk" ]; then
+    docker run -d --name "$DOCKER_NAME" -p "$OXIGRAPH_PORT:7878" \
+      -v "$OXIGRAPH_LOCATION_HOST:/data" oxigraph/oxigraph:latest \
+      serve --location /data --bind 0.0.0.0:7878 >/dev/null
+  else
+    docker run -d --name "$DOCKER_NAME" -p "$OXIGRAPH_PORT:7878" oxigraph/oxigraph:latest \
+      serve --bind 0.0.0.0:7878 >/dev/null
+  fi
+  wait_ready "http://localhost:$OXIGRAPH_PORT/sparql"
+  if [ "$MODE" = "disk" ]; then
+    echo "  Bulk-loading dataset into Oxigraph (RocksDB-backed) via HTTP POST..."
+  else
+    echo "  Bulk-loading dataset into Oxigraph (in-memory) via HTTP POST..."
+  fi
+  curl -s -X POST -T "$DATA" -H "Content-Type: application/n-triples" \
+    "http://localhost:$OXIGRAPH_PORT/store?default" -o /dev/null
+  OXIGRAPH_LOAD_END=$(date +%s.%N)
+  OXIGRAPH_LOAD_S=$(awk -v a="$OXIGRAPH_LOAD_START" -v b="$OXIGRAPH_LOAD_END" 'BEGIN{printf "%.2f", b-a}')
 fi
-wait_ready "http://localhost:$OXIGRAPH_PORT/sparql"
-if [ "$MODE" = "disk" ]; then
-  echo "  Bulk-loading dataset into Oxigraph (RocksDB-backed) via HTTP POST..."
-else
-  echo "  Bulk-loading dataset into Oxigraph (in-memory) via HTTP POST..."
-fi
-curl -s -X POST -T "$DATA" -H "Content-Type: application/n-triples" \
-  "http://localhost:$OXIGRAPH_PORT/store?default" -o /dev/null
-OXIGRAPH_LOAD_END=$(date +%s.%N)
-OXIGRAPH_LOAD_S=$(awk -v a="$OXIGRAPH_LOAD_START" -v b="$OXIGRAPH_LOAD_END" 'BEGIN{printf "%.2f", b-a}')
 
 # --- Fluree ---
 if [ "$RUN_FLUREE" = "1" ]; then
@@ -684,11 +729,13 @@ fi
 
 
 # --- QLever ---
-( cd "$QLEVER_DIR" && "$QLEVER_BIN/qlever-server" -i bench -p "$QLEVER_PORT" -n > "/tmp/qlever_server_${MODE}_bench.log" 2>&1 & )
-sleep 1
-QLEVER_PID=$(pgrep -f "qlever-server -i bench -p $QLEVER_PORT" | head -1)
-echo "Waiting for Oxigraph + QLever..."
-wait_ready "$QLEVER_READY_URL"
+if [ "$RUN_QLEVER" = "1" ]; then
+  ( cd "$QLEVER_DIR" && "$QLEVER_BIN/qlever-server" -i bench -p "$QLEVER_PORT" -n > "/tmp/qlever_server_${MODE}_bench.log" 2>&1 & )
+  sleep 1
+  QLEVER_PID=$(pgrep -f "qlever-server -i bench -p $QLEVER_PORT" | head -1)
+  echo "Waiting for QLever..."
+  wait_ready "$QLEVER_READY_URL"
+fi
 
 echo "=== [5/6] Running benchmark queries (warmup=$WARMUP, iters=$ITERS) ==="
 echo "engine,query,iter,time_s" > "$CSV"
@@ -701,12 +748,14 @@ if [ "$NEED_RING" = "1" ]; then
 fi
 
 # Oxigraph query phase
-start_cpu_sampler "" "" 1 0 0 ""
-run_engine_queries "oxigraph" "http://localhost:$OXIGRAPH_PORT/sparql" \
-  "Accept: application/sparql-results+json"
-OXIGRAPH_MEM=$(docker stats "$OXIGRAPH_STATS_NAME" --no-stream --format '{{.MemUsage}}' | awk -F'/' '{print $1}' | tr -d ' ')
-stop_cpu_sampler
-OXIGRAPH_CPU_PCT=$(avg_cpu "$OXIGRAPH_CPU_LOG")
+if [ "$RUN_OXIGRAPH" = "1" ]; then
+  start_cpu_sampler "" "" 1 0 0 ""
+  run_engine_queries "oxigraph" "http://localhost:$OXIGRAPH_PORT/sparql" \
+    "Accept: application/sparql-results+json"
+  OXIGRAPH_MEM=$(docker stats "$OXIGRAPH_STATS_NAME" --no-stream --format '{{.MemUsage}}' | awk -F'/' '{print $1}' | tr -d ' ')
+  stop_cpu_sampler
+  OXIGRAPH_CPU_PCT=$(avg_cpu "$OXIGRAPH_CPU_LOG")
+fi
 
 # Fluree query phase
 if [ "$RUN_FLUREE" = "1" ]; then
@@ -737,19 +786,25 @@ if [ "$RUN_RDFOX" = "1" ] && [ -n "${RDFOX_PID:-}" ]; then
 fi
 
 # QLever query phase
-start_cpu_sampler "" "" 0 1 0 ""
-run_engine_queries "qlever" "http://localhost:$QLEVER_PORT/" \
-  "Accept: application/sparql-results+json"
-QLEVER_RSS_KB=$(measure_footprint_kb "$QLEVER_PID")
-stop_cpu_sampler
-QLEVER_CPU_PCT=$(avg_cpu "$QLEVER_CPU_LOG")
+if [ "$RUN_QLEVER" = "1" ]; then
+  start_cpu_sampler "" "" 0 1 0 ""
+  run_engine_queries "qlever" "http://localhost:$QLEVER_PORT/" \
+    "Accept: application/sparql-results+json"
+  QLEVER_RSS_KB=$(measure_footprint_kb "$QLEVER_PID")
+  stop_cpu_sampler
+  QLEVER_CPU_PCT=$(avg_cpu "$QLEVER_CPU_LOG")
+fi
 
 echo "=== [6/6] Generating report ==="
 
 if [ "$MODE" = "disk" ]; then
   NOVA_DISK_KB=$(du -sk "$NOVA_LOCATION" 2>/dev/null | awk '{print $1}')
-  OXIGRAPH_DISK_KB=$(du -sk "$OXIGRAPH_LOCATION_HOST" 2>/dev/null | awk '{print $1}')
-  QLEVER_DISK_KB=$(du -sk "$QLEVER_DIR" 2>/dev/null | awk '{print $1}')
+  if [ "$RUN_OXIGRAPH" = "1" ]; then
+    OXIGRAPH_DISK_KB=$(du -sk "$OXIGRAPH_LOCATION_HOST" 2>/dev/null | awk '{print $1}')
+  fi
+  if [ "$RUN_QLEVER" = "1" ]; then
+    QLEVER_DISK_KB=$(du -sk "$QLEVER_DIR" 2>/dev/null | awk '{print $1}')
+  fi
   if [ "$RUN_FLUREE" = "1" ] && [ -n "$FLUREE_LOCATION_HOST" ]; then
     FLUREE_DISK_KB=$(du -sk "$FLUREE_LOCATION_HOST" 2>/dev/null | awk '{print $1}')
   fi
@@ -759,8 +814,12 @@ if [ "$MODE" = "disk" ]; then
   NOVA_LOAD_S="${NOVA_LOUDS_LOAD_S:-0}"
 
   echo "Nova (louds) mem: ${NOVA_RSS_KB} KB | CPU ${NOVA_CPU_PCT}% | disk ${NOVA_DISK_KB} KB | load ${NOVA_LOAD_S}s"
-  echo "Oxigraph MEM:     ${OXIGRAPH_MEM} | CPU ${OXIGRAPH_CPU_PCT}% | disk ${OXIGRAPH_DISK_KB} KB"
-  echo "QLever mem:       ${QLEVER_RSS_KB} KB | CPU ${QLEVER_CPU_PCT}% | disk ${QLEVER_DISK_KB} KB"
+  if [ "$RUN_OXIGRAPH" = "1" ]; then
+    echo "Oxigraph MEM:     ${OXIGRAPH_MEM} | CPU ${OXIGRAPH_CPU_PCT}% | disk ${OXIGRAPH_DISK_KB} KB"
+  fi
+  if [ "$RUN_QLEVER" = "1" ]; then
+    echo "QLever mem:       ${QLEVER_RSS_KB} KB | CPU ${QLEVER_CPU_PCT}% | disk ${QLEVER_DISK_KB} KB"
+  fi
   if [ "$RUN_FLUREE" = "1" ]; then
     echo "Fluree MEM:       ${FLUREE_MEM} | CPU ${FLUREE_CPU_PCT}% | disk ${FLUREE_DISK_KB:-0} KB | load ${FLUREE_LOAD_S}s"
   fi
@@ -769,20 +828,26 @@ if [ "$MODE" = "disk" ]; then
     --csv "$CSV" \
     --queries "$QUERIES" \
     --nova-rss-kb "$NOVA_RSS_KB" \
-    --qlever-rss-kb "$QLEVER_RSS_KB" \
-    --oxigraph-mem "$OXIGRAPH_MEM" \
     --nova-cpu-pct "$NOVA_CPU_PCT" \
-    --qlever-cpu-pct "$QLEVER_CPU_PCT" \
-    --oxigraph-cpu-pct "$OXIGRAPH_CPU_PCT" \
     --nova-load-s "$NOVA_LOAD_S" \
-    --qlever-load-s "$QLEVER_LOAD_S" \
-    --oxigraph-load-s "$OXIGRAPH_LOAD_S" \
     --nova-disk-kb "${NOVA_DISK_KB:-0}" \
-    --oxigraph-disk-kb "${OXIGRAPH_DISK_KB:-0}" \
-    --qlever-disk-kb "${QLEVER_DISK_KB:-0}" \
     --entities "$ENTITIES" \
     --triples "$(( ENTITIES * 25 ))" \
     --out "$RESULTS_MD"
+  if [ "$RUN_OXIGRAPH" = "1" ]; then
+    set -- "$@" \
+      --oxigraph-mem "$OXIGRAPH_MEM" \
+      --oxigraph-cpu-pct "$OXIGRAPH_CPU_PCT" \
+      --oxigraph-load-s "$OXIGRAPH_LOAD_S" \
+      --oxigraph-disk-kb "${OXIGRAPH_DISK_KB:-0}"
+  fi
+  if [ "$RUN_QLEVER" = "1" ]; then
+    set -- "$@" \
+      --qlever-rss-kb "$QLEVER_RSS_KB" \
+      --qlever-cpu-pct "$QLEVER_CPU_PCT" \
+      --qlever-load-s "$QLEVER_LOAD_S" \
+      --qlever-disk-kb "${QLEVER_DISK_KB:-0}"
+  fi
   if [ "$RUN_FLUREE" = "1" ]; then
     set -- "$@" \
       --fluree-mem "$FLUREE_MEM" \
@@ -790,10 +855,17 @@ if [ "$MODE" = "disk" ]; then
       --fluree-load-s "$FLUREE_LOAD_S" \
       --fluree-disk-kb "${FLUREE_DISK_KB:-0}"
   fi
+  if [ "$ENABLE_CHARTS" = "1" ]; then
+    set -- "$@" --charts
+  fi
   python3 "$OUT_DIR/generate_report_disk.py" "$@"
 else
-  echo "Oxigraph MEM:  ${OXIGRAPH_MEM} | avg CPU: ${OXIGRAPH_CPU_PCT}%"
-  echo "QLever mem:    ${QLEVER_RSS_KB} KB | avg CPU: ${QLEVER_CPU_PCT}% | index: ${QLEVER_LOAD_S}s"
+  if [ "$RUN_OXIGRAPH" = "1" ]; then
+    echo "Oxigraph MEM:  ${OXIGRAPH_MEM} | avg CPU: ${OXIGRAPH_CPU_PCT}%"
+  fi
+  if [ "$RUN_QLEVER" = "1" ]; then
+    echo "QLever mem:    ${QLEVER_RSS_KB} KB | avg CPU: ${QLEVER_CPU_PCT}% | index: ${QLEVER_LOAD_S}s"
+  fi
   if [ -n "$NOVA_LOUDS_RSS_KB" ]; then
     echo "Nova (louds):  ${NOVA_LOUDS_RSS_KB} KB | CPU ${NOVA_LOUDS_CPU_PCT}% | load ${NOVA_LOUDS_LOAD_S}s"
   fi
@@ -811,15 +883,21 @@ else
   set -- \
     --csv "$CSV" \
     --queries "$QUERIES" \
-    --qlever-rss-kb "$QLEVER_RSS_KB" \
-    --oxigraph-mem "$OXIGRAPH_MEM" \
-    --qlever-cpu-pct "$QLEVER_CPU_PCT" \
-    --oxigraph-cpu-pct "$OXIGRAPH_CPU_PCT" \
-    --qlever-load-s "$QLEVER_LOAD_S" \
-    --oxigraph-load-s "$OXIGRAPH_LOAD_S" \
     --entities "$ENTITIES" \
     --triples "$(( ENTITIES * 25 ))" \
     --out "$RESULTS_MD"
+  if [ "$RUN_OXIGRAPH" = "1" ]; then
+    set -- "$@" \
+      --oxigraph-mem "$OXIGRAPH_MEM" \
+      --oxigraph-cpu-pct "$OXIGRAPH_CPU_PCT" \
+      --oxigraph-load-s "$OXIGRAPH_LOAD_S"
+  fi
+  if [ "$RUN_QLEVER" = "1" ]; then
+    set -- "$@" \
+      --qlever-rss-kb "$QLEVER_RSS_KB" \
+      --qlever-cpu-pct "$QLEVER_CPU_PCT" \
+      --qlever-load-s "$QLEVER_LOAD_S"
+  fi
   if [ -n "$NOVA_LOUDS_RSS_KB" ]; then
     set -- "$@" \
       --nova-louds-rss-kb "$NOVA_LOUDS_RSS_KB" \
@@ -844,15 +922,20 @@ else
       --rdfox-cpu-pct "$RDFOX_CPU_PCT" \
       --rdfox-load-s "$RDFOX_LOAD_S"
   fi
+  if [ "$ENABLE_CHARTS" = "1" ]; then
+    set -- "$@" --charts
+  fi
   python3 "$OUT_DIR/generate_report.py" "$@"
 fi
 
 echo ""
 echo "Done. Results written to $RESULTS_MD (raw data: $CSV)"
-ids="nova-louds"
-[ "$NEED_RING" = "1" ] && ids="$ids, nova-ring"
-ids="$ids, oxigraph, qlever"
-[ "$RUN_FLUREE" = "1" ] && ids="$ids, fluree"
-[ "$RUN_RDFOX" = "1" ] && [ -n "${RDFOX_RSS_KB:-}" ] && ids="$ids, rdfox"
-echo "CSV engine IDs: $ids"
+ids=""
+[ "$NEED_LOUDS" = "1" ] && ids="${ids:+$ids, }nova-louds"
+[ "$NEED_RING" = "1" ] && ids="${ids:+$ids, }nova-ring"
+[ "$RUN_OXIGRAPH" = "1" ] && ids="${ids:+$ids, }oxigraph"
+[ "$RUN_QLEVER" = "1" ] && ids="${ids:+$ids, }qlever"
+[ "$RUN_FLUREE" = "1" ] && ids="${ids:+$ids, }fluree"
+[ "$RUN_RDFOX" = "1" ] && [ -n "${RDFOX_RSS_KB:-}" ] && ids="${ids:+$ids, }rdfox"
+echo "CSV engine IDs: ${ids:-none}"
 

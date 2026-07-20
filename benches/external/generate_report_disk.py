@@ -9,7 +9,7 @@ WAL-backed LoudsStore), Oxigraph (`--location`, RocksDB-backed), QLever
 Adds an on-disk-footprint table alongside the existing memory/CPU/latency
 tables.
 
-Also writes pure-stdlib SVG bar charts under charts/disk/ and embeds them
+Optionally writes pure-stdlib SVG bar charts under charts/ (--charts; off by default).disk/ and embeds them
 in the Markdown report (lower is better for latency/load/memory/disk/CPU).
 """
 
@@ -51,8 +51,8 @@ def main():
     ap.add_argument("--csv", required=True)
     ap.add_argument("--queries", required=True)
     ap.add_argument("--nova-rss-kb", type=float, required=True)
-    ap.add_argument("--qlever-rss-kb", type=float, required=True)
-    ap.add_argument("--oxigraph-mem", required=True)  # e.g. "338.2MiB"
+    ap.add_argument("--qlever-rss-kb", type=float, default=None)
+    ap.add_argument("--oxigraph-mem", default=None)  # e.g. "338.2MiB"
     ap.add_argument("--fluree-mem", default=None)  # docker stats string
     ap.add_argument("--nova-cpu-pct", type=float, default=None)
     ap.add_argument("--qlever-cpu-pct", type=float, default=None)
@@ -68,6 +68,8 @@ def main():
     ap.add_argument("--fluree-disk-kb", type=float, default=None)
     ap.add_argument("--entities", type=int, required=True)
     ap.add_argument("--triples", type=int, required=True)
+    ap.add_argument("--charts", action="store_true", default=False,
+                    help="Write SVG charts under charts/ and embed them (default: off)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -108,10 +110,15 @@ def main():
 
     out_path = os.path.abspath(args.out)
     charts_dir = os.path.join(os.path.dirname(out_path), "charts", "disk")
-    os.makedirs(charts_dir, exist_ok=True)
     chart_paths = []
+    write_charts = bool(getattr(args, "charts", False))
+    if write_charts:
+        os.makedirs(charts_dir, exist_ok=True)
 
     def emit_chart(filename, svg, alt):
+        """Write SVG + return markdown image, or empty string when charts disabled."""
+        if not write_charts:
+            return ""
         path = write_svg(os.path.join(charts_dir, filename), svg)
         chart_paths.append(path)
         return rel_md_image(out_path, path, alt)
@@ -250,14 +257,16 @@ def main():
         f"{args.nova_rss_kb / 1024:.1f} MiB | "
         "WAL-backed heap (recovered/compacted state resident) |"
     )
-    lines.append(
-        f"| Oxigraph (--location) | {args.oxigraph_mem} | RocksDB-backed "
-        "(block cache + heap) |"
-    )
-    lines.append(
-        f"| QLever (mmap, warmed) | {args.qlever_rss_kb / 1024:.1f} MiB | "
-        "Incl. memory-mapped index pages |"
-    )
+    if "oxigraph" in engines and args.oxigraph_mem:
+        lines.append(
+            f"| Oxigraph (--location) | {args.oxigraph_mem} | RocksDB-backed "
+            "(block cache + heap) |"
+        )
+    if "qlever" in engines and args.qlever_rss_kb is not None:
+        lines.append(
+            f"| QLever (mmap, warmed) | {args.qlever_rss_kb / 1024:.1f} MiB | "
+            "Incl. memory-mapped index pages |"
+        )
     if has_fluree and args.fluree_mem:
         lines.append(
             f"| Fluree (--storage-path) | {args.fluree_mem} | "
@@ -266,9 +275,11 @@ def main():
 
     mem_vals = {
         nova_key: args.nova_rss_kb / 1024,
-        "oxigraph": parse_mem_string(args.oxigraph_mem),
-        "qlever": args.qlever_rss_kb / 1024,
     }
+    if "oxigraph" in engines and args.oxigraph_mem:
+        mem_vals["oxigraph"] = parse_mem_string(args.oxigraph_mem)
+    if "qlever" in engines and args.qlever_rss_kb is not None:
+        mem_vals["qlever"] = args.qlever_rss_kb / 1024
     if has_fluree and args.fluree_mem:
         mem_vals["fluree"] = parse_mem_string(args.fluree_mem)
 
@@ -505,7 +516,10 @@ def main():
         f.write("\n".join(lines) + "\n")
 
     print(f"Wrote {args.out}")
-    print(f"Wrote {len(chart_paths)} SVG chart(s) under {charts_dir}")
+    if write_charts:
+        print(f"Wrote {len(chart_paths)} SVG chart(s) under {charts_dir}")
+    else:
+        print("SVG charts skipped (pass --charts to enable)")
 
 
 if __name__ == "__main__":

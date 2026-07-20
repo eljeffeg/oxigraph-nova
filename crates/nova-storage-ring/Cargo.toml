@@ -15,16 +15,16 @@ fulltext     = ["oxigraph-nova-storage-louds/fulltext"]
 # for the Braided Ring pilot.
 diagnostics  = []
 # Braided Ring pilot: cyclic QWT + NOVARNG1 + D2. Not on LoudsStore SPARQL path.
-# Huffman C_p is the product default when the pilot is enabled.
-cyclic-ring-pilot = ["dep:qwt", "dep:memmap2", "ring-huffman-cp"]
-# E5.9B Phase 2 (research/notes/e5.9b-qwt-substrate-matrix.md §7/§8): in-memory
-# column-local Huffman prototype for C_p only, with an O(σ_P) linear-scan
-# RDI/RNV fallback (cheap because σ_P is schema-sized, unlike C_o/C_s where
-# σ≈U makes O(σ) prohibitive). Not wired into CyclicRing/product path — a
-# standalone differentially-tested column substrate for feasibility only.
-# Pure cfg flag (no extra deps). Enabled by `cyclic-ring-pilot`.
-# Kept so benches/gates can name the Huffman substrate feature explicitly.
-ring-huffman-cp = []
+# Plain QWT256 C_p by default. Opt into Huffman C_p with `ring-huffman-cp`
+# (does not auto-enable; keep them independent for A/B size/latency).
+cyclic-ring-pilot = ["dep:qwt", "dep:memmap2"]
+# E5.9B Phase 2–4 (research/notes/e5.9b-qwt-substrate-matrix.md §7/§8):
+# Huffman C_p substrate (HuffColP / HQWA). Requires `cyclic-ring-pilot`.
+# When enabled, product build paths default C_p to PredicateColumn::Huff;
+# without it, C_p is plain QWT256. Enable explicitly for Huffman A/B:
+#   cargo run -p oxigraph-nova-bench --features ring-huffman-cp --example memory_report
+#   cargo test -p oxigraph-nova-storage-ring --features cyclic-ring-pilot,ring-huffman-cp
+ring-huffman-cp = ["cyclic-ring-pilot"]
 
 # Forwarded to LOUDS + common + core for LoudsStore::open / snapshot mmap path.
 # Disabled (via `default-features = false`) for the wasm32 build

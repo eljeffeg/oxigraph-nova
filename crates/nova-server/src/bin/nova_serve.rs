@@ -599,7 +599,11 @@ async fn run_ring(
         panic!("--backend ring requires --file <dataset>");
     }
 
-    eprintln!("[nova_serve] Backend: RingStore (cyclic QWT pilot, in-memory)");
+    #[cfg(feature = "ring-huffman-cp")]
+    const CP: &str = "Huffman C_p (ring-huffman-cp)";
+    #[cfg(not(feature = "ring-huffman-cp"))]
+    const CP: &str = "plain QWT256 C_p";
+    eprintln!("[nova_serve] Backend: RingStore (cyclic QWT pilot, in-memory; {CP})");
     let store = RingStore::new();
 
     let mut all_quads: Vec<Quad> = Vec::new();

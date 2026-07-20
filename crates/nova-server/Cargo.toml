@@ -23,7 +23,11 @@ geosparql = ["oxigraph-nova-query/geosparql", "dep:spargeo"]
 # Pilot: in-memory RingStore backend for nova_serve (`--backend ring`).
 # Enables cyclic-ring-pilot; NOT the default SPARQL path. In-memory only
 # (no --location). Used by benches/external mem harness with NOVA_BACKEND=ring.
+# Default C_p is plain QWT256. Opt into Huffman C_p with `ring-huffman-cp`.
 ring-backend = ["oxigraph-nova-storage-ring/cyclic-ring-pilot"]
+# A/B: Huffman C_p on RingStore (implies ring-backend / cyclic-ring-pilot).
+#   cargo build -p oxigraph-nova-server --release --features ring-huffman-cp --bin nova_serve
+ring-huffman-cp = ["ring-backend", "oxigraph-nova-storage-ring/ring-huffman-cp"]
 
 
 

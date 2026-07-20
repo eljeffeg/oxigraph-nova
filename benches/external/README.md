@@ -145,11 +145,20 @@ This will:
    as independent fresh processes.
 5. Warm-up, correctness check, then N timed iterations via `curl`.
 6. Measure physical footprint / container memory / CPU (and on-disk size with `--disk`).
-7. Generate `RESULTS_MEM.md` or `RESULTS_DISK.md` with SVG charts under `charts/`.
+7. Generate `RESULTS_MEM.md` or `RESULTS_DISK.md` (SVG charts off by default; pass `--charts`).
 
 Raw timings: `raw_results.csv` (mem) or `raw_results_disk.csv` (disk).
 
-### Charts
+### Charts (optional)
+
+SVG charts are **off by default**. Pass `--charts` to write them under `charts/`
+and embed them in the Markdown report:
+
+```bash
+./benches/external/run_comparison.sh --charts
+# or when regenerating from an existing CSV:
+python3 benches/external/generate_report.py ... --charts
+```
 
 | Report | Chart directory |
 |--------|-----------------|

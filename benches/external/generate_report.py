@@ -5,7 +5,7 @@ Computes p50/p95/mean latency per (engine, query) and renders a Markdown
 comparison table, along with an explicit methodology/storage-model section
 so the memory-vs-disk asymmetry between engines is never left implicit.
 
-Also writes pure-stdlib SVG bar charts under charts/ and embeds them in the
+Optionally writes pure-stdlib SVG bar charts under charts/ (--charts; off by default). and embeds them in the
 Markdown report (lower is better for latency/load/memory/CPU).
 
 Engines (mem harness, 4-way by default):
@@ -59,8 +59,8 @@ def main():
     ap.add_argument("--nova-rss-kb", type=float, default=None)
     ap.add_argument("--nova-cpu-pct", type=float, default=None)
     ap.add_argument("--nova-load-s", type=float, default=None)
-    ap.add_argument("--qlever-rss-kb", type=float, required=True)
-    ap.add_argument("--oxigraph-mem", required=True)  # e.g. "338.2MiB"
+    ap.add_argument("--qlever-rss-kb", type=float, default=None)
+    ap.add_argument("--oxigraph-mem", default=None)  # e.g. "338.2MiB"
     ap.add_argument("--fluree-mem", default=None)  # docker stats string
     ap.add_argument("--rdfox-rss-kb", type=float, default=None)
     ap.add_argument("--qlever-cpu-pct", type=float, default=None)
@@ -74,6 +74,8 @@ def main():
 
     ap.add_argument("--entities", type=int, required=True)
     ap.add_argument("--triples", type=int, required=True)
+    ap.add_argument("--charts", action="store_true", default=False,
+                    help="Write SVG charts under charts/ and embed them (default: off)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -120,9 +122,10 @@ def main():
     # Resolve resource metrics per engine key.
     rss_kb = {
         "oxigraph": None,  # string form used for table; numeric via parse_mem_string
-        "qlever": args.qlever_rss_kb,
         "fluree": None,
     }
+    if args.qlever_rss_kb is not None:
+        rss_kb["qlever"] = args.qlever_rss_kb
     if args.rdfox_rss_kb is not None:
         rss_kb["rdfox"] = args.rdfox_rss_kb
     cpu_pct = {
@@ -177,10 +180,15 @@ def main():
 
     out_path = os.path.abspath(args.out)
     charts_dir = os.path.join(os.path.dirname(out_path), "charts", "mem")
-    os.makedirs(charts_dir, exist_ok=True)
-    chart_paths = []  # for logging
+    chart_paths = []
+    write_charts = bool(getattr(args, "charts", False))
+    if write_charts:
+        os.makedirs(charts_dir, exist_ok=True)
 
     def emit_chart(filename, svg, alt):
+        """Write SVG + return markdown image, or empty string when charts disabled."""
+        if not write_charts:
+            return ""
         path = write_svg(os.path.join(charts_dir, filename), svg)
         chart_paths.append(path)
         return rel_md_image(out_path, path, alt)
@@ -343,11 +351,11 @@ def main():
         if eng in ("nova-louds", "nova-ring", "nova") and eng in rss_kb and rss_kb[eng] is not None:
             model = "Pure heap (LOUDS)" if eng != "nova-ring" else "Pure heap (Ring)"
             lines.append(f"| {label} | {rss_kb[eng] / 1024:.1f} MiB | {model} |")
-        elif eng == "oxigraph":
+        elif eng == "oxigraph" and args.oxigraph_mem:
             lines.append(
                 f"| {label} | {args.oxigraph_mem} | Pure heap (in-memory mode) |"
             )
-        elif eng == "qlever":
+        elif eng == "qlever" and args.qlever_rss_kb is not None:
             lines.append(
                 f"| {label} | {args.qlever_rss_kb / 1024:.1f} MiB | "
                 "Incl. memory-mapped index pages |"
@@ -365,9 +373,9 @@ def main():
     for eng in engines:
         if eng in ("nova-louds", "nova-ring", "nova", "rdfox") and eng in rss_kb and rss_kb[eng] is not None:
             mem_vals[eng] = rss_kb[eng] / 1024
-        elif eng == "oxigraph":
+        elif eng == "oxigraph" and args.oxigraph_mem:
             mem_vals[eng] = parse_mem_string(args.oxigraph_mem)
-        elif eng == "qlever":
+        elif eng == "qlever" and args.qlever_rss_kb is not None:
             mem_vals[eng] = args.qlever_rss_kb / 1024
         elif eng == "fluree" and args.fluree_mem:
             mem_vals[eng] = parse_mem_string(args.fluree_mem)
@@ -533,7 +541,10 @@ def main():
         f.write("\n".join(lines) + "\n")
 
     print(f"Wrote {args.out}")
-    print(f"Wrote {len(chart_paths)} SVG chart(s) under {charts_dir}")
+    if write_charts:
+        print(f"Wrote {len(chart_paths)} SVG chart(s) under {charts_dir}")
+    else:
+        print("SVG charts skipped (pass --charts to enable)")
 
 
 if __name__ == "__main__":
