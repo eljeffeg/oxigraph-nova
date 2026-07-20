@@ -1,7 +1,8 @@
 use mem_dbg::{MemSize, SizeFlags};
 use qwt::{
+    bitvector::wide::RS,
     perf_and_test_utils::{gen_queries, type_of, TimingQueries},
-    RSNarrow, RankBin, SelectBin,
+    AccessBin, RankBin, SelectBin,
 };
 
 const N_RUNS: usize = 5;
@@ -101,23 +102,57 @@ where
     );
 }
 
+fn perf_get<T>(ds: &T, queries: &[usize], n: usize, logn: usize, u: usize)
+where
+    T: AccessBin + MemSize,
+{
+    let mut result = false;
+
+    let mut t = TimingQueries::new(N_RUNS, N_QUERIES);
+    for _ in 0..N_RUNS {
+        t.start();
+        for &query in queries.iter() {
+            let i = (query + result as usize) % n;
+            result = unsafe { ds.get_unchecked(i) };
+        }
+        t.stop();
+    }
+    let (t_min, t_max, t_avg) = t.get();
+    println!(
+        "GET: [ds_name: {}, n: {}, logn: {}, bitsize: {:?}, min_time (ns): {}, max_time (ns): {}, avg_time (ns): {}, space (bytes): {}, space (Mbytes): {:.2}]",
+        type_of(&ds),
+        n,
+        logn,
+        u,
+        t_min,
+        t_max,
+        t_avg,
+        ds.mem_size(SizeFlags::default()),
+        ds.mem_size(SizeFlags::default()) as f64 / (1024.0 * 1024.0)
+    );
+}
+
 fn main() {
-    for logn in 30..33 {
+    for logn in 15..34 {
         let n: usize = 1 << logn;
 
         let fill_factor = 2; // 1/2 full
 
         let bv = (0..n).filter(|x| x % fill_factor == 0).collect();
-        let rs = RSNarrow::new(bv);
+        let rs = RS::new(bv);
 
         println!(
-            "created new rs_narrow | count_ones: {} | count_zeros: {}",
+            "created new bitvector | count_ones: {} | count_zeros: {} | len: {}",
             rs.count_ones(),
             rs.count_zeros(),
+            rs.len()
         );
 
         let queries = gen_queries(N_QUERIES, n);
         perf_rank1(&rs, &queries, n, logn, n);
+
+        let queries = gen_queries(N_QUERIES, n);
+        perf_get(&rs, &queries, n, logn, n);
 
         let queries = gen_queries(N_QUERIES, rs.count_ones() - 1);
         perf_select1(&rs, &queries, n, logn, n);

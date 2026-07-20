@@ -232,6 +232,16 @@ pub trait DatasetLftjSource: Send + Sync {
     ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
         None
     }
+
+    /// Optional multi-subject object intersection (W4b). Default: unsupported.
+    fn lftj_multi_subject_object_intersect(
+        &self,
+        _subjects: &[u64],
+        _predicate: Option<u64>,
+        _graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
+        None
+    }
 }
 
 // ── Dataset trait ─────────────────────────────────────────────────────────────
@@ -467,6 +477,21 @@ impl<S: QuadStore + 'static> DatasetLftjSource for StoreDataset<S> {
             _ => return None, // AnyNamed/Union → fallback
         };
         self.store.lftj_real_count(s, p, o, target_field, graph_id)
+    }
+
+    fn lftj_multi_subject_object_intersect(
+        &self,
+        subjects: &[u64],
+        predicate: Option<u64>,
+        graph: &GraphSelector,
+    ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
+        let graph_id: u8 = match graph {
+            GraphSelector::Default => 0u8,
+            GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
+            _ => return None,
+        };
+        self.store
+            .lftj_multi_subject_object_intersect(subjects, predicate, graph_id)
     }
 }
 

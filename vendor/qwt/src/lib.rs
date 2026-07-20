@@ -17,10 +17,15 @@ pub use qvector::rs_qvector::SuperblockPlain;
 
 
 pub mod bitvector;
-pub use bitvector::rs_narrow::RSNarrow;
-pub use bitvector::rs_wide::RSWide;
+pub use bitvector::narrow;
+pub use bitvector::wide;
 pub use bitvector::BitVector;
 pub use bitvector::BitVectorMut;
+
+#[deprecated(since = "0.5.0", note = "renamed to `qwt::narrow::RS`")]
+pub use bitvector::narrow::RS as RSNarrow;
+#[deprecated(since = "0.5.0", note = "renamed to `qwt::wide::RS`")]
+pub use bitvector::wide::RS as RSWide;
 
 pub mod utils;
 
@@ -29,7 +34,7 @@ pub use qvector::rs_qvector::RSQVector256;
 pub use qvector::rs_qvector::RSQVector512;
 
 pub mod quadwt;
-pub use quadwt::huffqwt::HuffQWaveletTree;
+pub use quadwt::huffqwt::{HuffQWaveletTree, PrefixCode};
 pub use quadwt::QWaveletTree;
 pub use quadwt::RangeDistinctIter;
 pub use quadwt::WTIndexable;
@@ -56,12 +61,12 @@ pub type HQWT256Pfs<T> = HuffQWaveletTree<T, RSQVector256, true>;
 pub type HQWT512Pfs<T> = HuffQWaveletTree<T, RSQVector512, true>;
 
 /// This type represents a binary wavelet tree,
-/// Each level of this tree is handled by a RSWide bitvector
-pub type WT<T> = WaveletTree<T, RSWide>;
+/// Each level of this tree is handled by a wide::RS bitvector
+pub type WT<T> = WaveletTree<T, wide::RS>;
 
 /// This type represents a binary wavelet tree compressed using huffman coding.
-/// Each level of this tree is handled by a RSWide bitvector
-pub type HWT<T> = WaveletTree<T, RSWide, true>;
+/// Each level of this tree is handled by a wide::RS bitvector
+pub type HWT<T> = WaveletTree<T, wide::RS, true>;
 
 use num_traits::Unsigned;
 

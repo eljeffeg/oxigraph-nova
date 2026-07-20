@@ -19,22 +19,31 @@
 <line class="grid" x1="56" y1="256.0" x2="616" y2="256.0"/>
 <text class="muted" x="48" y="260.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">0.00</text>
 <line class="grid" x1="56" y1="204.0" x2="616" y2="204.0"/>
-<text class="muted" x="48" y="208.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">375.0</text>
+<text class="muted" x="48" y="208.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">500.0</text>
 <line class="grid" x1="56" y1="152.0" x2="616" y2="152.0"/>
-<text class="muted" x="48" y="156.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">750.0</text>
+<text class="muted" x="48" y="156.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">1000</text>
 <line class="grid" x1="56" y1="100.0" x2="616" y2="100.0"/>
-<text class="muted" x="48" y="104.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">1125</text>
+<text class="muted" x="48" y="104.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">1500</text>
 <line class="grid" x1="56" y1="48.0" x2="616" y2="48.0"/>
-<text class="muted" x="48" y="52.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">1500 ms</text>
+<text class="muted" x="48" y="52.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">2000 ms</text>
 <line class="axis" x1="56" y1="48" x2="56" y2="256"/>
 <line class="axis" x1="56" y1="256" x2="616" y2="256"/>
-<rect x="123.2" y="179.6" width="97.1" height="76.4" fill="#2563eb" rx="3"/>
-<text class="title" x="171.7" y="173.6" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">551.2</text>
-<text class="label" x="171.7" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova</text>
-<rect x="287.5" y="185.3" width="97.1" height="70.7" fill="#dc2626" rx="3"/>
-<text class="title" x="336.0" y="179.3" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">509.5</text>
-<text class="label" x="336.0" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Oxigraph</text>
-<rect x="451.7" y="82.3" width="97.1" height="173.7" fill="#16a34a" rx="3"/>
-<text class="title" x="500.3" y="76.3" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">1253</text>
-<text class="label" x="500.3" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">QLever</text>
+<rect x="123.2" y="197.1" width="24.0" height="58.9" fill="#2563eb" rx="3"/>
+<text class="title" x="135.2" y="191.1" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">566.2</text>
+<text class="label" x="135.2" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (louds)</text>
+<rect x="214.4" y="144.1" width="24.0" height="111.9" fill="#7c3aed" rx="3"/>
+<text class="title" x="226.4" y="138.1" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">1076</text>
+<text class="label" x="226.4" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (ring)</text>
+<rect x="305.6" y="202.6" width="24.0" height="53.4" fill="#dc2626" rx="3"/>
+<text class="title" x="317.6" y="196.6" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">513.1</text>
+<text class="label" x="317.6" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Oxigraph</text>
+<rect x="396.8" y="118.6" width="24.0" height="137.4" fill="#16a34a" rx="3"/>
+<text class="title" x="408.8" y="112.6" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">1321</text>
+<text class="label" x="408.8" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">QLever</text>
+<rect x="488.0" y="98.1" width="24.0" height="157.9" fill="#ea580c" rx="3"/>
+<text class="title" x="500.0" y="92.1" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">1518</text>
+<text class="label" x="500.0" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Fluree</text>
+<rect x="579.2" y="241.6" width="24.0" height="14.4" fill="#0891b2" rx="3"/>
+<text class="title" x="591.2" y="235.6" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">138.1 ms</text>
+<text class="label" x="591.2" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">RDFox</text>
 </svg>

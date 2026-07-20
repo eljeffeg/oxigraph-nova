@@ -18,18 +18,40 @@
 //! This is the narrowest safe next seam after the ID facade — no dependency
 //! on `nova-storage-louds` beyond the temporary crate re-export, and no
 //! changes to `nova-store` query routing.
+//!
+//! ## Alphabet (product lock)
+//!
+//! The product path always uses a **compact shared alphabet** over symbols that
+//! appear in the graph: dense ids in `[0, |symbols|)`, assigned in ascending
+//! external order. Do **not** wire global TermId identity (`dense == TermId`)
+//! into this path — that widens the QWT, can add levels, grow the mapped image,
+//! and loses role-contiguous ranges. Phase-4 A/B for identity IDs lives as a
+//! separate experimental commit/branch only (see
+//! `research/notes/identity-ids-experiment.md`).
 
-use super::facade::BraidedRingIndex;
-use super::{MappedRingA, MappedRingError, open_novarng1_mmap};
-use std::collections::BTreeMap;
+use crate::facade::BraidedRingIndex;
+use crate::{MappedRingA, MappedRingError, open_novarng1_mmap};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+/// Sentinel in [`IdRemap::to_dense_vec`]: external id not in the alphabet.
+const DENSE_MISSING: u32 = u32::MAX;
+
 /// Bidirectional map between external (caller) IDs and dense shared-alphabet IDs.
+///
+/// Hot path is O(1) like LOUDS `vocab[local]`: external TermIds from the
+/// dictionary are dense `0..dict_len` after compact, so `to_dense` is a direct
+/// Vec index (not a BTreeMap walk). Risk table mitigation from
+/// `e5.11-sparql-product-wire.md`: "External remap dominates → Dense-only /
+/// O(1) remap".
+///
+/// Product alphabet is always compact `[0, |symbols|)`. Identity-global IDs are
+/// not a product mode (see module docs).
 #[derive(Clone, Debug, Default)]
 pub struct IdRemap {
-    /// external → dense
-    to_dense: BTreeMap<u64, u32>,
-    /// dense → external
+    /// `to_dense_vec[external as usize] = dense` or [`DENSE_MISSING`].
+    to_dense_vec: Vec<u32>,
+    /// dense → external (ascending external order).
     to_external: Vec<u64>,
 }
 
@@ -39,21 +61,27 @@ impl IdRemap {
     /// Symbols are assigned dense IDs in ascending external order so the
     /// mapping is deterministic across rebuilds of the same triple multiset.
     pub fn from_triples(triples: &[[u64; 3]]) -> Self {
-        let mut symbols = BTreeMap::new();
+        let mut symbols = BTreeSet::new();
         for t in triples {
             for &id in t {
-                symbols.entry(id).or_insert(true);
+                symbols.insert(id);
             }
         }
+        if symbols.is_empty() {
+            return Self::default();
+        }
+        let max_ext = *symbols.iter().next_back().unwrap_or(&0);
+        // Cap pathological sparse IDs: still correct via missing sentinel, but
+        // dictionary TermIds are dense 0..n so this is ~dict_len entries.
+        let mut to_dense_vec = vec![DENSE_MISSING; (max_ext as usize).saturating_add(1)];
         let mut to_external = Vec::with_capacity(symbols.len());
-        let mut to_dense = BTreeMap::new();
-        for (dense, &ext) in symbols.keys().enumerate() {
+        for (dense, ext) in symbols.into_iter().enumerate() {
             let d = dense as u32;
-            to_dense.insert(ext, d);
+            to_dense_vec[ext as usize] = d;
             to_external.push(ext);
         }
         Self {
-            to_dense,
+            to_dense_vec,
             to_external,
         }
     }
@@ -65,7 +93,13 @@ impl IdRemap {
 
     #[inline]
     pub fn to_dense(&self, external: u64) -> Option<u32> {
-        self.to_dense.get(&external).copied()
+        let i = external as usize;
+        let slot = *self.to_dense_vec.get(i)?;
+        if slot == DENSE_MISSING {
+            None
+        } else {
+            Some(slot)
+        }
     }
 
     #[inline]
@@ -86,7 +120,6 @@ impl IdRemap {
             Some(i as u32)
         }
     }
-
 
     /// Map an external triple into shared-alphabet coordinates.
     pub fn map_triple(&self, t: [u64; 3]) -> Option<[u32; 3]> {
@@ -119,9 +152,10 @@ pub struct BraidedGraphImage {
 }
 
 impl BraidedGraphImage {
-    /// Build from external-ID triples: remap → dedup → heap Ring A.
+    /// Build from external-ID triples: compact remap → dedup → heap Ring A.
     ///
-    /// Empty input yields an empty image (`universe = 0`, `n = 0`).
+    /// Always uses the compact shared alphabet `[0, |symbols|)`. Empty input
+    /// yields an empty image (`universe = 0`, `n = 0`).
     pub fn from_external_triples(triples: &[[u64; 3]]) -> Self {
         if triples.is_empty() {
             return Self {
@@ -224,7 +258,6 @@ impl BraidedGraphImage {
     /// Rebuild a heap-only image from this image's external SPO enumeration
     /// (round-trip stress).
     pub fn rebuild_from_external_roundtrip(&self) -> Self {
-
         let ext = self.enumerate_spo_external();
         Self::from_external_triples(&ext)
     }
@@ -233,7 +266,7 @@ impl BraidedGraphImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::scan::oracle_join_scan;
+    use crate::scan::oracle_join_scan;
 
     fn sparse_triples() -> Vec<[u64; 3]> {
         // Sparse external IDs with a duplicate.
@@ -261,6 +294,19 @@ mod tests {
             assert_eq!(r1.to_external(d), Some(ext));
             assert_eq!(r2.to_dense(ext), Some(d));
         }
+    }
+
+    #[test]
+    fn compact_alphabet_only_on_product_path() {
+        // Dense TermIds still compact to |symbols|, never identity global space.
+        let t = vec![[0u64, 1, 2], [0, 1, 3], [4, 1, 2]];
+        let img = BraidedGraphImage::from_external_triples(&t);
+        assert_eq!(img.n(), 3);
+        assert_eq!(img.remap().universe(), 5); // symbols 0,1,2,3,4
+        assert_eq!(img.enumerate_spo_external().len(), 3);
+        // External 4 maps to some dense < universe; not required to be 4.
+        assert!(img.remap().to_dense(4).is_some());
+        assert!(img.remap().to_dense(99).is_none());
     }
 
     #[test]

@@ -59,27 +59,111 @@ use qwt::mem_dbg::{MemSize, SizeFlags};
 use qwt::{AccessUnsigned, QWT256, RankUnsigned, SelectUnsigned};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "ring-huffman-cp")]
+use crate::huff_cp::HuffColP;
 
-/// E5.10 W0 — immutable mapped QWT (`NOVAQWT1`).
-pub mod mapped_qwt;
-/// E5.10 W1 — mmap-backed Ring A shell (`NOVARNG1` / `MappedRingA`).
-pub mod mapped_ring;
-/// Phase 4 ID-level facade + differential oracles (not QuadStore / not SPARQL).
-pub mod facade;
-/// Phase 4b ID-level LFTJ join/scan seam (`TrieIterator`, not QuadStore).
-pub mod scan;
-/// Phase 4b per-graph read-only canonical-ID image adapter.
-pub mod image;
-/// Phase 5 in-memory QuadStore: Dictionary + Delta + BraidedGraphImage.
-pub mod store;
+// ── Predicate column substrate (E5.9B Phase 3) ───────────────────────────────
 
-pub use facade::BraidedRingIndex;
-pub use image::{BraidedGraphImage, IdRemap};
-pub use mapped_ring::{
-    MappedRingA, MappedRingError, open_novarng1_mmap, write_novarng1_file, write_novarng1_v1,
-};
-pub use scan::BraidedJoinScan;
-pub use store::RingStore;
+/// Last-column substrate for **C_p only**.
+///
+/// Under `ring-huffman-cp`, the product default is [`PredicateColumn::Huff`].
+/// Without that feature, only [`PredicateColumn::Qwt`] is available.
+/// mmap (`NOVARNG1`) dual-format flattens Huff C_p as HQWA (`RNG_FLAG_HUFF_CP`).
+pub enum PredicateColumn {
+    /// Balanced QWT256 (product default).
+    Qwt(QWT256<u32>),
+    /// Locally-densified HQWT256 + O(σ_P) RDI/RNV fallback.
+    #[cfg(feature = "ring-huffman-cp")]
+    Huff(HuffColP),
+}
+
+impl PredicateColumn {
+    #[inline]
+    pub fn is_huff(&self) -> bool {
+        match self {
+            Self::Qwt(_) => false,
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::Huff(_) => true,
+        }
+    }
+
+    /// Borrow the QWT256 when this arm is plain Qwt (needed by NOVARNG1 flatten).
+    #[inline]
+    pub fn as_qwt(&self) -> Option<&QWT256<u32>> {
+        match self {
+            Self::Qwt(w) => Some(w),
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::Huff(_) => None,
+        }
+    }
+
+    /// Borrow the HuffColP when this arm is Huffman (NOVARNG1 HQWA flatten).
+    #[cfg(feature = "ring-huffman-cp")]
+    #[inline]
+    pub fn as_huff(&self) -> Option<&HuffColP> {
+        match self {
+            Self::Qwt(_) => None,
+            Self::Huff(h) => Some(h),
+        }
+    }
+
+    #[inline]
+    pub fn access(&self, pos: u32) -> u32 {
+
+        match self {
+            Self::Qwt(w) => w.get(pos as usize).expect("access in bounds"),
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::Huff(h) => h.access(pos),
+        }
+    }
+
+    #[inline]
+    pub fn rank(&self, symbol: u32, position: u32) -> u32 {
+        match self {
+            Self::Qwt(w) => w.rank(symbol, position as usize).unwrap_or(0) as u32,
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::Huff(h) => h.rank(symbol, position),
+        }
+    }
+
+    #[inline]
+    pub fn select(&self, symbol: u32, occurrence: u32) -> Option<u32> {
+        match self {
+            Self::Qwt(w) => w.select(symbol, occurrence as usize).map(|p| p as u32),
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::Huff(h) => h.select(symbol, occurrence),
+        }
+    }
+
+    #[inline]
+    pub fn mem_bytes(&self) -> usize {
+        match self {
+            Self::Qwt(w) => w.mem_size(SizeFlags::default()),
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::Huff(h) => h.mem_bytes(),
+        }
+    }
+
+    /// RNV: native guided on Qwt; O(σ_P) scan on Huff.
+    #[inline]
+    pub fn range_next_value(&self, start: u32, end: u32, target: u32) -> Option<u32> {
+        match self {
+            Self::Qwt(w) => w.range_next_value(start as usize..end as usize, target),
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::Huff(h) => h.range_next_value_scan(start, end, target),
+        }
+    }
+
+    /// Diagnostic: wavelet levels (0 for Huff — variable-depth codes).
+    #[inline]
+    pub fn n_levels(&self) -> usize {
+        match self {
+            Self::Qwt(w) => w.n_levels(),
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::Huff(_) => 0,
+        }
+    }
+}
 
 
 
@@ -251,7 +335,9 @@ impl CounterSnapshot {
 /// well-defined across columns (paper assumes Σ = [1..U]; we use [0..U)).
 pub struct CyclicRing {
     c_o: QWT256<u32>,
-    c_p: QWT256<u32>,
+    /// C_p substrate: Huffman under `ring-huffman-cp` (product default);
+    /// Qwt otherwise or via explicit `*_qwt_cp` builders.
+    c_p: PredicateColumn,
     c_s: QWT256<u32>,
     /// A_o[k] = |{ i : C_o[i] < k }|, length U+1.
     a_o: Vec<u32>,
@@ -261,12 +347,19 @@ pub struct CyclicRing {
     pub n: u32,
     /// Shared alphabet size U (max dense id + 1).
     pub universe: u32,
+    /// Role-local S/P/O sizes in the shared alphabet layout
+    /// (S∈[0,ns), P∈[ns,ns+np), O∈[ns+np,U)). Zero when unknown (legacy
+    /// `build_shared` without role sizes).
+    pub ns: u32,
+    pub np: u32,
+    pub no: u32,
     /// Optional external counters (shared with harness).
     counters: Option<&'static GlobalCounters>,
     /// Hot-path allocation detector (range_next_value must not allocate).
     /// Atomic so `CyclicRing` / store wrappers are `Send + Sync` for QuadStore.
     hot_path_allocs: AtomicU64,
 }
+
 
 impl CyclicRing {
     /// Attach process-global counters (typically a `static`).
@@ -294,6 +387,8 @@ impl CyclicRing {
     /// This preserves relative order within each role while giving a single
     /// Σ for A arrays (paper assumption). Returned ring reports
     /// `universe = ns+np+no`.
+    /// Build Ring A from role-local triples. Under `ring-huffman-cp`, C_p is
+    /// Huffman (product default); otherwise Qwt.
     pub fn build_from_role_local(triples: &[[u32; 3]], ns: u32, np: u32, no: u32) -> Self {
         let s_base = 0u32;
         let p_base = ns;
@@ -302,13 +397,77 @@ impl CyclicRing {
             .iter()
             .map(|&[s, p, o]| [s_base + s, p_base + p, o_base + o])
             .collect();
-        Self::build_shared(&mapped, ns + np + no)
+        #[cfg(feature = "ring-huffman-cp")]
+        {
+            Self::build_shared_inner(&mapped, ns + np + no, ns, np, no, true)
+        }
+        #[cfg(not(feature = "ring-huffman-cp"))]
+        {
+            let mut ring = Self::build_shared_inner(&mapped, ns + np + no, ns, np, no, false);
+            ring.ns = ns;
+            ring.np = np;
+            ring.no = no;
+            ring
+        }
+    }
+
+    /// Explicit Qwt C_p (differential / baseline). Same role-local remap.
+    pub fn build_from_role_local_qwt_cp(
+        triples: &[[u32; 3]],
+        ns: u32,
+        np: u32,
+        no: u32,
+    ) -> Self {
+        let s_base = 0u32;
+        let p_base = ns;
+        let o_base = ns + np;
+        let mapped: Vec<[u32; 3]> = triples
+            .iter()
+            .map(|&[s, p, o]| [s_base + s, p_base + p, o_base + o])
+            .collect();
+        Self::build_shared_inner(&mapped, ns + np + no, ns, np, no, false)
     }
 
     /// Build **Ring A** from triples already in a shared dense alphabet `[0, U)`.
     ///
     /// Cyclic class: SPO → OSP → POS (last columns C_o, C_p, C_s).
+    /// Under `ring-huffman-cp`, C_p defaults to Huffman via unique-P densify.
+    /// Role sizes (`ns`/`np`/`no`) are left 0 here.
     pub fn build_shared(triples: &[[u32; 3]], universe: u32) -> Self {
+        #[cfg(feature = "ring-huffman-cp")]
+        {
+            Self::build_shared_inner(triples, universe, 0, 0, 0, true)
+        }
+        #[cfg(not(feature = "ring-huffman-cp"))]
+        {
+            Self::build_shared_inner(triples, universe, 0, 0, 0, false)
+        }
+    }
+
+    /// Explicit Qwt C_p on a shared alphabet (differential / baseline).
+    pub fn build_shared_qwt_cp(triples: &[[u32; 3]], universe: u32) -> Self {
+        Self::build_shared_inner(triples, universe, 0, 0, 0, false)
+    }
+
+    /// Alias: Huffman C_p with role-local remap (same as default under feature).
+    #[cfg(feature = "ring-huffman-cp")]
+    pub fn build_from_role_local_huff_cp(
+        triples: &[[u32; 3]],
+        ns: u32,
+        np: u32,
+        no: u32,
+    ) -> Self {
+        Self::build_from_role_local(triples, ns, np, no)
+    }
+
+    fn build_shared_inner(
+        triples: &[[u32; 3]],
+        universe: u32,
+        ns: u32,
+        np: u32,
+        no: u32,
+        huff_cp: bool,
+    ) -> Self {
         let n = triples.len() as u32;
         // T_spo
         let mut spo = triples.to_vec();
@@ -329,19 +488,45 @@ impl CyclicRing {
         let a_p = cumulative_a(&c_p_vals, universe as usize);
         let a_s = cumulative_a(&c_s_vals, universe as usize);
 
+        let c_p = {
+            #[cfg(feature = "ring-huffman-cp")]
+            {
+                if huff_cp {
+                    if np > 0 {
+                        // Contiguous role-local P range [ns, ns+np).
+                        PredicateColumn::Huff(HuffColP::build_from_shared(&c_p_vals, ns, np))
+                    } else {
+                        // Compact shared alphabet: unique-P densify.
+                        PredicateColumn::Huff(HuffColP::build_from_column(&c_p_vals))
+                    }
+                } else {
+                    PredicateColumn::Qwt(QWT256::from(c_p_vals))
+                }
+            }
+            #[cfg(not(feature = "ring-huffman-cp"))]
+            {
+                let _ = huff_cp;
+                PredicateColumn::Qwt(QWT256::from(c_p_vals))
+            }
+        };
+
         Self {
             c_o: QWT256::from(c_o_vals),
-            c_p: QWT256::from(c_p_vals),
+            c_p,
             c_s: QWT256::from(c_s_vals),
             a_o,
             a_p,
             a_s,
             n,
             universe,
+            ns,
+            np,
+            no,
             counters: None,
             hot_path_allocs: AtomicU64::new(0),
         }
     }
+
 
     /// Build **Ring B** (reverse cyclic class) from role-local triples.
 
@@ -358,7 +543,11 @@ impl CyclicRing {
             .iter()
             .map(|&[s, p, o]| [s_base + s, p_base + p, o_base + o])
             .collect();
-        Self::build_ring_b_shared(&mapped, ns + np + no)
+        let mut ring = Self::build_ring_b_shared(&mapped, ns + np + no);
+        ring.ns = ns;
+        ring.np = np;
+        ring.no = no;
+        ring
     }
 
     /// Build **Ring B** from shared-alphabet triples.
@@ -399,13 +588,16 @@ impl CyclicRing {
 
         Self {
             c_o: QWT256::from(c_o_vals),
-            c_p: QWT256::from(c_p_vals),
+            c_p: PredicateColumn::Qwt(QWT256::from(c_p_vals)),
             c_s: QWT256::from(c_s_vals),
             a_o,
             a_p,
             a_s,
             n,
             universe,
+            ns: 0,
+            np: 0,
+            no: 0,
             counters: None,
             hot_path_allocs: AtomicU64::new(0),
         }
@@ -415,20 +607,38 @@ impl CyclicRing {
 
     pub fn mem_bytes(&self) -> usize {
         let q = self.c_o.mem_size(SizeFlags::default())
-            + self.c_p.mem_size(SizeFlags::default())
+            + self.c_p.mem_bytes()
             + self.c_s.mem_size(SizeFlags::default());
         let a = (self.a_o.len() + self.a_p.len() + self.a_s.len()) * 4;
         q + a + 136
     }
 
+    /// Whether C_p is the Huffman substrate (feature `ring-huffman-cp` only).
+    #[inline]
+    pub fn c_p_is_huff(&self) -> bool {
+        self.c_p.is_huff()
+    }
+
+    /// Borrow the C_p substrate (Qwt or Huff).
+    #[inline]
+    pub fn c_p_substrate(&self) -> &PredicateColumn {
+        &self.c_p
+    }
+
     // ── column accessors ─────────────────────────────────────────────────
 
+    /// QWT256 for O/S only. Panics if called with `Col::P` when C_p is Huffman
+    /// (use [`Self::col_qwt`] which returns `Option` for P, or dispatch via
+    /// access/rank/select which handle both arms).
     #[inline]
-    fn col_wt(&self, col: Col) -> &QWT256<u32> {
+    fn col_wt_os(&self, col: Col) -> &QWT256<u32> {
         match col {
             Col::O => &self.c_o,
-            Col::P => &self.c_p,
             Col::S => &self.c_s,
+            Col::P => self
+                .c_p
+                .as_qwt()
+                .expect("col_wt_os(Col::P) requires Qwt C_p substrate"),
         }
     }
 
@@ -442,10 +652,18 @@ impl CyclicRing {
     }
 
     /// Public QWT column accessor for E5.10 flatten / differential gates.
+    ///
+    /// Returns `None` for `Col::P` when C_p is the Huffman arm (cannot flatten
+    /// HQWT into `NOVARNG1` QWTA sections — in-memory experiment only).
     #[inline]
-    pub fn col_qwt(&self, col: Col) -> &QWT256<u32> {
-        self.col_wt(col)
+    pub fn col_qwt(&self, col: Col) -> Option<&QWT256<u32>> {
+        match col {
+            Col::O => Some(&self.c_o),
+            Col::S => Some(&self.c_s),
+            Col::P => self.c_p.as_qwt(),
+        }
     }
+
 
     /// Public A-array accessor for E5.10 flatten / differential gates.
     #[inline]
@@ -468,9 +686,13 @@ impl CyclicRing {
         self.bump(|c| {
             c.access.fetch_add(1, Ordering::Relaxed);
         });
-        self.col_wt(col)
-            .get(pos as usize)
-            .expect("access in bounds")
+        match col {
+            Col::P => self.c_p.access(pos),
+            Col::O | Col::S => self
+                .col_wt_os(col)
+                .get(pos as usize)
+                .expect("access in bounds"),
+        }
     }
 
     /// `rank(column, symbol, position)` — # of `symbol` in `[0, position)`.
@@ -479,9 +701,13 @@ impl CyclicRing {
         self.bump(|c| {
             c.rank.fetch_add(1, Ordering::Relaxed);
         });
-        self.col_wt(col)
-            .rank(symbol, position as usize)
-            .unwrap_or(0) as u32
+        match col {
+            Col::P => self.c_p.rank(symbol, position),
+            Col::O | Col::S => self
+                .col_wt_os(col)
+                .rank(symbol, position as usize)
+                .unwrap_or(0) as u32,
+        }
     }
 
     /// `select(column, symbol, occurrence)` — position of 0-based `occurrence`-th
@@ -491,10 +717,15 @@ impl CyclicRing {
         self.bump(|c| {
             c.select.fetch_add(1, Ordering::Relaxed);
         });
-        self.col_wt(col)
-            .select(symbol, occurrence as usize)
-            .map(|p| p as u32)
+        match col {
+            Col::P => self.c_p.select(symbol, occurrence),
+            Col::O | Col::S => self
+                .col_wt_os(col)
+                .select(symbol, occurrence as usize)
+                .map(|p| p as u32),
+        }
     }
+
 
     /// Paper Eq. (2) zero-based: `F_j(i) = A[c] + rank(c, i+1) - 1`, `c = C[i]`.
     ///
@@ -585,7 +816,7 @@ impl CyclicRing {
         self.range_next_value_native(col, r, target)
     }
 
-    /// Diagnostic oracle: row-scan via `get`. O(|range| · log σ).
+    /// Diagnostic oracle: row-scan via `access`. O(|range| · log σ).
     /// **Rejected for LFTJ** (E5.7); kept only for differential correctness.
     pub fn range_next_value_scan(&self, col: Col, r: RowRange, target: u32) -> Option<u32> {
         self.bump(|c| {
@@ -600,9 +831,9 @@ impl CyclicRing {
             self.bump(|c| {
                 c.rnv_scan_get_probes.fetch_add(1, Ordering::Relaxed);
                 c.rnv_get_probes.fetch_add(1, Ordering::Relaxed);
-                c.access.fetch_add(1, Ordering::Relaxed);
             });
-            let v = self.col_wt(col).get(i as usize).expect("in range");
+            // access() bumps its own counter
+            let v = self.access(col, i);
             if v >= target {
                 best = Some(match best {
                     Some(b) if b <= v => b,
@@ -616,8 +847,8 @@ impl CyclicRing {
         best
     }
 
-    /// Native guided RNV via vendored qwt `range_next_value`.
-    /// Worst case O(log σ) rank work; **independent of |range|**.
+    /// Native guided RNV (Qwt) or O(σ_P) scan (Huff C_p).
+    /// Worst case O(log σ) rank work on Qwt; **independent of |range|**.
     /// Zero extra persistent bytes.
     pub fn range_next_value_native(&self, col: Col, r: RowRange, target: u32) -> Option<u32> {
         self.bump(|c| {
@@ -627,45 +858,80 @@ impl CyclicRing {
         if r.is_empty() || target >= self.universe {
             return None;
         }
-        let wt = self.col_wt(col);
-        self.bump(|c| {
-            // Depth proxy: n_levels independent of row span.
-            c.rnv_native_levels
-                .fetch_add(wt.n_levels() as u64, Ordering::Relaxed);
-            // Upper bound on rank probes: ≤ 4 branches × 2 endpoints × levels.
-            c.rnv_native_rank_probes
-                .fetch_add((wt.n_levels() as u64) * 8, Ordering::Relaxed);
-        });
-        wt.range_next_value(r.start as usize..r.end as usize, target)
+        match col {
+            Col::P => {
+                self.bump(|c| {
+                    // Huff: O(np) rank pairs; Qwt: levels proxy.
+                    let levels = self.c_p.n_levels().max(1) as u64;
+                    c.rnv_native_levels.fetch_add(levels, Ordering::Relaxed);
+                    c.rnv_native_rank_probes
+                        .fetch_add(levels * 8, Ordering::Relaxed);
+                });
+                self.c_p.range_next_value(r.start, r.end, target)
+            }
+            Col::O | Col::S => {
+                let wt = self.col_wt_os(col);
+                self.bump(|c| {
+                    c.rnv_native_levels
+                        .fetch_add(wt.n_levels() as u64, Ordering::Relaxed);
+                    c.rnv_native_rank_probes
+                        .fetch_add((wt.n_levels() as u64) * 8, Ordering::Relaxed);
+                });
+                wt.range_next_value(r.start as usize..r.end as usize, target)
+            }
+        }
     }
 
     /// Stateful distinct-symbol enumeration over a column range (E5.7C / E5.9A).
     ///
-    /// Opens the wavelet projection once and yields sorted `(symbol, count)`
-    /// pairs with fixed O(log σ) iterator scratch. Prefer this over
-    /// repeated `range_next_value(prev+1)` for full sibling enumeration
-    /// (star / leap under a fixed prefix).
-    ///
-    /// Hard requirements: no Vec materialization, no eager collection,
-    /// 0 extra persistent bytes on the Ring.
-    ///
-    /// Note (E5.9A): short-range sequential-`get` materialize was measured and
-    /// **rejected** for star — access is ~40× LOUDS, so scan loses to wavelet
-    /// RDI with rank-all + unary collapse (~2.7× LOUDS).
+    /// On Qwt columns: opens wavelet RDI once (O(log σ) scratch).
+    /// On Huffman C_p: materializes O(σ_P) scan into a small vec (σ_P schema-sized)
+    /// and yields via [`CyclicRangeDistinctIter::HuffScan`].
     pub fn range_distinct_iter<'a>(&'a self, col: Col, r: RowRange) -> CyclicRangeDistinctIter<'a> {
         self.bump(|c| {
             c.rdi_calls.fetch_add(1, Ordering::Relaxed);
         });
-        let wt = self.col_wt(col);
-        let inner = if r.is_empty() {
-            wt.range_distinct_iter(0..0)
-        } else {
-            wt.range_distinct_iter(r.start as usize..r.end as usize)
-        };
-        CyclicRangeDistinctIter {
-            inner,
-            counters: self.counters,
-            finished: false,
+        match col {
+            Col::P => match &self.c_p {
+                PredicateColumn::Qwt(wt) => {
+                    let inner = if r.is_empty() {
+                        wt.range_distinct_iter(0..0)
+                    } else {
+                        wt.range_distinct_iter(r.start as usize..r.end as usize)
+                    };
+                    CyclicRangeDistinctIter {
+                        kind: RdiKind::Qwt { inner },
+                        counters: self.counters,
+                        finished: false,
+                    }
+                }
+                #[cfg(feature = "ring-huffman-cp")]
+                PredicateColumn::Huff(h) => {
+                    let pairs = h.range_distinct_scan(r.start, r.end);
+                    self.bump(|c| {
+                        c.rdi_rank_probes
+                            .fetch_add((h.np() as u64) * 2, Ordering::Relaxed);
+                    });
+                    CyclicRangeDistinctIter {
+                        kind: RdiKind::HuffScan { pairs, idx: 0 },
+                        counters: self.counters,
+                        finished: false,
+                    }
+                }
+            },
+            Col::O | Col::S => {
+                let wt = self.col_wt_os(col);
+                let inner = if r.is_empty() {
+                    wt.range_distinct_iter(0..0)
+                } else {
+                    wt.range_distinct_iter(r.start as usize..r.end as usize)
+                };
+                CyclicRangeDistinctIter {
+                    kind: RdiKind::Qwt { inner },
+                    counters: self.counters,
+                    finished: false,
+                }
+            }
         }
     }
 
@@ -680,6 +946,7 @@ impl CyclicRing {
         }
         n
     }
+
 
     /// `range_count`: number of symbols in `C[r]` whose value is in
     /// `[sym_lo, sym_hi]` (inclusive symbol bounds).
@@ -956,9 +1223,22 @@ pub use uring_oracle::{Orientation, OrientationCounters, URing};
 
 // ── Stateful distinct iterator wrapper (E5.7C / E5.9A) ───────────────────────
 
-/// Thin wrapper over qwt `RangeDistinctIter` that bumps Ring counters.
+enum RdiKind<'a> {
+    Qwt {
+        inner: qwt::RangeDistinctIter<'a, u32, qwt::RSQVector256, false>,
+    },
+    /// Materialized O(σ_P) scan for Huffman C_p (σ_P is schema-sized).
+    #[cfg_attr(not(feature = "ring-huffman-cp"), allow(dead_code))]
+    HuffScan {
+        pairs: Vec<(u32, u32)>,
+        idx: usize,
+    },
+}
+
+/// Thin wrapper over qwt `RangeDistinctIter` (or Huff O(σ_P) scan) that bumps
+/// Ring counters. Unified type so callers don't need to branch on substrate.
 pub struct CyclicRangeDistinctIter<'a> {
-    inner: qwt::RangeDistinctIter<'a, u32, qwt::RSQVector256, false>,
+    kind: RdiKind<'a>,
     counters: Option<&'static GlobalCounters>,
     finished: bool,
 }
@@ -967,53 +1247,87 @@ impl<'a> CyclicRangeDistinctIter<'a> {
     /// Next distinct symbol and its occurrence count in the open range.
     #[inline]
     pub fn next(&mut self) -> Option<(u32, u32)> {
-        match self.inner.next() {
-            Some((sym, cnt)) => {
-                if let Some(c) = self.counters {
-                    c.rdi_symbols.fetch_add(1, Ordering::Relaxed);
-                }
-                Some((sym, cnt as u32))
-            }
-            None => {
-                if !self.finished {
-                    self.finished = true;
+        match &mut self.kind {
+            RdiKind::Qwt { inner } => match inner.next() {
+                Some((sym, cnt)) => {
                     if let Some(c) = self.counters {
-                        c.rdi_rank_probes
-                            .fetch_add(self.inner.rank_probes, Ordering::Relaxed);
-                        c.rdi_frames_popped
-                            .fetch_add(self.inner.frames_popped, Ordering::Relaxed);
+                        c.rdi_symbols.fetch_add(1, Ordering::Relaxed);
                     }
+                    Some((sym, cnt as u32))
                 }
-                None
+                None => {
+                    if !self.finished {
+                        self.finished = true;
+                        if let Some(c) = self.counters {
+                            c.rdi_rank_probes
+                                .fetch_add(inner.rank_probes, Ordering::Relaxed);
+                            c.rdi_frames_popped
+                                .fetch_add(inner.frames_popped, Ordering::Relaxed);
+                        }
+                    }
+                    None
+                }
+            },
+            RdiKind::HuffScan { pairs, idx } => {
+                if *idx < pairs.len() {
+                    let out = pairs[*idx];
+                    *idx += 1;
+                    if let Some(c) = self.counters {
+                        c.rdi_symbols.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(out)
+                } else {
+                    self.finished = true;
+                    None
+                }
             }
         }
     }
 
-    /// Diagnostic: rank probes performed so far by the underlying DFS.
+    /// Diagnostic: rank probes performed so far by the underlying DFS (Qwt only).
     pub fn rank_probes(&self) -> u64 {
-        self.inner.rank_probes
+        match &self.kind {
+            RdiKind::Qwt { inner } => inner.rank_probes,
+            RdiKind::HuffScan { pairs, .. } => pairs.len() as u64 * 2,
+        }
     }
 
     pub fn frames_popped(&self) -> u64 {
-        self.inner.frames_popped
+        match &self.kind {
+            RdiKind::Qwt { inner } => inner.frames_popped,
+            RdiKind::HuffScan { .. } => 0,
+        }
     }
 
     pub fn empty_branches(&self) -> u64 {
-        self.inner.empty_branches
+        match &self.kind {
+            RdiKind::Qwt { inner } => inner.empty_branches,
+            RdiKind::HuffScan { .. } => 0,
+        }
     }
 
     pub fn branch_transitions(&self) -> u64 {
-        self.inner.branch_transitions
+        match &self.kind {
+            RdiKind::Qwt { inner } => inner.branch_transitions,
+            RdiKind::HuffScan { .. } => 0,
+        }
     }
 
     pub fn symbols_yielded(&self) -> u64 {
-        self.inner.symbols_yielded
+        match &self.kind {
+            RdiKind::Qwt { inner } => inner.symbols_yielded,
+            RdiKind::HuffScan { idx, .. } => *idx as u64,
+        }
     }
 
     pub fn children_pushed(&self) -> u64 {
-        self.inner.children_pushed
+        match &self.kind {
+            RdiKind::Qwt { inner } => inner.children_pushed,
+            RdiKind::HuffScan { .. } => 0,
+        }
     }
 }
+
 
 fn cumulative_a(col: &[u32], alphabet: usize) -> Vec<u32> {
     let mut a = vec![0u32; alphabet + 1];
@@ -1309,5 +1623,190 @@ mod tests {
         let u = URing::build_from_role_local(&triples, 2, 2, 3);
         assert_eq!(u.mem_bytes(), u.a.mem_bytes() + u.b.mem_bytes());
         assert_eq!(u.a.n, u.b.n);
+    }
+
+    /// Role-local tiny graph used for Qwt vs Huff C_p differential.
+    #[cfg(feature = "ring-huffman-cp")]
+    fn tiny_role() -> (Vec<[u32; 3]>, u32, u32, u32) {
+        // s∈[0,2), p∈[0,3), o∈[0,4)
+        let triples = vec![
+            [0, 0, 1],
+            [0, 0, 2],
+            [0, 1, 1],
+            [1, 0, 0],
+            [1, 1, 2],
+            [1, 2, 3],
+            [0, 2, 0],
+        ];
+        (triples, 2, 3, 4)
+    }
+
+    #[cfg(feature = "ring-huffman-cp")]
+    fn qwt_huff_pair() -> (CyclicRing, CyclicRing) {
+        let (t, ns, np, no) = tiny_role();
+        let q = CyclicRing::build_from_role_local_qwt_cp(&t, ns, np, no);
+        let h = CyclicRing::build_from_role_local_huff_cp(&t, ns, np, no);
+        assert!(!q.c_p_is_huff());
+        assert!(h.c_p_is_huff());
+        assert!(q.col_qwt(Col::P).is_some());
+        assert!(h.col_qwt(Col::P).is_none());
+        (q, h)
+    }
+
+    #[test]
+    #[cfg(feature = "ring-huffman-cp")]
+    fn huff_cp_enumerate_and_cycle_match_qwt() {
+        let (q, h) = qwt_huff_pair();
+        assert_eq!(q.n, h.n);
+        assert_eq!(q.universe, h.universe);
+        assert_eq!(q.ns, h.ns);
+        assert_eq!(q.np, h.np);
+        assert_eq!(q.no, h.no);
+
+        let mut eq = q.enumerate_spo();
+        let mut eh = h.enumerate_spo();
+        eq.sort_unstable();
+        eh.sort_unstable();
+        assert_eq!(eq, eh, "enumerate_spo multiset");
+
+        for i in 0..q.n {
+            let iq = q.f(Col::S, q.f(Col::P, q.f(Col::O, i)));
+            let ih = h.f(Col::S, h.f(Col::P, h.f(Col::O, i)));
+            assert_eq!(iq, i);
+            assert_eq!(ih, i);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ring-huffman-cp")]
+    fn huff_cp_access_rank_select_f_match_qwt() {
+        let (q, h) = qwt_huff_pair();
+        for col in [Col::O, Col::P, Col::S] {
+            for i in 0..q.n {
+                assert_eq!(q.access(col, i), h.access(col, i), "access {col:?} @{i}");
+                assert_eq!(q.f(col, i), h.f(col, i), "f {col:?} @{i}");
+                assert_eq!(
+                    q.f_inverse(col, i),
+                    h.f_inverse(col, i),
+                    "f_inv {col:?} @{i}"
+                );
+            }
+            for sym in 0..q.universe {
+                for pos in 0..=q.n {
+                    assert_eq!(
+                        q.rank(col, sym, pos),
+                        h.rank(col, sym, pos),
+                        "rank {col:?} sym={sym} pos={pos}"
+                    );
+                }
+                let total = q.rank(col, sym, q.n);
+                for occ in 0..total {
+                    assert_eq!(
+                        q.select(col, sym, occ),
+                        h.select(col, sym, occ),
+                        "select {col:?} sym={sym} occ={occ}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ring-huffman-cp")]
+    fn huff_cp_rnv_rdi_p_target_match_qwt() {
+        let (q, h) = qwt_huff_pair();
+        let n = q.n;
+        // Full + several subranges; focus Col::P (Huffman arm) but check all cols.
+        let ranges = [
+            RowRange::full(n),
+            RowRange { start: 0, end: n / 2 },
+            RowRange {
+                start: n / 3,
+                end: (2 * n) / 3,
+            },
+            RowRange::empty(),
+        ];
+        for r in ranges {
+            for col in [Col::O, Col::P, Col::S] {
+                for t in 0..q.universe + 2 {
+                    assert_eq!(
+                        q.range_next_value_native(col, r, t),
+                        h.range_next_value_native(col, r, t),
+                        "RNV {col:?} {r:?} t={t}"
+                    );
+                }
+                let mut vq = Vec::new();
+                let mut vh = Vec::new();
+                {
+                    let mut iq = q.range_distinct_iter(col, r);
+                    while let Some(x) = iq.next() {
+                        vq.push(x);
+                    }
+                }
+                {
+                    let mut ih = h.range_distinct_iter(col, r);
+                    while let Some(x) = ih.next() {
+                        vh.push(x);
+                    }
+                }
+                assert_eq!(vq, vh, "RDI {col:?} {r:?}");
+            }
+        }
+        // P-target shapes: lead_range(P) + backward_step on C_p
+        for p in q.ns..q.ns + q.np {
+            assert_eq!(q.range_p(p), h.range_p(p), "range_p {p}");
+            let full = RowRange::full(n);
+            assert_eq!(
+                q.backward_step(Col::P, full, p),
+                h.backward_step(Col::P, full, p),
+                "backward_step P p={p}"
+            );
+            // RDI/RNV on the P-lead range of C_s (after LF into POS)
+            let rp = q.range_p(p);
+            let mut t = 0u32;
+            loop {
+                let nq = q.range_next_value_native(Col::S, rp, t);
+                let nh = h.range_next_value_native(Col::S, rp, t);
+                assert_eq!(nq, nh, "P-lead RNV S p={p} t={t}");
+                match nq {
+                    None => break,
+                    Some(v) => {
+                        t = v.saturating_add(1);
+                        if t >= q.universe {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ring-huffman-cp")]
+    fn huff_cp_novarng1_flatten_hqwa() {
+        use crate::mapped_hqwt::{HQWA_MAGIC, RNG_FLAG_HUFF_CP};
+        use crate::{open_novarng1_mmap, parse_header, write_novarng1_v1};
+        let (t, ns, np, no) = tiny_role();
+        let h = CyclicRing::build_from_role_local_huff_cp(&t, ns, np, no);
+        let image = write_novarng1_v1(&h).expect("Huff C_p flattens via HQWA");
+        let hdr = parse_header(&image).unwrap();
+        assert_eq!(hdr.flags & RNG_FLAG_HUFF_CP, RNG_FLAG_HUFF_CP);
+        let cp = &image[hdr.off_cp as usize..hdr.off_cp as usize + hdr.len_cp as usize];
+        assert_eq!(&cp[0..4], HQWA_MAGIC);
+        // Explicit Qwt still flattens with flags=0
+        let q = CyclicRing::build_from_role_local_qwt_cp(&t, ns, np, no);
+        let qimg = write_novarng1_v1(&q).unwrap();
+        assert_eq!(parse_header(&qimg).unwrap().flags, 0);
+        // mmap open roundtrip
+        let dir = std::env::temp_dir().join(format!("huff_cp_flat_{}.bin", std::process::id()));
+        std::fs::write(&dir, &image).unwrap();
+        let mapped = open_novarng1_mmap(&dir).expect("open huff image");
+        let _ = std::fs::remove_file(&dir);
+        assert!(mapped.c_p_is_huff());
+        let mut heap = h.enumerate_spo();
+        let mut map = mapped.enumerate_spo().unwrap();
+        heap.sort_unstable();
+        map.sort_unstable();
+        assert_eq!(map, heap);
     }
 }

@@ -13,7 +13,7 @@
 //! results against a sorted triple-list oracle and heap↔mmap parity.
 
 
-use super::{
+use crate::{
     Col, CyclicRing, MappedRingA, MappedRingError, RowRange, open_novarng1_mmap, write_novarng1_file,
     write_novarng1_v1,
 };
@@ -132,6 +132,21 @@ impl BraidedRingIndex {
     #[inline]
     pub fn range_p(&self, p: u32) -> RowRange {
         self.lead_range(Col::P, p)
+    }
+
+    /// D1 braided two-range successor (requires mapped image).
+    ///
+    /// Product path for two subject ranges on a last column (typically Col::O).
+    pub fn intersection_next_value2(
+        &self,
+        col: Col,
+        first: RowRange,
+        second: RowRange,
+        target: u32,
+    ) -> Option<u32> {
+        self.mapped
+            .as_ref()?
+            .intersection_next_value2(col, first, second, target)
     }
 
     /// Product triangle: D2 braided three-range successor (requires mapped image).

@@ -200,6 +200,12 @@ impl HotQwtColumn {
         levels: [HotMappedLevel::EMPTY; MAX_LEVELS],
     };
 
+    /// Placeholder when MappedRingA stores Huffman C_p (no Qwt hot view).
+    #[inline]
+    pub fn empty_for_huff_placeholder() -> Self {
+        Self::EMPTY
+    }
+
     #[inline(always)]
     fn level(&self, level: usize) -> &HotMappedLevel {
         debug_assert!(level < self.n_levels);

@@ -88,13 +88,20 @@ See [`BRAIDED_RING_CLEANUP.md`](./BRAIDED_RING_CLEANUP.md):
 1. **Done:** extract winners onto clean branch `braided-ring-productize` from `main`  
 2. **Done (compat re-export):** split `nova-storage-louds` (production LOUDS) vs `nova-storage-ring` (Braided Ring + temporary re-export of LOUDS so dependents stay green)  
 3. **Done (research ballast):** archive e4x/e5x probe bins under `benches/archive/`; gate Ring B builders + URing behind `#[cfg(any(test, feature = "diagnostics"))]`; docs point LOUDS paths at `storage-louds`  
-4. **Done (ID facade + diffs):** `cyclic_ring::facade::BraidedRingIndex` (heap + optional `NOVARNG1` mmap); differentials for enumerate / lead-range / D2 vs dual_rnv + sorted-list oracle.  
+4. **Done (ID facade + diffs):** `facade::BraidedRingIndex (crate root)` (heap + optional `NOVARNG1` mmap); differentials for enumerate / lead-range / D2 vs dual_rnv + sorted-list oracle.  
 4b. **Done (ID LFTJ seam + image adapter):** `BraidedRingIndex::join_scan` → `TrieIterator`; `BraidedGraphImage` / `IdRemap` for external↔dense remap, dedup, mmap, SPO round-trip; multi-scan leapfrog + D2 differentials.  
-5. **Done (in-memory store seam):** `cyclic_ring::store::RingStore` — `Dictionary` + LOUDS-style `Delta` + per-graph `BraidedGraphImage`; `QuadStore` + `LftjSource` (LFTJ only when delta empty); insert/remove/compact/pattern/LFTJ tests. **No WAL/snapshot.** **Not** default SPARQL.
+5. **Done (in-memory store seam):** `ring_store::RingStore (crate root)` — `Dictionary` + LOUDS-style `Delta` + per-graph `BraidedGraphImage`; `QuadStore` + `LftjSource` (LFTJ only when delta empty); insert/remove/compact/pattern/LFTJ tests. **No WAL/snapshot.** **Not** default SPARQL.
 
 **Still open before SPARQL cutover:** wire `RingStore` into `nova-store` (feature-gated, non-default); WAL/persistence if needed; G1 polish if required; upstream qwt patches in parallel.
 
-**Do not** wire Braided Ring into default query until those integration gates are green.  
+**SPARQL product wire (E5.11 kernels → HTTP LFTJ):** plan in
+[`notes/e5.11-sparql-product-wire.md`](./notes/e5.11-sparql-product-wire.md)
+(W0 counters → W1 mmap on compact → W2 mapped RDI join_scan → W3 decode snapshot
+→ W4 D2 triangle → harness labels). Goal: RESULTS_MEM exercises the same
+mmap+RDI+D2 path F0 measured, without making Ring the default backend.
+
+**Do not** wire Braided Ring into default query until those integration gates are green.
+
 **Do not** redesign StarView until a measurement microbench with hard KEEP/DROP gates.
 
 

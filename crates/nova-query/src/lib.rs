@@ -18,7 +18,10 @@ pub use extensions::{
     AggregateState, CustomAggregate, CustomFunction, CustomOperator, ExtensionRegistry,
     TermFunction, Value, ValueType,
 };
-pub use lftj::{lftj_fallback_total, lftj_used_total};
+pub use lftj::{
+    collapse_counters_snapshot, lftj_fallback_total, lftj_used_total, reset_collapse_counters,
+    CollapseCounterSnapshot,
+};
 pub use options::{CancellationToken, EvalLimitError, QueryOptions};
 pub use select_vars::projected_variables;
 #[cfg(feature = "http-client")]

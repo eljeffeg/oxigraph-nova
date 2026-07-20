@@ -289,6 +289,32 @@ where
         self.n_levels
     }
 
+    /// Wavelet levels (RSQ vectors), for Nova mmap flatten (E5.9B HQWA).
+    #[must_use]
+    pub fn levels(&self) -> &[RS] {
+        &self.qvs
+    }
+
+    /// Per-level sequence lengths (`lens[level]`), needed by Huffman `get`
+    /// early-leaf termination. Same order as [`Self::levels`].
+    #[must_use]
+    pub fn level_lens(&self) -> &[usize] {
+        &self.lens
+    }
+
+    /// Encode LUT: index = symbol id, value = prefix code (len==0 ⇒ absent).
+    #[must_use]
+    pub fn codes_encode(&self) -> &[PrefixCode] {
+        &self.codes_encode
+    }
+
+    /// Decode LUT: `codes_decode[bit_len]` is sorted by code content.
+    /// Symbols are stored as `T` in the heap tree; callers flatten as needed.
+    #[must_use]
+    pub fn codes_decode(&self) -> &[Vec<(u32, T)>] {
+        &self.codes_decode
+    }
+
     /// Returns an iterator over the values in the wavelet tree.
     ///
     /// # Examples

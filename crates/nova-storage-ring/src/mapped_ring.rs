@@ -24,7 +24,7 @@
 //! [256..4096)  pad to page
 //! [page-aligned]
 //!   C_o QWTA section
-//!   C_p QWTA section
+//!   C_p QWTA section  (or HQWA when flags & RNG_FLAG_HUFF_CP)
 //!   C_s QWTA section
 //!   A_o[U+1] u32 LE  (8-byte aligned)
 //!   A_p[U+1] u32 LE
@@ -37,7 +37,7 @@
 //! |-----|--------|
 //! | 0   | magic `NOVARNG1` |
 //! | 8   | version u32 (=1) |
-//! | 12  | flags u32 (=0) |
+//! | 12  | flags u32 (bit0 = [`RNG_FLAG_HUFF_CP`] when C_p is HQWA) |
 //! | 16  | n u64 (#triples) |
 //! | 24  | universe u32 |
 //! | 28  | n_levels u16 (max of three columns; diagnostic) |
@@ -50,14 +50,25 @@
 //! | 96  | len_ao, len_ap, len_as : u64  (element counts = U+1) |
 //! | 120 | len_co, len_cp, len_cs : u64  (section byte lengths) |
 //! | 144 | reserved → 256 |
+//!
+//! Dual-format (E5.9B Phase 4, feature `ring-huffman-cp`): product default still
+//! writes QWTA C_p with `flags=0`. Huffman C_p writes an HQWA section and sets
+//! `flags |= RNG_FLAG_HUFF_CP`. Open branches on the flag (and C_p section magic).
 
-use super::mapped_qwt::{
+use crate::mapped_qwt::{
     HotQwtColumn, MappedQwtError, MappedQwtSection, MappedRangeDistinctIter, PAGE_ALIGN,
     PAGE_ALIGN_LOG2, align_up, build_qwta_section, fnv1a64,
 };
 #[cfg(any(test, feature = "diagnostics"))]
-use super::mapped_qwt::IntersectionIter3;
-use super::{Col, CyclicRing, RowRange};
+use crate::mapped_qwt::IntersectionIter3;
+#[cfg(feature = "ring-huffman-cp")]
+use crate::mapped_hqwt::{
+    HQWA_MAGIC, HotHuffColumn, MappedHqwtSection, RNG_FLAG_HUFF_CP, build_hqwa_section,
+};
+// Re-export flag constant for callers without the hqwt module path when feature is on.
+#[cfg(feature = "ring-huffman-cp")]
+pub use crate::mapped_hqwt::RNG_FLAG_HUFF_CP as NOVARNG1_FLAG_HUFF_CP;
+use crate::{Col, CyclicRing, RowRange};
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{self, Write};
@@ -67,6 +78,7 @@ use std::path::Path;
 pub const NOVARNG1_MAGIC: &[u8; 8] = b"NOVARNG1";
 pub const RNG_FORMAT_VERSION: u32 = 1;
 pub const RNG_HEADER_SIZE: usize = 256;
+
 
 /// Errors opening or writing a `NOVARNG1` image.
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +102,8 @@ pub enum MappedRingError {
 /// Parsed header directory (offsets into the image).
 #[derive(Clone, Copy, Debug)]
 pub struct Novarng1Header {
+    /// Header flags (bit0 = Huffman C_p / HQWA when feature enabled).
+    pub flags: u32,
     pub n: u64,
     pub universe: u32,
     pub n_levels: u16,
@@ -120,8 +134,14 @@ pub struct MappedRingA {
     mmap: Mmap,
     /// Open-time hot views (pointers alias `mmap`); built once at open.
     hot_o: HotQwtColumn,
+    /// Qwt C_p hot view. Present when C_p is QWTA (product default).
     hot_p: HotQwtColumn,
+    /// Huffman C_p hot view. Present when header flag RNG_FLAG_HUFF_CP is set.
+    #[cfg(feature = "ring-huffman-cp")]
+    hot_p_huff: Option<HotHuffColumn>,
     hot_s: HotQwtColumn,
+    /// Header flags (mirrors NOVARNG1 header).
+    pub flags: u32,
     pub n: u32,
     pub universe: u32,
     /// Diagnostic: max n_levels among columns (from header).
@@ -155,7 +175,7 @@ impl MappedRingA {
     }
 
     #[inline]
-    pub fn col_qwt(&self, col: Col) -> Result<MappedQwtSection<'_>, MappedRingError> {
+    fn col_section_bytes(&self, col: Col) -> Result<&[u8], MappedRingError> {
         let (off, len) = match col {
             Col::O => (self.off_co, self.len_co),
             Col::P => (self.off_cp, self.len_cp),
@@ -167,10 +187,46 @@ impl MappedRingA {
         if end > self.mmap.len() {
             return Err(MappedRingError::Layout("col OOB"));
         }
-        Ok(MappedQwtSection::open(&self.mmap[off..end])?)
+        Ok(&self.mmap[off..end])
     }
 
-    /// Open-time hot column for `col` (E5.11 B1). Pointers alias the mmap.
+    /// Open a QWTA section view. For `Col::P` fails when the image stores HQWA.
+    #[inline]
+    pub fn col_qwt(&self, col: Col) -> Result<MappedQwtSection<'_>, MappedRingError> {
+        if col == Col::P && self.c_p_is_huff() {
+            return Err(MappedRingError::Layout("C_p is HQWA (Huffman), not QWTA"));
+        }
+        Ok(MappedQwtSection::open(self.col_section_bytes(col)?)?)
+    }
+
+    /// Open HQWA C_p section when the image is Huffman-encoded.
+    #[cfg(feature = "ring-huffman-cp")]
+    #[inline]
+    pub fn col_hqwt_p(&self) -> Result<MappedHqwtSection<'_>, MappedRingError> {
+        if !self.c_p_is_huff() {
+            return Err(MappedRingError::Layout("C_p is QWTA, not HQWA"));
+        }
+        Ok(MappedHqwtSection::open(self.col_section_bytes(Col::P)?)?)
+    }
+
+    /// Whether this image stores Huffman C_p (HQWA section).
+    #[inline]
+    pub fn c_p_is_huff(&self) -> bool {
+        #[cfg(feature = "ring-huffman-cp")]
+        {
+            self.hot_p_huff.is_some() || (self.flags & RNG_FLAG_HUFF_CP) != 0
+        }
+        #[cfg(not(feature = "ring-huffman-cp"))]
+        {
+            false
+        }
+    }
+
+    /// Open-time Qwt hot column for `col` (E5.11 B1).
+    ///
+    /// For `Col::P` on a Huffman image this returns a dummy empty hot column;
+    /// use [`Self::access`] / [`Self::rank`] / [`Self::range_next_value`] which
+    /// dispatch correctly, or [`Self::col_hot_p_huff`].
     #[inline(always)]
     pub fn col_hot(&self, col: Col) -> &HotQwtColumn {
         match col {
@@ -178,6 +234,13 @@ impl MappedRingA {
             Col::P => &self.hot_p,
             Col::S => &self.hot_s,
         }
+    }
+
+    /// Huffman C_p hot view when present.
+    #[cfg(feature = "ring-huffman-cp")]
+    #[inline(always)]
+    pub fn col_hot_p_huff(&self) -> Option<&HotHuffColumn> {
+        self.hot_p_huff.as_ref()
     }
 
     #[inline]
@@ -193,18 +256,32 @@ impl MappedRingA {
     /// `access(column, position)` — `C[i]` via open-time hot column.
     #[inline]
     pub fn access(&self, col: Col, pos: u32) -> Option<u32> {
+        #[cfg(feature = "ring-huffman-cp")]
+        if col == Col::P {
+            if let Some(h) = self.hot_p_huff.as_ref() {
+                return h.get(pos as usize);
+            }
+        }
         self.col_hot(col).get(pos as usize)
     }
 
     /// Level-local rank of 2-bit symbol `b` on `col` at wavelet `level`.
+    /// Not meaningful for Huffman C_p (variable-depth codes); returns `None`.
     #[inline]
     pub fn rank_level(&self, col: Col, level: usize, b: u8, i: usize) -> Option<usize> {
+        if col == Col::P && self.c_p_is_huff() {
+            return None;
+        }
         self.col_hot(col).rank_level(level, b, i)
     }
 
     /// Level-local rank-all-4 on `col` at wavelet `level`.
+    /// Not meaningful for Huffman C_p; returns `None`.
     #[inline]
     pub fn rank_all_level(&self, col: Col, level: usize, i: usize) -> Option<[usize; 4]> {
+        if col == Col::P && self.c_p_is_huff() {
+            return None;
+        }
         self.col_hot(col).rank_all_level(level, i)
     }
 
@@ -220,6 +297,12 @@ impl MappedRingA {
     /// Full-symbol `rank(col, symbol, position)` — # of `symbol` in `[0, position)`.
     #[inline]
     pub fn rank(&self, col: Col, symbol: u32, position: u32) -> Option<u32> {
+        #[cfg(feature = "ring-huffman-cp")]
+        if col == Col::P {
+            if let Some(h) = self.hot_p_huff.as_ref() {
+                return h.rank(symbol, position as usize).map(|r| r as u32);
+            }
+        }
         self.col_hot(col)
             .rank(symbol, position as usize)
             .map(|r| r as u32)
@@ -228,6 +311,16 @@ impl MappedRingA {
     /// Full-symbol `select(col, symbol, occurrence)` — 0-based occurrence position.
     #[inline]
     pub fn select(&self, col: Col, symbol: u32, occurrence: u32) -> Option<u32> {
+        #[cfg(feature = "ring-huffman-cp")]
+        if col == Col::P {
+            if self.c_p_is_huff() {
+                return self
+                    .col_hqwt_p()
+                    .ok()?
+                    .select_shared(symbol, occurrence as usize)
+                    .map(|p| p as u32);
+            }
+        }
         self.col_qwt(col)
             .ok()?
             .select(symbol, occurrence as usize)
@@ -289,10 +382,17 @@ impl MappedRingA {
     // ── W3: native RNV + fixed-stack RDI ──────────────────────────────────
 
     /// Native guided `range_next_value` on column `col` (open-time hot path).
+    /// Huffman C_p uses O(σ_P) numeric scan (same as heap HuffColP).
     #[inline]
     pub fn range_next_value(&self, col: Col, r: RowRange, target: u32) -> Option<u32> {
         if r.is_empty() {
             return None;
+        }
+        #[cfg(feature = "ring-huffman-cp")]
+        if col == Col::P {
+            if let Some(h) = self.hot_p_huff.as_ref() {
+                return h.range_next_value_scan(r.start as usize..r.end as usize, target);
+            }
         }
         self.col_hot(col)
             .range_next_value(r.start as usize..r.end as usize, target)
@@ -312,6 +412,10 @@ impl MappedRingA {
     ) -> Option<u32> {
         if left.is_empty() || right.is_empty() {
             return None;
+        }
+        // Huffman C_p has no balanced 4-ary braid; dual-RNV leapfrog is correct.
+        if col == Col::P && self.c_p_is_huff() {
+            return self.intersection_next_value2_dual_rnv(col, left, right, target);
         }
         self.col_hot(col).intersection_next_value2(
             left.start as usize..left.end as usize,
@@ -352,11 +456,16 @@ impl MappedRingA {
         if left.is_empty() || right.is_empty() {
             return None;
         }
-        self.col_hot(col).intersection_next_value2_dual_rnv(
-            left.start as usize..left.end as usize,
-            right.start as usize..right.end as usize,
-            target,
-        )
+        // Implement via MappedRingA::range_next_value so Huffman C_p dispatches.
+        let mut t = target;
+        loop {
+            let a = self.range_next_value(col, left, t)?;
+            let b = self.range_next_value(col, right, a)?;
+            if b == a {
+                return Some(a);
+            }
+            t = b;
+        }
     }
 
     /// E5.11 D2: braided three-range intersection successor on `col`.
@@ -375,6 +484,9 @@ impl MappedRingA {
     ) -> Option<u32> {
         if first.is_empty() || second.is_empty() || third.is_empty() {
             return None;
+        }
+        if col == Col::P && self.c_p_is_huff() {
+            return self.intersection_next_value3_dual_rnv(col, first, second, third, target);
         }
         self.col_hot(col).intersection_next_value3(
             first.start as usize..first.end as usize,
@@ -537,29 +649,46 @@ impl MappedRingA {
         if first.is_empty() || second.is_empty() || third.is_empty() {
             return None;
         }
-        self.col_hot(col).intersection_next_value3_dual_rnv(
-            first.start as usize..first.end as usize,
-            second.start as usize..second.end as usize,
-            third.start as usize..third.end as usize,
-            target,
-        )
+        let mut t = target;
+        loop {
+            let a = self.range_next_value(col, first, t)?;
+            let b = self.range_next_value(col, second, a)?;
+            let c = self.range_next_value(col, third, b)?;
+            if c == a && b == a {
+                return Some(a);
+            }
+            t = c;
+        }
     }
 
-    /// Fixed-stack ordered distinct-symbol iterator on column `col`.
-
-    /// Uses the open-time hot column (E5.11 B1). Lifetime is tied to the
-    /// owning mmap (`self`).
+    /// Ordered distinct-symbol iterator on column `col`.
+    ///
+    /// Qwt columns use the fixed-stack mapped RDI (E5.11 B1). Huffman C_p uses
+    /// an O(σ_P) numeric scan materialised once (schema-sized).
     #[inline]
     pub fn range_distinct_iter(
         &self,
         col: Col,
         r: RowRange,
-    ) -> Option<MappedRangeDistinctIter<'_>> {
-        let hot = self.col_hot(col);
-        if r.is_empty() {
-            return Some(hot.range_distinct_iter(0..0));
+    ) -> Option<MappedColDistinctIter<'_>> {
+        #[cfg(feature = "ring-huffman-cp")]
+        if col == Col::P {
+            if let Some(h) = self.hot_p_huff.as_ref() {
+                let pairs = if r.is_empty() {
+                    Vec::new()
+                } else {
+                    h.range_distinct_scan(r.start as usize..r.end as usize)
+                };
+                return Some(MappedColDistinctIter::HuffScan { pairs, idx: 0 });
+            }
         }
-        Some(hot.range_distinct_iter(r.start as usize..r.end as usize))
+        let hot = self.col_hot(col);
+        let it = if r.is_empty() {
+            hot.range_distinct_iter(0..0)
+        } else {
+            hot.range_distinct_iter(r.start as usize..r.end as usize)
+        };
+        Some(MappedColDistinctIter::Qwt(it))
     }
 
     /// Count distinct symbols in range via RDI (diagnostic / gate).
@@ -612,17 +741,80 @@ impl MappedRingA {
     }
 }
 
+/// Column-agnostic mapped distinct iterator (Qwt RDI or Huffman O(σ_P) scan).
+pub enum MappedColDistinctIter<'a> {
+    Qwt(MappedRangeDistinctIter<'a>),
+    #[cfg(feature = "ring-huffman-cp")]
+    HuffScan {
+        pairs: Vec<(u32, u32)>,
+        idx: usize,
+    },
+}
+
+impl MappedColDistinctIter<'_> {
+    /// Next distinct symbol and its occurrence count in the range.
+    #[inline]
+    pub fn next_symbol(&mut self) -> Option<(u32, usize)> {
+        match self {
+            Self::Qwt(it) => it.next_symbol(),
+            #[cfg(feature = "ring-huffman-cp")]
+            Self::HuffScan { pairs, idx } => {
+                if *idx >= pairs.len() {
+                    return None;
+                }
+                let (s, c) = pairs[*idx];
+                *idx += 1;
+                Some((s, c as usize))
+            }
+        }
+    }
+}
+
 // ── write ───────────────────────────────────────────────────────────────────
 
 /// Flatten a pilot [`CyclicRing`] into a `NOVARNG1` image (owned bytes).
+///
+/// Product default: three QWTA sections, `flags = 0`.
+/// With `ring-huffman-cp`, a Huffman C_p ring writes an HQWA C_p section and
+/// sets `flags |= RNG_FLAG_HUFF_CP`.
 pub fn write_novarng1_v1(ring: &CyclicRing) -> Result<Vec<u8>, MappedRingError> {
     if !cfg!(target_endian = "little") {
         return Err(MappedRingError::NotLittleEndian);
     }
 
-    let sec_o = build_qwta_section(ring.col_qwt(Col::O))?;
-    let sec_p = build_qwta_section(ring.col_qwt(Col::P))?;
-    let sec_s = build_qwta_section(ring.col_qwt(Col::S))?;
+    let sec_o = build_qwta_section(
+        ring.col_qwt(Col::O)
+            .ok_or(MappedRingError::Layout("C_o QWT missing"))?,
+    )?;
+    let sec_s = build_qwta_section(
+        ring.col_qwt(Col::S)
+            .ok_or(MappedRingError::Layout("C_s QWT missing"))?,
+    )?;
+
+    #[cfg(feature = "ring-huffman-cp")]
+    let (sec_p, flags): (Vec<u8>, u32) = if ring.c_p_is_huff() {
+        let h = ring
+            .c_p_substrate()
+            .as_huff()
+            .ok_or(MappedRingError::Layout("C_p Huff arm missing"))?;
+        let sec = build_hqwa_section(h.wt(), h.local_to_shared())?;
+        (sec, RNG_FLAG_HUFF_CP)
+    } else {
+        let sec = build_qwta_section(
+            ring.col_qwt(Col::P)
+                .ok_or(MappedRingError::Layout("C_p QWT missing"))?,
+        )?;
+        (sec, 0)
+    };
+    #[cfg(not(feature = "ring-huffman-cp"))]
+    let (sec_p, flags): (Vec<u8>, u32) = {
+        let sec = build_qwta_section(
+            ring.col_qwt(Col::P).ok_or(MappedRingError::Layout(
+                "C_p is Huffman substrate; rebuild with ring-huffman-cp for HQWA, or use Qwt C_p",
+            ))?,
+        )?;
+        (sec, 0)
+    };
 
     let a_o = ring.col_a_slice(Col::O);
     let a_p = ring.col_a_slice(Col::P);
@@ -631,16 +823,27 @@ pub fn write_novarng1_v1(ring: &CyclicRing) -> Result<Vec<u8>, MappedRingError> 
     debug_assert_eq!(a_p.len(), a_o.len());
     debug_assert_eq!(a_s.len(), a_o.len());
 
-    let n_levels = [
-        ring.col_qwt(Col::O).n_levels(),
-        ring.col_qwt(Col::P).n_levels(),
-        ring.col_qwt(Col::S).n_levels(),
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(0) as u16;
+    // Diagnostic n_levels: max among Qwt columns (Huff C_p contributes 0).
+    let n_levels = {
+        let mut m = 0usize;
+        if let Some(w) = ring.col_qwt(Col::O) {
+            m = m.max(w.n_levels());
+        }
+        if let Some(w) = ring.col_qwt(Col::P) {
+            m = m.max(w.n_levels());
+        } else {
+            #[cfg(feature = "ring-huffman-cp")]
+            if let Some(h) = ring.c_p_substrate().as_huff() {
+                m = m.max(h.wt().n_levels());
+            }
+        }
+        if let Some(w) = ring.col_qwt(Col::S) {
+            m = m.max(w.n_levels());
+        }
+        m as u16
+    };
 
-    // Layout after 4 KiB header pad: three page-aligned QWT sections, then A.
+    // Layout after 4 KiB header pad: three page-aligned sections, then A.
     let mut cur = PAGE_ALIGN;
     let off_co = cur;
     cur += sec_o.len();
@@ -667,7 +870,7 @@ pub fn write_novarng1_v1(ring: &CyclicRing) -> Result<Vec<u8>, MappedRingError> 
     // Header (256 B)
     buf[0..8].copy_from_slice(NOVARNG1_MAGIC);
     buf[8..12].copy_from_slice(&RNG_FORMAT_VERSION.to_le_bytes());
-    // flags = 0
+    buf[12..16].copy_from_slice(&flags.to_le_bytes());
     buf[16..24].copy_from_slice(&(ring.n as u64).to_le_bytes());
     buf[24..28].copy_from_slice(&ring.universe.to_le_bytes());
     buf[28..30].copy_from_slice(&n_levels.to_le_bytes());
@@ -732,14 +935,47 @@ pub fn open_novarng1_from_mmap(mmap: Mmap) -> Result<MappedRingA, MappedRingErro
     let h = parse_header(&mmap)?;
     validate_directory(&mmap, &h)?;
 
-    // Open QWT sections once: validate magic/dir + build E5.11 B1 hot columns
-    // (raw pointers into the mmap; image bytes unchanged).
+    // Open O/S QWT sections once: validate magic/dir + build E5.11 B1 hot columns.
     let sec_o = MappedQwtSection::open(slice_range(&mmap, h.off_co, h.len_co)?)?;
-    let sec_p = MappedQwtSection::open(slice_range(&mmap, h.off_cp, h.len_cp)?)?;
     let sec_s = MappedQwtSection::open(slice_range(&mmap, h.off_cs, h.len_cs)?)?;
     let hot_o = sec_o.build_hot()?;
-    let hot_p = sec_p.build_hot()?;
     let hot_s = sec_s.build_hot()?;
+
+    // C_p: QWTA (default) or HQWA when flags bit0 set (feature ring-huffman-cp).
+    let cp_bytes = slice_range(&mmap, h.off_cp, h.len_cp)?;
+    #[cfg(feature = "ring-huffman-cp")]
+    let (hot_p, hot_p_huff) = {
+        let want_huff = (h.flags & RNG_FLAG_HUFF_CP) != 0;
+        if want_huff {
+            if cp_bytes.len() < 4 || &cp_bytes[0..4] != HQWA_MAGIC {
+                return Err(MappedRingError::Layout(
+                    "flags request HQWA C_p but section magic is not HQWA",
+                ));
+            }
+            let sec_p = MappedHqwtSection::open(cp_bytes)?;
+            let hot_h = sec_p.build_hot()?;
+            // Keep a dummy empty Qwt hot_p so col_hot(Col::P) stays safe.
+            (HotQwtColumn::empty_for_huff_placeholder(), Some(hot_h))
+        } else {
+            if cp_bytes.len() >= 4 && &cp_bytes[0..4] == HQWA_MAGIC {
+                return Err(MappedRingError::Layout(
+                    "C_p section is HQWA but RNG_FLAG_HUFF_CP not set",
+                ));
+            }
+            let sec_p = MappedQwtSection::open(cp_bytes)?;
+            (sec_p.build_hot()?, None)
+        }
+    };
+    #[cfg(not(feature = "ring-huffman-cp"))]
+    let hot_p = {
+        if (h.flags & 1) != 0 {
+            return Err(MappedRingError::Layout(
+                "image has Huffman C_p (RNG_FLAG_HUFF_CP); rebuild with ring-huffman-cp",
+            ));
+        }
+        let sec_p = MappedQwtSection::open(cp_bytes)?;
+        sec_p.build_hot()?
+    };
 
     // Bounds-check A arrays only (align + length).
     let _ = cast_u32_slice(&mmap, h.off_ao as usize, h.len_ao as usize)?;
@@ -757,7 +993,10 @@ pub fn open_novarng1_from_mmap(mmap: Mmap) -> Result<MappedRingA, MappedRingErro
         mmap,
         hot_o,
         hot_p,
+        #[cfg(feature = "ring-huffman-cp")]
+        hot_p_huff,
         hot_s,
+        flags: h.flags,
         n: h.n as u32,
         universe: h.universe,
         n_levels: h.n_levels,
@@ -797,6 +1036,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<Novarng1Header, MappedRingError> {
         return Err(MappedRingError::HeaderChecksum);
     }
     Ok(Novarng1Header {
+        flags: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
         n: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
         universe: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
         n_levels: u16::from_le_bytes(bytes[28..30].try_into().unwrap()),
@@ -897,13 +1137,14 @@ fn cast_u32_slice(bytes: &[u8], off: usize, n: usize) -> Result<&[u32], MappedRi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cyclic_ring::CyclicRing;
+    use crate::CyclicRing;
     use qwt::{AccessUnsigned, RankQuad};
     use std::io::Write;
 
     fn tiny_ring() -> CyclicRing {
         let triples = vec![[0, 0, 1], [0, 0, 2], [0, 1, 1], [1, 0, 0], [1, 1, 2]];
-        CyclicRing::build_shared(&triples, 3)
+        // W1–W4 tests cover QWTA path; force Qwt C_p.
+        CyclicRing::build_shared_qwt_cp(&triples, 3)
     }
 
     #[test]
@@ -929,7 +1170,7 @@ mod tests {
 
         // Access differential all columns
         for col in [Col::O, Col::P, Col::S] {
-            let heap = ring.col_qwt(col);
+            let heap = ring.col_qwt(col).expect("Qwt C_p for NOVARNG1 tests");
             for i in 0..ring.n {
                 assert_eq!(
                     mapped.access(col, i),
@@ -948,7 +1189,7 @@ mod tests {
 
         // Level-local rank_all
         for col in [Col::O, Col::P, Col::S] {
-            let heap = ring.col_qwt(col);
+            let heap = ring.col_qwt(col).expect("Qwt C_p for NOVARNG1 tests");
             let levels = heap.levels();
             for level in 0..heap.n_levels() {
                 let h = &levels[level];
@@ -1141,4 +1382,111 @@ mod tests {
             assert_eq!(mapped.range_s(s), Some(ring.range_s(s)));
         }
     }
+
+    #[test]
+    #[cfg(feature = "ring-huffman-cp")]
+    fn huff_cp_novarng1_roundtrip_vs_heap() {
+        // Role-local tiny graph (matches cyclic::tests::tiny_role shape).
+        let triples = vec![
+            [0, 0, 0],
+            [0, 0, 1],
+            [0, 1, 2],
+            [1, 0, 1],
+            [1, 2, 3],
+            [1, 1, 0],
+        ];
+        let ns = 2u32;
+        let np = 3u32;
+        let no = 4u32;
+        let ring = CyclicRing::build_from_role_local_huff_cp(&triples, ns, np, no);
+        assert!(ring.c_p_is_huff());
+
+        let image = write_novarng1_v1(&ring).expect("huff flatten");
+        let h = parse_header(&image).unwrap();
+        assert_eq!(h.flags & RNG_FLAG_HUFF_CP, RNG_FLAG_HUFF_CP);
+        let cp = &image[h.off_cp as usize..h.off_cp as usize + h.len_cp as usize];
+        assert_eq!(&cp[0..4], HQWA_MAGIC);
+
+        let dir = std::env::temp_dir().join(format!("novarng1_huff_{}.bin", std::process::id()));
+        std::fs::write(&dir, &image).unwrap();
+        let mapped = open_novarng1_mmap(&dir).expect("mmap open huff");
+        let _ = std::fs::remove_file(&dir);
+
+        assert!(mapped.c_p_is_huff());
+        assert_eq!(mapped.n, ring.n);
+        assert_eq!(mapped.universe, ring.universe);
+
+        for col in [Col::O, Col::P, Col::S] {
+            for i in 0..ring.n {
+                assert_eq!(
+                    mapped.access(col, i),
+                    Some(ring.access(col, i)),
+                    "access {col:?} @{i}"
+                );
+            }
+            for i in 0..=ring.n {
+                for sym in 0..ring.universe.min(16) {
+                    assert_eq!(
+                        mapped.rank(col, sym, i),
+                        Some(ring.rank(col, sym, i)),
+                        "rank {col:?} sym={sym} i={i}"
+                    );
+                }
+            }
+            for sym in 0..ring.universe {
+                let total = ring.rank(col, sym, ring.n);
+                for occ in 0..total.min(3) {
+                    assert_eq!(
+                        mapped.select(col, sym, occ),
+                        ring.select(col, sym, occ),
+                        "select {col:?} sym={sym} occ={occ}"
+                    );
+                }
+            }
+            for i in 0..ring.n {
+                let f_m = mapped.f(col, i).expect("f");
+                let f_h = ring.f(col, i);
+                assert_eq!(f_m, f_h, "f {col:?} i={i}");
+                assert_eq!(
+                    mapped.f_inverse(col, f_m),
+                    Some(ring.f_inverse(col, f_h)),
+                    "f_inv {col:?} i'={f_m}"
+                );
+            }
+        }
+
+        let full = RowRange::full(ring.n);
+        for col in [Col::O, Col::P, Col::S] {
+            for tgt in 0..ring.universe + 2 {
+                assert_eq!(
+                    mapped.range_next_value(col, full, tgt),
+                    ring.range_next_value_native(col, full, tgt),
+                    "RNV {col:?} t={tgt}"
+                );
+            }
+            let mut map_it = mapped.range_distinct_iter(col, full).unwrap();
+            let mut heap_it = ring.range_distinct_iter(col, full);
+            loop {
+                let m = map_it.next_symbol().map(|(s, c)| (s, c as u32));
+                let hv = heap_it.next();
+                assert_eq!(m, hv, "RDI {col:?}");
+                if m.is_none() {
+                    break;
+                }
+            }
+        }
+
+        let mut heap = ring.enumerate_spo();
+        let mut mapv = mapped.enumerate_spo().expect("enum");
+        heap.sort_unstable();
+        mapv.sort_unstable();
+        assert_eq!(mapv, heap);
+
+        // Qwt image still opens with flags=0
+        let q = CyclicRing::build_from_role_local_qwt_cp(&triples, ns, np, no);
+        let qimg = write_novarng1_v1(&q).unwrap();
+        let qh = parse_header(&qimg).unwrap();
+        assert_eq!(qh.flags, 0);
+    }
+
 }

@@ -15,7 +15,17 @@ fulltext     = ["oxigraph-nova-storage-louds/fulltext"]
 # for the Braided Ring pilot.
 diagnostics  = []
 # Braided Ring pilot: cyclic QWT + NOVARNG1 + D2. Not on LoudsStore SPARQL path.
-cyclic-ring-pilot = ["dep:qwt", "dep:memmap2"]
+# Huffman C_p is the product default when the pilot is enabled.
+cyclic-ring-pilot = ["dep:qwt", "dep:memmap2", "ring-huffman-cp"]
+# E5.9B Phase 2 (research/notes/e5.9b-qwt-substrate-matrix.md §7/§8): in-memory
+# column-local Huffman prototype for C_p only, with an O(σ_P) linear-scan
+# RDI/RNV fallback (cheap because σ_P is schema-sized, unlike C_o/C_s where
+# σ≈U makes O(σ) prohibitive). Not wired into CyclicRing/product path — a
+# standalone differentially-tested column substrate for feasibility only.
+# Pure cfg flag (no extra deps). Enabled by `cyclic-ring-pilot`.
+# Kept so benches/gates can name the Huffman substrate feature explicitly.
+ring-huffman-cp = []
+
 # Forwarded to LOUDS + common + core for LoudsStore::open / snapshot mmap path.
 # Disabled (via `default-features = false`) for the wasm32 build
 # (`oxigraph-nova-js`), which is in-memory-only and never calls
@@ -31,15 +41,20 @@ oxigraph-nova-storage-louds = { path = "../nova-storage-louds", default-features
 # (cyclic-ring-pilot only; not default SPARQL cutover).
 oxigraph-nova-core = { path = "../nova-core", default-features = false }
 
-# Used by cyclic_ring mmap error types (`MappedQwtError` / `MappedRingError`).
+# Used by Ring mmap error types (`MappedQwtError` / `MappedRingError`).
 thiserror = { workspace = true }
 
 # RingStore Mutex (Phase 5). Same lock style as LOUDS LoudsStore.
 parking_lot = { workspace = true }
 
 # Braided Ring substrate (optional; feature `cyclic-ring-pilot`).
-qwt     = { version = "0.4.0", optional = true }
+# Version must match vendor/qwt/Cargo.toml so [patch.crates-io] actually
+# applies (semver mismatch silently demotes the patch to [patch.unused] and
+# falls back to a real crates.io 0.4.0 lacking DataLine/SuperblockPlain/
+# range_next_value/range_distinct_iter — see research/notes/e5.9b-*.md).
+qwt     = { version = "0.5.0", optional = true }
 memmap2 = { version = "0.9", optional = true }
+
 
 
 

@@ -584,7 +584,7 @@ async fn run_ring(
     union_default_graph: bool,
     fulltext: bool,
 ) {
-    use oxigraph_nova_storage_ring::cyclic_ring::RingStore;
+    use oxigraph_nova_storage_ring::RingStore;
 
     if location.is_some() {
         panic!(

@@ -131,6 +131,27 @@ pub trait LftjSource: Send + Sync {
     fn lftj_has_delta(&self) -> bool {
         false
     }
+
+    /// Optional multi-subject object intersection (W4b / braided D1–D2).
+    ///
+    /// When LFTJ would open ≥2 leapfrog scans that all iterate **objects** under
+    /// distinct bound subjects (triangle closing edge / product G3 shape), the
+    /// engine may call this once instead of N independent `lftj_join_scan`s.
+    ///
+    /// `subjects`: external TermIds of the bound subjects (length ≥ 2).
+    /// `predicate`: optional bound predicate TermId shared by all patterns.
+    /// `graph_id`: internal graph id (0 = default).
+    ///
+    /// Default: `None` → engine keeps ordinary multi-scan leapfrog (LOUDS).
+    /// RingStore returns a D1 (2-way) or D2 (3-way) streaming iterator.
+    fn lftj_multi_subject_object_intersect(
+        &self,
+        _subjects: &[u64],
+        _predicate: Option<u64>,
+        _graph_id: u8,
+    ) -> Option<Box<dyn crate::trie::TrieIterator>> {
+        None
+    }
 }
 
 /// A single write operation for batch/transactional application via

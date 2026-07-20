@@ -10,9 +10,12 @@ publish      = false
 [features]
 default  = []
 # Braided Ring pilot (cyclic QWT / NOVARNG1 / D2).
-cyclic-ring-pilot = ["oxigraph-nova-storage-ring/cyclic-ring-pilot"]
+cyclic-ring-pilot = ["oxigraph-nova-storage-ring/cyclic-ring-pilot", "dep:qwt"]
 # DROP-branch matrices for e511 --full-campaign.
 diagnostics = ["oxigraph-nova-storage-ring/diagnostics"]
+# E5.9B Phase 2: standalone column-local Huffman C_p prototype (HuffColP).
+ring-huffman-cp = ["oxigraph-nova-storage-ring/ring-huffman-cp", "cyclic-ring-pilot"]
+
 
 # ── Runtime deps (needed by both [[bench]] and [[example]] targets) ──────────
 
@@ -20,7 +23,7 @@ diagnostics = ["oxigraph-nova-storage-ring/diagnostics"]
 oxigraph-nova-core           = { path = "../crates/nova-core" }
 oxigraph-nova-query          = { path = "../crates/nova-query" }
 oxigraph-nova-storage-memory = { path = "../crates/nova-storage-memory" }
-oxigraph-nova-storage-ring   = { path = "../crates/nova-storage-ring" }
+oxigraph-nova-storage-ring   = { path = "../crates/nova-storage-ring", features = ["cyclic-ring-pilot"] }
 oxrdf                   = { workspace = true }
 oxttl                   = { workspace = true }   # N-Triples parsing for optional BSBM file load
 spargebra               = { workspace = true }
@@ -28,6 +31,13 @@ anyhow                  = { workspace = true }
 serde                   = { workspace = true }
 serde_json              = { workspace = true }
 mimalloc = "0.1.52"
+sparesults = { workspace = true }
+# Optional direct qwt dependency for E5.9B research harnesses that compare
+# QWT256/HQWT256 directly (hqwt_vs_qwt_fair, e59b_hqwt_feasibility,
+# e59b_huffcolp_prototype). Version must match vendor/qwt/Cargo.toml so the
+# root [patch.crates-io] actually applies (see nova-storage-ring/Cargo.toml).
+qwt = { version = "0.5.0", optional = true }
+
 
 
 # ── Benchmark harness ────────────────────────────────────────────────────────
@@ -50,3 +60,56 @@ harness = false
 # ── Example: memory footprint estimator ─────────────────────────────────────
 [[example]]
 name = "memory_report"
+
+# Phase 2: staged scan cost breakdown (A–E) vs LOUDS, RESULTS_MEM-shaped.
+[[bin]]
+name = "phase2_scan_cost"
+path = "src/bin/phase2_scan_cost.rs"
+
+# Phase J1: join execution census (2join/star/path/triangle + VEO matrix).
+[[bin]]
+name = "phase_j1_join_census"
+path = "src/bin/phase_j1_join_census.rs"
+
+# Phase J: path_2hop forced-order + triangle D2 reachability ladder.
+[[bin]]
+name = "phase_j_path_triangle_census"
+path = "src/bin/phase_j_path_triangle_census.rs"
+
+# Phase K0: decode vs LFTJ-leapfrog cost split for path_2hop.
+[[bin]]
+name = "phase_k0_decode_profile"
+path = "src/bin/phase_k0_decode_profile.rs"
+
+# E5.9B: fair HQWT256 vs QWT256 point-op + Ring-op re-benchmark.
+[[bin]]
+name = "hqwt_vs_qwt_fair"
+path = "src/bin/hqwt_vs_qwt_fair.rs"
+required-features = ["cyclic-ring-pilot"]
+
+# E5.9B Phase 1: structural HQWT feasibility gate (ordered RDI / numeric RNV).
+[[bin]]
+name = "e59b_hqwt_feasibility"
+path = "src/bin/e59b_hqwt_feasibility.rs"
+required-features = ["cyclic-ring-pilot"]
+
+# E5.9B Phase 1: Col::P RDI/RNV primitive-usage audit.
+[[bin]]
+name = "e59b_colp_usage_audit"
+path = "src/bin/e59b_colp_usage_audit.rs"
+required-features = ["cyclic-ring-pilot"]
+
+# E5.9B Phase 2: HuffColP standalone prototype bytes/RDI/RNV benchmark.
+[[bin]]
+name = "e59b_huffcolp_prototype"
+path = "src/bin/e59b_huffcolp_prototype.rs"
+required-features = ["ring-huffman-cp"]
+
+# E5.9B Phase 3: CyclicRing PredicateColumn::Huff C_p end-to-end gates.
+[[bin]]
+name = "e59b_huff_cp_ring_gate"
+path = "src/bin/e59b_huff_cp_ring_gate.rs"
+required-features = ["ring-huffman-cp"]
+
+
+

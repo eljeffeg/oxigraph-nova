@@ -109,6 +109,79 @@ pub fn lftj_fallback_total() -> u64 {
     LFTJ_FALLBACK.load(Ordering::Relaxed)
 }
 
+// ── W4b multi-subject object collapse diagnostics (process-wide) ─────────────
+//
+// These counters answer "why did D2 never fire on triangle?" without requiring
+// a full SPARQL hang. Reset via [`reset_collapse_counters`].
+
+static TRIANGLE_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_REJECT_PATTERN: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_REJECT_BINDING_STATE: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_REJECT_COLUMN: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_REJECT_PRED: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_REJECT_SUBJECTS: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_DATASET_NONE: AtomicU64 = AtomicU64::new(0);
+static COLLAPSE_SUCCESS: AtomicU64 = AtomicU64::new(0);
+static LFTJ_DEPTH_ENTER: AtomicU64 = AtomicU64::new(0);
+static LFTJ_DEPTH_LEAF: AtomicU64 = AtomicU64::new(0);
+static LFTJ_SCAN_OPEN: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of W4b collapse / LFTJ depth counters for diagnostics harnesses.
+#[derive(Clone, Debug, Default)]
+pub struct CollapseCounterSnapshot {
+    pub triangle_shape_seen: u64,
+    pub collapse_attempts: u64,
+    pub collapse_reject_pattern: u64,
+    pub collapse_reject_binding_state: u64,
+    pub collapse_reject_column: u64,
+    pub collapse_reject_pred: u64,
+    pub collapse_reject_subjects: u64,
+    pub collapse_dataset_none: u64,
+    pub collapse_success: u64,
+    pub lftj_depth_enter: u64,
+    pub lftj_depth_leaf: u64,
+    pub lftj_scan_open: u64,
+}
+
+/// Zero all collapse / depth counters (harness use).
+pub fn reset_collapse_counters() {
+    for a in [
+        &TRIANGLE_SHAPE_SEEN,
+        &COLLAPSE_ATTEMPTS,
+        &COLLAPSE_REJECT_PATTERN,
+        &COLLAPSE_REJECT_BINDING_STATE,
+        &COLLAPSE_REJECT_COLUMN,
+        &COLLAPSE_REJECT_PRED,
+        &COLLAPSE_REJECT_SUBJECTS,
+        &COLLAPSE_DATASET_NONE,
+        &COLLAPSE_SUCCESS,
+        &LFTJ_DEPTH_ENTER,
+        &LFTJ_DEPTH_LEAF,
+        &LFTJ_SCAN_OPEN,
+    ] {
+        a.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Read collapse / depth counters.
+pub fn collapse_counters_snapshot() -> CollapseCounterSnapshot {
+    CollapseCounterSnapshot {
+        triangle_shape_seen: TRIANGLE_SHAPE_SEEN.load(Ordering::Relaxed),
+        collapse_attempts: COLLAPSE_ATTEMPTS.load(Ordering::Relaxed),
+        collapse_reject_pattern: COLLAPSE_REJECT_PATTERN.load(Ordering::Relaxed),
+        collapse_reject_binding_state: COLLAPSE_REJECT_BINDING_STATE.load(Ordering::Relaxed),
+        collapse_reject_column: COLLAPSE_REJECT_COLUMN.load(Ordering::Relaxed),
+        collapse_reject_pred: COLLAPSE_REJECT_PRED.load(Ordering::Relaxed),
+        collapse_reject_subjects: COLLAPSE_REJECT_SUBJECTS.load(Ordering::Relaxed),
+        collapse_dataset_none: COLLAPSE_DATASET_NONE.load(Ordering::Relaxed),
+        collapse_success: COLLAPSE_SUCCESS.load(Ordering::Relaxed),
+        lftj_depth_enter: LFTJ_DEPTH_ENTER.load(Ordering::Relaxed),
+        lftj_depth_leaf: LFTJ_DEPTH_LEAF.load(Ordering::Relaxed),
+        lftj_scan_open: LFTJ_SCAN_OPEN.load(Ordering::Relaxed),
+    }
+}
+
 // ── Field specification ────────────────────────────────────────────────────────
 
 /// How a single s/p/o field in a triple pattern is classified for LFTJ.
@@ -394,23 +467,40 @@ fn build_spec<D: Dataset>(
 
 // ── Adaptive VEO sort ─────────────────────────────────────────────────────────
 
-/// Sort `unbound` (var indices into `join_vars`) ascending by the minimum
-/// **real bound-context subtree size** across all patterns that contain each
-/// variable — CLTJ*'s adaptive VEO (§3.5).
+/// Sort `unbound` (var indices into `join_vars`) ascending by a **constraint-
+/// aware** bound-context cost — CLTJ*'s adaptive VEO (§3.5) with a product-path
+/// correction for multi-constant patterns.
 ///
 /// For each candidate variable/pattern this calls
 /// [`Dataset::lftj_real_count`], a zero-allocation probe that performs the
 /// same LOUDS navigation as opening a real scan but never constructs a
-/// `Box<dyn TrieIterator>`. This is the *actual* leaf-descendant count under
-/// the current binding, matching the C++ reference's `subtree_size_fixed1/2`,
-/// not a static dataset-wide vocabulary-size proxy.
+/// `Box<dyn TrieIterator>`.
+///
+/// ## Why not raw min(distinct)?
+///
+/// Raw min distinct under each open can pick a catastrophically wrong outer
+/// variable when backends return *accurate* counts. Classic BSBM 2join:
+///
+/// ```text
+///   ?s P31 class0 . ?s P131 ?region
+///   distinct(?region | P131) = 500
+///   distinct(?s | P31, class0) = 1000
+/// ```
+///
+/// Min-count VEO binds `?region` first → ~50k subject probes under each region
+/// then class0 filter (~50× slower). Binding `?s` first is O(class0 subjects).
+/// LOUDS's coarse vocab heuristic accidentally preferred `?s`; Ring's exact
+/// MiddleRuns/LastCol estimates exposed the bug (Phase J1 census, 2026-07).
+///
+/// **Fix:** scale each pattern's count by `1/(n_bound+1)²` where `n_bound` is
+/// the number of already-bound/const fields in the probe (not the target).
+/// Multi-constant patterns (P31+class0) beat single-constant ones (P131 alone)
+/// even when raw distinct is slightly larger. Falls back to first-appearance
+/// order on ties (stable).
 ///
 /// Falls back to `dataset.lftj_estimate_count(...)` when `lftj_real_count`
-/// returns `None` (non-CLTJ backends, or `AnyNamed`/`Union` graph selectors).
-/// For non-CLTJ backends all estimates are `u64::MAX`, so the sort is stable
-/// (preserves first-appearance order).
-///
-/// Sorting 3–6 elements is O(1) — the overhead is negligible.
+/// returns `None`. For non-CLTJ backends all estimates are `u64::MAX`, so the
+/// sort is stable (preserves first-appearance order).
 fn veo_sort<D: Dataset>(
     unbound: &[usize],
     specs: &[PatternSpec],
@@ -432,7 +522,13 @@ fn veo_sort<D: Dataset>(
                 let w = dataset
                     .lftj_real_count(sv, pv, ov, tf, graph)
                     .unwrap_or_else(|| dataset.lftj_estimate_count(sv, pv, ov, tf, graph));
-                weight = weight.min(w);
+                // n_bound = consts + already-bound join vars in this probe
+                // (target field is None and does not count).
+                let n_bound = (sv.is_some() as u64) + (pv.is_some() as u64) + (ov.is_some() as u64);
+                let denom = (n_bound + 1).saturating_mul(n_bound + 1).max(1);
+                // ceil(w / denom) without overflow for huge w.
+                let effective = w / denom + u64::from(w % denom != 0);
+                weight = weight.min(effective.max(1));
             }
             Candidate {
                 var_idx: vi,
@@ -441,10 +537,12 @@ fn veo_sort<D: Dataset>(
         })
         .collect();
 
-    candidates.sort_by_key(|c| c.weight);
+    // Ascending weight; stable on ties → first-appearance order preserved.
+    candidates.sort_by(|a, b| a.weight.cmp(&b.weight).then_with(|| a.var_idx.cmp(&b.var_idx)));
 
     candidates.into_iter().map(|c| c.var_idx).collect()
 }
+
 
 // ── Leapfrog synchronization ──────────────────────────────────────────────────
 
@@ -501,6 +599,66 @@ fn leapfrog_sync(scans: &mut [Box<dyn oxigraph_nova_core::TrieIterator>]) -> Opt
 ///   recursive call and loop iteration checks it first so cancellation
 ///   propagates back up to `eval_bgp_lftj` promptly.
 #[allow(clippy::too_many_arguments)]
+
+/// W4b: if every resolved scan is "bound subject → target object" (optionally
+/// with the same bound predicate), ask the dataset for a multi-subject object
+/// intersection iterator (Ring D1/D2). Returns `None` to keep ordinary leapfrog.
+fn try_collapse_subject_object_intersect<D: Dataset>(
+    dataset: &D,
+    graph: &GraphSelector,
+    resolved: &[(Option<u64>, Option<u64>, Option<u64>, usize)],
+) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
+    if resolved.len() < 2 {
+        COLLAPSE_REJECT_PATTERN.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    COLLAPSE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if resolved.len() >= 3 {
+        // Triangle-closing shape candidate (≥3 active object-target scans).
+        TRIANGLE_SHAPE_SEEN.fetch_add(1, Ordering::Relaxed);
+    }
+    // All must target object (field 2), have bound subject, unbound object.
+    let mut subjects: Vec<u64> = Vec::with_capacity(resolved.len());
+    let mut pred: Option<Option<u64>> = None;
+    for &(s, p, o, tf) in resolved {
+        if tf != 2 {
+            COLLAPSE_REJECT_COLUMN.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if s.is_none() || o.is_some() {
+            COLLAPSE_REJECT_BINDING_STATE.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        subjects.push(s.unwrap());
+        match pred {
+            None => pred = Some(p),
+            Some(prev) if prev != p => {
+                COLLAPSE_REJECT_PRED.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            Some(_) => {}
+        }
+    }
+    // Distinct subjects required (duplicate S would be a no-op / degenerate).
+    subjects.sort_unstable();
+    subjects.dedup();
+    if subjects.len() < 2 {
+        COLLAPSE_REJECT_SUBJECTS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let predicate = pred.flatten();
+    match dataset.lftj_multi_subject_object_intersect(&subjects, predicate, graph) {
+        Some(it) => {
+            COLLAPSE_SUCCESS.fetch_add(1, Ordering::Relaxed);
+            Some(it)
+        }
+        None => {
+            COLLAPSE_DATASET_NONE.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
 fn lftj_step<D: Dataset>(
     dataset: &D,
     specs: &[PatternSpec],
@@ -531,6 +689,7 @@ fn lftj_step<D: Dataset>(
     // allocation-reduction rationale (measured via `profile_eval
     // --count-allocs`).
     if unbound.is_empty() {
+        LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
         let values: Vec<Option<oxigraph_nova_core::Term>> = bindings
             .iter()
             .map(|binding| {
@@ -542,6 +701,8 @@ fn lftj_step<D: Dataset>(
         results.push(Solution::positional(Arc::clone(join_vars), values));
         return;
     }
+
+    LFTJ_DEPTH_ENTER.fetch_add(1, Ordering::Relaxed);
 
     // ── Adaptive VEO: re-sort remaining unbound variables by min count ──────
     //
@@ -587,14 +748,32 @@ fn lftj_step<D: Dataset>(
         return;
     }
 
-    // ── Obtain one scan per active pattern ───────────────────────────────────
+    // ── Obtain scans (W4b: collapse multi-subject → object to D1/D2) ────────
+    //
+    // When ≥2 active patterns all target the object field under distinct bound
+    // subjects (triangle closing edge / product G3 shape), prefer one braided
+    // intersection iterator over N independent leapfrog scans.
+    let resolved: Vec<(Option<u64>, Option<u64>, Option<u64>, usize)> = active
+        .iter()
+        .map(|sp| sp.resolve_for_var(var_idx, bindings))
+        .collect();
+
     let mut scans: Vec<Box<dyn oxigraph_nova_core::TrieIterator>> =
         Vec::with_capacity(active.len());
-    for sp in &active {
-        let (sv, pv, ov, target_field) = sp.resolve_for_var(var_idx, bindings);
-        match dataset.lftj_join_scan(sv, pv, ov, target_field, graph) {
-            Some(scan) => scans.push(scan),
-            None => return, // scan not available → caller will use fallback
+
+    let collapsed = try_collapse_subject_object_intersect(dataset, graph, &resolved);
+    if let Some(scan) = collapsed {
+        LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+        scans.push(scan);
+    } else {
+        for &(sv, pv, ov, target_field) in &resolved {
+            match dataset.lftj_join_scan(sv, pv, ov, target_field, graph) {
+                Some(scan) => {
+                    LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+                    scans.push(scan);
+                }
+                None => return, // scan not available → caller will use fallback
+            }
         }
     }
 
