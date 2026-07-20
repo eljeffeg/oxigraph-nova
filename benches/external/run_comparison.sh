@@ -28,6 +28,7 @@
 # Options:
 #   --disk                  Disk-backed / persistent comparison
 #   --backends=both|louds|ring   Nova backends (mem only; default both).
+#                           Ring uses Huffman C_p by default (no env needed).
 #                           Ignored with --disk (always louds).
 #   --no-oxigraph           Skip Oxigraph
 #   --no-qlever             Skip QLever
@@ -38,6 +39,8 @@
 #
 # Env:
 #   NOVA_BACKENDS=both|louds|ring   Same as --backends (mem default: both)
+#   NOVA_RING_HUFFMAN=0             A/B only: plain QWT256 C_p (ring-backend-qwt).
+#                                  Default / unset / 1 = Huffman C_p (product).
 #   QUERY_TIMEOUT_S=60
 #   QLEVER_BIN_DIR=/path/to/qlever/build
 #   RDFOX_BIN=path/to/RDFox         (default: research/rdfox/RDFox)
@@ -333,15 +336,21 @@ case "$NOVA_BACKENDS" in
   ring) NEED_RING=1 ;;
 esac
 if [ "$NEED_RING" = "1" ]; then
-  # Product default: Huffman C_p via ring-backend. Set NOVA_RING_HUFFMAN=0 for
-  # plain QWT256 A/B (ring-backend-qwt).
-  if [ "${NOVA_RING_HUFFMAN:-1}" = "0" ]; then
-    echo "  Ring binary: features=ring-backend-qwt (plain QWT256 C_p A/B)"
-    cargo build --release -p oxigraph-nova-server --features ring-backend-qwt --bin nova_serve
-  else
-    echo "  Ring binary: features=ring-backend (Huffman C_p product default)"
-    cargo build --release -p oxigraph-nova-server --features ring-backend --bin nova_serve
-  fi
+  # Product default = Huffman C_p (`ring-backend`). No env var required.
+  # Opt out only for A/B: NOVA_RING_HUFFMAN=0 → plain QWT256 (`ring-backend-qwt`).
+  _rh="${NOVA_RING_HUFFMAN-}"
+  case "$(printf '%s' "$_rh" | tr '[:upper:]' '[:lower:]')" in
+    0|false|off|no|qwt)
+      echo "  Ring C_p: plain QWT256 (NOVA_RING_HUFFMAN=$_rh A/B)"
+      echo "  Ring binary: --features ring-backend-qwt"
+      cargo build --release -p oxigraph-nova-server --features ring-backend-qwt --bin nova_serve
+      ;;
+    *)
+      echo "  Ring C_p: Huffman (product default — unset NOVA_RING_HUFFMAN or any value except 0/false/off)"
+      echo "  Ring binary: --features ring-backend"
+      cargo build --release -p oxigraph-nova-server --features ring-backend --bin nova_serve
+      ;;
+  esac
   cp -f "$ROOT/target/release/nova_serve" "$NOVA_RING_BIN"
 fi
 

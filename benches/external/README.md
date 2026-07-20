@@ -12,7 +12,7 @@ with identical SPARQL queries:
 
 | Report | Command | Engines |
 |--------|---------|---------|
-| [`RESULTS_MEM.md`](./RESULTS_MEM.md) | `./run_comparison.sh` | Nova (louds), Nova (ring), Oxigraph, QLever, Fluree [+ RDFox if licensed] |
+| [`RESULTS_MEM.md`](./RESULTS_MEM.md) | `./run_comparison.sh` | Nova (louds), Nova (ring, Huffman C_p default), Oxigraph, QLever, Fluree [+ RDFox if licensed] |
 | [`RESULTS_DISK.md`](./RESULTS_DISK.md) | `./run_comparison.sh --disk` | Nova (louds), Oxigraph, QLever, Fluree |
 
 Nova (ring) is mem-only (no WAL / `--location` yet), so `--disk` is louds-only.
@@ -22,6 +22,16 @@ Legacy wrappers still work:
 
 - `run_comparison_mem.sh` → `run_comparison.sh`
 - `run_comparison_disk.sh` → `run_comparison.sh --disk`
+
+### Ring C_p (Huffman)
+
+Plain `./run_comparison.sh` builds Nova (ring) with **Huffman C_p** (`--features ring-backend`). You do **not** need `NOVA_RING_HUFFMAN=1`.
+
+```bash
+./benches/external/run_comparison.sh                 # louds + ring (Huffman) + externals
+./benches/external/run_comparison.sh --backends=ring # ring only, still Huffman
+NOVA_RING_HUFFMAN=0 ./benches/external/run_comparison.sh --backends=ring  # Qwt A/B only
+```
 
 ## Why this exists
 
@@ -42,7 +52,7 @@ here and again at the top of every generated `RESULTS_MEM.md`:
 | Engine | Storage model in this benchmark |
 |--------|----------------------------------|
 | **Nova (louds)** | Pure in-process heap (`LoudsStore` — LOUDS + LFTJ). Default production in-memory backend. |
-| **Nova (ring)** | Pure in-process heap (`RingStore` pilot — cyclic QWT ring). Built with `--features ring-backend`, started with `--backend ring`. Mem-only. |
+| **Nova (ring)** | Pure in-process heap (`RingStore` pilot — cyclic QWT + **Huffman C_p** product default). Built with `--features ring-backend`, started with `--backend ring`. Mem-only. Plain QWT A/B: `NOVA_RING_HUFFMAN=0`. |
 | **Oxigraph** | `serve` run **without** `--location` → pure in-memory storage (not its default RocksDB-backed mode) |
 | **QLever** | Memory-mapped disk index — QLever has no in-memory-only mode. A mandatory warm-up pass is run before every timed measurement so the OS page cache holds the working set resident, giving steady-state RAM-speed reads, consistent with how QLever's own published benchmarks are run. |
 | **Fluree** | Ephemeral container FS (`fluree/server`, no host volume). Default file storage lives inside the container and is destroyed with it — functionally in-memory for this bench. SPARQL is connection-scoped; the harness injects `FROM <ledger>` into each query. |
