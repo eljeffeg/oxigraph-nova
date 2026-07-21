@@ -113,10 +113,10 @@ def main():
         "nova": "Nova (louds)",  # legacy CSV rows
         "nova-louds": "Nova (louds)",
         "nova-ring": "Nova (ring)",
-        "oxigraph": "Oxigraph (in-memory)",
-        "qlever": "QLever (mmap, warmed)",
-        "fluree": "Fluree (ephemeral container)",
-        "rdfox": "RDFox (in-memory)",
+        "oxigraph": "Oxigraph",
+        "qlever": "QLever",
+        "fluree": "Fluree",
+        "rdfox": "RDFox",
     }
 
     # Resolve resource metrics per engine key.
@@ -220,8 +220,8 @@ def main():
         "|---|---|---|",
         "| **Nova (louds)** | Pure in-process heap (`LoudsStore`) | Default "
         "production in-memory backend; LOUDS + LFTJ index. |",
-        "| **Nova (ring)** | Pure in-process heap (`RingStore` pilot) | Cyclic "
-        "QWT ring backend (`--backend ring`); mem-only (no WAL/disk yet). |",
+        "| **Nova (ring)** | Pure in-process heap (`RingStore`) | Cyclic "
+        "QWT ring backend (`--backend ring`); in-memory bulk_load (WAL available via `--location` on disk runs). |",
         "| **Oxigraph** | Pure in-memory (`serve` run **without** `--location`) | "
         "Deliberately run in-memory (not its default RocksDB-backed mode) to match "
         "Nova's memory model. |",
@@ -233,8 +233,8 @@ def main():
         "— functionally in-memory for this bench. SPARQL is connection-scoped; the "
         "harness injects `FROM <ledger>` into each query (addressing only). |",
         "| **RDFox** | In-memory datastore (sandbox/daemon, `parallel-nn`) | "
-        "Optional: requires a valid `RDFox.lic` (not the evaluation EULA text). "
-        "Binary defaults to `research/rdfox/RDFox`. |",
+        "Optional comparator: licensed RDFox binary + `.lic` (auto-skipped when "
+        "missing; `research/` is gitignored and not required). |",
     ]
     # Only emit rows for engines present (plus always show Nova/Oxigraph/QLever core notes if any of them present)
     present = set(engines)

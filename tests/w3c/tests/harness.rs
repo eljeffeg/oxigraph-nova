@@ -21,8 +21,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use oxigraph_nova_core::{GraphName, Oxigraph, Quad, QuadStore};
+use oxigraph_nova_engine_ring::LoudsStore;
 use oxigraph_nova_query::{Evaluator, QueryResult, Solution, StoreDataset};
-use oxigraph_nova_storage_ring::LoudsStore;
 use oxrdf::{Dataset as OxrdfDataset, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use oxttl::{NTriplesParser, TriGParser, TurtleParser};
 use sparesults::{QueryResultsFormat, QueryResultsParser, ReaderQueryResultsParserOutput};

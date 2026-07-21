@@ -1,0 +1,67 @@
+[package]
+name        = "oxigraph-nova-cli"
+description = "Standalone offline CLI tooling for Oxigraph Nova (load / backup / query / update / dump / convert / optimize / serve / serve-read-only)"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+# Opt-in Tantivy full-text search, forwarded through to nova-server/
+# nova-engine-ring's own `fulltext` feature.
+fulltext = ["oxigraph-nova-server/fulltext", "oxigraph-nova-engine-ring/fulltext", "oxigraph-nova-mcp?/fulltext"]
+# Opt-in outbound HTTP client, forwarded through to nova-server's own
+# `http-client` feature: unblocks SPARQL 1.1 Update's `LOAD <iri>` and gives
+# the server a default, real HTTP-backed `SERVICE` clause handler.
+http-client = ["oxigraph-nova-server/http-client"]
+# Opt-in GeoSPARQL extension functions, forwarded through to nova-server's
+# own `geosparql` feature.
+geosparql = ["oxigraph-nova-server/geosparql"]
+# Cyclic-QWT RingStore backend for `oxigraph serve --backend ring`
+# (forwards to nova-server's `ring-backend`, which enables cyclic-ring
+# + Huffman C_p). Supports both in-memory and persistent `--location`.
+ring-backend = ["oxigraph-nova-server/ring-backend", "oxigraph-nova-mcp?/ring-backend"]
+# Opt-in MCP (Model Context Protocol) stdio server, exposing SPARQL query/
+# update/data-model-discovery tools to LLM agents (`oxigraph mcp serve`).
+# Zero-cost when disabled: `oxigraph-nova-mcp` (and its `rmcp`/`schemars`
+# dependencies) are only pulled in when this feature is enabled.
+mcp = ["dep:oxigraph-nova-mcp", "oxigraph-nova-mcp/louds-backend"]
+
+
+
+
+[dependencies]
+oxigraph-nova-core         = { path = "../../core/nova-core" }
+oxigraph-nova-engine-ring = { path = "../../engines/nova-engine-ring" }
+oxigraph-nova-query        = { path = "../../core/nova-query" }
+oxigraph-nova-server       = { path = "../nova-server" }
+oxigraph-nova-shacl        = { path = "../../core/nova-shacl" }
+oxigraph-nova-reasoning    = { path = "../../core/nova-reasoning" }
+oxigraph-nova-cypher       = { path = "../../core/nova-cypher" }
+oxigraph-nova-mcp          = { path = "../nova-mcp", optional = true }
+
+
+oxrdf          = { workspace = true }
+oxrdfio        = { workspace = true }
+spargebra      = { workspace = true }
+sparesults     = { workspace = true }
+clap           = { workspace = true }
+anyhow         = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+mimalloc = "0.1.52"
+parking_lot = { workspace = true }
+
+
+
+[[bin]]
+name = "oxigraph"
+path = "src/main.rs"
+
+[dev-dependencies]
+# Blocking HTTP client for the `serve-read-only` integration test
+# (tests/cli.rs): spawns and talks to a real `oxigraph serve-read-only`
+# subprocess over HTTP. Same version already used by nova-server's own
+# tests/crash_recovery.rs and tests/w3c's harness.
+ureq = "3"

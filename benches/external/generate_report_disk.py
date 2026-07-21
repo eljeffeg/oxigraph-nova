@@ -3,14 +3,20 @@
 run_comparison.sh --disk.
 
 Same shape as generate_report.py (the in-memory comparison), but for the
-disk-backed/persistent configuration of each engine: Nova (`--location`,
-WAL-backed LoudsStore), Oxigraph (`--location`, RocksDB-backed), QLever
-(memory-mapped disk index), and optionally Fluree (`--storage-path`).
+disk-backed/persistent configuration of each engine:
+
+  - Nova (louds): `--location` WAL-backed LoudsStore
+  - Nova (ring): `--location` WAL-backed RingStore (same product surface)
+  - Oxigraph: `--location` RocksDB-backed
+  - QLever: memory-mapped disk index
+  - Fluree (optional): `--storage-path`
+
 Adds an on-disk-footprint table alongside the existing memory/CPU/latency
 tables.
 
-Optionally writes pure-stdlib SVG bar charts under charts/ (--charts; off by default).disk/ and embeds them
-in the Markdown report (lower is better for latency/load/memory/disk/CPU).
+Optionally writes pure-stdlib SVG bar charts under charts/disk/ (--charts;
+off by default) and embeds them in the Markdown report (lower is better for
+latency/load/memory/disk/CPU).
 """
 
 import argparse
@@ -50,29 +56,42 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--queries", required=True)
-    ap.add_argument("--nova-rss-kb", type=float, required=True)
+    # Dual Nova backends (preferred). Legacy single --nova-* still accepted.
+    ap.add_argument("--nova-louds-rss-kb", type=float, default=None)
+    ap.add_argument("--nova-ring-rss-kb", type=float, default=None)
+    ap.add_argument("--nova-louds-cpu-pct", type=float, default=None)
+    ap.add_argument("--nova-ring-cpu-pct", type=float, default=None)
+    ap.add_argument("--nova-louds-load-s", type=float, default=None)
+    ap.add_argument("--nova-ring-load-s", type=float, default=None)
+    ap.add_argument("--nova-louds-disk-kb", type=float, default=None)
+    ap.add_argument("--nova-ring-disk-kb", type=float, default=None)
+    # Legacy single-Nova flags (map onto whichever backend is present in CSV).
+    ap.add_argument("--nova-rss-kb", type=float, default=None)
+    ap.add_argument("--nova-cpu-pct", type=float, default=None)
+    ap.add_argument("--nova-load-s", type=float, default=None)
+    ap.add_argument("--nova-disk-kb", type=float, default=None)
     ap.add_argument("--qlever-rss-kb", type=float, default=None)
     ap.add_argument("--oxigraph-mem", default=None)  # e.g. "338.2MiB"
     ap.add_argument("--fluree-mem", default=None)  # docker stats string
-    ap.add_argument("--nova-cpu-pct", type=float, default=None)
     ap.add_argument("--qlever-cpu-pct", type=float, default=None)
     ap.add_argument("--oxigraph-cpu-pct", type=float, default=None)
     ap.add_argument("--fluree-cpu-pct", type=float, default=None)
-    ap.add_argument("--nova-load-s", type=float, default=None)
     ap.add_argument("--qlever-load-s", type=float, default=None)
     ap.add_argument("--oxigraph-load-s", type=float, default=None)
     ap.add_argument("--fluree-load-s", type=float, default=None)
-    ap.add_argument("--nova-disk-kb", type=float, default=None)
     ap.add_argument("--oxigraph-disk-kb", type=float, default=None)
     ap.add_argument("--qlever-disk-kb", type=float, default=None)
     ap.add_argument("--fluree-disk-kb", type=float, default=None)
     ap.add_argument("--entities", type=int, required=True)
     ap.add_argument("--triples", type=int, required=True)
-    ap.add_argument("--charts", action="store_true", default=False,
-                    help="Write SVG charts under charts/ and embed them (default: off)")
+    ap.add_argument(
+        "--charts",
+        action="store_true",
+        default=False,
+        help="Write SVG charts under charts/ and embed them (default: off)",
+    )
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-
 
     with open(args.queries) as f:
         query_defs = json.load(f)
@@ -90,23 +109,101 @@ def main():
             except ValueError:
                 continue
 
-    # Discover engines from CSV. Disk harness is louds-only (Ring has no WAL).
+    # Discover engines from CSV so LOUDS vs Ring runs both label honestly.
     engines_seen = sorted({e for (e, _q) in data.keys()})
-    preferred = ["nova-louds", "nova", "oxigraph", "qlever", "fluree"]
+    preferred = [
+        "nova-louds",
+        "nova-ring",
+        "nova",
+        "oxigraph",
+        "qlever",
+        "fluree",
+    ]
     engines = [e for e in preferred if e in engines_seen]
     engines += [e for e in engines_seen if e not in engines]
 
     engine_labels = {
-        "nova": "Nova (louds, --location)",  # legacy CSV rows
-        "nova-louds": "Nova (louds, --location)",
-        "oxigraph": "Oxigraph (--location, RocksDB-backed)",
-        "qlever": "QLever (mmap, warmed)",
-        "fluree": "Fluree (--storage-path)",
+        "nova": "Nova (louds)",  # legacy CSV rows
+        "nova-louds": "Nova (louds)",
+        "nova-ring": "Nova (ring)",
+        "oxigraph": "Oxigraph",
+        "qlever": "QLever",
+        "fluree": "Fluree",
     }
-    # Resource metrics are passed as single Nova slots; map onto whichever Nova key is present.
-    nova_key = "nova-louds" if "nova-louds" in engines else ("nova" if "nova" in engines else "nova-louds")
+
+    # Resolve resource metrics per engine key.
+    rss_kb = {}
+    cpu_pct = {
+        "oxigraph": args.oxigraph_cpu_pct,
+        "qlever": args.qlever_cpu_pct,
+        "fluree": args.fluree_cpu_pct,
+    }
+    load_s = {
+        "oxigraph": args.oxigraph_load_s,
+        "qlever": args.qlever_load_s,
+        "fluree": args.fluree_load_s,
+    }
+    disk_kb = {
+        "oxigraph": args.oxigraph_disk_kb,
+        "qlever": args.qlever_disk_kb,
+        "fluree": args.fluree_disk_kb,
+    }
+
+    if args.qlever_rss_kb is not None:
+        rss_kb["qlever"] = args.qlever_rss_kb
+
+    if args.nova_louds_rss_kb is not None:
+        rss_kb["nova-louds"] = args.nova_louds_rss_kb
+    if args.nova_ring_rss_kb is not None:
+        rss_kb["nova-ring"] = args.nova_ring_rss_kb
+    if args.nova_louds_cpu_pct is not None:
+        cpu_pct["nova-louds"] = args.nova_louds_cpu_pct
+    if args.nova_ring_cpu_pct is not None:
+        cpu_pct["nova-ring"] = args.nova_ring_cpu_pct
+    if args.nova_louds_load_s is not None:
+        load_s["nova-louds"] = args.nova_louds_load_s
+    if args.nova_ring_load_s is not None:
+        load_s["nova-ring"] = args.nova_ring_load_s
+    if args.nova_louds_disk_kb is not None:
+        disk_kb["nova-louds"] = args.nova_louds_disk_kb
+    if args.nova_ring_disk_kb is not None:
+        disk_kb["nova-ring"] = args.nova_ring_disk_kb
+
+    # Legacy single-Nova flags: attach to whichever Nova key is present.
+    if args.nova_rss_kb is not None:
+        for k in ("nova-louds", "nova-ring", "nova"):
+            if k in engines and k not in rss_kb:
+                rss_kb[k] = args.nova_rss_kb
+                break
+        else:
+            rss_kb["nova"] = args.nova_rss_kb
+    if args.nova_cpu_pct is not None:
+        for k in ("nova-louds", "nova-ring", "nova"):
+            if k in engines and k not in cpu_pct:
+                cpu_pct[k] = args.nova_cpu_pct
+                break
+        else:
+            cpu_pct["nova"] = args.nova_cpu_pct
+    if args.nova_load_s is not None:
+        for k in ("nova-louds", "nova-ring", "nova"):
+            if k in engines and k not in load_s:
+                load_s[k] = args.nova_load_s
+                break
+        else:
+            load_s["nova"] = args.nova_load_s
+    if args.nova_disk_kb is not None:
+        for k in ("nova-louds", "nova-ring", "nova"):
+            if k in engines and k not in disk_kb:
+                disk_kb[k] = args.nova_disk_kb
+                break
+        else:
+            disk_kb["nova"] = args.nova_disk_kb
+
     has_fluree = "fluree" in engines
+    has_ring = "nova-ring" in engines
+    has_louds = bool(set(engines) & {"nova-louds", "nova"})
     n_engines = len(engines)
+
 
     out_path = os.path.abspath(args.out)
     charts_dir = os.path.join(os.path.dirname(out_path), "charts", "disk")
@@ -132,7 +229,6 @@ def main():
         f"Dataset: {args.entities:,} synthetic BSBM-style entities "
         f"({args.triples:,} triples), identical N-Triples file loaded into "
         f"all {n_engines} engines. "
-        "Nova (ring) is not included — Ring has no WAL / `--location` path yet. "
         "RDFox is mem-only in this harness and is not included on disk.\n"
     )
 
@@ -148,13 +244,20 @@ def main():
     lines.append("**Storage model per engine** (this matters — see below):\n")
     lines.append("| Engine | Storage model | Notes |")
     lines.append("|---|---|---|")
-    lines.append(
-        "| **Nova (louds)** | `LoudsStore::open(dir)` — WAL-backed | Every "
-        "`insert()` is durably logged (fsync-per-write) to a "
-        "write-ahead log before being applied in memory; periodic "
-        "`compact()` merges the delta into an on-disk snapshot. "
-        "CSV id: `nova-louds`. |"
-    )
+    if has_louds:
+        lines.append(
+            "| **Nova (louds)** | `LoudsStore::open(dir)` — WAL-backed | Every "
+            "`insert()` is durably logged (fsync-per-write) to a "
+            "write-ahead log before being applied in memory; periodic "
+            "`compact()` merges the delta into an on-disk snapshot. "
+            "CSV id: `nova-louds`. |"
+        )
+    if has_ring:
+        lines.append(
+            "| **Nova (ring)** | `RingStore::open(dir)` — WAL-backed | Same "
+            "product surface as LOUDS: `--location` WAL + snapshot via "
+            "`nova_serve --backend ring`. CSV id: `nova-ring`. |"
+        )
     lines.append(
         "| **Oxigraph** | `serve --location <dir>` — RocksDB-backed | "
         "Oxigraph's own default/production persistent storage mode "
@@ -172,6 +275,10 @@ def main():
             "File-backed persistent ledger. SPARQL is connection-scoped; the "
             "harness injects `FROM <ledger>` into each query. |"
         )
+    lines.append(
+        "| **RDFox** | N/A (In-memory only) | RDFox is not disk-backed and "
+        "thus excluded from this benchmark. |"
+    )
     lines.append("")
 
     lines.append(
@@ -183,56 +290,75 @@ def main():
         "choice over raw `ps -o rss`.\n"
     )
 
+    disk_notes = []
+    if has_louds:
+        disk_notes.append("WAL + snapshot files for Nova (louds)")
+    if has_ring:
+        disk_notes.append("WAL + snapshot files for Nova (ring)")
+    disk_notes.append("the full RocksDB directory for Oxigraph")
+    disk_notes.append("all QLever index/permutation files")
+    if has_fluree:
+        disk_notes.append("Fluree storage-path contents")
+    if len(disk_notes) == 1:
+        disk_note_str = disk_notes[0]
+    elif len(disk_notes) == 2:
+        disk_note_str = f"{disk_notes[0]} and {disk_notes[1]}"
+    else:
+        disk_note_str = ", ".join(disk_notes[:-1]) + f", and {disk_notes[-1]}"
+
     lines.append(
         "**On-disk footprint** is measured via `du -sk` on each engine's "
-        "data directory after the query phase completes (includes WAL + "
-        "snapshot files for Nova, the full RocksDB directory for "
-        "Oxigraph, all QLever index/permutation files"
-        + (", and Fluree storage-path contents" if has_fluree else "")
-        + ").\n"
+        f"data directory after the query phase completes (includes {disk_note_str}).\n"
     )
     lines.append(
         "**CPU usage** is sampled every ~0.3s throughout each engine's "
         "query phase and averaged. Values are percent of one CPU core.\n"
     )
+    lines.append(
+        "**Process isolation (Nova backends).** Nova (louds) and Nova (ring) "
+        "are launched as **independent fresh processes** and measured in "
+        "**separate phases** (start → load → warm-up → timed queries → "
+        "resource sample → kill), not selected by flipping a backend flag "
+        "inside one long-running process.\n"
+    )
 
     lines.append("")
     lines.append("## Dataset Load Time\n")
-    lines.append(
+    load_blurb = (
         "Wall-clock time to load the identical N-Triples dataset and "
-        "become ready to serve queries. For Nova this includes WAL-logging "
-        "every triple (fsync-per-write) plus a `compact()` pass — "
-        "necessarily slower than the in-memory `bulk_load()` path measured "
-        "in `RESULTS_MEM.md`. For Oxigraph this is the HTTP bulk-load POST into "
-        "the RocksDB-backed store. For QLever this is the same "
-        "`qlever-index` build step as the in-memory comparison (QLever's "
-        "index is always disk-based)"
-        + (". For Fluree this is create-ledger + N-Triples insert into `--storage-path`"
-           if has_fluree else "")
-        + ".\n"
+        "become ready to serve queries."
     )
+    if has_louds:
+        load_blurb += (
+            " For Nova (louds) this includes WAL-logging every triple "
+            "(fsync-per-write) plus a `compact()` pass — necessarily slower "
+            "than the in-memory `bulk_load()` path measured in `RESULTS_MEM.md`."
+        )
+    if has_ring:
+        load_blurb += (
+            " For Nova (ring) this is parse + `bulk_load()` into a WAL-backed "
+            "`--location` store (same crash-safe snapshot commit path as LOUDS)."
+        )
+    load_blurb += (
+        " For Oxigraph this is the HTTP bulk-load POST into the "
+        "RocksDB-backed store. For QLever this is the same `qlever-index` "
+        "build step as the in-memory comparison (QLever's index is always "
+        "disk-based)"
+    )
+    if has_fluree:
+        load_blurb += (
+            ". For Fluree this is create-ledger + N-Triples insert into "
+            "`--storage-path`"
+        )
+    load_blurb += ".\n"
+    lines.append(load_blurb)
     lines.append("| Engine | Load time |")
     lines.append("|---|---|")
-    if args.nova_load_s is not None:
-        lines.append(
-            f"| {engine_labels.get(nova_key, 'Nova (louds, --location)')} | "
-            f"{args.nova_load_s:.2f} s |"
-        )
-    if args.oxigraph_load_s is not None:
-        lines.append(f"| Oxigraph (--location) | {args.oxigraph_load_s:.2f} s |")
-    if args.qlever_load_s is not None:
-        lines.append(f"| QLever (mmap, warmed) | {args.qlever_load_s:.2f} s |")
-    if has_fluree and args.fluree_load_s is not None:
-        lines.append(f"| Fluree (--storage-path) | {args.fluree_load_s:.2f} s |")
+    for eng in engines:
+        if eng in load_s and load_s[eng] is not None:
+            lines.append(f"| {engine_labels.get(eng, eng)} | {load_s[eng]:.2f} s |")
 
-    load_vals = {
-        nova_key: args.nova_load_s,
-        "oxigraph": args.oxigraph_load_s,
-        "qlever": args.qlever_load_s,
-    }
-    if has_fluree:
-        load_vals["fluree"] = args.fluree_load_s
-
+    load_vals = {e: load_s.get(e) for e in engines}
     if any(v is not None for v in load_vals.values()):
         lines.append("")
         lines.append(
@@ -252,36 +378,44 @@ def main():
     lines.append("## Memory Usage (Physical Footprint)\n")
     lines.append("| Engine | Memory | Storage model |")
     lines.append("|---|---|---|")
-    lines.append(
-        f"| {engine_labels.get(nova_key, 'Nova (louds, --location)')} | "
-        f"{args.nova_rss_kb / 1024:.1f} MiB | "
-        "WAL-backed heap (recovered/compacted state resident) |"
-    )
-    if "oxigraph" in engines and args.oxigraph_mem:
-        lines.append(
-            f"| Oxigraph (--location) | {args.oxigraph_mem} | RocksDB-backed "
-            "(block cache + heap) |"
-        )
-    if "qlever" in engines and args.qlever_rss_kb is not None:
-        lines.append(
-            f"| QLever (mmap, warmed) | {args.qlever_rss_kb / 1024:.1f} MiB | "
-            "Incl. memory-mapped index pages |"
-        )
-    if has_fluree and args.fluree_mem:
-        lines.append(
-            f"| Fluree (--storage-path) | {args.fluree_mem} | "
-            "Container memory (file-backed ledger) |"
-        )
+    for eng in engines:
+        label = engine_labels.get(eng, eng)
+        if eng in ("nova-louds", "nova") and eng in rss_kb and rss_kb[eng] is not None:
+            lines.append(
+                f"| {label} | {rss_kb[eng] / 1024:.1f} MiB | "
+                "WAL-backed heap (recovered/compacted state resident) |"
+            )
+        elif eng == "nova-ring" and eng in rss_kb and rss_kb[eng] is not None:
+            lines.append(
+                f"| {label} | {rss_kb[eng] / 1024:.1f} MiB | "
+                "WAL-backed heap (recovered/compacted state resident) |"
+            )
+        elif eng == "oxigraph" and args.oxigraph_mem:
+            lines.append(
+                f"| {label} | {args.oxigraph_mem} | RocksDB-backed "
+                "(block cache + heap) |"
+            )
+        elif eng == "qlever" and args.qlever_rss_kb is not None:
+            lines.append(
+                f"| {label} | {args.qlever_rss_kb / 1024:.1f} MiB | "
+                "Incl. memory-mapped index pages |"
+            )
+        elif eng == "fluree" and args.fluree_mem:
+            lines.append(
+                f"| {label} | {args.fluree_mem} | "
+                "Container memory (file-backed ledger) |"
+            )
 
-    mem_vals = {
-        nova_key: args.nova_rss_kb / 1024,
-    }
-    if "oxigraph" in engines and args.oxigraph_mem:
-        mem_vals["oxigraph"] = parse_mem_string(args.oxigraph_mem)
-    if "qlever" in engines and args.qlever_rss_kb is not None:
-        mem_vals["qlever"] = args.qlever_rss_kb / 1024
-    if has_fluree and args.fluree_mem:
-        mem_vals["fluree"] = parse_mem_string(args.fluree_mem)
+    mem_vals = {}
+    for eng in engines:
+        if eng in ("nova-louds", "nova-ring", "nova") and eng in rss_kb and rss_kb[eng] is not None:
+            mem_vals[eng] = rss_kb[eng] / 1024
+        elif eng == "oxigraph" and args.oxigraph_mem:
+            mem_vals[eng] = parse_mem_string(args.oxigraph_mem)
+        elif eng == "qlever" and args.qlever_rss_kb is not None:
+            mem_vals[eng] = args.qlever_rss_kb / 1024
+        elif eng == "fluree" and args.fluree_mem:
+            mem_vals[eng] = parse_mem_string(args.fluree_mem)
 
     lines.append("")
     lines.append(
@@ -297,42 +431,30 @@ def main():
         )
     )
 
-    if (
-        args.nova_disk_kb is not None
-        or args.oxigraph_disk_kb is not None
-        or args.qlever_disk_kb is not None
-        or args.fluree_disk_kb is not None
-    ):
+    if any(disk_kb.get(e) is not None for e in engines):
         lines.append("")
         lines.append("## On-Disk Footprint\n")
         lines.append(
             "`du -sk` on each engine's data directory after the query "
-            "phase (WAL + snapshot for Nova, full RocksDB dir for "
-            "Oxigraph, all index/permutation files for QLever"
+            "phase (WAL + snapshot for both Nova backends, full "
+            "RocksDB dir for Oxigraph, all "
+            "index/permutation files for QLever"
             + (", Fluree storage-path for Fluree" if has_fluree else "")
             + ").\n"
         )
         lines.append("| Engine | On-disk size |")
         lines.append("|---|---|")
-        if args.nova_disk_kb is not None:
-            lines.append(
-                f"| {engine_labels.get(nova_key, 'Nova (louds, --location)')} | "
-                f"{args.nova_disk_kb / 1024:.1f} MiB |"
-            )
-        if args.oxigraph_disk_kb is not None:
-            lines.append(f"| Oxigraph (--location) | {args.oxigraph_disk_kb / 1024:.1f} MiB |")
-        if args.qlever_disk_kb is not None:
-            lines.append(f"| QLever (mmap, warmed) | {args.qlever_disk_kb / 1024:.1f} MiB |")
-        if has_fluree and args.fluree_disk_kb is not None:
-            lines.append(f"| Fluree (--storage-path) | {args.fluree_disk_kb / 1024:.1f} MiB |")
+        for eng in engines:
+            if disk_kb.get(eng) is not None:
+                lines.append(
+                    f"| {engine_labels.get(eng, eng)} | "
+                    f"{disk_kb[eng] / 1024:.1f} MiB |"
+                )
 
         disk_vals = {
-            nova_key: (args.nova_disk_kb / 1024) if args.nova_disk_kb is not None else None,
-            "oxigraph": (args.oxigraph_disk_kb / 1024) if args.oxigraph_disk_kb is not None else None,
-            "qlever": (args.qlever_disk_kb / 1024) if args.qlever_disk_kb is not None else None,
+            e: (disk_kb[e] / 1024) if disk_kb.get(e) is not None else None
+            for e in engines
         }
-        if has_fluree and args.fluree_disk_kb is not None:
-            disk_vals["fluree"] = args.fluree_disk_kb / 1024
 
         lines.append("")
         lines.append(
@@ -348,36 +470,18 @@ def main():
             )
         )
 
-    if (
-        args.nova_cpu_pct is not None
-        or args.qlever_cpu_pct is not None
-        or args.oxigraph_cpu_pct is not None
-        or args.fluree_cpu_pct is not None
-    ):
+    if any(cpu_pct.get(e) is not None for e in engines):
         lines.append("")
         lines.append("## CPU Usage (average % of one core during query phase)\n")
         lines.append("| Engine | Avg CPU % |")
         lines.append("|---|---|")
-        if args.nova_cpu_pct is not None:
-            lines.append(
-                f"| {engine_labels.get(nova_key, 'Nova (louds, --location)')} | "
-                f"{args.nova_cpu_pct:.1f}% |"
-            )
-        if args.oxigraph_cpu_pct is not None:
-            lines.append(f"| Oxigraph (--location) | {args.oxigraph_cpu_pct:.1f}% |")
-        if args.qlever_cpu_pct is not None:
-            lines.append(f"| QLever (mmap, warmed) | {args.qlever_cpu_pct:.1f}% |")
-        if has_fluree and args.fluree_cpu_pct is not None:
-            lines.append(f"| Fluree (--storage-path) | {args.fluree_cpu_pct:.1f}% |")
+        for eng in engines:
+            if cpu_pct.get(eng) is not None:
+                lines.append(
+                    f"| {engine_labels.get(eng, eng)} | {cpu_pct[eng]:.1f}% |"
+                )
 
-        cpu_vals = {
-            nova_key: args.nova_cpu_pct,
-            "oxigraph": args.oxigraph_cpu_pct,
-            "qlever": args.qlever_cpu_pct,
-        }
-        if has_fluree:
-            cpu_vals["fluree"] = args.fluree_cpu_pct
-
+        cpu_vals = {e: cpu_pct.get(e) for e in engines}
         lines.append("")
         lines.append(
             emit_chart(
@@ -391,7 +495,6 @@ def main():
                 "CPU usage by engine (lower is better)",
             )
         )
-
 
     # Precompute p50/p95 per (engine, query) for tables + charts
     p50_by_eq = {}

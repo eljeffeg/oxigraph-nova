@@ -1,0 +1,62 @@
+[package]
+name        = "oxigraph-nova-query"
+description = "SPARQL 1.2 evaluator, Dataset trait, Solution type, and extension registry for Oxigraph Nova"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+oxigraph-nova-core = { path = "../nova-core", default-features = false }
+
+oxrdf         = { workspace = true }
+spargebra     = { workspace = true }
+sparopt       = { workspace = true, optional = true }  # algebra optimizer: filter pushdown, join reordering
+oxsdatatypes  = { workspace = true }   # Correct XSD value semantics for comparison / arithmetic
+oxiri         = { workspace = true }   # RFC 3987 IRI parsing/resolution for the IRI()/URI() SPARQL function
+anyhow        = { workspace = true }
+tracing       = { workspace = true }
+sha2          = { workspace = true }   # SHA-256/384/512 hash functions
+sha1          = { workspace = true }   # SHA-1 hash function
+md-5          = { workspace = true }   # MD5 hash function
+regex         = { workspace = true }   # SPARQL REGEX() / REPLACE() built-ins
+uuid          = { workspace = true }   # SPARQL UUID() / STRUUID() built-ins
+rand          = { workspace = true }   # SPARQL RAND() built-in
+parking_lot   = { workspace = true }
+
+
+# Opt-in via the `http-client` feature: fetch client for LOAD and the
+# built-in SERVICE handler. oxrdfio parses LOAD's fetched RDF; sparesults
+# parses SERVICE's SPARQL-results response.
+oxhttp        = { workspace = true, optional = true }
+oxrdfio       = { workspace = true, optional = true }
+sparesults    = { workspace = true, optional = true }
+
+# Opt-in via the `geosparql` feature: GeoSPARQL 1.1 extension functions
+# (geof:distance, sf:intersects, etc.) — see `crate::evaluator`'s
+# `geosparql_function_local`.
+spargeo       = { workspace = true, optional = true }
+
+# `std::time::SystemTime::now()` panics on wasm32-unknown-unknown (no OS
+# clock there) — NOW() uses `js_sys::Date::now()` instead on that target
+# only (see `evaluator::current_datetime_string`).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = { workspace = true }
+
+[features]
+default = ["sparopt", "mmap"]
+sparopt = ["dep:sparopt"]
+http-client = ["dep:oxhttp", "dep:oxrdfio", "dep:sparesults"]
+geosparql = ["dep:spargeo"]
+# Forwards to `oxigraph-nova-core`'s `mmap` feature (see its doc comment).
+# This crate itself has no mmap-specific code — it exists purely so that
+# `oxigraph-nova-js`'s wasm32 build (which sets `default-features = false`
+# on this crate) can disable `mmap` all the way down to `nova-core` even
+# though it depends on this crate.
+mmap = ["oxigraph-nova-core/mmap"]
+
+[dev-dependencies]
+oxigraph-nova-engine-memory = { path = "../../engines/nova-engine-memory" }
+oxigraph-nova-engine-ring = { path = "../../engines/nova-engine-ring", features = ["fulltext"] }
+pretty_assertions = { workspace = true }
+oxhttp = { workspace = true }

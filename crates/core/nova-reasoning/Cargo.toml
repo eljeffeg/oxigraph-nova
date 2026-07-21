@@ -1,0 +1,38 @@
+[package]
+name        = "oxigraph-nova-reasoning"
+description = "OWL 2 RL reasoning: LFTJ-native semi-naive fixpoint driver for Oxigraph Nova"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+default = ["mmap"]
+# Forwards to `oxigraph-nova-core`'s `mmap` feature (see its doc comment).
+# This crate itself has no mmap-specific code.
+mmap = ["oxigraph-nova-core/mmap"]
+
+[dependencies]
+oxigraph-nova-core = { path = "../nova-core", default-features = false }
+# `engine`/`reasoning_dataset` operate at the `Dataset` seam (not raw
+# `QuadStore`) so `ReasoningDataset<D: Dataset>` can wrap any SPARQL-facing
+# dataset, mirroring `oxigraph-nova-query`'s own `StoreDataset` adapter.
+oxigraph-nova-query = { path = "../nova-query", default-features = false }
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+
+
+
+[dev-dependencies]
+# Only integration/unit tests need a real storage backend + oxrdf term
+# constructors — the fixpoint/join/rule core has no dependency on any
+# concrete QuadStore, only on TermIds (`u64`).
+oxigraph-nova-engine-ring = { path = "../../engines/nova-engine-ring" }
+oxrdf = { workspace = true }
+# Differential-testing oracle: an independent, mature OWL 2 RL reasoner
+# (datafrog-based) used only in tests, to cross-check `LftjFixpointEngine`'s
+# output against a from-scratch implementation of the same rules. Never a
+# dependency of any production (non-test) code in this crate.
+reasonable = { workspace = true }
+
+

@@ -12,8 +12,8 @@
 
 use mimalloc::MiMalloc;
 use oxigraph_nova_core::{GraphName, Quad};
+use oxigraph_nova_engine_ring::LoudsStore;
 use oxigraph_nova_query::{Evaluator, QueryResult, StoreDataset};
-use oxigraph_nova_storage_ring::LoudsStore;
 use oxttl::NTriplesParser;
 use serde::Deserialize;
 use spargebra::SparqlParser;

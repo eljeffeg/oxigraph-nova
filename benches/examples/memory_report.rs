@@ -73,8 +73,8 @@
 //! ```
 
 use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Subject, Term};
-use oxigraph_nova_storage_memory::MemoryStore;
-use oxigraph_nova_storage_ring::LoudsStore;
+use oxigraph_nova_engine_memory::MemoryStore;
+use oxigraph_nova_engine_ring::LoudsStore;
 use std::sync::Arc;
 
 // -- Data generation ----------------------------------------------------------

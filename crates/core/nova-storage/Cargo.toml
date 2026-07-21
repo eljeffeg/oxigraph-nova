@@ -1,0 +1,31 @@
+[package]
+name        = "oxigraph-nova-storage"
+description = "Generic WAL/MANIFEST/dictionary persistence machinery reusable by any QuadStore backend"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+default = ["mmap"]
+# See `oxigraph-nova-core`'s `mmap` feature doc comment. Gates
+# `dict_snapshot.rs`'s `load_mmap`-based functions.
+mmap = ["epserde/mmap", "oxigraph-nova-core/mmap"]
+
+[dependencies]
+oxigraph-nova-core = { path = "../nova-core", default-features = false }
+oxrdf         = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+crc32fast     = "1.5"     # WAL record + MANIFEST framing checksum
+epserde       = { version = "0.12.5", default-features = false, features = ["derive", "std"] } # mmap/read_mem load of nova.dict.<gen> (DictSnapshot); see `mmap` feature above
+# lz4 block-container for `nova.dict.<gen>` (dict only; index stays uncompressed mmap).
+# `default-features = false` drops frame + safe-encode/decode (faster block path).
+# `alloc` is required for Vec-returning APIs (`compress_prepend_size` /
+# `decompress_size_prepended`) when default features are off (lz4_flex ≥ 0.14).
+lz4_flex      = { version = "0.14", default-features = false, features = ["alloc"] }
+
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+

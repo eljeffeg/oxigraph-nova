@@ -4,20 +4,22 @@
 # Modes:
 #   (default) in-memory  — Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree
 #                          + RDFox when a valid license is present (optional)
-#   --disk               — Nova (louds, --location) | Oxigraph (--location) |
-#                          QLever | Fluree (--storage-path)
-#                          Ring is skipped in disk mode (no WAL yet).
+#   --disk               — Nova (louds, --location) | Nova (ring, --location) |
+#                          Oxigraph (--location) | QLever | Fluree (--storage-path)
+#                          Both Nova backends use WAL + snapshot under --location.
 #                          RDFox is mem-only in this harness (skipped on --disk).
 #
-# Methodology (see README.md):
+# Methodology (see docs/benchmarks/README.md):
 #   Mem:
 #     - Nova (louds/ring): pure in-process heap; independent fresh processes.
 #     - Oxigraph: serve WITHOUT --location (pure in-memory).
 #     - QLever: mmap index + warm-up (only mode).
 #     - Fluree: fluree/server Docker, no host volume (ephemeral container FS).
-#     - RDFox: sandbox/daemon endpoint, in-memory (requires RDFox.lic).
+#     - RDFox: optional; sandbox/daemon in-memory when binary+license present
+#       (research/ is gitignored — missing install auto-skips with a note).
 #   Disk:
-#     - Nova (louds): --location WAL/snapshot path.
+#     - Nova (louds): --location WAL/snapshot path (LoudsStore).
+#     - Nova (ring): --location WAL/snapshot path (RingStore; same product surface).
 #     - Oxigraph: serve --location (RocksDB).
 #     - QLever: same mmap index.
 #     - Fluree: --storage-path with host volume mount.
@@ -27,9 +29,8 @@
 #
 # Options:
 #   --disk                  Disk-backed / persistent comparison
-#   --backends=both|louds|ring   Nova backends (mem only; default both).
+#   --backends=both|louds|ring   Nova backends (default both for mem and disk).
 #                           Ring uses Huffman C_p by default (no env needed).
-#                           Ignored with --disk (always louds).
 #   --no-oxigraph           Skip Oxigraph
 #   --no-qlever             Skip QLever
 #   --no-fluree             Skip Fluree (default: include via Docker)
@@ -38,13 +39,16 @@
 #   -h, --help              Show this help
 #
 # Env:
-#   NOVA_BACKENDS=both|louds|ring   Same as --backends (mem default: both)
+#   NOVA_BACKENDS=both|louds|ring   Same as --backends (default: both)
 #   NOVA_RING_HUFFMAN=0             A/B only: plain QWT256 C_p (ring-backend-qwt).
 #                                  Default / unset / 1 = Huffman C_p (product).
 #   QUERY_TIMEOUT_S=60
 #   QLEVER_BIN_DIR=/path/to/qlever/build
-#   RDFOX_BIN=path/to/RDFox         (default: research/rdfox/RDFox)
-#   RDFOX_LICENSE=path/to/RDFox.lic (default: research/rdfox/RDFox.lic or ~/.RDFox/RDFox.lic)
+#   RDFOX_BIN=path/to/RDFox         (optional; tried in order: $RDFOX_BIN,
+#                                   research/applications/rdfox/RDFox if present,
+#                                   then `command -v RDFox`. research/ is gitignored.)
+#   RDFOX_LICENSE=path/to/RDFox.lic (optional; research/.../RDFox.lic if present,
+#                                   else ~/.RDFox/RDFox.lic)
 #   RDFOX_ROLE / RDFOX_PASSWORD     (default guest/guest for sandbox)
 
 
@@ -122,12 +126,8 @@ fi
 
 QUERY_TIMEOUT_S="${QUERY_TIMEOUT_S:-60}"
 
-# Nova backends: disk is always louds-only.
-if [ "$MODE" = "disk" ]; then
-  NOVA_BACKENDS="louds"
-else
-  NOVA_BACKENDS="${BACKENDS_FLAG:-${NOVA_BACKENDS:-both}}"
-fi
+# Nova backends: both mem and disk default to louds+ring.
+NOVA_BACKENDS="${BACKENDS_FLAG:-${NOVA_BACKENDS:-both}}"
 case "$NOVA_BACKENDS" in
   both|louds|ring) ;;
   *)
@@ -135,23 +135,22 @@ case "$NOVA_BACKENDS" in
     exit 1
     ;;
 esac
-if [ "$MODE" = "disk" ] && [ "$NOVA_BACKENDS" != "louds" ]; then
-  echo "Note: --disk forces Nova (louds) only (Ring has no WAL/--location yet)." >&2
-  NOVA_BACKENDS="louds"
-fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BENCH_DIR="/tmp/oxigraph-nova-bench"
 OUT_DIR="$ROOT/benches/external"
+RESULTS_DIR="$ROOT/docs/benchmarks"
 QLEVER_BIN="${QLEVER_BIN_DIR:-/Users/jgentes/Documents/Workspace/qlever/build}"
 DATA="$BENCH_DIR/dataset_${ENTITIES}.nt"
 QUERIES="$BENCH_DIR/dataset_${ENTITIES}.queries.json"
-RESULTS_MD="$OUT_DIR/$RESULT_FILE"
+RESULTS_MD="$RESULTS_DIR/$RESULT_FILE"
 
 if [ "$MODE" = "disk" ]; then
   QLEVER_DIR="/tmp/qlever_bench_disk"
   CSV="$OUT_DIR/raw_results_disk.csv"
   NOVA_LOCATION="$BENCH_DIR/nova_disk_data"
+  # Separate --location roots so louds/ring disk footprints stay comparable.
+  NOVA_RING_LOCATION="$BENCH_DIR/nova_ring_disk_data"
   OXIGRAPH_LOCATION_HOST="$BENCH_DIR/oxigraph_disk_data"
   FLUREE_LOCATION_HOST="$BENCH_DIR/fluree_disk_data"
   NOVA_PORT=3031
@@ -167,6 +166,7 @@ else
   QLEVER_DIR="/tmp/qlever_bench"
   CSV="$OUT_DIR/raw_results.csv"
   NOVA_LOCATION=""
+  NOVA_RING_LOCATION=""
   OXIGRAPH_LOCATION_HOST=""
   FLUREE_LOCATION_HOST=""
   NOVA_PORT=3030
@@ -183,11 +183,21 @@ fi
 FLUREE_LEDGER="bench:main"
 FLUREE_CPU_LOG="/tmp/fluree_${MODE}_cpu_samples.txt"
 RDFOX_CPU_LOG="/tmp/rdfox_${MODE}_cpu_samples.txt"
-RDFOX_BIN="${RDFOX_BIN:-$ROOT/research/rdfox/RDFox}"
-# Prefer explicit env, then in-tree key next to binary, then ~/.RDFox/RDFox.lic
+# RDFox is fully optional. The default path under research/applications/ is
+# gitignored (local vendor tree only) — clones without research/ simply skip.
+if [ -z "${RDFOX_BIN:-}" ]; then
+  if [ -x "$ROOT/research/applications/rdfox/RDFox" ]; then
+    RDFOX_BIN="$ROOT/research/applications/rdfox/RDFox"
+  elif command -v RDFox >/dev/null 2>&1; then
+    RDFOX_BIN="$(command -v RDFox)"
+  else
+    RDFOX_BIN=""
+  fi
+fi
+# Prefer explicit env, then local research key (if present), then ~/.RDFox/RDFox.lic
 if [ -z "${RDFOX_LICENSE:-}" ]; then
-  if [ -f "$ROOT/research/rdfox/RDFox.lic" ]; then
-    RDFOX_LICENSE="$ROOT/research/rdfox/RDFox.lic"
+  if [ -f "$ROOT/research/applications/rdfox/RDFox.lic" ]; then
+    RDFOX_LICENSE="$ROOT/research/applications/rdfox/RDFox.lic"
   else
     RDFOX_LICENSE="$HOME/.RDFox/RDFox.lic"
   fi
@@ -247,7 +257,7 @@ if [ "$MODE" = "disk" ]; then
   fi
   RUN_RDFOX=0
 elif [ "$ENABLE_RDFOX" = "1" ]; then
-  if [ -x "$RDFOX_BIN" ] && [ -f "$RDFOX_LICENSE" ]; then
+  if [ -n "${RDFOX_BIN:-}" ] && [ -x "$RDFOX_BIN" ] && [ -f "$RDFOX_LICENSE" ]; then
     # evaluation_license.txt is NOT a valid key; require a real .lic file.
     if grep -qi 'END USER LICENCE AGREEMENT\|EVALUATION LICENCE' "$RDFOX_LICENSE" 2>/dev/null; then
       echo "Note: RDFox license at $RDFOX_LICENSE is EULA text, not a key; skipping RDFox." >&2
@@ -256,11 +266,13 @@ elif [ "$ENABLE_RDFOX" = "1" ]; then
       RUN_RDFOX=1
     fi
   else
-    if [ ! -x "$RDFOX_BIN" ]; then
-      echo "Note: RDFox binary not found at $RDFOX_BIN; skipping RDFox." >&2
+    if [ -z "${RDFOX_BIN:-}" ] || [ ! -x "${RDFOX_BIN:-}" ]; then
+      echo "Note: RDFox binary not found; skipping RDFox (optional engine)." >&2
+      echo "      research/ is gitignored — clones without a local RDFox install skip automatically." >&2
+      echo "      To include: set RDFOX_BIN to an executable RDFox, or place one on PATH." >&2
     elif [ ! -f "$RDFOX_LICENSE" ]; then
-      echo "Note: RDFox license not found at $RDFOX_LICENSE; skipping RDFox." >&2
-      echo "      Place a valid RDFox.lic at research/rdfox/RDFox.lic or ~/.RDFox/RDFox.lic." >&2
+      echo "Note: RDFox license not found at $RDFOX_LICENSE; skipping RDFox (optional engine)." >&2
+      echo "      Set RDFOX_LICENSE or place a valid key at ~/.RDFox/RDFox.lic." >&2
     fi
     RUN_RDFOX=0
   fi
@@ -273,8 +285,8 @@ if [ "$RUN_QLEVER" = "1" ] || [ "$ENABLE_QLEVER" = "1" ]; then
   mkdir -p "$QLEVER_DIR"
 fi
 if [ "$MODE" = "disk" ]; then
-  rm -rf "$NOVA_LOCATION" "$OXIGRAPH_LOCATION_HOST" "$FLUREE_LOCATION_HOST"
-  mkdir -p "$NOVA_LOCATION"
+  rm -rf "$NOVA_LOCATION" "$NOVA_RING_LOCATION" "$OXIGRAPH_LOCATION_HOST" "$FLUREE_LOCATION_HOST"
+  mkdir -p "$NOVA_LOCATION" "$NOVA_RING_LOCATION"
   [ "$ENABLE_OXIGRAPH" = "1" ] && mkdir -p "$OXIGRAPH_LOCATION_HOST"
   [ "$ENABLE_FLUREE" = "1" ] && mkdir -p "$FLUREE_LOCATION_HOST"
 fi
@@ -397,19 +409,40 @@ RDFOX_LOAD_S=""
 RDFOX_RSS_KB=""
 RDFOX_CPU_PCT=""
 
-# Kill a pid (and briefly wait) without hanging the harness on EXIT.
+# Kill a pid and reap it without hanging the harness on EXIT.
+#
+# macOS bash 3.2 prints async "Terminated: 15" job-status lines if a background
+# child dies while the shell is *not* blocked in wait (e.g. sleeping in a poll
+# loop after kill). Always kill then wait immediately; never sleep between them.
+#
+# Also kill direct children first: a bash subshell blocked in external `sleep`
+# defers SIGTERM until sleep returns, so the RDFox keep-alive
+# (`while true; do sleep 3600; done`) would hang wait for up to an hour.
 _kill_pid() {
   local pid="${1:-}"
+  local kids=""
   [ -z "$pid" ] && return 0
+
+  kids=$(pgrep -P "$pid" 2>/dev/null || true)
+  if [ -n "$kids" ]; then
+    # shellcheck disable=SC2086
+    kill $kids 2>/dev/null || true
+  fi
   kill "$pid" 2>/dev/null || true
-  local i
-  for i in 1 2 3 4 5; do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 0.2
-  done
-  kill -9 "$pid" 2>/dev/null || true
-  # Non-blocking reaping only (don't hang EXIT trap on foreign/orphaned pids).
+  # Reap immediately so bash never gets a chance to print the async notice.
+  # If $pid is not a child of this shell, wait fails instantly (non-zero) — fine.
   wait "$pid" 2>/dev/null || true
+
+  # Escalate only if still alive (non-child orphans, stubborn binaries).
+  if kill -0 "$pid" 2>/dev/null; then
+    kids=$(pgrep -P "$pid" 2>/dev/null || true)
+    if [ -n "$kids" ]; then
+      # shellcheck disable=SC2086
+      kill -9 $kids 2>/dev/null || true
+    fi
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
 }
 
 cleanup() {
@@ -560,29 +593,43 @@ stop_cpu_sampler() {
 }
 
 
-# Start one Nova process. tag=louds|ring. disk_mode uses --location for louds only.
+# Start one Nova process. tag=louds|ring.
+# Disk: both backends use --location (WAL + snapshot) via the StorageEngine registry.
+# Mem: --file only (in-memory bulk_load).
 start_nova() {
   local tag="$1"
   local bin="$2"
   local log="$3"
   free_port "$NOVA_PORT"
   if [ -n "${NOVA_PID:-}" ]; then
-    kill "$NOVA_PID" 2>/dev/null || true
-    wait "$NOVA_PID" 2>/dev/null || true
+    _kill_pid "$NOVA_PID"
     NOVA_PID=""
   fi
 
+  # Avoid empty-array expansion under bash 3.2 + set -u ("unbound variable").
+  # Build argv via set -- instead of backend_flag=().
   if [ "$MODE" = "disk" ]; then
-    # Disk: louds only, with --location
-    "$bin" --location "$NOVA_LOCATION" --file "$DATA" \
-      --bind "127.0.0.1:$NOVA_PORT" > "$log" 2>&1 &
-  elif [ "$tag" = "ring" ]; then
-    "$bin" --backend ring --file "$DATA" \
-      --bind "127.0.0.1:$NOVA_PORT" > "$log" 2>&1 &
+    local loc="$NOVA_LOCATION"
+    if [ "$tag" = "ring" ]; then
+      loc="$NOVA_RING_LOCATION"
+    fi
+    rm -rf "$loc"
+    mkdir -p "$loc"
+    if [ "$tag" = "ring" ]; then
+      set -- --backend ring --location "$loc" --file "$DATA" \
+        --bind "127.0.0.1:$NOVA_PORT"
+    else
+      set -- --location "$loc" --file "$DATA" \
+        --bind "127.0.0.1:$NOVA_PORT"
+    fi
   else
-    "$bin" --file "$DATA" \
-      --bind "127.0.0.1:$NOVA_PORT" > "$log" 2>&1 &
+    if [ "$tag" = "ring" ]; then
+      set -- --backend ring --file "$DATA" --bind "127.0.0.1:$NOVA_PORT"
+    else
+      set -- --file "$DATA" --bind "127.0.0.1:$NOVA_PORT"
+    fi
   fi
+  "$bin" "$@" > "$log" 2>&1 &
   NOVA_PID=$!
 }
 
@@ -612,36 +659,52 @@ run_nova_backend() {
   start_cpu_sampler "$NOVA_PID" "$cpu_log" 0 0
   run_engine_queries "$engine_id" "http://127.0.0.1:$NOVA_PORT/sparql" \
     "Accept: application/sparql-results+json"
-  local rss_kb cpu_pct
+  local rss_kb cpu_pct disk_kb=""
   rss_kb=$(measure_footprint_kb "$NOVA_PID")
   stop_cpu_sampler
   cpu_pct=$(avg_cpu "$cpu_log")
 
-  # Keep Nova alive in disk mode until after disk du; mem tears down each phase.
-  if [ "$MODE" = "mem" ]; then
-    kill "$NOVA_PID" 2>/dev/null || true
-    wait "$NOVA_PID" 2>/dev/null || true
-    NOVA_PID=""
+  # Disk footprint of the --location tree (WAL + snapshot + images).
+  if [ "$MODE" = "disk" ]; then
+    if [ "$tag" = "louds" ]; then
+      disk_kb=$(du -sk "$NOVA_LOCATION" 2>/dev/null | awk '{print $1}')
+    else
+      disk_kb=$(du -sk "$NOVA_RING_LOCATION" 2>/dev/null | awk '{print $1}')
+    fi
   fi
+
+  # Tear down each Nova phase (both mem and disk): backends run sequentially
+  # and must not leave a prior process holding the port / image dir.
+  _kill_pid "$NOVA_PID"
+  NOVA_PID=""
 
   if [ "$tag" = "louds" ]; then
     NOVA_LOUDS_LOAD_S="$load_s"
     NOVA_LOUDS_RSS_KB="$rss_kb"
     NOVA_LOUDS_CPU_PCT="$cpu_pct"
+    NOVA_LOUDS_DISK_KB="${disk_kb:-}"
   else
     NOVA_RING_LOAD_S="$load_s"
     NOVA_RING_RSS_KB="$rss_kb"
     NOVA_RING_CPU_PCT="$cpu_pct"
+    NOVA_RING_DISK_KB="${disk_kb:-}"
   fi
-  echo "  Nova ($tag) load=${load_s}s mem=${rss_kb}KB cpu=${cpu_pct}%"
+  if [ -n "${disk_kb:-}" ]; then
+    echo "  Nova ($tag) load=${load_s}s mem=${rss_kb}KB cpu=${cpu_pct}% disk=${disk_kb}KB"
+  else
+    echo "  Nova ($tag) load=${load_s}s mem=${rss_kb}KB cpu=${cpu_pct}%"
+  fi
 }
+
 
 NOVA_LOUDS_LOAD_S=""
 NOVA_LOUDS_RSS_KB=""
 NOVA_LOUDS_CPU_PCT=""
+NOVA_LOUDS_DISK_KB=""
 NOVA_RING_LOAD_S=""
 NOVA_RING_RSS_KB=""
 NOVA_RING_CPU_PCT=""
+NOVA_RING_DISK_KB=""
 
 echo "=== [4/6] Starting external engines ==="
 
@@ -778,9 +841,15 @@ fi
 
 # --- QLever ---
 if [ "$RUN_QLEVER" = "1" ]; then
-  ( cd "$QLEVER_DIR" && "$QLEVER_BIN/qlever-server" -i bench -p "$QLEVER_PORT" -n > "/tmp/qlever_server_${MODE}_bench.log" 2>&1 & )
-  sleep 1
-  QLEVER_PID=$(pgrep -f "qlever-server -i bench -p $QLEVER_PORT" | head -1)
+  # Keep qlever-server as a direct child of this shell so cleanup can wait/reap
+  # it without bash printing "Terminated: 15". (cd ... && cmd &) orphans the
+  # process from the parent job table; pgrep then finds a non-child PID.
+  (
+    cd "$QLEVER_DIR" || exit 1
+    exec "$QLEVER_BIN/qlever-server" -i bench -p "$QLEVER_PORT" -n \
+      > "/tmp/qlever_server_${MODE}_bench.log" 2>&1
+  ) &
+  QLEVER_PID=$!
   echo "Waiting for QLever..."
   wait_ready "$QLEVER_READY_URL"
 fi
@@ -846,7 +915,14 @@ fi
 echo "=== [6/6] Generating report ==="
 
 if [ "$MODE" = "disk" ]; then
-  NOVA_DISK_KB=$(du -sk "$NOVA_LOCATION" 2>/dev/null | awk '{print $1}')
+  # Prefer per-backend disk_kb captured while each Nova process was alive.
+  # Fall back to post-hoc du for louds WAL dir if needed.
+  if [ -z "${NOVA_LOUDS_DISK_KB:-}" ] && [ -n "${NOVA_LOCATION:-}" ]; then
+    NOVA_LOUDS_DISK_KB=$(du -sk "$NOVA_LOCATION" 2>/dev/null | awk '{print $1}')
+  fi
+  if [ -z "${NOVA_RING_DISK_KB:-}" ] && [ -n "${NOVA_RING_LOCATION:-}" ]; then
+    NOVA_RING_DISK_KB=$(du -sk "$NOVA_RING_LOCATION" 2>/dev/null | awk '{print $1}')
+  fi
   if [ "$RUN_OXIGRAPH" = "1" ]; then
     OXIGRAPH_DISK_KB=$(du -sk "$OXIGRAPH_LOCATION_HOST" 2>/dev/null | awk '{print $1}')
   fi
@@ -856,32 +932,43 @@ if [ "$MODE" = "disk" ]; then
   if [ "$RUN_FLUREE" = "1" ] && [ -n "$FLUREE_LOCATION_HOST" ]; then
     FLUREE_DISK_KB=$(du -sk "$FLUREE_LOCATION_HOST" 2>/dev/null | awk '{print $1}')
   fi
-  # Prefer louds metrics (only Nova on disk)
-  NOVA_RSS_KB="${NOVA_LOUDS_RSS_KB:-0}"
-  NOVA_CPU_PCT="${NOVA_LOUDS_CPU_PCT:-0}"
-  NOVA_LOAD_S="${NOVA_LOUDS_LOAD_S:-0}"
 
-  echo "Nova (louds) mem: ${NOVA_RSS_KB} KB | CPU ${NOVA_CPU_PCT}% | disk ${NOVA_DISK_KB} KB | load ${NOVA_LOAD_S}s"
+  if [ -n "$NOVA_LOUDS_RSS_KB" ]; then
+    echo "Nova (louds):  ${NOVA_LOUDS_RSS_KB} KB | CPU ${NOVA_LOUDS_CPU_PCT}% | disk ${NOVA_LOUDS_DISK_KB:-0} KB | load ${NOVA_LOUDS_LOAD_S}s"
+  fi
+  if [ -n "$NOVA_RING_RSS_KB" ]; then
+    echo "Nova (ring):   ${NOVA_RING_RSS_KB} KB | CPU ${NOVA_RING_CPU_PCT}% | disk ${NOVA_RING_DISK_KB:-0} KB | load ${NOVA_RING_LOAD_S}s"
+  fi
   if [ "$RUN_OXIGRAPH" = "1" ]; then
-    echo "Oxigraph MEM:     ${OXIGRAPH_MEM} | CPU ${OXIGRAPH_CPU_PCT}% | disk ${OXIGRAPH_DISK_KB} KB"
+    echo "Oxigraph MEM:  ${OXIGRAPH_MEM} | CPU ${OXIGRAPH_CPU_PCT}% | disk ${OXIGRAPH_DISK_KB} KB"
   fi
   if [ "$RUN_QLEVER" = "1" ]; then
-    echo "QLever mem:       ${QLEVER_RSS_KB} KB | CPU ${QLEVER_CPU_PCT}% | disk ${QLEVER_DISK_KB} KB"
+    echo "QLever mem:    ${QLEVER_RSS_KB} KB | CPU ${QLEVER_CPU_PCT}% | disk ${QLEVER_DISK_KB} KB"
   fi
   if [ "$RUN_FLUREE" = "1" ]; then
-    echo "Fluree MEM:       ${FLUREE_MEM} | CPU ${FLUREE_CPU_PCT}% | disk ${FLUREE_DISK_KB:-0} KB | load ${FLUREE_LOAD_S}s"
+    echo "Fluree MEM:    ${FLUREE_MEM} | CPU ${FLUREE_CPU_PCT}% | disk ${FLUREE_DISK_KB:-0} KB | load ${FLUREE_LOAD_S}s"
   fi
 
   set -- \
     --csv "$CSV" \
     --queries "$QUERIES" \
-    --nova-rss-kb "$NOVA_RSS_KB" \
-    --nova-cpu-pct "$NOVA_CPU_PCT" \
-    --nova-load-s "$NOVA_LOAD_S" \
-    --nova-disk-kb "${NOVA_DISK_KB:-0}" \
     --entities "$ENTITIES" \
     --triples "$(( ENTITIES * 25 ))" \
     --out "$RESULTS_MD"
+  if [ -n "$NOVA_LOUDS_RSS_KB" ]; then
+    set -- "$@" \
+      --nova-louds-rss-kb "$NOVA_LOUDS_RSS_KB" \
+      --nova-louds-cpu-pct "$NOVA_LOUDS_CPU_PCT" \
+      --nova-louds-load-s "$NOVA_LOUDS_LOAD_S" \
+      --nova-louds-disk-kb "${NOVA_LOUDS_DISK_KB:-0}"
+  fi
+  if [ -n "$NOVA_RING_RSS_KB" ]; then
+    set -- "$@" \
+      --nova-ring-rss-kb "$NOVA_RING_RSS_KB" \
+      --nova-ring-cpu-pct "$NOVA_RING_CPU_PCT" \
+      --nova-ring-load-s "$NOVA_RING_LOAD_S" \
+      --nova-ring-disk-kb "${NOVA_RING_DISK_KB:-0}"
+  fi
   if [ "$RUN_OXIGRAPH" = "1" ]; then
     set -- "$@" \
       --oxigraph-mem "$OXIGRAPH_MEM" \

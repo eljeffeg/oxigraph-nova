@@ -16,7 +16,7 @@ In short:
 | Dimension              | Oxigraph                                      | Oxigraph Nova                                      |
 |------------------------|-----------------------------------------------|----------------------------------------------------|
 | **Primary Goal**       | Production excellence, stability, compliance  | Algorithmic innovation + latest standards          |
-| **Storage Engine**     | RocksDB (mature, battle-tested)               | CompactLTJ Ring + LSM delta (research-oriented)    |
+| **Storage Engine**     | RocksDB (mature, battle-tested)               | CompactLTJ LOUDS (default) + Cyclic-QWT Ring; LSM delta + WAL |
 | **Join Evaluation**    | Traditional (actively being optimized)        | Leapfrog Triejoin (worst-case optimal)             |
 | **RDF / SPARQL Level** | Full RDF 1.1 + preliminary 1.2                | Full RDF 1.2 / SPARQL 1.2 / openCypher             |
 | **Stability Profile**  | High — ready for production use               | Experimental / bleeding-edge                       |
@@ -52,39 +52,52 @@ All `rdf-12` / `sparql-12` feature flags are enabled across the parsing stack fr
 
 Nova separates the storage engine from the SPARQL evaluator behind two small
 traits, `QuadStore` and `Dataset` — the only seam the query engine depends
-on. Production **six-order CompactLTJ LOUDS** lives in
-`oxigraph-nova-storage-louds` (`RingStore` + LSM delta + WAL/snapshot).
-Dependents still import `oxigraph_nova_storage_ring::RingStore` via a temporary
-re-export during the Braided Ring productization split.
+on. Product surfaces (CLI, MCP, `nova-store`, `nova_serve`) never hard-code a
+concrete store type: they hold `Arc<dyn StorageEngine>` and construct engines
+through a self-registering **`BackendFactory`** registry
+(`inventory::submit!` in each engine crate). Deleting a `nova-engine-xxx`
+crate (and its dependency edge) simply removes that name from
+`--backend` / `available_backends()`; everything else keeps working.
 
-**Braided Ring** (feature `cyclic-ring-pilot` on `oxigraph-nova-storage-ring`):
-cyclic QWT columns, `NOVARNG1` mmap images, and D2 braided multi-range
-intersection — **not** wired into SPARQL yet. See
-[`research/BRAIDED_RING.md`](./research/BRAIDED_RING.md).
+| Backend | Crate | Status | Select with |
+|---|---|---|---|
+| **LOUDS** (`LoudsStore`) | `oxigraph-nova-engine-louds` | Default production: six-order CompactLTJ + LSM delta + WAL/snapshot | `--backend louds` (default) |
+| **Ring** (`RingStore`) | `oxigraph-nova-engine-ring` (`cyclic-ring`) | Cyclic-QWT with full product surface (WAL, bulk_load, fulltext, backup) | build with `--features ring-backend`, then `--backend ring` |
 
-The full crate layout, the CompactLTJ/Leapfrog-Triejoin design in depth, and
-the extension seams for building on top of Nova (`QuadStore`, `Dataset`,
-`TextSearch`, `ServiceHandler`, custom SPARQL functions, embedding the HTTP
-server) are documented in **[`ARCHITECTURE.md`](./docs/ARCHITECTURE.md)**.
+`oxigraph-nova-engine-ring` still **re-exports** the LOUDS surface so older
+`oxigraph_nova_engine_ring::LoudsStore` imports stay green during the split.
+
+The full crate layout, `StorageEngine` / registry design, CompactLTJ/LFTJ
+depth, and extension seams (`QuadStore`, `Dataset`, `TextSearch`,
+`ServiceHandler`, embedding the HTTP server) are in
+**[`ARCHITECTURE.md`](./docs/ARCHITECTURE.md)**.
+
 
 ---
 
 ## Full-text search (opt-in)
 
 
-An optional Tantivy-backed full-text index sits alongside the Ring, gated
-behind a `fulltext` cargo feature on `oxigraph-nova-storage-ring` so the
-dependency and index-file overhead are zero-cost until explicitly enabled:
+An optional Tantivy-backed full-text index sits alongside the storage index,
+gated behind a `fulltext` cargo feature (forwarded through `engine-ring` →
+`engine-louds`, and available on Ring when built with `ring-backend`) so the
+dependency and index-file overhead are zero-cost until explicitly enabled.
+Works with every registered backend:
 
 ```sh
 # Server binary built with full-text search support:
 cargo run -p oxigraph-nova-server --release --features fulltext --bin nova_serve -- \
     --location ./data --fulltext --bind 0.0.0.0:3030
 
+# Ring backend + fulltext:
+cargo run -p oxigraph-nova-server --release --features "fulltext,ring-backend" --bin nova_serve -- \
+    --backend ring --location ./data --fulltext --bind 0.0.0.0:3030
+
 # Or via the `oxigraph` CLI's `serve` subcommand:
 cargo run --release --bin oxigraph --features fulltext -- \
     serve --location ./data --fulltext --bind 0.0.0.0:3030
 ```
+
 
 Once enabled, two SPARQL extension functions become available under a
 dedicated function-IRI namespace — the same convention Jena/GraphDB/Stardog
@@ -107,18 +120,19 @@ join runs, rather than scanning every row and re-checking the filter
 afterward.
 
 **Consistency model:** the index is rebuilt incrementally on the same
-compaction cycle that rebuilds the Ring (`RingStore::compact()`), not on
-every write — search results are eventually consistent with the live delta,
-matching the existing LFTJ nested-loop-fallback semantics for uncompacted
-writes. A generation marker recorded alongside a persistent store's snapshot
-detects a stale or missing index at `enable_fulltext()` time (e.g. turning
-the feature on for the first time against a pre-existing database, or
-recovering from a prior crash) and triggers a one-time full rebuild
-automatically rather than silently serving stale results.
+compaction cycle that rebuilds the storage image (`StorageEngine::compact()`),
+not on every write — search results are eventually consistent with the live
+delta, matching the existing LFTJ nested-loop-fallback semantics for
+uncompacted writes. A generation marker recorded alongside a persistent
+store's snapshot detects a stale or missing index at `enable_fulltext()` time
+(e.g. turning the feature on for the first time against a pre-existing
+database, or recovering from a prior crash) and triggers a one-time full
+rebuild automatically rather than silently serving stale results.
 
-See `crates/nova-fulltext/src/lib.rs` for the Tantivy schema and
-`crates/nova-storage-louds/src/fulltext.rs` for the compaction-time indexing
-glue (still reachable via the ring crate re-export for feature wiring).
+See `crates/core/nova-fulltext/src/lib.rs` for the Tantivy schema and
+`crates/engines/nova-engine-louds/src/fulltext.rs` /
+`crates/engines/nova-engine-ring/src/ring_store.rs` for compaction-time indexing glue.
+
 
 
 ## OWL 2 RL reasoning (opt-in)
@@ -184,7 +198,7 @@ SELECT ?animal WHERE { ?animal a <Ex:Animal> }
 -- → returns both explicit Ex:Animal instances and inferred ones (dogs, etc.)
 ```
 
-See `crates/nova-reasoning/src/lib.rs`'s module doc comment for the crate's internal architecture (`SortedVecTrie`, `AtomSource`/`CombinedSource`, `fixpoint::closure_over_store`), and `crates/nova-server/tests/reasoning_http.rs` for end-to-end HTTP examples.
+See `crates/core/nova-reasoning/src/lib.rs`'s module doc comment for the crate's internal architecture (`SortedVecTrie`, `AtomSource`/`CombinedSource`, `fixpoint::closure_over_store`), and `crates/server/nova-server/tests/reasoning_http.rs` for end-to-end HTTP examples.
 
 ## GeoSPARQL support (opt-in)
 
@@ -229,8 +243,8 @@ way as any other SPARQL extension function — no spatial index accelerates
 the candidate set beforehand, so filtering happens after the enclosing basic
 graph pattern has otherwise been evaluated.
 
-See `crates/nova-query/src/evaluator.rs`'s `geosparql_function_local` for the
-function-dispatch table, and `crates/nova-server/src/service_description.rs`
+See `crates/core/nova-query/src/evaluator.rs`'s `geosparql_function_local` for the
+function-dispatch table, and `crates/server/nova-server/src/service_description.rs`
 for how enabled functions are advertised via `sd:extensionFunction` in the
 SPARQL Service Description.
 
@@ -283,7 +297,7 @@ seam above (`ReasoningEngine`) — a pluggable, `Dataset`-level operation, so
 alternative implementations (e.g. a heavier SHACL-SPARQL-capable backend)
 can be swapped in later without changing callers. See
 **[`ARCHITECTURE.md`](./docs/ARCHITECTURE.md#8-shaclvalidator--shacl-validation-seam)**
-for the trait itself, and `crates/nova-shacl/src/lib.rs`'s module doc
+for the trait itself, and `crates/core/nova-shacl/src/lib.rs`'s module doc
 comment for exactly which SHACL Core targets (`sh:targetNode`,
 `sh:targetClass`, implicit class targets) and constraints (`sh:minCount`,
 `sh:maxCount`, `sh:datatype`, `sh:nodeKind`, `sh:class`, `sh:hasValue`,
@@ -337,7 +351,7 @@ and Tantivy-backed full-text search described above (each requiring the
 corresponding cargo feature to also be built in), and `--max-results <n>`
 caps the number of rows/triples a single `sparql_query` call may return.
 
-See `crates/nova-mcp/src/lib.rs`'s module doc comment for the full tool
+See `crates/server/nova-mcp/src/lib.rs`'s module doc comment for the full tool
 reference and transport details.
 
 
@@ -410,7 +424,7 @@ oxrdf 0.5. Until that upgrade lands, seed annotated relationships via SPARQL
 Update / Turtle-star if you need them on disk, then query them with Cypher
 `MATCH`.
 
-See `crates/nova-cypher/src/lib.rs` and `crates/nova-cypher/src/lower.rs`
+See `crates/core/nova-cypher/src/lib.rs` and `crates/core/nova-cypher/src/lower.rs`
 for the full grammar, mapping table, and lowering strategy.
 
 ## Conformance and compatibility
@@ -445,7 +459,8 @@ cargo bench -p oxigraph-nova-bench -- query/triangle # cyclic join only
 cargo run -p oxigraph-nova-bench --example memory_report --release  # memory footprint table
 ```
 
-These are internal Criterion benchmarks (`benches/bsbm_large.rs`, `benches/wikidata_slice.rs`) that compare Nova's own `RingStore` against its in-memory baseline. For a comparison against external, independently-developed engines, see the next section.
+These are internal Criterion benchmarks (`benches/bsbm_large.rs`, `benches/wikidata_slice.rs`) that compare Nova's storage backends against its in-memory baseline. For a comparison against external, independently-developed engines, see the next section.
+
 
 ### External comparative benchmarks (Nova vs Oxigraph vs QLever)
 
@@ -455,24 +470,26 @@ identical synthetic BSBM-style datasets and identical SPARQL queries, run throug
 
 | Report | Storage mode |
 |---|---|
-| [`RESULTS_MEM.md`](./benches/external/RESULTS_MEM.md) | In-memory (all engines) |
-| [`RESULTS_DISK.md`](./benches/external/RESULTS_DISK.md) | Persistent/disk-backed (each engine's native mode) |
+| [`RESULTS_MEM.md`](./docs/benchmarks/RESULTS_MEM.md) | In-memory (all engines) |
+| [`RESULTS_DISK.md`](./docs/benchmarks/RESULTS_DISK.md) | Persistent/disk-backed (each engine's native mode) |
 
-See [`benches/external/README.md`](./benches/external/README.md) for the full methodology, storage-model fairness notes, and instructions to run the harness yourself.
+See [`benches/external/README.md`](./docs/benchmarks/README.md) for the full methodology, storage-model fairness notes, and instructions to run the harness yourself.
 
 
 ## Command-line interface (`oxigraph`)
 
 Building the workspace also produces a standalone `oxigraph` binary
-(`crates/nova-cli`, package `oxigraph-nova-cli`) that matches upstream
+(`crates/server/nova-cli`, package `oxigraph-nova-cli`) that matches upstream
 `oxigraph-cli`'s full 9-subcommand surface — `load`, `backup`, `query`,
 `update`, `dump`, `convert`, `optimize`, `serve`, and `serve-read-only` —
-against Nova's own `RingStore`, plus Nova's own SHACL `validate` addition,
-an openCypher `cypher` subcommand (`cypher query` / `cypher update`), and
-an opt-in `mcp` subcommand (12 top-level subcommands; `cypher` and `mcp`
+against any registered `StorageEngine` (default LOUDS; Ring with
+`--features ring-backend --backend ring`), plus Nova's own SHACL `validate`
+addition, an openCypher `cypher` subcommand (`cypher query` / `cypher update`),
+and an opt-in `mcp` subcommand (12 top-level subcommands; `cypher` and `mcp`
 each have nested actions — `mcp serve` is gated behind the `mcp` cargo
 feature; see "MCP server (opt-in)" and "openCypher support" above),
 under the same binary name so scripts/muscle memory carry over:
+
 
 ```sh
 cargo build --release --bin oxigraph
@@ -486,13 +503,14 @@ cargo build --release --bin oxigraph
 | oxigraph update | `--location <dir> (--update <u> \| --update-file <f>)` | Run a SPARQL update against a persistent store, offline (no HTTP) |
 | oxigraph dump | `--location <dir> [--file <f>] [--format <fmt>] [--graph <iri>]` | Serialize a store's logical RDF content out to a file, optionally restricted to one graph |
 | oxigraph convert | `[--from-file <f>] [--from-format <fmt>] [--to-file <f>] [--to-format <fmt>]` | Stream-convert one RDF file to another format, with no store involved at all — supports stdin/stdout |
-| oxigraph optimize | `--location <dir>` | Force storage compaction on demand (`RingStore::compact()`) |
-| oxigraph serve | `[--location <dir>] [--file <path>] [--bind <addr>]` | Start the same SPARQL 1.2 HTTP server described below, as a subcommand instead of a separate binary |
-| oxigraph serve-read-only | `--location <dir> [--bind <addr>]` | Same as `serve`, but every write (`/update`, `PUT`/`POST`/`DELETE /store`) is rejected at the HTTP layer with `403 Forbidden` |
-| oxigraph validate | `--location <dir> --shapes <path> [--shapes-format <fmt>] [--results-file <f>]` | Validate a persistent store's data against a SHACL shapes graph, offline (no HTTP) — exits non-zero if the data does not conform, so this doubles as a CI gate (see "SHACL validation" above) |
-| oxigraph cypher query | `--location <dir> (--query <q> \| --query-file <f>) [--results-file <f>] [--results-format <fmt>]` | Run an openCypher read query against a persistent store, offline — results format-negotiated the same way as `/cypher` / `/sparql` (see "openCypher support" above) |
-| oxigraph cypher update | `--location <dir> (--update <u> \| --update-file <f>)` | Run an openCypher write statement against a persistent store, offline (see "openCypher support" above) |
-| oxigraph mcp serve | `[--location <dir>] [--reasoning] [--fulltext] [--max-results <n>]` | `mcp`'s nested `serve` action: start an MCP (Model Context Protocol) server over stdio, exposing SPARQL/openCypher query/update and data-model-discovery tools to LLM agents — requires the `mcp` cargo feature (see "MCP server (opt-in)" above) |
+| oxigraph optimize | `--location <dir> [--backend <name>]` | Force storage compaction on demand (`StorageEngine::compact()`) |
+| oxigraph serve | `[--location <dir>] [--file <path>] [--bind <addr>] [--backend <name>]` | Start the same SPARQL 1.2 HTTP server described below, as a subcommand instead of a separate binary |
+| oxigraph serve-read-only | `--location <dir> [--bind <addr>] [--backend <name>]` | Same as `serve`, but every write (`/update`, `PUT`/`POST`/`DELETE /store`) is rejected at the HTTP layer with `403 Forbidden` |
+| oxigraph validate | `--location <dir> --shapes <path> [--shapes-format <fmt>] [--results-file <f>] [--backend <name>]` | Validate a persistent store's data against a SHACL shapes graph, offline (no HTTP) — exits non-zero if the data does not conform, so this doubles as a CI gate (see "SHACL validation" above) |
+| oxigraph cypher query | `--location <dir> (--query <q> \| --query-file <f>) [--results-file <f>] [--results-format <fmt>] [--backend <name>]` | Run an openCypher read query against a persistent store, offline — results format-negotiated the same way as `/cypher` / `/sparql` (see "openCypher support" above) |
+| oxigraph cypher update | `--location <dir> (--update <u> \| --update-file <f>) [--backend <name>]` | Run an openCypher write statement against a persistent store, offline (see "openCypher support" above) |
+| oxigraph mcp serve | `[--location <dir>] [--backend <name>] [--reasoning] [--fulltext] [--max-results <n>]` | `mcp`'s nested `serve` action: start an MCP (Model Context Protocol) server over stdio, exposing SPARQL/openCypher query/update and data-model-discovery tools to LLM agents — requires the `mcp` cargo feature (see "MCP server (opt-in)" above) |
+
 
 ```sh
 # Bulk-load a dataset directly into a persistent store
@@ -554,16 +572,17 @@ A handful of upstream `oxigraph-cli` flags aren't implemented yet (query
 
 ## Running the server
 
-`nova_serve` is a standalone SPARQL 1.1 HTTP server binary, built on the same
-`RingStore` (Ring + LFTJ) used throughout this crate. Its flags are
-deliberately named to match upstream Oxigraph's own CLI where the concepts
-overlap, so a script or muscle memory built around `oxigraph serve`/
-`oxigraph load` mostly carries over unchanged:
+`nova_serve` is a standalone SPARQL 1.1 HTTP server binary. It constructs a
+`StorageEngine` via the self-registering backend registry (default LOUDS;
+Ring with `--features ring-backend --backend ring`) and serves it through
+`Server<dyn QuadStore>`. Flags match upstream Oxigraph's CLI where concepts
+overlap:
 
 | Flag                    | Alias(es) | Meaning                                                                 |
 |-------------------------|-----------|--------------------------------------------------------------------------|
-| `--file <file>`         | `-f`      | Bulk-load an N-Triples dataset (matches `oxigraph load --file`) |
+| `--file <file>`         | `-f`      | Bulk-load an RDF dataset (matches `oxigraph load --file`) |
 | `--location <dir>`      | `-l`      | Persistent, WAL-backed store rooted at `<dir>` (matches `oxigraph serve --location`) |
+| `--backend <name>`      |           | Storage backend (`louds` default; `ring` requires `--features ring-backend`) |
 | `--bind <addr>`         | `-b`      | Listen address, default `0.0.0.0:3030` (matches `oxigraph serve --bind`) |
 | `--compact-threshold <n>` |          | Delta-size threshold that triggers automatic inline compaction (persistent stores only) |
 | `--sync-interval-ms <n>` |          | Override the default 500ms WAL fsync/group-commit interval (persistent stores only) |
@@ -582,12 +601,17 @@ cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
 cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
     --location ./data --bind 0.0.0.0:3030
 
+# Ring backend (WAL + snapshot, same product surface as LOUDS):
+cargo run -p oxigraph-nova-server --release --features ring-backend --bin nova_serve -- \
+    --backend ring --location ./data --file dataset.nt --bind 0.0.0.0:3030
+
 # Persistent store, bulk-loaded from a dataset on first run only (an
 # existing WAL at --location is replayed on subsequent runs and --file
 # is then ignored):
 cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
     --location ./data --file dataset.nt --bind 0.0.0.0:3030
 ```
+
 
 Once running, the server exposes the SPARQL 1.1 Protocol, the SPARQL 1.1
 Graph Store HTTP Protocol, and openCypher query/update endpoints, all
@@ -625,7 +649,7 @@ curl http://localhost:3030/metrics
 ```
 
 See `nova_serve --help` for the full flag reference, and
-`crates/nova-server/src/lib.rs`'s module doc comment for the complete list of
+`crates/server/nova-server/src/lib.rs`'s module doc comment for the complete list of
 supported RDF/SPARQL-results serialization formats.
 
 ### Authentication

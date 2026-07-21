@@ -1,0 +1,17 @@
+[package]
+name        = "oxigraph-nova-engine-memory"
+description = "In-memory QuadStore implementation for testing and development"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+oxigraph-nova-core = { path = "../../core/nova-core" }
+oxrdf         = { workspace = true }
+anyhow        = { workspace = true }
+parking_lot   = { workspace = true }
+
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

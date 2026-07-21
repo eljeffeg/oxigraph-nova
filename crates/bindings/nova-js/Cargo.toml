@@ -1,0 +1,67 @@
+[package]
+name        = "oxigraph-nova-js"
+description = "JavaScript/WASM bindings (oxigraph-js-compatible API) for Oxigraph Nova, backed by oxigraph-nova-store"
+readme      = "README.md"
+keywords    = ["RDF", "N-Triples", "Turtle", "SPARQL"]
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+publish = false
+
+
+[lib]
+crate-type = ["cdylib"]
+name = "oxigraph"
+doc = false
+
+[features]
+default = ["rdf-12"]
+rdf-12 = ["oxrdf/rdf-12", "spargebra/sparql-12"]
+
+[dependencies]
+# WASM target: in-memory only (Store::new(), no `--location`), so `mmap`
+# (which requires `mmap-rs`, unsupported on wasm32) is disabled all the way
+# down the dependency graph — see each crate's `mmap` feature doc comment.
+oxigraph-nova-store        = { path = "../../server/nova-store", default-features = false }
+oxigraph-nova-query        = { path = "../../core/nova-query", default-features = false }
+oxigraph-nova-engine-ring = { path = "../../engines/nova-engine-ring", default-features = false }
+oxigraph-nova-core         = { path = "../../core/nova-core", default-features = false }
+
+oxrdf      = { workspace = true }
+oxrdfio    = { workspace = true, features = ["async-tokio"] }
+spargebra  = { workspace = true }
+sparesults = { workspace = true }
+anyhow     = { workspace = true }
+
+console_error_panic_hook.workspace = true
+js-sys.workspace = true
+# NOTE: the workspace-level `tokio` dependency enables `features = ["full"]`
+# (rt-multi-thread, net, process, signal, fs, ...), which pull in `mio`.
+# `mio` has no wasm32-unknown-unknown backend (only wasm32-wasip1), so it
+# fails to compile for this crate's target. We only need `AsyncRead`/`ReadBuf`
+# (io.rs) and `TokioAsyncReaderQuadParser` (oxrdfio's `async-tokio` feature),
+# both of which live under tokio's `io-util` feature — so override down to
+# just that, sidestepping mio entirely for the wasm32 build.
+tokio = { version = "1.52", default-features = false, features = ["io-util"] }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+
+# `rand`/`sux` transitively depend on two getrandom major versions (0.3 via
+# rand_core 0.9, used by oxrdf/spargebra's blank-node-id generation, and 0.4
+# via rand 0.10, used by sux's dictionary permutation arrays). Neither has a
+# default wasm32-unknown-unknown backend (unlike wasm32-unknown-wasi); each
+# requires explicitly opting in to the `wasm_js` feature (which defers to
+# `js-sys`/`wasm-bindgen`'s `crypto.getRandomValues`, exactly like
+# oxigraph-js's own `oxigraph/js` feature does upstream). Depending on both
+# versions directly here (Cargo feature-unifies by exact version) turns that
+# feature on workspace-wide for the wasm32 build only.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+# nova-query's UUID()/STRUUID() SPARQL built-ins use the `uuid` crate, which
+# (like getrandom) requires an explicit randomness source feature on wasm32.
+uuid = { version = "1", features = ["js"] }
+
+
+

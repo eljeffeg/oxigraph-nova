@@ -24,7 +24,7 @@
 #       --location /data --bind 0.0.0.0:3030
 #
 # See docker-compose.yml for a ready-to-use Compose setup, and
-# `nova_serve --help` (or crates/nova-server/src/bin/nova_serve.rs) for the
+# `nova_serve --help` (or crates/server/nova-server/src/bin/nova_serve.rs) for the
 # full CLI flag reference.
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -52,12 +52,26 @@ RUN rustup show
 # Copy manifests first to allow Docker to cache the dependency build
 # across source-only changes.
 COPY Cargo.toml Cargo.lock ./
-COPY crates/nova-core/Cargo.toml crates/nova-core/Cargo.toml
-COPY crates/nova-query/Cargo.toml crates/nova-query/Cargo.toml
-COPY crates/nova-storage-memory/Cargo.toml crates/nova-storage-memory/Cargo.toml
-COPY crates/nova-storage-common/Cargo.toml crates/nova-storage-common/Cargo.toml
-COPY crates/nova-storage-ring/Cargo.toml crates/nova-storage-ring/Cargo.toml
-COPY crates/nova-server/Cargo.toml crates/nova-server/Cargo.toml
+# core
+COPY crates/core/nova-core/Cargo.toml crates/core/nova-core/Cargo.toml
+COPY crates/core/nova-query/Cargo.toml crates/core/nova-query/Cargo.toml
+COPY crates/core/nova-fulltext/Cargo.toml crates/core/nova-fulltext/Cargo.toml
+COPY crates/core/nova-reasoning/Cargo.toml crates/core/nova-reasoning/Cargo.toml
+COPY crates/core/nova-shacl/Cargo.toml crates/core/nova-shacl/Cargo.toml
+COPY crates/core/nova-cypher/Cargo.toml crates/core/nova-cypher/Cargo.toml
+# engines
+COPY crates/core/nova-storage/Cargo.toml crates/core/nova-storage/Cargo.toml
+COPY crates/engines/nova-engine-memory/Cargo.toml crates/engines/nova-engine-memory/Cargo.toml
+COPY crates/engines/nova-engine-louds/Cargo.toml crates/engines/nova-engine-louds/Cargo.toml
+COPY crates/engines/nova-engine-ring/Cargo.toml crates/engines/nova-engine-ring/Cargo.toml
+# server
+COPY crates/server/nova-server/Cargo.toml crates/server/nova-server/Cargo.toml
+COPY crates/server/nova-store/Cargo.toml crates/server/nova-store/Cargo.toml
+COPY crates/server/nova-cli/Cargo.toml crates/server/nova-cli/Cargo.toml
+COPY crates/server/nova-mcp/Cargo.toml crates/server/nova-mcp/Cargo.toml
+# bindings
+COPY crates/bindings/nova-python/Cargo.toml crates/bindings/nova-python/Cargo.toml
+COPY crates/bindings/nova-js/Cargo.toml crates/bindings/nova-js/Cargo.toml
 COPY tests/w3c/Cargo.toml tests/w3c/Cargo.toml
 COPY benches/Cargo.toml benches/Cargo.toml
 
