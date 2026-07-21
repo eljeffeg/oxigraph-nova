@@ -928,6 +928,10 @@ fn eval_sp_expansion_walk<D: Dataset>(
     // expand stays dense — no per-subject external↔dense remap.
     if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
         SP_EXPANSION_SELECTED.fetch_add(1, Ordering::Relaxed);
+        // Cache subject decode across consecutive objects of the same s
+        // (star_with_features expands ~20 features per product).
+        let mut last_s: Option<u64> = None;
+        let mut last_s_term: Option<std::sync::Arc<Term>> = None;
         let emit_result = prepared.execute(&mut |ids| {
             // SP-expansion emits [s, o]
             debug_assert!(ids.len() >= 2);
@@ -941,7 +945,10 @@ fn eval_sp_expansion_walk<D: Dataset>(
             }
             step += 1;
             LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
-            let s_term = dataset.lftj_decode_term(s); // Option<Arc<Term>>
+            if last_s != Some(s) {
+                last_s = Some(s);
+                last_s_term = dataset.lftj_decode_term(s);
+            }
             emit_sp_expansion_solution(
                 dataset,
                 join_vars,
@@ -949,7 +956,7 @@ fn eval_sp_expansion_walk<D: Dataset>(
                 plan.o_idx,
                 s,
                 o,
-                &s_term,
+                &last_s_term,
                 &mut results,
             );
             Ok(())

@@ -1734,9 +1734,12 @@ pub fn oracle_join_scan(
 // R1 middle-b range cache; R2 cheap hit rebind; pred adjacency
 
 /// Max SP row-span that materialises objects via `access` instead of opening a
-/// mapped LastCol RDI. Tuned for subject-star 2join where BSBM P131 degree is 1
-/// (and small multi-valued properties stay well under this).
-const SP_SMALL_RANGE_ACCESS: u32 = 16;
+/// mapped LastCol RDI / RNV walk.
+///
+/// RESULTS_MEM `star_with_features` expands P2 with FAN_OUT_FEATURES=20 objects
+/// per subject. Keeping T ≥ 20 avoids the expensive RNV path on that shape
+/// (and still covers degree-1 P131 2join).
+const SP_SMALL_RANGE_ACCESS: u32 = 32;
 
 /// Body of a prepared SP→O cursor after `reset_to_subject` / `reset_from_range`.
 ///
@@ -1746,12 +1749,12 @@ const SP_SMALL_RANGE_ACCESS: u32 = 16;
 enum SpObjectBody {
     /// No objects under the current subject.
     Empty,
-    /// Degree-1 SP (BSBM P131): single external object, zero heap alloc.
-    Singleton(u64),
-    /// Tiny multi-valued SP range: external object ids via O-column access.
-    /// Avoids RDI open/rebind overhead on low-fanout subjects.
-    Materialized { vals: Vec<u64>, pos: usize },
-    /// Larger SP ranges: mapped LastCol RDI / RNV walk.
+    /// Degree-1 SP: single dense object (external on key()).
+    SingletonDense(u32),
+    /// Tiny multi-valued SP: dense O ids via access. Two-hop hop2 adj can
+    /// use key_dense() and skip external→dense remap per middle b.
+    MaterializedDense { vals: Vec<u32>, pos: usize },
+    /// Larger SP ranges: mapped LastCol RDI / RNV walk (keys external).
     Mapped(BraidedMappedLastColScan),
 }
 
@@ -1820,12 +1823,11 @@ impl PreparedSpObjectScanImpl {
         PredicateAdjacency::build(img.index().ring_ref(), pred_dense, universe, mode).map(Arc::new)
     }
 
-    /// Materialise distinct external O ids from a small SP row span via access.
+    /// Materialise distinct dense O ids from a small SP row span via access.
     /// T_spo is sorted by o within (s,p), so consecutive equal O values collapse.
     #[inline]
-    fn materialize_small_range(&self, range: RowRange) -> Vec<u64> {
+    fn materialize_small_range_dense(&self, range: RowRange) -> Vec<u32> {
         let ring = self.img.index().ring_ref();
-        let remap = self.img.remap();
         let mut vals = Vec::with_capacity(range.len().min(SP_SMALL_RANGE_ACCESS) as usize);
         let mut prev: Option<u32> = None;
         for pos in range.start..range.end {
@@ -1834,9 +1836,26 @@ impl PreparedSpObjectScanImpl {
                 continue;
             }
             prev = Some(d);
-            vals.push(remap.to_external(d).unwrap_or(u64::from(d)));
+            vals.push(d);
         }
         vals
+    }
+
+    #[inline]
+    fn key_dense(&self) -> Option<u32> {
+        match &self.body {
+            SpObjectBody::SingletonDense(d) => Some(*d),
+            SpObjectBody::MaterializedDense { vals, pos } => Some(vals[*pos]),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn external_of_dense(&self, d: u32) -> u64 {
+        self.img
+            .remap()
+            .to_external(d)
+            .unwrap_or(u64::from(d))
     }
 
     #[inline]
@@ -1856,20 +1875,18 @@ impl PreparedSpObjectScanImpl {
         if range.len() <= SP_SMALL_RANGE_ACCESS {
             let t_cur = std::time::Instant::now();
             let ring = self.img.index().ring_ref();
-            let remap = self.img.remap();
             let body = if range.len() == 1 {
                 let d = ring.access(Col::O, range.start);
-                let ext = remap.to_external(d).unwrap_or(u64::from(d));
-                SpObjectBody::Singleton(ext)
+                SpObjectBody::SingletonDense(d)
             } else {
-                let vals = self.materialize_small_range(range);
+                let vals = self.materialize_small_range_dense(range);
                 if vals.is_empty() {
                     self.body = SpObjectBody::Empty;
                     let ns = t_cur.elapsed().as_nanos() as u64;
                     SPARQL_PATH.k9_sp_cursor_ns.fetch_add(ns, Ordering::Relaxed);
                     return false;
                 }
-                SpObjectBody::Materialized { vals, pos: 0 }
+                SpObjectBody::MaterializedDense { vals, pos: 0 }
             };
             let ns = t_cur.elapsed().as_nanos() as u64;
             SPARQL_PATH.k9_sp_cursor_ns.fetch_add(ns, Ordering::Relaxed);
@@ -2014,8 +2031,8 @@ impl PreparedSpObjectScan for PreparedSpObjectScanImpl {
     #[inline]
     fn key(&self) -> u64 {
         match &self.body {
-            SpObjectBody::Singleton(v) => *v,
-            SpObjectBody::Materialized { vals, pos } => vals[*pos],
+            SpObjectBody::SingletonDense(d) => self.external_of_dense(*d),
+            SpObjectBody::MaterializedDense { vals, pos } => self.external_of_dense(vals[*pos]),
             SpObjectBody::Mapped(c) => c.key(),
             SpObjectBody::Empty => panic!("PreparedSpObjectScan::key at_end"),
         }
@@ -2024,10 +2041,10 @@ impl PreparedSpObjectScan for PreparedSpObjectScanImpl {
     #[inline]
     fn advance(&mut self) {
         match &mut self.body {
-            SpObjectBody::Singleton(_) => {
+            SpObjectBody::SingletonDense(_) => {
                 self.body = SpObjectBody::Empty;
             }
-            SpObjectBody::Materialized { vals, pos } => {
+            SpObjectBody::MaterializedDense { vals, pos } => {
                 *pos += 1;
                 if *pos < vals.len() {
                     SPARQL_PATH
@@ -2051,8 +2068,8 @@ impl PreparedSpObjectScan for PreparedSpObjectScanImpl {
     fn at_end(&self) -> bool {
         match &self.body {
             SpObjectBody::Empty => true,
-            SpObjectBody::Singleton(_) => false,
-            SpObjectBody::Materialized { vals, pos } => *pos >= vals.len(),
+            SpObjectBody::SingletonDense(_) => false,
+            SpObjectBody::MaterializedDense { vals, pos } => *pos >= vals.len(),
             SpObjectBody::Mapped(c) => c.at_end(),
         }
     }
@@ -2271,19 +2288,24 @@ impl PreparedTwoHop for PreparedTwoHopImpl {
                     .fetch_add(1, Ordering::Relaxed);
             }
             while !self.hop1.at_end() {
-                let b = self.hop1.key();
+                // Dense hop1 body skips external→dense remap on every middle b.
+                let (b, b_dense) = if let Some(d) = self.hop1.key_dense() {
+                    (self.hop1.external_of_dense(d), d)
+                } else {
+                    let b = self.hop1.key();
+                    let t_remap = std::time::Instant::now();
+                    let Some(d) = img_ref.remap().to_dense(b) else {
+                        self.hop1.advance();
+                        continue;
+                    };
+                    SPARQL_PATH
+                        .k9_sp_remap_ns
+                        .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    (b, d)
+                };
                 SPARQL_PATH
                     .k9_p2_range_lookups
                     .fetch_add(1, Ordering::Relaxed);
-
-                let t_remap = std::time::Instant::now();
-                let Some(b_dense) = img_ref.remap().to_dense(b) else {
-                    self.hop1.advance();
-                    continue;
-                };
-                SPARQL_PATH
-                    .k9_sp_remap_ns
-                    .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 let bi = b_dense as usize;
 
                 if bi < seen_b.len() && !seen_b[bi] {
@@ -2957,14 +2979,19 @@ pub struct PreparedPredD1 {
 
 impl PreparedPredD1 {
     pub fn prepare(img: Arc<BraidedGraphImage>, predicate: u64) -> Option<Self> {
+        let adj = PreparedSpObjectScanImpl::build_shared_adj(&img, predicate);
+        Self::prepare_with_adj(img, predicate, adj)
+    }
+
+    pub fn prepare_with_adj(
+        img: Arc<BraidedGraphImage>,
+        predicate: u64,
+        adj: Option<Arc<PredicateAdjacency>>,
+    ) -> Option<Self> {
         if !img.has_mapped() {
             return None;
         }
         let pred_dense = img.remap().to_dense(predicate)?;
-        let mode = effective_pred_adjacency_mode();
-        let universe = img.universe() as usize;
-        let adj = PredicateAdjacency::build(img.index().ring_ref(), pred_dense, universe, mode)
-            .map(Arc::new);
         SPARQL_PATH.d1_pred_prepare.fetch_add(1, Ordering::Relaxed);
         Some(Self {
             img,
@@ -2997,10 +3024,15 @@ impl PreparedPredD1 {
 }
 
 /// Left-bound handle: SP(a,P) range fixed; each right subject does one D1 open.
+///
+/// When left SP is tiny (≤ wedge left-once T), `left_tiny` holds sorted distinct
+/// dense O once per outer `a`. Each `intersect_right` only materialises right
+/// and two-pointer merges — no re-walk of left.
 struct PreparedLeftD1 {
     img: Arc<BraidedGraphImage>,
     pred_dense: u32,
     left_range: RowRange,
+    left_tiny: Option<Vec<u32>>,
     adj: Option<Arc<PredicateAdjacency>>,
 }
 
@@ -3037,6 +3069,20 @@ impl PreparedLeftIntersect for PreparedLeftD1 {
         SPARQL_PATH
             .d1_left_range_reuse
             .fetch_add(1, Ordering::Relaxed);
+
+        if let Some(ref left_vals) = self.left_tiny {
+            let t = effective_wedge_left_once_threshold()
+                .max(effective_d1_tiny_merge_threshold());
+            if t > 0 && r1.len() <= t {
+                let right_vals = materialize_sp_o_dense(&self.img, r1);
+                let commons = merge_dense_sorted_to_external(&self.img, left_vals, &right_vals);
+                return Some(Box::new(TinyMergeScan {
+                    vals: commons,
+                    pos: 0,
+                }) as Box<dyn TrieIterator>);
+            }
+        }
+
         Some(Box::new(BraidedSpD1ObjectScan::open(
             Arc::clone(&self.img),
             self.left_range,
@@ -3056,10 +3102,17 @@ impl PreparedPredObjectIntersect for PreparedPredD1 {
         if left_range.is_empty() {
             return None;
         }
+        let t = effective_wedge_left_once_threshold().max(effective_d1_tiny_merge_threshold());
+        let left_tiny = if t > 0 && left_range.len() <= t {
+            Some(materialize_sp_o_dense(&self.img, left_range))
+        } else {
+            None
+        };
         Some(Box::new(PreparedLeftD1 {
             img: Arc::clone(&self.img),
             pred_dense: self.pred_dense,
             left_range,
+            left_tiny,
             adj: self.adj.clone(),
         }))
     }
@@ -3189,11 +3242,13 @@ fn materialize_sp_o_dense(img: &BraidedGraphImage, range: RowRange) -> Vec<u32> 
     vals
 }
 
-/// Two-pointer ∩ of two tiny SP object lists → external TermIds (sorted).
+/// Two-pointer ∩ of two sorted dense id slices → external TermIds.
 #[inline]
-fn materialize_sp_d1_tiny_merge(img: &BraidedGraphImage, r0: RowRange, r1: RowRange) -> Vec<u64> {
-    let a = materialize_sp_o_dense(img, r0);
-    let b = materialize_sp_o_dense(img, r1);
+fn merge_dense_sorted_to_external(
+    img: &BraidedGraphImage,
+    a: &[u32],
+    b: &[u32],
+) -> Vec<u64> {
     let remap = img.remap();
     let mut out = Vec::with_capacity(a.len().min(b.len()));
     let (mut i, mut j) = (0usize, 0usize);
@@ -3210,6 +3265,50 @@ fn materialize_sp_d1_tiny_merge(img: &BraidedGraphImage, r0: RowRange, r1: RowRa
         }
     }
     out
+}
+
+/// Two-pointer ∩ of two tiny SP object lists → external TermIds (sorted).
+#[inline]
+fn materialize_sp_d1_tiny_merge(img: &BraidedGraphImage, r0: RowRange, r1: RowRange) -> Vec<u64> {
+    let a = materialize_sp_o_dense(img, r0);
+    let b = materialize_sp_o_dense(img, r1);
+    merge_dense_sorted_to_external(img, &a, &b)
+}
+
+/// Pre-buffered external intersection walk (left-once / tiny-merge result).
+struct TinyMergeScan {
+    vals: Vec<u64>,
+    pos: usize,
+}
+
+impl TrieIterator for TinyMergeScan {
+    #[inline]
+    fn key(&self) -> u64 {
+        self.vals[self.pos]
+    }
+
+    fn seek(&mut self, target: u64) {
+        while self.pos < self.vals.len() && self.vals[self.pos] < target {
+            self.pos += 1;
+        }
+    }
+
+    fn advance(&mut self) {
+        self.pos = self.pos.saturating_add(1).min(self.vals.len());
+    }
+
+    fn open(&self) -> Box<dyn TrieIterator> {
+        Box::new(EmptyTrieIter)
+    }
+
+    #[inline]
+    fn at_end(&self) -> bool {
+        self.pos >= self.vals.len()
+    }
+
+    fn remaining_count(&self) -> u64 {
+        self.vals.len().saturating_sub(self.pos) as u64
+    }
 }
 
 impl TrieIterator for BraidedSpD1ObjectScan {
@@ -3307,9 +3406,13 @@ impl PreparedWedgeImpl {
         if !img.has_mapped() {
             return None;
         }
-        let hop = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), predicate)?;
-        // PreparedPredD1::prepare already bumps d1_pred_prepare.
-        let d1 = PreparedPredD1::prepare(Arc::clone(&img), predicate)?;
+        let adj = PreparedSpObjectScanImpl::build_shared_adj(&img, predicate);
+        let hop = PreparedSpObjectScanImpl::prepare_with_shared_adj(
+            Arc::clone(&img),
+            predicate,
+            adj.clone(),
+        )?;
+        let d1 = PreparedPredD1::prepare_with_adj(Arc::clone(&img), predicate, adj)?;
         Some(Self {
             img,
             predicate,
