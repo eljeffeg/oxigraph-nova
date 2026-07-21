@@ -1,21 +1,28 @@
 [workspace]
+exclude = ["vendor/qwt"]
 resolver = "2"
 members = [
-    "crates/nova-core",
-    "crates/nova-query",
-    "crates/nova-storage-memory",
-    "crates/nova-storage-common",
-    "crates/nova-storage-ring",
-    "crates/nova-fulltext",
-    "crates/nova-reasoning",
-    "crates/nova-shacl",
-    "crates/nova-cypher",
-    "crates/nova-server",
-    "crates/nova-store",
-    "crates/nova-cli",
-    "crates/nova-mcp",
-    "crates/nova-python",
-    "crates/nova-js",
+    # core
+    "crates/core/nova-core",
+    "crates/core/nova-query",
+    "crates/core/nova-fulltext",
+    "crates/core/nova-reasoning",
+    "crates/core/nova-shacl",
+    "crates/core/nova-cypher",
+    # engines (pluggable StorageEngine backends)
+    "crates/core/nova-storage",
+    "crates/engines/nova-engine-memory",
+    "crates/engines/nova-engine-louds",
+    "crates/engines/nova-engine-ring",
+    # server / product surface
+    "crates/server/nova-server",
+    "crates/server/nova-store",
+    "crates/server/nova-cli",
+    "crates/server/nova-mcp",
+    # language bindings
+    "crates/bindings/nova-python",
+    "crates/bindings/nova-js",
+    # tests / benches
     "tests/w3c",
     "benches",
 ]
@@ -110,7 +117,7 @@ rand = "0.10"   # SPARQL RAND() built-in
 parking_lot = "0.12"
 
 # ── Full-text search ────────────────────────────────────────────────────────
-# Opt-in via nova-storage-ring's `fulltext` cargo feature (crates/nova-fulltext).
+# Opt-in via nova-engine-ring's `fulltext` cargo feature (crates/core/nova-fulltext).
 # Zero-cost when the feature is disabled: no crate in the default build graph
 # depends on tantivy.
 tantivy = "0.26"
@@ -173,3 +180,10 @@ codegen-units  = 1       # maximise inlining + cross-crate optimisation (slower 
 inherits        = "release"
 debug           = 1
 split-debuginfo = "off"
+
+
+# Braided Ring — vendored qwt 0.5.0 with public DataLine / rank helpers for mmap.
+# Upstream: https://github.com/rossanoventurini/qwt @ crates.io 0.5.0
+[patch.crates-io]
+qwt = { path = "vendor/qwt" }
+

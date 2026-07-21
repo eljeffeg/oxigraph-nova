@@ -1,4 +1,4 @@
-//! Memory footprint estimator: RingStore vs CLTJ vs MemoryStore.
+//! Memory footprint estimator: LoudsStore vs CLTJ vs MemoryStore.
 //!
 //! Prints a table showing how much memory each backend uses at various dataset
 //! sizes, along with the memory savings achieved by the CLTJ implementation.
@@ -20,8 +20,8 @@
 //!   compact footprint.
 //!   Vocabulary arrays (`vocab[d]`: local→global ID maps) remain `Arc<Vec<u64>>`
 //!   (64 bits/entry) for O(1) direct indexing and SIMD `partition_point` on the
-//!   LFTJ hot path — attempting bit-packed vocab caused 8–22% query regressions
-//!   and was reverted.
+//!   LFTJ hot path — kept as `&[u64]` rather than bit-packed; bit-packing
+//!   regressed query latency by ~8–22% because `seek()` is the LFTJ hot path.
 //!   This is the CompactLTJ design from Arroyuelo et al. (VLDB Journal 2025).
 //!
 //! # LOUDS label count model
@@ -73,8 +73,8 @@
 //! ```
 
 use oxigraph_nova_core::{GraphName, NamedNode, Quad, QuadStore, Subject, Term};
-use oxigraph_nova_storage_memory::MemoryStore;
-use oxigraph_nova_storage_ring::RingStore;
+use oxigraph_nova_engine_memory::MemoryStore;
+use oxigraph_nova_engine_ring::LoudsStore;
 use std::sync::Arc;
 
 // -- Data generation ----------------------------------------------------------
@@ -176,7 +176,7 @@ fn estimate_ring_wavelet(n: usize, triple_count: usize) -> (usize, usize) {
 /// **Vocab arrays:** 3 `Arc<Vec<u64>>` are Arc-cloned across all 6 tries × 3 depth slots
 /// (18 total slots share 3 backing allocations).  Unique entry counts:
 /// n subjects + 3 predicates + (n+110) objects = 2n+113 entries × 8 bytes each.
-/// Bit-packed vocab was attempted but reverted due to 8–22% query regressions
+/// Vocab stays plain `u64` (not bit-packed): bit-packing regressed query latency ~8–22%
 /// from bit-unpacking on the LFTJ hot path (`key()` called on every leapfrog step).
 ///
 /// Returns `(louds_bytes, vocab_bytes, dict_bytes)`.
@@ -202,7 +202,7 @@ fn estimate_cltj(n: usize, triple_count: usize) -> (usize, usize, usize) {
 
     let louds_bytes = l_bytes + t_bytes;
 
-    // Vocab arrays: 3 Arc<Vec<u64>> (64 bits/entry; bit-packed version was reverted).
+    // Vocab arrays: 3 Arc<Vec<u64>> (64 bits/entry; not bit-packed — seek is LFTJ-hot).
     // Unique entries: n (orig_s) + 3 (orig_p) + (n+110) (orig_o) = 2n+113.
     // 3 backing allocations shared via Arc across 18 per-trie vocab slots.
     let vocab_entries = 2 * n + 113;
@@ -248,7 +248,7 @@ fn main() {
 
     {
         let quads = generate_quads(100);
-        let rs = Arc::new(RingStore::new());
+        let rs = Arc::new(LoudsStore::new());
         for q in &quads {
             rs.insert(q).unwrap();
         }
@@ -256,7 +256,7 @@ fn main() {
         assert_eq!(
             rs.triple_count(),
             500,
-            "unexpected triple count in RingStore"
+            "unexpected triple count in LoudsStore"
         );
         let ms = Arc::new(MemoryStore::new());
         for q in &quads {
@@ -284,7 +284,7 @@ fn main() {
     println!(
         "                     vocab stays Arc<Vec<u64>> (64 bits/entry) for LFTJ hot-path speed"
     );
-    println!("                     (bit-packed vocab reverted: caused 8-22% regressions)");
+    println!("                     (vocab stays u64: bit-packing regressed queries ~8-22%)");
     println!();
     println!("  Columns show TOTAL memory (index + vocab + dict) unless marked 'LOUDS-only'.");
     println!();
@@ -396,7 +396,7 @@ fn main() {
     let l_bytes = (total_labels * bits_per_entry).div_ceil(8);
     let t_bytes = (total_labels * 11 + 4) / (8 * 8);
 
-    // Vocab detail: stays at 64 bits/entry (bit-packed vocab reverted)
+    // Vocab detail: stays at 64 bits/entry (bit-packing would regress seek)
     let vocab_entries = 2 * n + 113;
     let vocab_bytes_compact = (vocab_entries * bits_per_entry).div_ceil(8); // what bit-packed vocab would have been
     let vocab_saving_pct_if_10b = (cltj_vocab - vocab_bytes_compact) * 100 / cltj_vocab;
@@ -431,7 +431,7 @@ fn main() {
         vocab_entries / 1000,
     );
     println!(
-        "  |    (bit-packed vocab bit-packed vocab would save {}% -> {} but caused 8-22% query regression)",
+        "  |    (bit-packing would save {}% -> {} but regresses queries ~8-22% on seek hot path)",
         vocab_saving_pct_if_10b,
         fmt_bytes(vocab_bytes_compact),
     );
@@ -476,13 +476,13 @@ fn main() {
         fmt_bytes(total_labels * 4),
         fmt_bytes(l_bytes),
     );
-    println!("     Vocab stays Arc<Vec<u64>> (64 bits/entry) — bit-packed vocab bit-packed vocab");
+    println!("     Vocab stays Arc<Vec<u64>> (64 bits/entry) — not bit-packed:");
     println!(
-        "     was reverted: would have saved {}% ({}) but caused 8-22% query regression",
+        "     bit-packing would save {}% ({}) but regresses queries ~8-22%",
         vocab_saving_pct_if_10b,
         fmt_bytes(cltj_vocab - vocab_bytes_compact),
     );
-    println!("     because key() (hottest LFTJ op) became a bit-unpack on every call.");
+    println!("     because key() (hottest LFTJ op) becomes a bit-unpack on every call.");
     println!();
     println!(
         "  2. LOUDS-only ({:.1} B/triple at N=10k) meets the <=20 B/triple target.",

@@ -1,0 +1,82 @@
+[package]
+name        = "oxigraph-nova-engine-ring"
+description = "Braided Ring (cyclic QWT / NOVARNG1 / D2) + temporary re-export of production LOUDS LoudsStore"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+default = ["mmap"]
+# Opt-in Tantivy-backed full-text search — forwarded to the LOUDS crate
+# (shared glue + production LoudsStore) and pulls in the Tantivy wrapper
+# so RingStore can hold a FulltextIndex directly. Zero-cost when disabled.
+fulltext     = [
+    "oxigraph-nova-engine-louds/fulltext",
+    "dep:oxigraph-nova-fulltext",
+]
+
+# Research-only DROP-branch APIs (D3/D4/E1 counters, C1/prefetch mutation knobs)
+# for the Braided Ring.
+diagnostics  = []
+# Braided Ring: cyclic QWT + NOVARNG1 + D2. Not on LoudsStore SPARQL path.
+# Substrate only (qwt + memmap2). C_p encoding is selected by `ring-huffman-cp`.
+cyclic-ring = ["dep:qwt", "dep:memmap2"]
+# Huffman C_p (HuffColP / HQWA). Requires cyclic-ring.
+# Product default: nova-server `ring-backend` enables this feature so build_*
+# paths use PredicateColumn::Huff. Without it, C_p is plain QWT256
+# (`ring-backend-qwt` / explicit `*_qwt_cp` builders for A/B).
+#   cargo test -p oxigraph-nova-engine-ring --features cyclic-ring,ring-huffman-cp
+ring-huffman-cp = ["cyclic-ring"]
+
+# Forwarded to LOUDS + common + core for LoudsStore::open / snapshot mmap path
+# and RingStore::open dict/image mmap path.
+# Disabled (via `default-features = false`) for the wasm32 build
+# (`oxigraph-nova-js`), which is in-memory-only and never calls
+# `LoudsStore::open` / `RingStore::open`.
+mmap = [
+    "oxigraph-nova-engine-louds/mmap",
+    "oxigraph-nova-storage/mmap",
+]
+
+
+[dependencies]
+# Production LOUDS LoudsStore — re-exported from lib.rs for dependent compatibility.
+# Also used by RingStore for `delta::Delta` reuse.
+oxigraph-nova-engine-louds = { path = "../nova-engine-louds", default-features = false }
+
+# Dictionary / QuadStore / TrieIterator for join_scan + RingStore
+# (cyclic-ring only; not default SPARQL cutover).
+oxigraph-nova-core = { path = "../../core/nova-core", default-features = false }
+inventory = "0.3" # self-register BackendFactory (ring) for product open_backend/new_backend
+
+
+# Shared WAL / MANIFEST / dict-snapshot machinery (backend-agnostic durability).
+# Used by RingStore::open / crash-safe compact for lifecycle parity with LOUDS.
+oxigraph-nova-storage = { path = "../../core/nova-storage" }
+
+# Tantivy full-text index (optional; feature `fulltext`).
+# RingStore holds FulltextIndex directly; LOUDS fulltext glue is reused for
+# marker paths / index_quad_* / rebuild_from_spo_triples.
+oxigraph-nova-fulltext = { path = "../../core/nova-fulltext", optional = true }
+
+# Used by Ring mmap error types (`MappedQwtError` / `MappedRingError`).
+thiserror = { workspace = true }
+
+
+# RingStore Mutex. Same lock style as LOUDS LoudsStore.
+parking_lot = { workspace = true }
+
+# Braided Ring substrate (optional; feature `cyclic-ring`).
+# Version must match vendor/qwt/Cargo.toml so [patch.crates-io] actually
+# applies (semver mismatch silently demotes the patch to [patch.unused] and
+# falls back to a real crates.io 0.4.0 lacking DataLine/SuperblockPlain/
+# range_next_value/range_distinct_iter).
+qwt     = { version = "0.5.0", optional = true }
+memmap2 = { version = "0.9", optional = true }
+
+
+
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

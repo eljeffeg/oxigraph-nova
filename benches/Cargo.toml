@@ -9,14 +9,21 @@ publish      = false
 
 [features]
 default  = []
+# Braided Ring (cyclic QWT / NOVARNG1 / D2).
+cyclic-ring = ["oxigraph-nova-engine-ring/cyclic-ring", "ring-huffman-cp", "dep:qwt"]
+# DROP-branch matrices for e511 --full-campaign.
+diagnostics = ["oxigraph-nova-engine-ring/diagnostics"]
+# Huffman C_p (product default; enabled by cyclic-ring). Standalone A/B name.
+ring-huffman-cp = ["oxigraph-nova-engine-ring/ring-huffman-cp"]
+
 
 # ── Runtime deps (needed by both [[bench]] and [[example]] targets) ──────────
 
 [dependencies]
-oxigraph-nova-core           = { path = "../crates/nova-core" }
-oxigraph-nova-query          = { path = "../crates/nova-query" }
-oxigraph-nova-storage-memory = { path = "../crates/nova-storage-memory" }
-oxigraph-nova-storage-ring   = { path = "../crates/nova-storage-ring" }
+oxigraph-nova-core           = { path = "../crates/core/nova-core" }
+oxigraph-nova-query          = { path = "../crates/core/nova-query" }
+oxigraph-nova-engine-memory = { path = "../crates/engines/nova-engine-memory" }
+oxigraph-nova-engine-ring   = { path = "../crates/engines/nova-engine-ring", features = ["cyclic-ring", "ring-huffman-cp"] }
 oxrdf                   = { workspace = true }
 oxttl                   = { workspace = true }   # N-Triples parsing for optional BSBM file load
 spargebra               = { workspace = true }
@@ -24,6 +31,12 @@ anyhow                  = { workspace = true }
 serde                   = { workspace = true }
 serde_json              = { workspace = true }
 mimalloc = "0.1.52"
+sparesults = { workspace = true }
+# Optional direct qwt dependency for archived harnesses that compare
+# QWT256/HQWT256 directly. Version must match vendor/qwt/Cargo.toml so the
+# root [patch.crates-io] actually applies (see nova-engine-ring/Cargo.toml).
+qwt = { version = "0.5.0", optional = true }
+
 
 
 # ── Benchmark harness ────────────────────────────────────────────────────────

@@ -20,18 +20,28 @@ import math
 import os
 from typing import List, Optional, Sequence, Tuple
 
-# Stable palette: Nova / Oxigraph / QLever
+# Stable palette: Nova / Oxigraph / QLever / Fluree / RDFox
 ENGINE_COLORS = {
-    "nova": "#2563eb",
+    "nova": "#2563eb",  # legacy single-Nova CSV id
+    "nova-louds": "#2563eb",
+    "nova-ring": "#7c3aed",
     "oxigraph": "#dc2626",
     "qlever": "#16a34a",
+    "fluree": "#ea580c",
+    "rdfox": "#0891b2",
 }
 
 ENGINE_SHORT = {
-    "nova": "Nova",
+    "nova": "Nova (louds)",
+    "nova-louds": "Nova (louds)",
+    "nova-ring": "Nova (ring)",
     "oxigraph": "Oxigraph",
     "qlever": "QLever",
+    "fluree": "Fluree",
+    "rdfox": "RDFox",
 }
+
+
 
 # Shared stylesheet: transparent bg, light-default text, dark via media query.
 # Classes used by chart elements:

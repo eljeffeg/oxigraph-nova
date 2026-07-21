@@ -9,10 +9,10 @@ publish = false
 # `cargo test -p oxigraph-nova-w3c-harness`.
 
 [dependencies]
-oxigraph-nova-core           = { path = "../../crates/nova-core" }
-oxigraph-nova-query          = { path = "../../crates/nova-query" }
-oxigraph-nova-storage-memory = { path = "../../crates/nova-storage-memory" }
-oxigraph-nova-storage-ring   = { path = "../../crates/nova-storage-ring" }
+oxigraph-nova-core           = { path = "../../crates/core/nova-core" }
+oxigraph-nova-query          = { path = "../../crates/core/nova-query" }
+oxigraph-nova-engine-memory = { path = "../../crates/engines/nova-engine-memory" }
+oxigraph-nova-engine-ring   = { path = "../../crates/engines/nova-engine-ring" }
 oxrdf      = { workspace = true }
 oxttl      = { workspace = true }
 oxrdfxml   = { workspace = true }  # some W3C SPARQL 1.1 subquery fixtures ship .rdf (RDF/XML) data

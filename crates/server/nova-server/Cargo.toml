@@ -1,0 +1,86 @@
+[package]
+name        = "oxigraph-nova-server"
+description = "SPARQL 1.2 HTTP endpoint for Oxigraph Nova (SPARQL Protocol)"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+# Opt-in Tantivy full-text search (`text:query`/`text:contains`), forwarded
+# straight through to `oxigraph-nova-engine-ring`'s own `fulltext` feature.
+fulltext = ["oxigraph-nova-engine-ring/fulltext"]
+# Opt-in outbound HTTP client, forwarded straight through to
+# `oxigraph-nova-query`'s own `http-client` feature: unblocks SPARQL 1.1
+# Update's `LOAD <iri>` and gives `Server::new` a default, real HTTP-backed
+# `SERVICE` clause handler (`oxigraph_nova_query::HttpServiceHandler`) —
+# see `Server::new`'s doc comment.
+http-client = ["oxigraph-nova-query/http-client"]
+# Opt-in GeoSPARQL extension functions (geof:distance, sf:intersects, etc.),
+# forwarded straight through to `oxigraph-nova-query`'s own `geosparql`
+# feature. Advertised in the SPARQL Service Description document.
+geosparql = ["oxigraph-nova-query/geosparql", "dep:spargeo"]
+# In-memory RingStore backend for nova_serve (`--backend ring`).
+# Enables cyclic-ring + Huffman C_p (product default). NOT the default
+# SPARQL path. In-memory only (no --location). Used by benches/external with
+# NOVA_BACKEND=ring.
+ring-backend = [
+    "oxigraph-nova-engine-ring/cyclic-ring",
+    "oxigraph-nova-engine-ring/ring-huffman-cp",
+]
+# Alias: same as ring-backend (Huffman is the product default).
+ring-huffman-cp = ["ring-backend"]
+# A/B only: RingStore with plain QWT256 C_p (no Huffman).
+#   cargo build -p oxigraph-nova-server --release --features ring-backend-qwt --bin nova_serve
+ring-backend-qwt = ["oxigraph-nova-engine-ring/cyclic-ring"]
+
+
+
+
+
+[dependencies]
+oxigraph-nova-core         = { path = "../../core/nova-core" }
+oxigraph-nova-query        = { path = "../../core/nova-query" }
+oxigraph-nova-engine-ring = { path = "../../engines/nova-engine-ring" }
+oxigraph-nova-reasoning    = { path = "../../core/nova-reasoning" }
+oxigraph-nova-shacl        = { path = "../../core/nova-shacl" }
+oxigraph-nova-cypher       = { path = "../../core/nova-cypher" }
+
+oxrdf          = { workspace = true }
+oxrdfio        = { workspace = true }
+spargebra      = { workspace = true }
+
+sparesults     = { workspace = true }
+tokio          = { workspace = true }
+tokio-stream   = { workspace = true }
+axum           = { workspace = true }
+tower-http     = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+anyhow         = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+mimalloc         = { version = "0.1.52", features = ["extended"] }
+libmimalloc-sys  = { version = "0.1.49", features = ["extended"] }
+# Opt-in via the `geosparql` feature: only needed to enumerate
+# `GEOSPARQL_EXTENSION_FUNCTIONS`'s IRIs for the SPARQL Service Description
+# (`sd:extensionFunction` triples) — see `service_description.rs`.
+spargeo          = { workspace = true, optional = true }
+
+
+
+
+[[bin]]
+name = "nova_serve"
+path = "src/bin/nova_serve.rs"
+
+[dev-dependencies]
+oxigraph-nova-engine-memory = { path = "../../engines/nova-engine-memory" }
+tower             = { workspace = true }   # Router::oneshot for integration tests
+pretty_assertions = { workspace = true }
+
+tokio             = { workspace = true }
+ureq              = "3"    # blocking HTTP client for the crash-recovery integration
+                             # test (tests/crash_recovery.rs) — spawns and talks to a
+                             # real `nova_serve` subprocess; matches the same `ureq`
+                             # version already used by tests/w3c's harness.

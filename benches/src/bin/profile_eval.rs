@@ -1,5 +1,5 @@
 //! Ad-hoc profiling tool: loads the 500K-entity benchmark dataset into a
-//! RingStore and times pure in-process query evaluation (no HTTP, no JSON
+//! LoudsStore and times pure in-process query evaluation (no HTTP, no JSON
 //! serialization) for the exact same queries used by the external HTTP
 //! benchmark (`benches/external/run_comparison.sh`), read directly from
 //! `dataset.queries.json` to guarantee byte-identical SPARQL text. Used to
@@ -18,8 +18,8 @@
 //! allocation-count differences from ordinary run-to-run noise.
 
 use oxigraph_nova_core::{GraphName, Quad};
+use oxigraph_nova_engine_ring::LoudsStore;
 use oxigraph_nova_query::{Dataset, Evaluator, QueryResult, StoreDataset};
-use oxigraph_nova_storage_ring::RingStore;
 use oxttl::NTriplesParser;
 use serde::Deserialize;
 use spargebra::SparqlParser;
@@ -212,7 +212,7 @@ fn main() {
         }
         Quad::new(t.subject, t.predicate, t.object, GraphName::DefaultGraph)
     });
-    let store = RingStore::new();
+    let store = LoudsStore::new();
     let count = store.bulk_load(quads).expect("bulk_load failed");
     eprintln!(
         "[profile_eval] Loaded + compacted {count} triples in {:.2}s.",

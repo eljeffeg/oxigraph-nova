@@ -1,0 +1,31 @@
+[package]
+name        = "oxigraph-nova-python"
+description = "Python bindings (pyoxigraph-compatible API) for Oxigraph Nova, backed by oxigraph-nova-store"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+name = "pyoxigraph"
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[features]
+default = ["rdf-12"]
+rdf-12 = ["oxrdf/rdf-12", "spargebra/sparql-12"]
+abi3 = ["pyo3/abi3-py38"]
+
+[dependencies]
+oxigraph-nova-store = { path = "../../server/nova-store" }
+oxigraph-nova-query  = { path = "../../core/nova-query" }
+oxigraph-nova-engine-ring = { path = "../../engines/nova-engine-ring" }
+oxigraph-nova-core   = { path = "../../core/nova-core" }
+oxrdf      = { workspace = true }
+oxrdfio    = { workspace = true }
+
+spargebra  = { workspace = true }
+
+sparesults = { workspace = true }
+anyhow     = { workspace = true }
+pyo3 = { workspace = true, features = ["extension-module"] }

@@ -1,0 +1,42 @@
+[package]
+name        = "oxigraph-nova-engine-louds"
+description = "Production six-order LOUDS LoudsStore (CompactLTJ) for Oxigraph Nova"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+default = ["mmap"]
+# Opt-in Tantivy-backed full-text search (see `crates/core/nova-fulltext`),
+# indexed incrementally on LoudsStore's compaction cycle. Zero-cost when
+# disabled: no tantivy dependency is even compiled in.
+fulltext = ["dep:oxigraph-nova-fulltext"]
+# See `oxigraph-nova-core`'s `mmap` feature doc comment. Gates
+# `snapshot.rs`'s `load_mmap`-based functions, used by `LoudsStore::open`'s
+# disk-backed recovery path and `commit_compaction`'s persistent-store
+# branch. Disabled (via `default-features = false`) for the wasm32 build
+# (`oxigraph-nova-js`), which is in-memory-only and never calls
+# `LoudsStore::open`.
+mmap = ["epserde/mmap", "sux/mmap", "oxigraph-nova-core/mmap", "oxigraph-nova-storage/mmap"]
+
+[dependencies]
+oxigraph-nova-core = { path = "../../core/nova-core", default-features = false }
+oxigraph-nova-storage = { path = "../../core/nova-storage", default-features = false } # generic WAL/MANIFEST/dict-persistence machinery (backend-agnostic)
+oxigraph-nova-fulltext = { path = "../../core/nova-fulltext", optional = true }
+inventory     = "0.3" # self-register BackendFactory for product open_backend/new_backend
+oxrdf         = { workspace = true }
+
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+parking_lot   = { workspace = true }
+sux           = { version = "0.14", default-features = false, features = ["epserde"] } # T backend (Rank9+SelectAdapt), L array (BitFieldVec); epserde+mmap for mmap-based snapshot persistence
+
+value-traits  = "0.2.0"  # SliceByValue::index_value for safe BitFieldVec reads
+mem_dbg       = "0.4"     # MemSize trait — sux's Rank9/SelectAdapt/BitFieldVec already derive it;
+                           # used for real per-component memory-breakdown diagnostics.
+epserde       = { version = "0.12.5", default-features = false, features = ["derive", "std"] } # mmap snapshot format for LoudsTrie T/L arrays; see `mmap` feature above
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

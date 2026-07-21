@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Generate RESULTS.md from raw_results.csv produced by run_comparison.sh.
+"""Generate RESULTS_MEM.md from raw_results.csv produced by run_comparison_mem.sh.
 
 Computes p50/p95/mean latency per (engine, query) and renders a Markdown
 comparison table, along with an explicit methodology/storage-model section
 so the memory-vs-disk asymmetry between engines is never left implicit.
 
-Also writes pure-stdlib SVG bar charts under charts/ and embeds them in the
+Optionally writes pure-stdlib SVG bar charts under charts/ (--charts; off by default). and embeds them in the
 Markdown report (lower is better for latency/load/memory/CPU).
+
+Engines (mem harness, 4-way by default):
+  nova-louds | nova-ring | oxigraph | qlever
 """
 import argparse
 import csv
@@ -45,20 +48,36 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--queries", required=True)
-    ap.add_argument("--nova-rss-kb", type=float, required=True)
-    ap.add_argument("--qlever-rss-kb", type=float, required=True)
-    ap.add_argument("--oxigraph-mem", required=True)  # e.g. "338.2MiB"
+    # Dual Nova backends (preferred). Legacy single --nova-* still accepted.
+    ap.add_argument("--nova-louds-rss-kb", type=float, default=None)
+    ap.add_argument("--nova-ring-rss-kb", type=float, default=None)
+    ap.add_argument("--nova-louds-cpu-pct", type=float, default=None)
+    ap.add_argument("--nova-ring-cpu-pct", type=float, default=None)
+    ap.add_argument("--nova-louds-load-s", type=float, default=None)
+    ap.add_argument("--nova-ring-load-s", type=float, default=None)
+    # Legacy single-Nova flags (map onto whichever backend is present in CSV).
+    ap.add_argument("--nova-rss-kb", type=float, default=None)
     ap.add_argument("--nova-cpu-pct", type=float, default=None)
+    ap.add_argument("--nova-load-s", type=float, default=None)
+    ap.add_argument("--qlever-rss-kb", type=float, default=None)
+    ap.add_argument("--oxigraph-mem", default=None)  # e.g. "338.2MiB"
+    ap.add_argument("--fluree-mem", default=None)  # docker stats string
+    ap.add_argument("--rdfox-rss-kb", type=float, default=None)
     ap.add_argument("--qlever-cpu-pct", type=float, default=None)
     ap.add_argument("--oxigraph-cpu-pct", type=float, default=None)
-    ap.add_argument("--nova-load-s", type=float, default=None)
+    ap.add_argument("--fluree-cpu-pct", type=float, default=None)
+    ap.add_argument("--rdfox-cpu-pct", type=float, default=None)
     ap.add_argument("--qlever-load-s", type=float, default=None)
     ap.add_argument("--oxigraph-load-s", type=float, default=None)
+    ap.add_argument("--fluree-load-s", type=float, default=None)
+    ap.add_argument("--rdfox-load-s", type=float, default=None)
+
     ap.add_argument("--entities", type=int, required=True)
     ap.add_argument("--triples", type=int, required=True)
+    ap.add_argument("--charts", action="store_true", default=False,
+                    help="Write SVG charts under charts/ and embed them (default: off)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-
 
     with open(args.queries) as f:
         query_defs = json.load(f)
@@ -68,56 +87,175 @@ def main():
     with open(args.csv) as f:
         reader = csv.DictReader(f)
         for row in reader:
-            data[(row["engine"], row["query"])].append(float(row["time_s"]))
+            t = row["time_s"]
+            if t in ("timeout", ""):
+                continue
+            try:
+                data[(row["engine"], row["query"])].append(float(t))
+            except ValueError:
+                continue
 
-    engines = ["nova", "oxigraph", "qlever"]
+    # Discover engines from CSV so LOUDS vs Ring runs both label honestly.
+    engines_seen = sorted({e for (e, _q) in data.keys()})
+    preferred = [
+        "nova-louds",
+        "nova-ring",
+        "nova",
+        "oxigraph",
+        "qlever",
+        "fluree",
+        "rdfox",
+    ]
+    engines = [e for e in preferred if e in engines_seen]
+    engines += [e for e in engines_seen if e not in engines]
+
     engine_labels = {
-        "nova": "Nova (Ring+LFTJ)",
-        "oxigraph": "Oxigraph (in-memory)",
-        "qlever": "QLever (mmap, warmed)",
+        "nova": "Nova (louds)",  # legacy CSV rows
+        "nova-louds": "Nova (louds)",
+        "nova-ring": "Nova (ring)",
+        "oxigraph": "Oxigraph",
+        "qlever": "QLever",
+        "fluree": "Fluree",
+        "rdfox": "RDFox",
     }
+
+    # Resolve resource metrics per engine key.
+    rss_kb = {
+        "oxigraph": None,  # string form used for table; numeric via parse_mem_string
+        "fluree": None,
+    }
+    if args.qlever_rss_kb is not None:
+        rss_kb["qlever"] = args.qlever_rss_kb
+    if args.rdfox_rss_kb is not None:
+        rss_kb["rdfox"] = args.rdfox_rss_kb
+    cpu_pct = {
+        "oxigraph": args.oxigraph_cpu_pct,
+        "qlever": args.qlever_cpu_pct,
+        "fluree": args.fluree_cpu_pct,
+        "rdfox": args.rdfox_cpu_pct,
+    }
+    load_s = {
+        "oxigraph": args.oxigraph_load_s,
+        "qlever": args.qlever_load_s,
+        "fluree": args.fluree_load_s,
+        "rdfox": args.rdfox_load_s,
+    }
+
+
+    if args.nova_louds_rss_kb is not None:
+        rss_kb["nova-louds"] = args.nova_louds_rss_kb
+    if args.nova_ring_rss_kb is not None:
+        rss_kb["nova-ring"] = args.nova_ring_rss_kb
+    if args.nova_louds_cpu_pct is not None:
+        cpu_pct["nova-louds"] = args.nova_louds_cpu_pct
+    if args.nova_ring_cpu_pct is not None:
+        cpu_pct["nova-ring"] = args.nova_ring_cpu_pct
+    if args.nova_louds_load_s is not None:
+        load_s["nova-louds"] = args.nova_louds_load_s
+    if args.nova_ring_load_s is not None:
+        load_s["nova-ring"] = args.nova_ring_load_s
+
+    # Legacy single-Nova flags: attach to whichever Nova key is present.
+    if args.nova_rss_kb is not None:
+        for k in ("nova-louds", "nova-ring", "nova"):
+            if k in engines and k not in rss_kb:
+                rss_kb[k] = args.nova_rss_kb
+                break
+        else:
+            rss_kb["nova"] = args.nova_rss_kb
+    if args.nova_cpu_pct is not None:
+        for k in ("nova-louds", "nova-ring", "nova"):
+            if k in engines and k not in cpu_pct:
+                cpu_pct[k] = args.nova_cpu_pct
+                break
+        else:
+            cpu_pct["nova"] = args.nova_cpu_pct
+    if args.nova_load_s is not None:
+        for k in ("nova-louds", "nova-ring", "nova"):
+            if k in engines and k not in load_s:
+                load_s[k] = args.nova_load_s
+                break
+        else:
+            load_s["nova"] = args.nova_load_s
 
     out_path = os.path.abspath(args.out)
     charts_dir = os.path.join(os.path.dirname(out_path), "charts", "mem")
-    os.makedirs(charts_dir, exist_ok=True)
-    chart_paths = []  # for logging
+    chart_paths = []
+    write_charts = bool(getattr(args, "charts", False))
+    if write_charts:
+        os.makedirs(charts_dir, exist_ok=True)
 
     def emit_chart(filename, svg, alt):
+        """Write SVG + return markdown image, or empty string when charts disabled."""
+        if not write_charts:
+            return ""
         path = write_svg(os.path.join(charts_dir, filename), svg)
         chart_paths.append(path)
         return rel_md_image(out_path, path, alt)
 
+    n_engines = len(engines)
+    title_bits = []
+    for e in engines:
+        title_bits.append(engine_labels.get(e, e).split(" (")[0])
+    # Prefer short title from present engines
+    title = " vs ".join(dict.fromkeys(title_bits))  # dedupe while preserving order
     lines = []
-    lines.append("# Comparative Benchmark: Nova vs Oxigraph vs QLever\n")
+    lines.append(f"# Comparative Benchmark: {title}\n")
     lines.append(
         f"Dataset: {args.entities:,} synthetic BSBM-style entities "
-        f"({args.triples:,} triples), identical N-Triples file loaded into all three engines.\n"
+        f"({args.triples:,} triples), identical N-Triples file loaded into "
+        f"all {n_engines} engines.\n"
     )
 
     lines.append("## Methodology & Storage Model\n")
     lines.append(
-        "All three engines were benchmarked over the SPARQL 1.1 HTTP Protocol "
+        f"All {n_engines} engines were benchmarked over the SPARQL 1.1 HTTP Protocol "
         "(`curl` to each engine's `/sparql` or query endpoint) using **byte-identical "
         "SPARQL query text** against a **byte-identical dataset**. Each query was run "
         "with a warm-up pass (discarded) before N timed iterations, so all reported "
         "latencies reflect steady-state (not cold-cache) performance.\n"
     )
-    lines.append(
-        "**Storage model per engine** (this matters — see below):\n\n"
-        "| Engine | Storage model | Notes |\n"
-        "|---|---|---|\n"
-        "| **Nova** | Pure in-process heap memory | No disk persistence exists at all; "
-        "the whole dataset + index must fit in RAM. |\n"
+    storage_rows = [
+        "| Engine | Storage model | Notes |",
+        "|---|---|---|",
+        "| **Nova (louds)** | Pure in-process heap (`LoudsStore`) | Default "
+        "production in-memory backend; LOUDS + LFTJ index. |",
+        "| **Nova (ring)** | Pure in-process heap (`RingStore`) | Cyclic "
+        "QWT ring backend (`--backend ring`); in-memory bulk_load (WAL available via `--location` on disk runs). |",
         "| **Oxigraph** | Pure in-memory (`serve` run **without** `--location`) | "
         "Deliberately run in-memory (not its default RocksDB-backed mode) to match "
-        "Nova's memory model — this is an apples-to-apples memory comparison, not "
-        "Oxigraph's disk-persistent configuration. |\n"
+        "Nova's memory model. |",
         "| **QLever** | Memory-mapped disk index (mmap) | QLever has **no pure "
-        "in-memory mode** — its index format is inherently a set of memory-mapped "
-        "files. After the warm-up pass, the OS page cache holds the working set "
-        "resident in RAM, so steady-state latency is effectively RAM-speed. This is "
-        "consistent with how QLever is used and benchmarked in practice. |\n"
-    )
+        "in-memory mode**. After warm-up the OS page cache holds the working set "
+        "resident — consistent with QLever's published methodology. |",
+        "| **Fluree** | Ephemeral container FS (`fluree/server`, no host volume) | "
+        "Default file storage lives inside the container and is destroyed with it "
+        "— functionally in-memory for this bench. SPARQL is connection-scoped; the "
+        "harness injects `FROM <ledger>` into each query (addressing only). |",
+        "| **RDFox** | In-memory datastore (sandbox/daemon, `parallel-nn`) | "
+        "Optional comparator: licensed RDFox binary + `.lic` (auto-skipped when "
+        "missing; `research/` is gitignored and not required). |",
+    ]
+    # Only emit rows for engines present (plus always show Nova/Oxigraph/QLever core notes if any of them present)
+    present = set(engines)
+    lines.append("**Storage model per engine** (this matters — see below):\n")
+    lines.append(storage_rows[0])
+    lines.append(storage_rows[1])
+    if present & {"nova-louds", "nova", "nova-ring"}:
+        if present & {"nova-louds", "nova"}:
+            lines.append(storage_rows[2])
+        if "nova-ring" in present:
+            lines.append(storage_rows[3])
+    if "oxigraph" in present:
+        lines.append(storage_rows[4])
+    if "qlever" in present:
+        lines.append(storage_rows[5])
+    if "fluree" in present:
+        lines.append(storage_rows[6])
+    if "rdfox" in present:
+        lines.append(storage_rows[7])
+    lines.append("")
+
     lines.append(
         "**Memory usage** is reported as *physical footprint* for Nova/QLever "
         "(macOS `vmmap -summary <pid>`'s `Physical footprint:` line — falls back "
@@ -134,7 +272,7 @@ def main():
         "pages resident via the OS page cache — architecturally different from "
         "Nova/Oxigraph's pure heap allocations, but it answers the same practical "
         "question (\"how much RAM does this process hold to serve the "
-        "workload\"), so it is used as the common denominator across all three. "
+        "workload\"), so it is used as the common denominator across engines. "
         "This asymmetry is called out explicitly here rather than left implicit.\n"
     )
 
@@ -145,32 +283,44 @@ def main():
         "1.5 cores kept busy on average) — this is a coarse approximation, not a "
         "precise profiler measurement, but useful for relative comparison.\n"
     )
-
-
+    lines.append(
+        "**Process isolation (Nova backends).** Nova (louds) and Nova (ring) are "
+        "launched as **independent fresh processes** and measured in **separate "
+        "phases** (start → load → warm-up → timed queries → resource sample → "
+        "kill), not selected by flipping a backend flag inside one long-running "
+        "process. Each backend uses its own release binary (`nova_serve` default "
+        "vs `nova_serve --backend ring` built with `--features ring-backend`). "
+        "This keeps RSS/CPU samples attributable to a single backend and avoids "
+        "cross-backend heap or page-cache contamination within the Nova process.\n"
+    )
+    lines.append(
+        "**Latency variability.** Primary latency comparisons use **medians "
+        "(p50)** (with p95 for tail behavior). Within-process iteration stddev can "
+        "be material — e.g. Ring `path_2hop` stddev around **66.47 ms** versus "
+        "about **23.20 ms** for LOUDS on the same query shape — so means alone are "
+        "easy to over-read. Future optimization runs should keep medians as the "
+        "headline metric, use enough timed rounds after warm-up, and may add "
+        "**process-level repetitions** (full restart → load → query phase) on top "
+        "of within-process query iterations when comparing backends or tracking "
+        "regressions.\n"
+    )
 
     lines.append("")
     lines.append("## Dataset Load Time\n")
     lines.append(
         "Wall-clock time to load the identical N-Triples dataset and become ready "
         "to serve queries (includes parsing + index construction for all engines; "
-        "for Nova this is parse + `compact()` into the Ring/LFTJ index, for QLever "
-        "this is the separate `qlever-index` build step, for Oxigraph this is the "
-        "HTTP bulk-load POST into the in-memory store).\n"
+        "for Nova this is parse + `compact()` into the LOUDS or Ring index, for "
+        "QLever this is the separate `qlever-index` build step, for Oxigraph this "
+        "is the HTTP bulk-load POST into the in-memory store).\n"
     )
     lines.append("| Engine | Load time |")
     lines.append("|---|---|")
-    if args.nova_load_s is not None:
-        lines.append(f"| Nova (Ring+LFTJ) | {args.nova_load_s:.2f} s |")
-    if args.oxigraph_load_s is not None:
-        lines.append(f"| Oxigraph (in-memory) | {args.oxigraph_load_s:.2f} s |")
-    if args.qlever_load_s is not None:
-        lines.append(f"| QLever (mmap, warmed) | {args.qlever_load_s:.2f} s |")
+    for eng in engines:
+        if eng in load_s and load_s[eng] is not None:
+            lines.append(f"| {engine_labels.get(eng, eng)} | {load_s[eng]:.2f} s |")
 
-    load_vals = {
-        "nova": args.nova_load_s,
-        "oxigraph": args.oxigraph_load_s,
-        "qlever": args.qlever_load_s,
-    }
+    load_vals = {e: load_s.get(e) for e in engines}
     if any(v is not None for v in load_vals.values()):
         lines.append("")
         lines.append(
@@ -196,18 +346,40 @@ def main():
 
     lines.append("| Engine | Memory | Storage model |")
     lines.append("|---|---|---|")
-    lines.append(f"| Nova (Ring+LFTJ) | {args.nova_rss_kb / 1024:.1f} MiB | Pure heap |")
-    lines.append(f"| Oxigraph (in-memory) | {args.oxigraph_mem} | Pure heap (in-memory mode) |")
-    lines.append(
-        f"| QLever (mmap, warmed) | {args.qlever_rss_kb / 1024:.1f} MiB | "
-        "Incl. memory-mapped index pages |"
-    )
+    for eng in engines:
+        label = engine_labels.get(eng, eng)
+        if eng in ("nova-louds", "nova-ring", "nova") and eng in rss_kb and rss_kb[eng] is not None:
+            model = "Pure heap (LOUDS)" if eng != "nova-ring" else "Pure heap (Ring)"
+            lines.append(f"| {label} | {rss_kb[eng] / 1024:.1f} MiB | {model} |")
+        elif eng == "oxigraph" and args.oxigraph_mem:
+            lines.append(
+                f"| {label} | {args.oxigraph_mem} | Pure heap (in-memory mode) |"
+            )
+        elif eng == "qlever" and args.qlever_rss_kb is not None:
+            lines.append(
+                f"| {label} | {args.qlever_rss_kb / 1024:.1f} MiB | "
+                "Incl. memory-mapped index pages |"
+            )
+        elif eng == "fluree" and args.fluree_mem:
+            lines.append(
+                f"| {label} | {args.fluree_mem} | Ephemeral container FS |"
+            )
+        elif eng == "rdfox" and eng in rss_kb and rss_kb[eng] is not None:
+            lines.append(
+                f"| {label} | {rss_kb[eng] / 1024:.1f} MiB | Pure heap (RDFox) |"
+            )
 
-    mem_vals = {
-        "nova": args.nova_rss_kb / 1024,
-        "oxigraph": parse_mem_string(args.oxigraph_mem),
-        "qlever": args.qlever_rss_kb / 1024,
-    }
+    mem_vals = {}
+    for eng in engines:
+        if eng in ("nova-louds", "nova-ring", "nova", "rdfox") and eng in rss_kb and rss_kb[eng] is not None:
+            mem_vals[eng] = rss_kb[eng] / 1024
+        elif eng == "oxigraph" and args.oxigraph_mem:
+            mem_vals[eng] = parse_mem_string(args.oxigraph_mem)
+        elif eng == "qlever" and args.qlever_rss_kb is not None:
+            mem_vals[eng] = args.qlever_rss_kb / 1024
+        elif eng == "fluree" and args.fluree_mem:
+            mem_vals[eng] = parse_mem_string(args.fluree_mem)
+
     lines.append("")
     lines.append(
         emit_chart(
@@ -222,27 +394,18 @@ def main():
         )
     )
 
-    if (
-        args.nova_cpu_pct is not None
-        or args.qlever_cpu_pct is not None
-        or args.oxigraph_cpu_pct is not None
-    ):
+    if any(cpu_pct.get(e) is not None for e in engines):
         lines.append("")
         lines.append("## CPU Usage (average % of one core during query phase)\n")
         lines.append("| Engine | Avg CPU % |")
         lines.append("|---|---|")
-        if args.nova_cpu_pct is not None:
-            lines.append(f"| Nova (Ring+LFTJ) | {args.nova_cpu_pct:.1f}% |")
-        if args.oxigraph_cpu_pct is not None:
-            lines.append(f"| Oxigraph (in-memory) | {args.oxigraph_cpu_pct:.1f}% |")
-        if args.qlever_cpu_pct is not None:
-            lines.append(f"| QLever (mmap, warmed) | {args.qlever_cpu_pct:.1f}% |")
+        for eng in engines:
+            if cpu_pct.get(eng) is not None:
+                lines.append(
+                    f"| {engine_labels.get(eng, eng)} | {cpu_pct[eng]:.1f}% |"
+                )
 
-        cpu_vals = {
-            "nova": args.nova_cpu_pct,
-            "oxigraph": args.oxigraph_cpu_pct,
-            "qlever": args.qlever_cpu_pct,
-        }
+        cpu_vals = {e: cpu_pct.get(e) for e in engines}
         lines.append("")
         lines.append(
             emit_chart(
@@ -274,37 +437,64 @@ def main():
     lines.append("## Latency Results (milliseconds, HTTP round-trip via curl)\n")
     lines.append(
         "One sub-section per query, with each engine as a column and each "
-        "percentile (p50, p95) as a row. Charts use p50 latency (lower is better).\n"
+        "percentile (p50, p95) as a row. Charts use p50 latency (lower is better). "
+        "`path_2hop` and `triangle` are charted separately — their latencies are "
+        "orders of magnitude higher and would crush the scale of the other queries.\n"
     )
 
-    # Overview grouped chart (all queries, p50)
-    series = []
-    for engine in engines:
-        series.append(
-            (
-                ENGINE_SHORT[engine],
-                [p50_by_eq[(engine, q)] for q in query_order],
-                ENGINE_COLORS[engine],
+    # Split overview charts: heavy queries (path_2hop, triangle) dominate the
+    # y-scale and make every other bar unreadable when plotted together.
+    HEAVY_QUERIES = {"path_2hop", "triangle"}
+    light_queries = [q for q in query_order if q not in HEAVY_QUERIES]
+    heavy_queries = [q for q in query_order if q in HEAVY_QUERIES]
+
+    def _latency_series(qnames):
+        out = []
+        for engine in engines:
+            out.append(
+                (
+                    ENGINE_SHORT.get(engine, engine),
+                    [p50_by_eq[(engine, q)] for q in qnames],
+                    ENGINE_COLORS.get(engine, "#6b7280"),
+                )
+            )
+        return out
+
+    if light_queries:
+        lines.append(
+            emit_chart(
+                "latency_p50_overview.svg",
+                grouped_bar_chart(
+                    "Query Latency p50 (scan / joins / star)",
+                    light_queries,
+                    _latency_series(light_queries),
+                    unit="ms",
+                    note="lower is better; path_2hop & triangle omitted (see next chart)",
+                ),
+                "p50 latency by query and engine — light queries (lower is better)",
             )
         )
-    lines.append(
-        emit_chart(
-            "latency_p50_overview.svg",
-            grouped_bar_chart(
-                "Query Latency p50 (all queries)",
-                query_order,
-                series,
-                unit="ms",
-                note="lower is better",
-            ),
-            "p50 latency by query and engine (lower is better)",
+        lines.append("")
+
+    if heavy_queries:
+        lines.append(
+            emit_chart(
+                "latency_p50_heavy.svg",
+                grouped_bar_chart(
+                    "Query Latency p50 (path_2hop / triangle)",
+                    heavy_queries,
+                    _latency_series(heavy_queries),
+                    unit="ms",
+                    note="lower is better; separate scale from lighter queries",
+                ),
+                "p50 latency for path_2hop and triangle (lower is better)",
+            )
         )
-    )
-    lines.append("")
+        lines.append("")
 
     for qname in query_order:
         lines.append(f"### {qname}\n")
-        header_cells = ["Metric"] + [engine_labels[engine] for engine in engines]
+        header_cells = ["Metric"] + [engine_labels.get(engine, engine) for engine in engines]
         lines.append("| " + " | ".join(header_cells) + " |")
         lines.append("|" + "---|" * len(header_cells))
 
@@ -342,7 +532,7 @@ def main():
     )
     for qname in query_order:
         lines.append(f"### {qname}\n")
-        header_cells = ["Metric"] + [engine_labels[engine] for engine in engines]
+        header_cells = ["Metric"] + [engine_labels.get(engine, engine) for engine in engines]
         lines.append("| " + " | ".join(header_cells) + " |")
         lines.append("|" + "---|" * len(header_cells))
 
@@ -374,13 +564,14 @@ def main():
         row("max (ms)", "max", lambda v: f"{v:.2f}")
         lines.append("")
 
-
-
     with open(args.out, "w") as f:
         f.write("\n".join(lines) + "\n")
 
     print(f"Wrote {args.out}")
-    print(f"Wrote {len(chart_paths)} SVG chart(s) under {charts_dir}")
+    if write_charts:
+        print(f"Wrote {len(chart_paths)} SVG chart(s) under {charts_dir}")
+    else:
+        print("SVG charts skipped (pass --charts to enable)")
 
 
 if __name__ == "__main__":

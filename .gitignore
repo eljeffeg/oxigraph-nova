@@ -40,6 +40,9 @@ profile.json.gz
 # snippets/) — a build artifact, not source, mirroring how upstream
 # oxigraph-js's own `js/pkg` is likewise untracked/generated-only (see its
 # biome.json, which excludes `**/pkg/**/*` from linting for the same reason).
-/crates/nova-js/node_modules
-/crates/nova-js/pkg/
+/crates/bindings/nova-js/node_modules
+/crates/bindings/nova-js/pkg/
 
+/benches/archive
+/vendor/qwt/.git_disabled
+/.vscode

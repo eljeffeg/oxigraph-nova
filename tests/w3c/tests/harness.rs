@@ -21,8 +21,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use oxigraph_nova_core::{GraphName, Oxigraph, Quad, QuadStore};
+use oxigraph_nova_engine_ring::LoudsStore;
 use oxigraph_nova_query::{Evaluator, QueryResult, Solution, StoreDataset};
-use oxigraph_nova_storage_ring::RingStore;
 use oxrdf::{Dataset as OxrdfDataset, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 use oxttl::{NTriplesParser, TriGParser, TurtleParser};
 use sparesults::{QueryResultsFormat, QueryResultsParser, ReaderQueryResultsParserOutput};
@@ -1242,7 +1242,7 @@ trait TestStore: QuadStore + Default {
     fn compact_store(&self) -> Result<(), Oxigraph>;
 }
 
-impl TestStore for RingStore {
+impl TestStore for LoudsStore {
     fn compact_store(&self) -> Result<(), Oxigraph> {
         self.compact()
     }
@@ -1389,7 +1389,7 @@ struct RunSummary {
 /// Run every test case in `tests`, recording a plain pass/fail outcome for
 /// each. Shared between the SPARQL 1.1 and SPARQL 1.2 harness entry points.
 /// Generic over the storage engine under test (kept generic for possible
-/// future engines even though `RingStore` is the sole production backend).
+/// future engines even though `LoudsStore` is the sole production backend).
 fn run_all<S: TestStore + 'static>(tests: &[TestCase]) -> RunSummary {
     let mut n_pass = 0usize;
     let mut failures: Vec<String> = Vec::new();
@@ -1462,9 +1462,9 @@ fn w3c_sparql11_query() {
 
     eprintln!("[W3C] {} test cases found", tests.len());
 
-    let summary = run_all::<RingStore>(&tests);
+    let summary = run_all::<LoudsStore>(&tests);
     let (n_fail, _pct) = report_summary(
-        "W3C SPARQL 1.1 Query Conformance Results (RingStore)",
+        "W3C SPARQL 1.1 Query Conformance Results (LoudsStore)",
         &summary,
     );
 
@@ -1501,9 +1501,9 @@ fn w3c_sparql12_query() {
 
     eprintln!("[W3C] {} test cases found", tests.len());
 
-    let summary = run_all::<RingStore>(&tests);
+    let summary = run_all::<LoudsStore>(&tests);
     let (n_fail, _pct) = report_summary(
-        "W3C SPARQL 1.2 Query Conformance Results (WD, RingStore)",
+        "W3C SPARQL 1.2 Query Conformance Results (WD, LoudsStore)",
         &summary,
     );
 
