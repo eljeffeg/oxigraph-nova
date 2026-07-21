@@ -46,7 +46,7 @@
 //!
 //! Open validates header/bounds/align only — no full-body checksum preload.
 
-use qwt::bytes::{qwt256_to_bytes, LayoutError as QwtLayoutError, QwtView, QWTB_MAGIC};
+use qwt::bytes::{LayoutError as QwtLayoutError, QWTB_MAGIC, QwtView, qwt256_to_bytes};
 use qwt::utils::select_in_word_u128;
 use qwt::{AccessQuad, DataLine, QWT256, RankQuad, SuperblockPlain};
 use std::io::{self, Write};
@@ -3393,7 +3393,6 @@ pub(crate) fn map_qwt_layout(e: QwtLayoutError) -> MappedQwtError {
     }
 }
 
-
 /// Flatten a heap `QWT256<u32>` into a `NOVAQWT1` image (owned bytes).
 pub fn write_novaqwt1_v1(qwt: &QWT256<u32>) -> Result<Vec<u8>, MappedQwtError> {
     let sec = build_qwta_section(qwt)?;
@@ -4064,23 +4063,23 @@ mod expand3_unique_load {
                 [0; 4]
             };
             let mut dl_loads = 0u8;
-            let (intra_as, intra_ae, intra_bs, intra_be, intra_cs, intra_ce) = if line_id < lv.data_len
-            {
-                dl_loads = 1;
-                let d = unsafe { lv.data_at(line_id) };
-                unsafe {
-                    (
-                        d.rank_all_unchecked(a_start & 255),
-                        d.rank_all_unchecked(a_end & 255),
-                        d.rank_all_unchecked(b_start & 255),
-                        d.rank_all_unchecked(b_end & 255),
-                        d.rank_all_unchecked(c_start & 255),
-                        d.rank_all_unchecked(c_end & 255),
-                    )
-                }
-            } else {
-                ([0; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4])
-            };
+            let (intra_as, intra_ae, intra_bs, intra_be, intra_cs, intra_ce) =
+                if line_id < lv.data_len {
+                    dl_loads = 1;
+                    let d = unsafe { lv.data_at(line_id) };
+                    unsafe {
+                        (
+                            d.rank_all_unchecked(a_start & 255),
+                            d.rank_all_unchecked(a_end & 255),
+                            d.rank_all_unchecked(b_start & 255),
+                            d.rank_all_unchecked(b_end & 255),
+                            d.rank_all_unchecked(c_start & 255),
+                            d.rank_all_unchecked(c_end & 255),
+                        )
+                    }
+                } else {
+                    ([0; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4])
+                };
             let add = |br: [usize; 4], intra: [usize; 4]| -> [usize; 4] {
                 [
                     br[0] + intra[0],
@@ -4182,7 +4181,6 @@ mod expand3_unique_load {
             unique_sb_loads: sbs.loads,
         }
     }
-
 }
 
 #[cfg(any(test, feature = "diagnostics"))]
@@ -4481,8 +4479,6 @@ pub(crate) fn fnv1a64(data: &[u8]) -> u64 {
     h
 }
 
-
-
 /// 64-byte-aligned owned byte buffer (DataLine / SuperblockPlain cast safe).
 pub(crate) struct AlignedBuf {
     ptr: *mut u8,
@@ -4545,7 +4541,6 @@ impl Clone for AlignedBuf {
         Self::from_slice(self.as_slice())
     }
 }
-
 
 // ── tests ───────────────────────────────────────────────────────────────────
 

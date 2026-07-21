@@ -32,7 +32,7 @@ use crate::mapped_qwt::{
     MAX_LEVELS, MappedLevel, MappedQwtError, PAGE_ALIGN, align_up, level_get, level_rank,
     level_select, map_qwt_layout,
 };
-use qwt::bytes::{hqwt256_to_bytes, HqwtView, HQWB_MAGIC};
+use qwt::bytes::{HQWB_MAGIC, HqwtView, hqwt256_to_bytes};
 use qwt::{AccessQuad, DataLine, HQWT256, RankQuad, SuperblockPlain};
 use std::ops::Range;
 
@@ -252,7 +252,13 @@ impl<'m> MappedHqwtSection<'m> {
         }
         let view = self.hqwt_view()?;
         let o = view.levels()[level].n_occs_smaller();
-        Ok([o[0] as u64, o[1] as u64, o[2] as u64, o[3] as u64, o[4] as u64])
+        Ok([
+            o[0] as u64,
+            o[1] as u64,
+            o[2] as u64,
+            o[3] as u64,
+            o[4] as u64,
+        ])
     }
 
     /// Build open-time hot column from [`HqwtView`] POD + outer shared map.
@@ -290,9 +296,8 @@ impl<'m> MappedHqwtSection<'m> {
             for i in 0..self.np as usize {
                 let o = self.off_shared_map + i * 4;
                 if o + 4 <= self.sec.len() {
-                    local_to_shared.push(u32::from_le_bytes(
-                        self.sec[o..o + 4].try_into().unwrap(),
-                    ));
+                    local_to_shared
+                        .push(u32::from_le_bytes(self.sec[o..o + 4].try_into().unwrap()));
                 }
             }
         }
@@ -313,7 +318,6 @@ impl<'m> MappedHqwtSection<'m> {
             levels,
         })
     }
-
 
     fn level_len(&self, level: usize) -> usize {
         self.hqwt_view()
@@ -663,7 +667,10 @@ mod tests {
         let map: Vec<u32> = (0..5).map(|i| 10 + i).collect();
         let sec = build_hqwa_section(&wt, &map).expect("build");
         assert_eq!(&sec[0..4], HQWA_MAGIC);
-        assert_eq!(u32::from_le_bytes(sec[4..8].try_into().unwrap()), HQWA_VERSION);
+        assert_eq!(
+            u32::from_le_bytes(sec[4..8].try_into().unwrap()),
+            HQWA_VERSION
+        );
         let aligned = AlignedBuf::from_slice(&sec);
         let view = MappedHqwtSection::open(aligned.as_slice()).expect("open");
         assert_eq!(view.n, data.len());
