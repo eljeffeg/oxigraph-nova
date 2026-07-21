@@ -1575,6 +1575,7 @@ pub struct Expand3SharedStats {
 }
 
 /// Which specialized path `hot_level_range_expand3` took.
+#[cfg(any(test, feature = "diagnostics"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Expand3Path {
     /// All six endpoints in one DataLine (1 SB + 1 line).
@@ -1940,6 +1941,7 @@ impl HotQwtColumn {
 }
 
 /// Result of a true unique-load three-range expand (D4-C).
+#[cfg(any(test, feature = "diagnostics"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Expand3Result {
     pub first: RangeExpand,
@@ -3540,6 +3542,7 @@ pub(crate) fn level_rank_all(lv: &MappedLevel<'_>, i: usize) -> [usize; 4] {
 
 // ──: three-range expand locality helpers ───────────────────────────
 
+#[cfg(any(test, feature = "diagnostics"))]
 #[derive(Clone, Copy, Debug)]
 struct RangeTouchIds {
     line_s: usize,
@@ -3551,6 +3554,7 @@ struct RangeTouchIds {
     sb_loads: u8,
 }
 
+#[cfg(any(test, feature = "diagnostics"))]
 #[inline]
 fn range_touch_ids(start: usize, end: usize) -> RangeTouchIds {
     // end is exclusive; empty ranges should not reach here.
@@ -3575,6 +3579,7 @@ fn range_touch_ids(start: usize, end: usize) -> RangeTouchIds {
     }
 }
 
+#[cfg(any(test, feature = "diagnostics"))]
 #[inline]
 fn push_unique_u32(buf: &mut [u32; 6], n: &mut usize, v: u32) {
     for &existing in buf.iter().take(*n) {
@@ -3588,6 +3593,7 @@ fn push_unique_u32(buf: &mut [u32; 6], n: &mut usize, v: u32) {
     }
 }
 
+#[cfg(any(test, feature = "diagnostics"))]
 #[inline]
 fn unique_touch3(a: RangeTouchIds, b: RangeTouchIds, c: RangeTouchIds) -> (u8, u8) {
     let mut lines = [0u32; 6];
@@ -3603,6 +3609,7 @@ fn unique_touch3(a: RangeTouchIds, b: RangeTouchIds, c: RangeTouchIds) -> (u8, u
     (n_lines as u8, n_sbs as u8)
 }
 
+#[cfg(any(test, feature = "diagnostics"))]
 #[inline]
 fn lines_overlap(x: RangeTouchIds, y: RangeTouchIds) -> bool {
     // Closed intervals on line ids [line_s, line_e].
@@ -3813,364 +3820,373 @@ fn hot_level_range_expand(lv: &HotMappedLevel, start: usize, end: usize) -> Rang
     }
 }
 
-// ──: true unique-load three-range expand ─────────────────────────
+#[cfg(any(test, feature = "diagnostics"))]
+mod expand3_unique_load {
+    use super::*;
 
-/// Fixed local cache entry for a loaded DataLine (by index).
-#[derive(Clone, Copy)]
-struct LoadedLine {
-    index: usize,
-    value: DataLine,
-}
+    // ──: true unique-load three-range expand ─────────────────────────
 
-/// Fixed local cache entry for a loaded SuperblockPlain (by index).
-#[derive(Clone, Copy)]
-struct LoadedSuperblock {
-    index: usize,
-    value: SuperblockPlain,
-}
-
-/// Tiny fixed line cache (max 6 unique endpoint lines). No heap.
-struct LineCache {
-    slots: [LoadedLine; 6],
-    n: usize,
-    loads: u8,
-}
-
-impl LineCache {
-    #[inline(always)]
-    fn new() -> Self {
-        Self {
-            // Dummy zeros; never read before write.
-            slots: [LoadedLine {
-                index: usize::MAX,
-                value: DataLine::default(),
-            }; 6],
-            n: 0,
-            loads: 0,
-        }
+    /// Fixed local cache entry for a loaded DataLine (by index).
+    #[derive(Clone, Copy)]
+    struct LoadedLine {
+        index: usize,
+        value: DataLine,
     }
 
-    #[inline(always)]
-    fn get<'a>(&'a mut self, lv: &HotMappedLevel, id: usize) -> Option<&'a DataLine> {
-        for i in 0..self.n {
-            if self.slots[i].index == id {
-                // SAFETY: slots[i] is initialized when n > i.
-                return Some(&self.slots[i].value);
+    /// Fixed local cache entry for a loaded SuperblockPlain (by index).
+    #[derive(Clone, Copy)]
+    struct LoadedSuperblock {
+        index: usize,
+        value: SuperblockPlain,
+    }
+
+    /// Tiny fixed line cache (max 6 unique endpoint lines). No heap.
+    struct LineCache {
+        slots: [LoadedLine; 6],
+        n: usize,
+        loads: u8,
+    }
+
+    impl LineCache {
+        #[inline(always)]
+        fn new() -> Self {
+            Self {
+                // Dummy zeros; never read before write.
+                slots: [LoadedLine {
+                    index: usize::MAX,
+                    value: DataLine::default(),
+                }; 6],
+                n: 0,
+                loads: 0,
             }
         }
-        if id >= lv.data_len {
-            return None;
-        }
-        // SAFETY: id < data_len (open-validated).
-        let value = unsafe { *lv.data_at(id) };
-        debug_assert!(self.n < 6);
-        self.slots[self.n] = LoadedLine { index: id, value };
-        self.n += 1;
-        self.loads += 1;
-        Some(&self.slots[self.n - 1].value)
-    }
-}
 
-/// Tiny fixed superblock cache (max 6 unique endpoint SBs). No heap.
-struct SbCache {
-    slots: [LoadedSuperblock; 6],
-    n: usize,
-    loads: u8,
-}
-
-impl SbCache {
-    #[inline(always)]
-    fn new() -> Self {
-        Self {
-            slots: [LoadedSuperblock {
-                index: usize::MAX,
-                value: SuperblockPlain::default(),
-            }; 6],
-            n: 0,
-            loads: 0,
+        #[inline(always)]
+        fn get<'a>(&'a mut self, lv: &HotMappedLevel, id: usize) -> Option<&'a DataLine> {
+            for i in 0..self.n {
+                if self.slots[i].index == id {
+                    // SAFETY: slots[i] is initialized when n > i.
+                    return Some(&self.slots[i].value);
+                }
+            }
+            if id >= lv.data_len {
+                return None;
+            }
+            // SAFETY: id < data_len (open-validated).
+            let value = unsafe { *lv.data_at(id) };
+            debug_assert!(self.n < 6);
+            self.slots[self.n] = LoadedLine { index: id, value };
+            self.n += 1;
+            self.loads += 1;
+            Some(&self.slots[self.n - 1].value)
         }
     }
 
-    #[inline(always)]
-    fn get<'a>(&'a mut self, lv: &HotMappedLevel, id: usize) -> Option<&'a SuperblockPlain> {
-        for i in 0..self.n {
-            if self.slots[i].index == id {
-                return Some(&self.slots[i].value);
+    /// Tiny fixed superblock cache (max 6 unique endpoint SBs). No heap.
+    struct SbCache {
+        slots: [LoadedSuperblock; 6],
+        n: usize,
+        loads: u8,
+    }
+
+    impl SbCache {
+        #[inline(always)]
+        fn new() -> Self {
+            Self {
+                slots: [LoadedSuperblock {
+                    index: usize::MAX,
+                    value: SuperblockPlain::default(),
+                }; 6],
+                n: 0,
+                loads: 0,
             }
         }
-        if id >= lv.super_len {
-            return None;
-        }
-        // SAFETY: id < super_len (open-validated).
-        let value = unsafe { *lv.super_at(id) };
-        debug_assert!(self.n < 6);
-        self.slots[self.n] = LoadedSuperblock { index: id, value };
-        self.n += 1;
-        self.loads += 1;
-        Some(&self.slots[self.n - 1].value)
-    }
-}
 
-#[inline(always)]
-fn rank_all_from_caches(
-    lv: &HotMappedLevel,
-    pos: usize,
-    lines: &mut LineCache,
-    sbs: &mut SbCache,
-) -> [usize; 4] {
-    let block = pos / BLOCK_SIZE;
-    let sb_idx = block / BLOCKS_IN_SUPERBLOCK;
-    let block_in_sb = block % BLOCKS_IN_SUPERBLOCK;
-    let block_ranks = if let Some(sb) = sbs.get(lv, sb_idx) {
-        sb.get_rank_all(block_in_sb)
-    } else {
-        [0; 4]
-    };
-    let line_id = pos >> 8;
-    let offset = pos & 255;
-    let intra = if let Some(d) = lines.get(lv, line_id) {
-        unsafe { d.rank_all_unchecked(offset) }
-    } else {
-        [0; 4]
-    };
-    [
-        block_ranks[0] + intra[0],
-        block_ranks[1] + intra[1],
-        block_ranks[2] + intra[2],
-        block_ranks[3] + intra[3],
-    ]
-}
-
-#[inline(always)]
-fn range_expand_from_ranks(
-    ranks_s: [usize; 4],
-    ranks_e: [usize; 4],
-    path: RangeCountsPath,
-    dl: u64,
-    sb: u64,
-) -> RangeExpand {
-    RangeExpand {
-        path,
-        ranks_s,
-        counts: [
-            ranks_e[0] - ranks_s[0],
-            ranks_e[1] - ranks_s[1],
-            ranks_e[2] - ranks_s[2],
-            ranks_e[3] - ranks_s[3],
-        ],
-        data_line_loads: dl,
-        superblock_loads: sb,
-    }
-}
-
-#[inline(always)]
-fn common_mask3(a: &RangeExpand, b: &RangeExpand, c: &RangeExpand) -> u8 {
-    let mut m = 0u8;
-    for i in 0..4 {
-        if a.counts[i] != 0 && b.counts[i] != 0 && c.counts[i] != 0 {
-            m |= 1 << i;
+        #[inline(always)]
+        fn get<'a>(&'a mut self, lv: &HotMappedLevel, id: usize) -> Option<&'a SuperblockPlain> {
+            for i in 0..self.n {
+                if self.slots[i].index == id {
+                    return Some(&self.slots[i].value);
+                }
+            }
+            if id >= lv.super_len {
+                return None;
+            }
+            // SAFETY: id < super_len (open-validated).
+            let value = unsafe { *lv.super_at(id) };
+            debug_assert!(self.n < 6);
+            self.slots[self.n] = LoadedSuperblock { index: id, value };
+            self.n += 1;
+            self.loads += 1;
+            Some(&self.slots[self.n - 1].value)
         }
     }
-    m
-}
 
-#[inline(always)]
-fn push_unique_usize(buf: &mut [usize; 6], n: &mut usize, v: usize) {
-    for &existing in buf.iter().take(*n) {
-        if existing == v {
-            return;
-        }
-    }
-    if *n < 6 {
-        buf[*n] = v;
-        *n += 1;
-    }
-}
-
-/// D4-C: expand three ranges with unique physical DataLine / Superblock loads.
-///
-/// Classifies the six endpoints first, loads each unique record once into a
-/// fixed local cache, then computes all endpoint ranks from that cache.
-/// Algebraically identical to three independent [`hot_level_range_expand`]
-/// calls; the only difference is load deduplication.
-#[inline(always)]
-fn hot_level_range_expand3(
-    lv: &HotMappedLevel,
-    a_start: usize,
-    a_end: usize,
-    b_start: usize,
-    b_end: usize,
-    c_start: usize,
-    c_end: usize,
-) -> Expand3Result {
-    debug_assert!(a_start <= a_end && a_end <= lv.qv_len);
-    debug_assert!(b_start <= b_end && b_end <= lv.qv_len);
-    debug_assert!(c_start <= c_end && c_end <= lv.qv_len);
-
-    // Logical load requests (what three independent B2 expands would pay).
-    let touch_a = range_touch_ids(a_start, a_end);
-    let touch_b = range_touch_ids(b_start, b_end);
-    let touch_c = range_touch_ids(c_start, c_end);
-    let logical_line = touch_a.line_loads + touch_b.line_loads + touch_c.line_loads;
-    let logical_sb = touch_a.sb_loads + touch_b.sb_loads + touch_c.sb_loads;
-
-    // Unique endpoint line / SB ids among the six endpoints.
-    let ends = [a_start, a_end, b_start, b_end, c_start, c_end];
-    let mut line_ids = [0usize; 6];
-    let mut n_lines = 0usize;
-    let mut sb_ids = [0usize; 6];
-    let mut n_sbs = 0usize;
-    for &p in &ends {
-        // end may equal start on empty (already filtered), or be exclusive.
-        // For exclusive end that lands on a block boundary, end>>8 is the next
-        // line id — matching B2 expand which uses end / BLOCK_SIZE for path
-        // classification. rank_all at an exclusive end still needs that line
-        // when offset==0 only for the block rank; B2 still loads line_e.
-        let line = p >> 8;
-        let block = p / BLOCK_SIZE;
-        let sb = block / BLOCKS_IN_SUPERBLOCK;
-        push_unique_usize(&mut line_ids, &mut n_lines, line);
-        push_unique_usize(&mut sb_ids, &mut n_sbs, sb);
-    }
-
-    // ── Path 1: all six endpoints in one DataLine ───────────────────────────
-    // Dominant on product triangle (~81% frames per D4-A).
-    if n_lines == 1 {
-        let line_id = line_ids[0];
-        let sb_id = sb_ids[0]; // all same line ⇒ same SB
-        let mut sb_loads = 0u8;
-        let block_in_sb = (a_start / BLOCK_SIZE) % BLOCKS_IN_SUPERBLOCK;
-        // All endpoints share the line, so block ranks for every endpoint use
-        // the same superblock; but block_in_sb may differ only if lines were
-        // different — here they are not. For SameLine per-range, start and end
-        // share block_in_sb. Across three ranges on the same line they share
-        // the same block as well (one DataLine = one block).
-        let block_ranks = if sb_id < lv.super_len {
-            sb_loads = 1;
-            // SAFETY: sb_id < super_len.
-            unsafe { lv.super_at(sb_id).get_rank_all(block_in_sb) }
+    #[inline(always)]
+    fn rank_all_from_caches(
+        lv: &HotMappedLevel,
+        pos: usize,
+        lines: &mut LineCache,
+        sbs: &mut SbCache,
+    ) -> [usize; 4] {
+        let block = pos / BLOCK_SIZE;
+        let sb_idx = block / BLOCKS_IN_SUPERBLOCK;
+        let block_in_sb = block % BLOCKS_IN_SUPERBLOCK;
+        let block_ranks = if let Some(sb) = sbs.get(lv, sb_idx) {
+            sb.get_rank_all(block_in_sb)
         } else {
             [0; 4]
         };
-        let mut dl_loads = 0u8;
-        let (intra_as, intra_ae, intra_bs, intra_be, intra_cs, intra_ce) = if line_id < lv.data_len
-        {
-            dl_loads = 1;
-            let d = unsafe { lv.data_at(line_id) };
-            unsafe {
-                (
-                    d.rank_all_unchecked(a_start & 255),
-                    d.rank_all_unchecked(a_end & 255),
-                    d.rank_all_unchecked(b_start & 255),
-                    d.rank_all_unchecked(b_end & 255),
-                    d.rank_all_unchecked(c_start & 255),
-                    d.rank_all_unchecked(c_end & 255),
-                )
-            }
+        let line_id = pos >> 8;
+        let offset = pos & 255;
+        let intra = if let Some(d) = lines.get(lv, line_id) {
+            unsafe { d.rank_all_unchecked(offset) }
         } else {
-            ([0; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4])
+            [0; 4]
         };
-        let add = |br: [usize; 4], intra: [usize; 4]| -> [usize; 4] {
-            [
-                br[0] + intra[0],
-                br[1] + intra[1],
-                br[2] + intra[2],
-                br[3] + intra[3],
-            ]
+        [
+            block_ranks[0] + intra[0],
+            block_ranks[1] + intra[1],
+            block_ranks[2] + intra[2],
+            block_ranks[3] + intra[3],
+        ]
+    }
+
+    #[inline(always)]
+    fn range_expand_from_ranks(
+        ranks_s: [usize; 4],
+        ranks_e: [usize; 4],
+        path: RangeCountsPath,
+        dl: u64,
+        sb: u64,
+    ) -> RangeExpand {
+        RangeExpand {
+            path,
+            ranks_s,
+            counts: [
+                ranks_e[0] - ranks_s[0],
+                ranks_e[1] - ranks_s[1],
+                ranks_e[2] - ranks_s[2],
+                ranks_e[3] - ranks_s[3],
+            ],
+            data_line_loads: dl,
+            superblock_loads: sb,
+        }
+    }
+
+    #[inline(always)]
+    fn common_mask3(a: &RangeExpand, b: &RangeExpand, c: &RangeExpand) -> u8 {
+        let mut m = 0u8;
+        for i in 0..4 {
+            if a.counts[i] != 0 && b.counts[i] != 0 && c.counts[i] != 0 {
+                m |= 1 << i;
+            }
+        }
+        m
+    }
+
+    #[inline(always)]
+    fn push_unique_usize(buf: &mut [usize; 6], n: &mut usize, v: usize) {
+        for &existing in buf.iter().take(*n) {
+            if existing == v {
+                return;
+            }
+        }
+        if *n < 6 {
+            buf[*n] = v;
+            *n += 1;
+        }
+    }
+
+    /// D4-C: expand three ranges with unique physical DataLine / Superblock loads.
+    ///
+    /// Classifies the six endpoints first, loads each unique record once into a
+    /// fixed local cache, then computes all endpoint ranks from that cache.
+    /// Algebraically identical to three independent [`hot_level_range_expand`]
+    /// calls; the only difference is load deduplication.
+    #[inline(always)]
+    pub(super) fn hot_level_range_expand3(
+        lv: &HotMappedLevel,
+        a_start: usize,
+        a_end: usize,
+        b_start: usize,
+        b_end: usize,
+        c_start: usize,
+        c_end: usize,
+    ) -> Expand3Result {
+        debug_assert!(a_start <= a_end && a_end <= lv.qv_len);
+        debug_assert!(b_start <= b_end && b_end <= lv.qv_len);
+        debug_assert!(c_start <= c_end && c_end <= lv.qv_len);
+
+        // Logical load requests (what three independent B2 expands would pay).
+        let touch_a = range_touch_ids(a_start, a_end);
+        let touch_b = range_touch_ids(b_start, b_end);
+        let touch_c = range_touch_ids(c_start, c_end);
+        let logical_line = touch_a.line_loads + touch_b.line_loads + touch_c.line_loads;
+        let logical_sb = touch_a.sb_loads + touch_b.sb_loads + touch_c.sb_loads;
+
+        // Unique endpoint line / SB ids among the six endpoints.
+        let ends = [a_start, a_end, b_start, b_end, c_start, c_end];
+        let mut line_ids = [0usize; 6];
+        let mut n_lines = 0usize;
+        let mut sb_ids = [0usize; 6];
+        let mut n_sbs = 0usize;
+        for &p in &ends {
+            // end may equal start on empty (already filtered), or be exclusive.
+            // For exclusive end that lands on a block boundary, end>>8 is the next
+            // line id — matching B2 expand which uses end / BLOCK_SIZE for path
+            // classification. rank_all at an exclusive end still needs that line
+            // when offset==0 only for the block rank; B2 still loads line_e.
+            let line = p >> 8;
+            let block = p / BLOCK_SIZE;
+            let sb = block / BLOCKS_IN_SUPERBLOCK;
+            push_unique_usize(&mut line_ids, &mut n_lines, line);
+            push_unique_usize(&mut sb_ids, &mut n_sbs, sb);
+        }
+
+        // ── Path 1: all six endpoints in one DataLine ───────────────────────────
+        // Dominant on product triangle (~81% frames per D4-A).
+        if n_lines == 1 {
+            let line_id = line_ids[0];
+            let sb_id = sb_ids[0]; // all same line ⇒ same SB
+            let mut sb_loads = 0u8;
+            let block_in_sb = (a_start / BLOCK_SIZE) % BLOCKS_IN_SUPERBLOCK;
+            // All endpoints share the line, so block ranks for every endpoint use
+            // the same superblock; but block_in_sb may differ only if lines were
+            // different — here they are not. For SameLine per-range, start and end
+            // share block_in_sb. Across three ranges on the same line they share
+            // the same block as well (one DataLine = one block).
+            let block_ranks = if sb_id < lv.super_len {
+                sb_loads = 1;
+                // SAFETY: sb_id < super_len.
+                unsafe { lv.super_at(sb_id).get_rank_all(block_in_sb) }
+            } else {
+                [0; 4]
+            };
+            let mut dl_loads = 0u8;
+            let (intra_as, intra_ae, intra_bs, intra_be, intra_cs, intra_ce) = if line_id < lv.data_len
+            {
+                dl_loads = 1;
+                let d = unsafe { lv.data_at(line_id) };
+                unsafe {
+                    (
+                        d.rank_all_unchecked(a_start & 255),
+                        d.rank_all_unchecked(a_end & 255),
+                        d.rank_all_unchecked(b_start & 255),
+                        d.rank_all_unchecked(b_end & 255),
+                        d.rank_all_unchecked(c_start & 255),
+                        d.rank_all_unchecked(c_end & 255),
+                    )
+                }
+            } else {
+                ([0; 4], [0; 4], [0; 4], [0; 4], [0; 4], [0; 4])
+            };
+            let add = |br: [usize; 4], intra: [usize; 4]| -> [usize; 4] {
+                [
+                    br[0] + intra[0],
+                    br[1] + intra[1],
+                    br[2] + intra[2],
+                    br[3] + intra[3],
+                ]
+            };
+            let first = range_expand_from_ranks(
+                add(block_ranks, intra_as),
+                add(block_ranks, intra_ae),
+                RangeCountsPath::SameLine,
+                dl_loads as u64,
+                sb_loads as u64,
+            );
+            let second = range_expand_from_ranks(
+                add(block_ranks, intra_bs),
+                add(block_ranks, intra_be),
+                RangeCountsPath::SameLine,
+                0,
+                0,
+            );
+            let third = range_expand_from_ranks(
+                add(block_ranks, intra_cs),
+                add(block_ranks, intra_ce),
+                RangeCountsPath::SameLine,
+                0,
+                0,
+            );
+            let mask = common_mask3(&first, &second, &third);
+            return Expand3Result {
+                first,
+                second,
+                third,
+                common_mask: mask,
+                path: Expand3Path::AllSameLine,
+                logical_line_requests: logical_line,
+                unique_line_loads: dl_loads,
+                logical_sb_requests: logical_sb,
+                unique_sb_loads: sb_loads,
+            };
+        }
+
+        // ── Path 2 / 3 / general: fixed local caches ────────────────────────────
+        // Preload unique lines and SBs, then rank all six endpoints.
+        let mut lines = LineCache::new();
+        let mut sbs = SbCache::new();
+
+        // Eagerly touch unique ids so load counts reflect physical unique loads
+        // even if a later rank path is empty (should not happen for valid ranges).
+        for &id in sb_ids.iter().take(n_sbs) {
+            let _ = sbs.get(lv, id);
+        }
+        for &id in line_ids.iter().take(n_lines) {
+            let _ = lines.get(lv, id);
+        }
+
+        let a_s = rank_all_from_caches(lv, a_start, &mut lines, &mut sbs);
+        let a_e = rank_all_from_caches(lv, a_end, &mut lines, &mut sbs);
+        let b_s = rank_all_from_caches(lv, b_start, &mut lines, &mut sbs);
+        let b_e = rank_all_from_caches(lv, b_end, &mut lines, &mut sbs);
+        let c_s = rank_all_from_caches(lv, c_start, &mut lines, &mut sbs);
+        let c_e = rank_all_from_caches(lv, c_end, &mut lines, &mut sbs);
+
+        let path_for = |s: usize, e: usize| -> RangeCountsPath {
+            let bs = s / BLOCK_SIZE;
+            let be = e / BLOCK_SIZE;
+            if bs == be {
+                RangeCountsPath::SameLine
+            } else if bs / BLOCKS_IN_SUPERBLOCK == be / BLOCKS_IN_SUPERBLOCK {
+                RangeCountsPath::SameSuperblock
+            } else {
+                RangeCountsPath::General
+            }
         };
-        let first = range_expand_from_ranks(
-            add(block_ranks, intra_as),
-            add(block_ranks, intra_ae),
-            RangeCountsPath::SameLine,
-            dl_loads as u64,
-            sb_loads as u64,
-        );
-        let second = range_expand_from_ranks(
-            add(block_ranks, intra_bs),
-            add(block_ranks, intra_be),
-            RangeCountsPath::SameLine,
-            0,
-            0,
-        );
-        let third = range_expand_from_ranks(
-            add(block_ranks, intra_cs),
-            add(block_ranks, intra_ce),
-            RangeCountsPath::SameLine,
-            0,
-            0,
-        );
+
+        let first = range_expand_from_ranks(a_s, a_e, path_for(a_start, a_end), 0, 0);
+        let second = range_expand_from_ranks(b_s, b_e, path_for(b_start, b_end), 0, 0);
+        let third = range_expand_from_ranks(c_s, c_e, path_for(c_start, c_end), 0, 0);
         let mask = common_mask3(&first, &second, &third);
-        return Expand3Result {
+
+        let path = if n_lines == 2 {
+            Expand3Path::TwoLine
+        } else if n_sbs == 1 {
+            Expand3Path::SharedSb
+        } else {
+            Expand3Path::General
+        };
+
+        Expand3Result {
             first,
             second,
             third,
             common_mask: mask,
-            path: Expand3Path::AllSameLine,
+            path,
             logical_line_requests: logical_line,
-            unique_line_loads: dl_loads,
+            unique_line_loads: lines.loads,
             logical_sb_requests: logical_sb,
-            unique_sb_loads: sb_loads,
-        };
-    }
-
-    // ── Path 2 / 3 / general: fixed local caches ────────────────────────────
-    // Preload unique lines and SBs, then rank all six endpoints.
-    let mut lines = LineCache::new();
-    let mut sbs = SbCache::new();
-
-    // Eagerly touch unique ids so load counts reflect physical unique loads
-    // even if a later rank path is empty (should not happen for valid ranges).
-    for &id in sb_ids.iter().take(n_sbs) {
-        let _ = sbs.get(lv, id);
-    }
-    for &id in line_ids.iter().take(n_lines) {
-        let _ = lines.get(lv, id);
-    }
-
-    let a_s = rank_all_from_caches(lv, a_start, &mut lines, &mut sbs);
-    let a_e = rank_all_from_caches(lv, a_end, &mut lines, &mut sbs);
-    let b_s = rank_all_from_caches(lv, b_start, &mut lines, &mut sbs);
-    let b_e = rank_all_from_caches(lv, b_end, &mut lines, &mut sbs);
-    let c_s = rank_all_from_caches(lv, c_start, &mut lines, &mut sbs);
-    let c_e = rank_all_from_caches(lv, c_end, &mut lines, &mut sbs);
-
-    let path_for = |s: usize, e: usize| -> RangeCountsPath {
-        let bs = s / BLOCK_SIZE;
-        let be = e / BLOCK_SIZE;
-        if bs == be {
-            RangeCountsPath::SameLine
-        } else if bs / BLOCKS_IN_SUPERBLOCK == be / BLOCKS_IN_SUPERBLOCK {
-            RangeCountsPath::SameSuperblock
-        } else {
-            RangeCountsPath::General
+            unique_sb_loads: sbs.loads,
         }
-    };
-
-    let first = range_expand_from_ranks(a_s, a_e, path_for(a_start, a_end), 0, 0);
-    let second = range_expand_from_ranks(b_s, b_e, path_for(b_start, b_end), 0, 0);
-    let third = range_expand_from_ranks(c_s, c_e, path_for(c_start, c_end), 0, 0);
-    let mask = common_mask3(&first, &second, &third);
-
-    let path = if n_lines == 2 {
-        Expand3Path::TwoLine
-    } else if n_sbs == 1 {
-        Expand3Path::SharedSb
-    } else {
-        Expand3Path::General
-    };
-
-    Expand3Result {
-        first,
-        second,
-        third,
-        common_mask: mask,
-        path,
-        logical_line_requests: logical_line,
-        unique_line_loads: lines.loads,
-        logical_sb_requests: logical_sb,
-        unique_sb_loads: sbs.loads,
     }
+
 }
+
+#[cfg(any(test, feature = "diagnostics"))]
+use expand3_unique_load::hot_level_range_expand3;
 
 // ──: fused range_counts4 (same-line / same-SB / general) ───────────
 

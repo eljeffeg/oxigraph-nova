@@ -703,7 +703,7 @@ const VEO_MIDDLE_CACHE_CAP: usize = 4096;
 /// - **MiddleRuns** (default): exact distinct-run count up to
 ///   [`VEO_MIDDLE_EXACT_RUN_BUDGET`]; fall back to row-span heuristic if budget
 ///   exceeded. Results are **cached** per (range, mid) so adaptive VEO does
-/// not re-walk the same middle on every outer binding.
+///   not re-walk the same middle on every outer binding.
 ///   `NOVA_RING_VEO_OLD_HEURISTIC=1` forces the old row-span path (A/B).
 /// - **LastCol**: min(row-span, vocab heuristic) — LOUDS-style, no full RDI.
 ///

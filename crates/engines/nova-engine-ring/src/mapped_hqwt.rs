@@ -675,11 +675,7 @@ mod tests {
         }
         for &sym in &[10u32, 12, 14] {
             for &i in &[0usize, 100, 1000, data.len()] {
-                assert_eq!(
-                    hot.rank(sym, i),
-                    wt.rank(sym - 10, i).or(Some(0)).map(|r| if sym < 10 || sym >= 15 { 0 } else { r }),
-                    // densified heap ranks local; compare via local rank
-                );
+                // densified heap ranks are local; compare via local rank
                 let local = sym - 10;
                 assert_eq!(
                     hot.rank(sym, i),
