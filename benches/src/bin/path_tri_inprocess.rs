@@ -1,13 +1,12 @@
 //! In-process heavy-query p50 (no HTTP/serialize) — LOUDS vs Ring.
 //! Dataset matches external RESULTS_MEM generator (`generate_quads_large`).
-use std::sync::Arc;
-use std::time::Instant;
-
 use oxigraph_nova_bench::generate_quads_large;
 use oxigraph_nova_core::QuadStore;
 use oxigraph_nova_engine_ring::{LoudsStore, RingStore};
 use oxigraph_nova_query::{Evaluator, QueryResult, StoreDataset};
 use spargebra::SparqlParser;
+use std::sync::Arc;
+use std::time::Instant;
 
 const N: usize = 50_000;
 

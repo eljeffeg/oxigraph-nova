@@ -32,8 +32,7 @@ use crate::image::BraidedGraphImage;
 use crate::mapped_qwt::{HotQwtColumn, MappedRangeDistinctIter};
 use crate::product_path::{
     PredAdjacencyMode, SPARQL_PATH, effective_d1_tiny_merge_threshold,
-    effective_pred_adjacency_mode, effective_wedge_left_once_threshold,
-    ring_counters_log_enabled,
+    effective_pred_adjacency_mode, effective_wedge_left_once_threshold, ring_counters_log_enabled,
 };
 use crate::ring_nav::RingRef;
 use crate::{Col, RowRange};
@@ -1852,10 +1851,7 @@ impl PreparedSpObjectScanImpl {
 
     #[inline]
     fn external_of_dense(&self, d: u32) -> u64 {
-        self.img
-            .remap()
-            .to_external(d)
-            .unwrap_or(u64::from(d))
+        self.img.remap().to_external(d).unwrap_or(u64::from(d))
     }
 
     #[inline]
@@ -3071,8 +3067,7 @@ impl PreparedLeftIntersect for PreparedLeftD1 {
             .fetch_add(1, Ordering::Relaxed);
 
         if let Some(ref left_vals) = self.left_tiny {
-            let t = effective_wedge_left_once_threshold()
-                .max(effective_d1_tiny_merge_threshold());
+            let t = effective_wedge_left_once_threshold().max(effective_d1_tiny_merge_threshold());
             if t > 0 && r1.len() <= t {
                 let right_vals = materialize_sp_o_dense(&self.img, r1);
                 let commons = merge_dense_sorted_to_external(&self.img, left_vals, &right_vals);
@@ -3244,11 +3239,7 @@ fn materialize_sp_o_dense(img: &BraidedGraphImage, range: RowRange) -> Vec<u32> 
 
 /// Two-pointer ∩ of two sorted dense id slices → external TermIds.
 #[inline]
-fn merge_dense_sorted_to_external(
-    img: &BraidedGraphImage,
-    a: &[u32],
-    b: &[u32],
-) -> Vec<u64> {
+fn merge_dense_sorted_to_external(img: &BraidedGraphImage, a: &[u32], b: &[u32]) -> Vec<u64> {
     let remap = img.remap();
     let mut out = Vec::with_capacity(a.len().min(b.len()));
     let (mut i, mut j) = (0usize, 0usize);
