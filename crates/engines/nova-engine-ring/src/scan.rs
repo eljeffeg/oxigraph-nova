@@ -1008,14 +1008,13 @@ impl BraidedMappedLastColScan {
         }
         self.range = range;
         // Huffman C_p: stay on RNV.
-        if self.col == Col::P {
-            if let Some(m) = self.img.index().mapped() {
-                if m.c_p_is_huff() {
-                    self.mode = LastColMode::Rnv;
-                    self.current = self.mapped_rnv(0);
-                    return self.current.is_some();
-                }
-            }
+        if self.col == Col::P
+            && let Some(m) = self.img.index().mapped()
+            && m.c_p_is_huff()
+        {
+            self.mode = LastColMode::Rnv;
+            self.current = self.mapped_rnv(0);
+            return self.current.is_some();
         }
         self.mode = LastColMode::Rdi;
         // Rebuild RDI on the live hot column for this range.
@@ -1042,10 +1041,10 @@ impl TrieIterator for BraidedMappedLastColScan {
         if self.at_end() {
             return;
         }
-        if let Some(cur) = self.current {
-            if self.external_key(cur) >= target {
-                return;
-            }
+        if let Some(cur) = self.current
+            && self.external_key(cur) >= target
+        {
+            return;
         }
         let dense_target = match self.img.remap().to_dense(target) {
             Some(d) => d,
@@ -1182,10 +1181,10 @@ impl TrieIterator for BraidedD1ObjectScan {
         if self.at_end() {
             return;
         }
-        if let Some(cur) = self.current {
-            if self.external_key(cur) >= target {
-                return;
-            }
+        if let Some(cur) = self.current
+            && self.external_key(cur) >= target
+        {
+            return;
         }
         let dense_target = match self.img.remap().to_dense(target) {
             Some(d) => d,
@@ -1294,10 +1293,10 @@ impl TrieIterator for BraidedD2ObjectScan {
         if self.at_end() {
             return;
         }
-        if let Some(cur) = self.current {
-            if self.external_key(cur) >= target {
-                return;
-            }
+        if let Some(cur) = self.current
+            && self.external_key(cur) >= target
+        {
+            return;
         }
         let dense_target = match self.img.remap().to_dense(target) {
             Some(d) => d,
@@ -1739,6 +1738,10 @@ pub fn oracle_join_scan(
 const SP_SMALL_RANGE_ACCESS: u32 = 16;
 
 /// Body of a prepared SP→O cursor after `reset_to_subject` / `reset_from_range`.
+///
+/// `Mapped` holds a full RDI stack (~4KB+); boxing would allocate on every
+/// subject reset that takes the large-range path.
+#[allow(clippy::large_enum_variant)]
 enum SpObjectBody {
     /// No objects under the current subject.
     Empty,
@@ -2062,7 +2065,7 @@ impl PreparedSpObjectScan for PreparedSpObjectScanImpl {
 /// K9.4: dense subject→SP(RowRange) table for a fixed predicate.
 ///
 /// Shared across HTTP requests via the store-level SP adj cache (`Arc`).
-pub(crate) struct PredicateAdjacency {
+pub struct PredicateAdjacency {
     ranges: Vec<Option<RowRange>>,
     ranges_present: u64,
     bytes: u64,
@@ -3131,10 +3134,10 @@ impl TrieIterator for BraidedSpD1ObjectScan {
         if self.at_end() {
             return;
         }
-        if let Some(cur) = self.current {
-            if self.external_key(cur) >= target {
-                return;
-            }
+        if let Some(cur) = self.current
+            && self.external_key(cur) >= target
+        {
+            return;
         }
         let dense_target = match self.img.remap().to_dense(target) {
             Some(d) => d,
@@ -3232,16 +3235,16 @@ impl PreparedWedge for PreparedWedgeImpl {
             }
             while !self.hop.at_end() {
                 let b = self.hop.key();
-                if b != a {
-                    if let Some(mut c_scan) = left.intersect_right(b) {
-                        while !c_scan.at_end() {
-                            let c = c_scan.key();
-                            if c != a && c != b {
-                                emit(&[a, b, c])?;
-                                rows += 1;
-                            }
-                            c_scan.advance();
+                if b != a
+                    && let Some(mut c_scan) = left.intersect_right(b)
+                {
+                    while !c_scan.at_end() {
+                        let c = c_scan.key();
+                        if c != a && c != b {
+                            emit(&[a, b, c])?;
+                            rows += 1;
                         }
+                        c_scan.advance();
                     }
                 }
                 self.hop.advance();

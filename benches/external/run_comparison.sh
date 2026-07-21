@@ -412,12 +412,15 @@ RDFOX_CPU_PCT=""
 # Kill a pid and reap it without hanging the harness on EXIT.
 #
 # macOS bash 3.2 prints async "Terminated: 15" job-status lines if a background
-# child dies while the shell is *not* blocked in wait (e.g. sleeping in a poll
-# loop after kill). Always kill then wait immediately; never sleep between them.
+# child dies while the shell is *not* blocked in wait (e.g. sleeping between
+# kill and wait). Always signal then wait immediately — never sleep in between.
 #
-# Also kill direct children first: a bash subshell blocked in external `sleep`
-# defers SIGTERM until sleep returns, so the RDFox keep-alive
-# (`while true; do sleep 3600; done`) would hang wait for up to an hour.
+# SIGKILL (not just SIGTERM): wait-after-TERM hangs forever when a server traps
+# or ignores SIGTERM (observed with qlever-server / RDFox during cleanup).
+# Benchmark teardown does not need graceful shutdown.
+#
+# Kill direct children first: a bash subshell blocked in external `sleep`
+# defers SIGTERM until sleep returns (`while true; do sleep 3600; done`).
 _kill_pid() {
   local pid="${1:-}"
   local kids=""
@@ -426,23 +429,12 @@ _kill_pid() {
   kids=$(pgrep -P "$pid" 2>/dev/null || true)
   if [ -n "$kids" ]; then
     # shellcheck disable=SC2086
-    kill $kids 2>/dev/null || true
+    kill -9 $kids 2>/dev/null || true
   fi
-  kill "$pid" 2>/dev/null || true
-  # Reap immediately so bash never gets a chance to print the async notice.
-  # If $pid is not a child of this shell, wait fails instantly (non-zero) — fine.
+  kill -9 "$pid" 2>/dev/null || true
+  # Reap immediately so bash never prints the async "Terminated: 15" notice.
+  # If $pid is not our child, wait fails instantly — fine.
   wait "$pid" 2>/dev/null || true
-
-  # Escalate only if still alive (non-child orphans, stubborn binaries).
-  if kill -0 "$pid" 2>/dev/null; then
-    kids=$(pgrep -P "$pid" 2>/dev/null || true)
-    if [ -n "$kids" ]; then
-      # shellcheck disable=SC2086
-      kill -9 $kids 2>/dev/null || true
-    fi
-    kill -9 "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-  fi
 }
 
 cleanup() {
@@ -464,12 +456,17 @@ cleanup() {
     free_port "$RDFOX_PORT" 2>/dev/null || true
   fi
   if [ -n "${RDFOX_WORKDIR:-}" ]; then
-    pkill -f "RDFox.*${RDFOX_WORKDIR}" 2>/dev/null || true
+    pkill -9 -f "RDFox.*${RDFOX_WORKDIR}" 2>/dev/null || true
   fi
   # Drop fifo keep-alive if present.
   [ -n "${RDFOX_STDIN_FIFO:-}" ] && rm -f "$RDFOX_STDIN_FIFO" 2>/dev/null || true
-  docker rm -f "$DOCKER_NAME" >/dev/null 2>&1 || true
-  docker rm -f "$FLUREE_DOCKER_NAME" >/dev/null 2>&1 || true
+  # docker rm can hang on a wedged daemon — fire-and-forget so EXIT never blocks.
+  if command -v docker >/dev/null 2>&1; then
+    ( docker rm -f "$DOCKER_NAME" >/dev/null 2>&1 || true ) &
+    disown $! 2>/dev/null || true
+    ( docker rm -f "$FLUREE_DOCKER_NAME" >/dev/null 2>&1 || true ) &
+    disown $! 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -495,8 +492,7 @@ free_port() {
     old=$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
     if [ -n "$old" ]; then
       # shellcheck disable=SC2086
-      kill $old 2>/dev/null || true
-      sleep 0.5
+      kill -9 $old 2>/dev/null || true
     fi
   fi
 }

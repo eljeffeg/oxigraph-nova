@@ -133,11 +133,11 @@ impl SpAdjCache {
             return Some(Arc::clone(a));
         }
         let a = build()?;
-        if self.map.len() >= self.cap {
-            if let Some(old) = self.order.first().copied() {
-                self.order.remove(0);
-                self.map.remove(&old);
-            }
+        if self.map.len() >= self.cap
+            && let Some(old) = self.order.first().copied()
+        {
+            self.order.remove(0);
+            self.map.remove(&old);
         }
         self.map.insert(key, Arc::clone(&a));
         self.order.push(key);
@@ -1057,7 +1057,7 @@ impl RingStore {
             }
             collected.push(quad);
         }
-        if let Some(cb) = on_progress.as_deref_mut()
+        if let Some(cb) = on_progress
             && !consumed.is_multiple_of(PROGRESS_REPORT_INTERVAL)
         {
             cb(consumed as u64);
@@ -1139,7 +1139,6 @@ impl RingStore {
     }
 
     /// Whether every non-empty compacted graph currently has a mapped image open.
-
     pub fn all_graphs_mapped(&self) -> bool {
         let inner = self.inner.lock();
         !inner.graphs.is_empty() && inner.graphs.values().all(|g| g.has_mapped())

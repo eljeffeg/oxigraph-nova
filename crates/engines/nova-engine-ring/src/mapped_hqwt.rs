@@ -35,9 +35,11 @@
 //! Encode entry (8 B): `content u32` + `len u32` (PrefixCode).
 //! Decode dir entry (16 B): `off u64` + `n_pairs u64` (pairs are content,u32 + symbol,u32).
 
+#[cfg(test)]
+use crate::mapped_qwt::AlignedBuf;
 use crate::mapped_qwt::{
-    AlignedBuf, MAX_LEVELS, MappedLevel, MappedQwtError, PAGE_ALIGN, align_up, level_get,
-    level_rank, level_select,
+    MAX_LEVELS, MappedLevel, MappedQwtError, PAGE_ALIGN, align_up, level_get, level_rank,
+    level_select,
 };
 use qwt::{AccessQuad, DataLine, HQWT256, RankQuad, SuperblockPlain};
 use std::ops::Range;
@@ -240,8 +242,8 @@ pub fn build_hqwa_section(
         cur += 40;
         cur = align_up(cur, 4);
         let mut sel = [0usize; 4];
-        for s in 0..4 {
-            sel[s] = cur;
+        for (s, sel_off) in sel.iter_mut().enumerate() {
+            *sel_off = cur;
             cur += lp.select[s].len();
             cur = align_up(cur, 4);
         }
@@ -457,8 +459,8 @@ impl<'m> MappedHqwtSection<'m> {
             return Err(MappedQwtError::Layout("occs OOB"));
         }
         let mut o = [0u64; 5];
-        for i in 0..5 {
-            o[i] = u64::from_le_bytes(
+        for (i, slot) in o.iter_mut().enumerate() {
+            *slot = u64::from_le_bytes(
                 self.sec[off_occs + i * 8..off_occs + i * 8 + 8]
                     .try_into()
                     .unwrap(),
@@ -543,14 +545,14 @@ impl<'m> MappedHqwtSection<'m> {
             level_lens.push(if self.n == 0 { 0 } else { self.level_len(i) });
         }
         let mut levels = [HotHuffLevel::EMPTY; MAX_LEVELS];
-        for level in 0..self.n_levels {
+        for (level, slot) in levels.iter_mut().enumerate().take(self.n_levels) {
             let lv = self.level_view(level)?;
             let occs_u64 = self.n_occs_smaller_level(level)?;
             let mut occs = [0usize; 5];
-            for i in 0..5 {
-                occs[i] = occs_u64[i] as usize;
+            for (i, o) in occs.iter_mut().enumerate() {
+                *o = occs_u64[i] as usize;
             }
-            levels[level] = HotHuffLevel {
+            *slot = HotHuffLevel {
                 data: lv.data.as_ptr(),
                 superblocks: lv.superblocks.as_ptr(),
                 data_len: lv.data.len(),
@@ -889,7 +891,7 @@ fn slice_as_bytes<T>(s: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
 }
 
-fn cast_slice<'a, T>(sec: &'a [u8], off: usize, n: usize) -> Result<&'a [T], MappedQwtError> {
+fn cast_slice<T>(sec: &[u8], off: usize, n: usize) -> Result<&[T], MappedQwtError> {
     if n == 0 {
         return Ok(&[]);
     }
@@ -904,7 +906,7 @@ fn cast_slice<'a, T>(sec: &'a [u8], off: usize, n: usize) -> Result<&'a [T], Map
     }
     // Absolute pointer alignment (Vec bases are not 64-aligned; AlignedBuf/mmap are).
     let ptr = unsafe { sec.as_ptr().add(off) };
-    if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+    if !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return Err(MappedQwtError::Layout("cast align"));
     }
     // SAFETY: bounds + absolute align checked; T is POD.
@@ -933,8 +935,7 @@ mod tests {
         assert_eq!(mapped.np, np);
         assert_eq!(mapped.p_base, p_base);
 
-        for i in 0..data.len() {
-            let local = data[i];
+        for (i, &local) in data.iter().enumerate() {
             assert_eq!(mapped.get_local(i), Some(local));
             assert_eq!(mapped.get_shared(i), Some(local + p_base));
             assert_eq!(hot.get(i), Some(local + p_base));

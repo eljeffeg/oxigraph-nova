@@ -1703,7 +1703,7 @@ impl PresenceSummaryTable {
         for level in 0..hot.n_levels {
             let lv = hot.level(level);
             let n = lv.qv_len;
-            let n_cells = if n == 0 { 0 } else { (n + s - 1) / s };
+            let n_cells = if n == 0 { 0 } else { n.div_ceil(s) };
             let mut cells = vec![0u8; n_cells];
             for i in 0..n {
                 let dig = hot_level_get(lv, i);
@@ -2240,8 +2240,8 @@ fn short_range_batch_decode(
         // Same-line fast path: all positions in one DataLine → one load.
         let mut same_line = true;
         let line0 = (pos[0] as usize) >> 8;
-        for i in 1..n {
-            if (pos[i] as usize) >> 8 != line0 {
+        for &p in pos.iter().take(n).skip(1) {
+            if (p as usize) >> 8 != line0 {
                 same_line = false;
                 break;
             }
@@ -2308,12 +2308,12 @@ fn short_range_batch_decode(
         out_sym[0] = sym[0];
         out_cnt[0] = 1;
         n_out = 1;
-        for i in 1..n {
-            if sym[i] == out_sym[n_out - 1] {
+        for &s in sym.iter().take(n).skip(1) {
+            if s == out_sym[n_out - 1] {
                 out_cnt[n_out - 1] += 1;
                 dedup_merges += 1;
             } else {
-                out_sym[n_out] = sym[i];
+                out_sym[n_out] = s;
                 out_cnt[n_out] = 1;
                 n_out += 1;
             }
@@ -2437,8 +2437,8 @@ impl<'m> MappedQwtSection<'m> {
             return Err(MappedQwtError::Layout("occs OOB"));
         }
         let mut o = [0u64; 5];
-        for i in 0..5 {
-            o[i] = u64::from_le_bytes(
+        for (i, slot) in o.iter_mut().enumerate() {
+            *slot = u64::from_le_bytes(
                 self.sec[off_occs + i * 8..off_occs + i * 8 + 8]
                     .try_into()
                     .unwrap(),
@@ -2454,14 +2454,14 @@ impl<'m> MappedQwtSection<'m> {
     /// lifetime of the returned pointers.
     pub fn build_hot(&self) -> Result<HotQwtColumn, MappedQwtError> {
         let mut levels = [HotMappedLevel::EMPTY; MAX_LEVELS];
-        for level in 0..self.n_levels {
+        for (level, slot) in levels.iter_mut().enumerate().take(self.n_levels) {
             let lv = self.level_view(level)?;
             let occs_u64 = self.n_occs_smaller_level(level)?;
             let mut occs = [0usize; 5];
-            for i in 0..5 {
-                occs[i] = occs_u64[i] as usize;
+            for (i, o) in occs.iter_mut().enumerate() {
+                *o = occs_u64[i] as usize;
             }
-            levels[level] = HotMappedLevel {
+            *slot = HotMappedLevel {
                 data: lv.data.as_ptr(),
                 superblocks: lv.superblocks.as_ptr(),
                 data_len: lv.data.len(),
@@ -3507,8 +3507,8 @@ pub fn build_qwta_section(qwt: &QWT256<u32>) -> Result<Vec<u8>, MappedQwtError> 
         cur += 40; // 5×u64
         cur = align_up(cur, 4);
         let mut sel = [0usize; 4];
-        for s in 0..4 {
-            sel[s] = cur;
+        for (s, sel_off) in sel.iter_mut().enumerate() {
+            *sel_off = cur;
             cur += lp.select[s].len();
             cur = align_up(cur, 4);
         }
@@ -3624,7 +3624,7 @@ pub fn open_novaqwt1(bytes: &[u8]) -> Result<MappedQwtOwned, MappedQwtError> {
     if n_levels > MAX_LEVELS {
         return Err(MappedQwtError::TooManyLevels(n_levels));
     }
-    if sec_off % PAGE_ALIGN != 0 {
+    if !sec_off.is_multiple_of(PAGE_ALIGN) {
         return Err(MappedQwtError::Layout("section not page-aligned"));
     }
     if sec_off
@@ -3752,8 +3752,8 @@ fn range_touch_ids(start: usize, end: usize) -> RangeTouchIds {
 
 #[inline]
 fn push_unique_u32(buf: &mut [u32; 6], n: &mut usize, v: u32) {
-    for i in 0..*n {
-        if buf[i] == v {
+    for &existing in buf.iter().take(*n) {
+        if existing == v {
             return;
         }
     }
@@ -4151,8 +4151,8 @@ fn common_mask3(a: &RangeExpand, b: &RangeExpand, c: &RangeExpand) -> u8 {
 
 #[inline(always)]
 fn push_unique_usize(buf: &mut [usize; 6], n: &mut usize, v: usize) {
-    for i in 0..*n {
-        if buf[i] == v {
+    for &existing in buf.iter().take(*n) {
+        if existing == v {
             return;
         }
     }
@@ -4295,11 +4295,11 @@ fn hot_level_range_expand3(
 
     // Eagerly touch unique ids so load counts reflect physical unique loads
     // even if a later rank path is empty (should not happen for valid ranges).
-    for i in 0..n_sbs {
-        let _ = sbs.get(lv, sb_ids[i]);
+    for &id in sb_ids.iter().take(n_sbs) {
+        let _ = sbs.get(lv, id);
     }
-    for i in 0..n_lines {
-        let _ = lines.get(lv, line_ids[i]);
+    for &id in line_ids.iter().take(n_lines) {
+        let _ = lines.get(lv, id);
     }
 
     let a_s = rank_all_from_caches(lv, a_start, &mut lines, &mut sbs);
@@ -4377,7 +4377,11 @@ pub(crate) struct RangeExpand {
 /// Algebraically identical to two `level_rank_all` probes, but reuses a single
 /// superblock / data-line load when endpoints share a block or superblock.
 /// Star locality A.1 measured ~90.6% same 256-block — that is the SameLine path.
+///
+/// Product hot path uses [`hot_level_range_expand`]; this slice-based variant is
+/// retained for differential tests against the mmap open path.
 #[inline]
+#[allow(dead_code)] // exercised by unit tests; product path uses hot_* variant
 pub(crate) fn level_range_expand(lv: &MappedLevel<'_>, start: usize, end: usize) -> RangeExpand {
     debug_assert!(start <= end);
     debug_assert!(end <= lv.n_symbols);
@@ -4641,7 +4645,7 @@ fn slice_as_bytes<T>(s: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
 }
 
-fn cast_slice<'a, T>(sec: &'a [u8], off: usize, n: usize) -> Result<&'a [T], MappedQwtError> {
+fn cast_slice<T>(sec: &[u8], off: usize, n: usize) -> Result<&[T], MappedQwtError> {
     let need = n
         .checked_mul(std::mem::size_of::<T>())
         .ok_or(MappedQwtError::Layout("overflow"))?;
@@ -4651,7 +4655,7 @@ fn cast_slice<'a, T>(sec: &'a [u8], off: usize, n: usize) -> Result<&'a [T], Map
     // Absolute pointer alignment (relative off%align is insufficient for
     // arbitrary Vec bases; AlignedBuf / page mmap guarantee it).
     let ptr = unsafe { sec.as_ptr().add(off) };
-    if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+    if !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return Err(MappedQwtError::Layout("align"));
     }
     // SAFETY: absolute alignment checked; T is POD; LE host; bounds checked.
@@ -4754,8 +4758,7 @@ mod tests {
 
         // Level-local rank_all vs heap RSQVector
         let levels = qwt.levels();
-        for level in 0..qwt.n_levels() {
-            let heap = &levels[level];
+        for (level, heap) in levels.iter().enumerate().take(qwt.n_levels()) {
             let nsym = heap.len();
             for &i in &[
                 0usize,
@@ -5323,7 +5326,7 @@ mod tests {
 
         // ── Continuation / exhaustion ────────────────────────────────────
         let mut rest = vec![4u32];
-        while let Some(v) = it.next() {
+        for v in it.by_ref() {
             rest.push(v);
         }
         assert_eq!(rest, (4..16).collect::<Vec<_>>());

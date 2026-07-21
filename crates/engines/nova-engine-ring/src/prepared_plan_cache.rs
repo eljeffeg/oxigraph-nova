@@ -272,6 +272,11 @@ impl PhysicalOpPreparedPlanCache {
         self.map.len()
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub fn clear(&mut self) {
         let n = self.map.len() as u64;
         self.map.clear();
@@ -315,8 +320,8 @@ impl PhysicalOpPreparedPlanCache {
 
     /// Return a plan after execute (does not bump insert counter).
     pub fn put_back(&mut self, key: PhysicalOpPlanKey, plan: PreparedPhysicalOp) {
-        if self.map.contains_key(&key) {
-            self.map.insert(key, CacheEntry { plan });
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.map.entry(key) {
+            e.insert(CacheEntry { plan });
             self.touch(&key);
             return;
         }
@@ -343,10 +348,10 @@ pub struct CachedPhysicalOpGuard {
 
 impl Drop for CachedPhysicalOpGuard {
     fn drop(&mut self) {
-        if let Some(plan) = self.plan.take() {
-            if self.return_to_cache {
-                self.cache.lock().put_back(self.key, plan);
-            }
+        if let Some(plan) = self.plan.take()
+            && self.return_to_cache
+        {
+            self.cache.lock().put_back(self.key, plan);
         }
     }
 }

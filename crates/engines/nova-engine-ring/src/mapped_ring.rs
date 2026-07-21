@@ -256,10 +256,10 @@ impl MappedRingA {
     #[inline]
     pub fn access(&self, col: Col, pos: u32) -> Option<u32> {
         #[cfg(feature = "ring-huffman-cp")]
-        if col == Col::P {
-            if let Some(h) = self.hot_p_huff.as_ref() {
-                return h.get(pos as usize);
-            }
+        if col == Col::P
+            && let Some(h) = self.hot_p_huff.as_ref()
+        {
+            return h.get(pos as usize);
         }
         self.col_hot(col).get(pos as usize)
     }
@@ -297,10 +297,10 @@ impl MappedRingA {
     #[inline]
     pub fn rank(&self, col: Col, symbol: u32, position: u32) -> Option<u32> {
         #[cfg(feature = "ring-huffman-cp")]
-        if col == Col::P {
-            if let Some(h) = self.hot_p_huff.as_ref() {
-                return h.rank(symbol, position as usize).map(|r| r as u32);
-            }
+        if col == Col::P
+            && let Some(h) = self.hot_p_huff.as_ref()
+        {
+            return h.rank(symbol, position as usize).map(|r| r as u32);
         }
         self.col_hot(col)
             .rank(symbol, position as usize)
@@ -311,14 +311,12 @@ impl MappedRingA {
     #[inline]
     pub fn select(&self, col: Col, symbol: u32, occurrence: u32) -> Option<u32> {
         #[cfg(feature = "ring-huffman-cp")]
-        if col == Col::P {
-            if self.c_p_is_huff() {
-                return self
-                    .col_hqwt_p()
-                    .ok()?
-                    .select_shared(symbol, occurrence as usize)
-                    .map(|p| p as u32);
-            }
+        if col == Col::P && self.c_p_is_huff() {
+            return self
+                .col_hqwt_p()
+                .ok()?
+                .select_shared(symbol, occurrence as usize)
+                .map(|p| p as u32);
         }
         self.col_qwt(col)
             .ok()?
@@ -388,10 +386,10 @@ impl MappedRingA {
             return None;
         }
         #[cfg(feature = "ring-huffman-cp")]
-        if col == Col::P {
-            if let Some(h) = self.hot_p_huff.as_ref() {
-                return h.range_next_value_scan(r.start as usize..r.end as usize, target);
-            }
+        if col == Col::P
+            && let Some(h) = self.hot_p_huff.as_ref()
+        {
+            return h.range_next_value_scan(r.start as usize..r.end as usize, target);
         }
         self.col_hot(col)
             .range_next_value(r.start as usize..r.end as usize, target)
@@ -614,7 +612,7 @@ impl MappedRingA {
     }
 
     /// Persistent fixed-stack three-range intersection iterator (D3-B).
-
+    ///
     /// The iterator borrows this mmap-backed image and stores only its bounded
     /// traversal stack; no persistent image bytes or heap allocation are added.
     #[inline]
@@ -667,15 +665,15 @@ impl MappedRingA {
     #[inline]
     pub fn range_distinct_iter(&self, col: Col, r: RowRange) -> Option<MappedColDistinctIter<'_>> {
         #[cfg(feature = "ring-huffman-cp")]
-        if col == Col::P {
-            if let Some(h) = self.hot_p_huff.as_ref() {
-                let pairs = if r.is_empty() {
-                    Vec::new()
-                } else {
-                    h.range_distinct_scan(r.start as usize..r.end as usize)
-                };
-                return Some(MappedColDistinctIter::HuffScan { pairs, idx: 0 });
-            }
+        if col == Col::P
+            && let Some(h) = self.hot_p_huff.as_ref()
+        {
+            let pairs = if r.is_empty() {
+                Vec::new()
+            } else {
+                h.range_distinct_scan(r.start as usize..r.end as usize)
+            };
+            return Some(MappedColDistinctIter::HuffScan { pairs, idx: 0 });
         }
         let hot = self.col_hot(col);
         let it = if r.is_empty() {
@@ -737,6 +735,10 @@ impl MappedRingA {
 }
 
 /// Column-agnostic mapped distinct iterator (Qwt RDI or Huffman O(σ_P) scan).
+///
+/// `MappedRangeDistinctIter` is intentionally large (fixed RDI stack on the
+/// hot path); boxing would add a heap alloc per open.
+#[allow(clippy::large_enum_variant)]
 pub enum MappedColDistinctIter<'a> {
     Qwt(MappedRangeDistinctIter<'a>),
     #[cfg(feature = "ring-huffman-cp")]
@@ -1067,7 +1069,7 @@ fn validate_directory(bytes: &[u8], h: &Novarng1Header) -> Result<(), MappedRing
         (h.off_cs, h.len_cs, "cs"),
     ] {
         let _ = name;
-        if (off as usize) % page != 0 {
+        if !(off as usize).is_multiple_of(page) {
             return Err(MappedRingError::Layout("QWT section not page-aligned"));
         }
         let end = (off as usize)
@@ -1082,7 +1084,7 @@ fn validate_directory(bytes: &[u8], h: &Novarng1Header) -> Result<(), MappedRing
         (h.off_ap, h.len_ap),
         (h.off_as, h.len_as),
     ] {
-        if (off as usize) % 4 != 0 {
+        if !(off as usize).is_multiple_of(4) {
             return Err(MappedRingError::Layout("A not 4-aligned"));
         }
         let need = (len as usize)
@@ -1121,7 +1123,7 @@ fn cast_u32_slice(bytes: &[u8], off: usize, n: usize) -> Result<&[u32], MappedRi
     let need = n
         .checked_mul(4)
         .ok_or(MappedRingError::Layout("overflow"))?;
-    if off % 4 != 0 {
+    if !off.is_multiple_of(4) {
         return Err(MappedRingError::Layout("align"));
     }
     if off
@@ -1194,8 +1196,7 @@ mod tests {
         for col in [Col::O, Col::P, Col::S] {
             let heap = ring.col_qwt(col).expect("Qwt C_p for NOVARNG1 tests");
             let levels = heap.levels();
-            for level in 0..heap.n_levels() {
-                let h = &levels[level];
+            for (level, h) in levels.iter().enumerate().take(heap.n_levels()) {
                 let nsym = h.len();
                 for &i in &[0usize, 1, nsym / 2, nsym] {
                     if i > nsym {

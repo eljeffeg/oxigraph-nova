@@ -560,7 +560,7 @@ impl CyclicRing {
     }
 
     /// Build **Ring B** (reverse cyclic class) from role-local triples.
-
+    ///
     /// Same shared-alphabet remap as [`Self::build_from_role_local`].
     ///
     /// Cyclic class: OPS → SOP → PSO (last columns C_s, C_p, C_o).
@@ -594,6 +594,7 @@ impl CyclicRing {
     /// - `lead_range(S)` partitions T_sop by s (after F_s from OPS)
     /// - `lead_range(P)` partitions T_pso by p
     /// - `lead_range(O)` partitions T_ops by o
+    ///
     /// DROP (E5.8): research/applications/oracle only — requires `diagnostics` feature.
     #[cfg(any(test, feature = "diagnostics"))]
     pub fn build_ring_b_shared(triples: &[[u32; 3]], universe: u32) -> Self {
@@ -635,7 +636,6 @@ impl CyclicRing {
     }
 
     /// Exact complete bytes (qwt MemSize + A arrays + shell), matching E5.6 accounting.
-
     pub fn mem_bytes(&self) -> usize {
         self.mem_breakdown().total()
     }
@@ -1271,6 +1271,9 @@ pub use uring_oracle::{Orientation, OrientationCounters, URing};
 
 // ── Stateful distinct iterator wrapper (E5.7C / E5.9A) ───────────────────────
 
+// Qwt RangeDistinctIter is ~4KB of fixed stack state; boxing would add a heap
+// alloc on every RDI open on the LFTJ hot path. Prefer stack layout.
+#[allow(clippy::large_enum_variant)]
 enum RdiKind<'a> {
     Qwt {
         inner: qwt::RangeDistinctIter<'a, u32, qwt::RSQVector256, false>,
@@ -1290,7 +1293,11 @@ pub struct CyclicRangeDistinctIter<'a> {
 
 impl<'a> CyclicRangeDistinctIter<'a> {
     /// Next distinct symbol and its occurrence count in the open range.
+    ///
+    /// Named `next` intentionally (mirrors qwt RDI); not `Iterator` because
+    /// finish also flushes diagnostic counters into `GlobalCounters`.
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(u32, u32)> {
         match &mut self.kind {
             RdiKind::Qwt { inner } => match inner.next() {

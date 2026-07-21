@@ -937,7 +937,7 @@ fn eval_sp_expansion_walk<D: Dataset>(
                 && step.is_multiple_of(4096)
                 && tok.is_cancelled()
             {
-                    return Err(());
+                return Err(());
             }
             step += 1;
             LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
@@ -983,9 +983,9 @@ fn eval_sp_expansion_walk<D: Dataset>(
             && step.is_multiple_of(4096)
             && tok.is_cancelled()
         {
-                return Err(anyhow::Error::from(
-                    crate::options::EvalLimitError::Cancelled,
-                ));
+            return Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            ));
         }
         step += 1;
         let s = s_scan.key();
@@ -1103,7 +1103,7 @@ fn eval_two_hop_walk<D: Dataset>(
                 && step.is_multiple_of(4096)
                 && tok.is_cancelled()
             {
-                    return Err(());
+                return Err(());
             }
             step += 1;
             LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
@@ -1159,9 +1159,9 @@ fn eval_two_hop_walk<D: Dataset>(
             && step.is_multiple_of(4096)
             && tok.is_cancelled()
         {
-                return Err(anyhow::Error::from(
-                    crate::options::EvalLimitError::Cancelled,
-                ));
+            return Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            ));
         }
         step += 1;
         let a = a_scan.key();
@@ -1250,7 +1250,7 @@ fn eval_wedge_walk<D: Dataset>(
                 && step.is_multiple_of(4096)
                 && tok.is_cancelled()
             {
-                    return Err(());
+                return Err(());
             }
             step += 1;
             LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
@@ -1290,9 +1290,9 @@ fn eval_wedge_walk<D: Dataset>(
             && step.is_multiple_of(4096)
             && tok.is_cancelled()
         {
-                return Err(anyhow::Error::from(
-                    crate::options::EvalLimitError::Cancelled,
-                ));
+            return Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            ));
         }
         step += 1;
         let a = a_scan.key();
@@ -1434,7 +1434,7 @@ fn eval_k_chain_walk<D: Dataset>(
                 && step.is_multiple_of(4096)
                 && tok.is_cancelled()
             {
-                    return Err(());
+                return Err(());
             }
             step += 1;
             LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
@@ -1476,9 +1476,9 @@ fn eval_k_chain_walk<D: Dataset>(
             && step.is_multiple_of(4096)
             && tok.is_cancelled()
         {
-                return Err(anyhow::Error::from(
-                    crate::options::EvalLimitError::Cancelled,
-                ));
+            return Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            ));
         }
         step += 1;
         let a = a_scan.key();
@@ -1597,7 +1597,7 @@ fn eval_star_walk<D: Dataset>(
                 && step.is_multiple_of(4096)
                 && tok.is_cancelled()
             {
-                    return Err(());
+                return Err(());
             }
             step += 1;
             LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
@@ -1640,9 +1640,9 @@ fn eval_star_walk<D: Dataset>(
             && step.is_multiple_of(4096)
             && tok.is_cancelled()
         {
-                return Err(anyhow::Error::from(
-                    crate::options::EvalLimitError::Cancelled,
-                ));
+            return Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            ));
         }
         step += 1;
         let s = s_scan.key();
