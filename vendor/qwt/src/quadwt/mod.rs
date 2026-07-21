@@ -41,13 +41,11 @@ use crate::{
     AccessUnsigned, OccsRangeUnsigned, RankUnsigned, SelectUnsigned, WTIterator, WTSupport,
 };
 use crate::{QVector, QVectorBuilder}; // Traits
-
 use mem_dbg::{MemDbg, MemSize};
-use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
-
 // Traits bound
 use num_traits::{AsPrimitive, PrimInt, Unsigned};
+use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
 use std::ops::{Bound, Range, RangeBounds, Shl, Shr};
 
 pub mod huffqwt;
@@ -260,7 +258,9 @@ where
         self.n_levels
     }
 
-    /// Per-level RS quad vectors for E5.10 flatten (read-only).
+    /// Per-level RS quad vectors (read-only).
+    ///
+    /// Exposed for zero-copy / mmap flatten of the tree layout.
     #[inline]
     pub fn levels(&self) -> &[RS] {
         &self.qvs
@@ -276,7 +276,6 @@ where
     /// symbol occurs. Half-open row range `[start, end)`.
     ///
     /// # Complexity
-
     /// Guided top-down walk over the wavelet matrix using only per-level
     /// 4-ary ranks. Worst case `O(n_levels)` with a constant number of
     /// branch ranks per level — **not** `O(|range|)` and **not**
@@ -285,10 +284,6 @@ where
     /// # Space
     /// Zero additional persistent data; uses a fixed stack of size
     /// `n_levels` (≤ 32 on this type's addressable alphabets).
-    ///
-    /// # Nova / PRISM note
-    /// Upstreamable API added for paper-faithful Ring `range_next_value`.
-    /// Does not expose internal `qvs`.
     ///
     /// # Examples
     /// ```
@@ -424,9 +419,10 @@ where
         None
     }
 
-    /// Linear-scan oracle for [`Self::range_next_value`] (diagnostic only).
+    /// Linear-scan oracle for [`Self::range_next_value`] (diagnostic / test only).
     ///
     /// Complexity `O(|range| · log σ)` via repeated `get`. Not for hot paths.
+    #[cfg(test)]
     #[must_use]
     pub fn range_next_value_scan(&self, range: Range<usize>, target: T) -> Option<T> {
         if range.start > range.end || range.end > self.n || range.start == range.end {
@@ -449,7 +445,7 @@ where
         best
     }
 
-    /// Stateful distinct-symbol enumerator over a row range (E5.7C).
+    /// Stateful distinct-symbol enumerator over a row range.
     ///
     /// Yields `(symbol, count)` in lexicographic order for every symbol that
     /// occurs at least once in `range`. Uses a **fixed** O(log σ) stack —
@@ -466,7 +462,7 @@ where
     /// use qwt::QWT256;
     /// let qwt = QWT256::from(vec![1u8, 0, 1, 0, 2, 4, 5, 3]);
     /// let got: Vec<_> = qwt.range_distinct_iter(0..8).collect();
-    /// assert_eq!(got, vec![(0,2),(1,2),(2,1),(3,1),(4,1),(5,1)]);
+    /// assert_eq!(got, vec![(0, 2), (1, 2), (2, 1), (3, 1), (4, 1), (5, 1)]);
     /// ```
     #[must_use]
     pub fn range_distinct_iter(
@@ -489,7 +485,10 @@ where
     ///
     /// assert_eq!(qwt.iter().collect::<Vec<_>>(), data);
     ///
-    /// assert_eq!(qwt.iter().rev().collect::<Vec<_>>(), data.into_iter().rev().collect::<Vec<_>>());
+    /// assert_eq!(
+    ///     qwt.iter().rev().collect::<Vec<_>>(),
+    ///     data.into_iter().rev().collect::<Vec<_>>()
+    /// );
     /// ```
     pub fn iter(
         &self,
@@ -599,7 +598,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use qwt::{QWT256, RankUnsigned};
+    /// use qwt::{RankUnsigned, QWT256};
     ///
     /// let data = vec![1u8, 0, 1, 0, 2, 4, 5, 3];
     ///
@@ -608,8 +607,8 @@ where
     /// assert_eq!(qwt.rank_prefetch(1, 2), Some(1));
     /// assert_eq!(qwt.rank_prefetch(3, 8), Some(1));
     /// assert_eq!(qwt.rank_prefetch(1, 0), Some(0));
-    /// assert_eq!(qwt.rank_prefetch(1, 9), None);  // Too large position
-    /// assert_eq!(qwt.rank_prefetch(6, 1), None);  // Too large symbol
+    /// assert_eq!(qwt.rank_prefetch(1, 9), None); // Too large position
+    /// assert_eq!(qwt.rank_prefetch(6, 1), None); // Too large symbol
     /// ```
     #[inline(always)]
     #[must_use]
@@ -635,7 +634,7 @@ where
     ///
     /// # Examples
     /// ```
-    /// use qwt::{QWT256, RankUnsigned};
+    /// use qwt::{RankUnsigned, QWT256};
     ///
     /// let data = vec![1u8, 0, 1, 0, 2, 4, 5, 3];
     ///
@@ -845,7 +844,7 @@ where
     }
 }
 
-// ── RangeDistinctIter (E5.7C — fixed-stack stateful distinct enumeration) ──
+// ── RangeDistinctIter (fixed-stack stateful distinct enumeration) ──
 
 /// Fixed-stack distinct-symbol iterator over a wavelet row range.
 ///
@@ -856,7 +855,7 @@ pub struct RangeDistinctIter<'a, T, RS, const WITH_PREFETCH_SUPPORT: bool> {
     /// DFS stack; only `sp` slots are live.
     stack: [RangeDistinctFrame; 128],
     sp: usize,
-    /// Diagnostic counters (optional harness use / E5.9A profile).
+    /// Optional profiling counters (rank probes, frames, children).
     pub rank_probes: u64,
     pub frames_popped: u64,
     pub children_pushed: u64,
@@ -883,10 +882,7 @@ where
     usize: AsPrimitive<T>,
     RS: RSforWT,
 {
-    fn new(
-        tree: &'a QWaveletTree<T, RS, WITH_PREFETCH_SUPPORT>,
-        range: Range<usize>,
-    ) -> Self {
+    fn new(tree: &'a QWaveletTree<T, RS, WITH_PREFETCH_SUPPORT>, range: Range<usize>) -> Self {
         let mut stack = [RangeDistinctFrame::default(); 128];
         let mut sp = 0usize;
         if range.start < range.end && range.end <= tree.n && tree.n_levels > 0 {
@@ -913,7 +909,7 @@ where
 
     /// Returns the next distinct symbol and its occurrence count in the range.
     ///
-    /// E5.9A tighten:
+    /// Optimizations:
     /// - **Rank-all-4** at start/end (shared data-line loads).
     /// - **Unary path collapse**: when exactly one child is nonempty, descend
     ///   in-place without stack push/pop until a branch or leaf.
@@ -975,8 +971,8 @@ where
                     break; // no children — dead frame
                 }
 
-                // Unary path collapse (E5.9A lever B): one live child → descend
-                // in-place, skip stack traffic until a branch or leaf.
+                // Unary path collapse: one live child → descend in-place,
+                // skip stack traffic until a branch or leaf.
                 if nc == 1 {
                     cur.start = cand_s[0];
                     cur.end = cand_e[0];
@@ -1012,7 +1008,6 @@ where
     }
 }
 
-
 impl<'a, T, RS, const WITH_PREFETCH_SUPPORT: bool> Iterator
     for RangeDistinctIter<'a, T, RS, WITH_PREFETCH_SUPPORT>
 where
@@ -1043,7 +1038,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use qwt::{QWT256, RankUnsigned};
+    /// use qwt::{RankUnsigned, QWT256};
     ///
     /// let data = vec![1u8, 0, 1, 0, 2, 4, 5, 3];
     ///
@@ -1052,8 +1047,8 @@ where
     /// assert_eq!(qwt.rank(1, 2), Some(1));
     /// assert_eq!(qwt.rank(3, 8), Some(1));
     /// assert_eq!(qwt.rank(1, 0), Some(0));
-    /// assert_eq!(qwt.rank(1, 9), None);  // Too large position
-    /// assert_eq!(qwt.rank(6, 1), None);  // Too large symbol
+    /// assert_eq!(qwt.rank(1, 9), None); // Too large position
+    /// assert_eq!(qwt.rank(6, 1), None); // Too large symbol
     /// ```
 
     #[inline(always)]
@@ -1079,7 +1074,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use qwt::{QWT256, RankUnsigned};
+    /// use qwt::{RankUnsigned, QWT256};
     ///
     /// let data = vec![1u8, 0, 1, 0, 2, 4, 5, 3];
     ///
@@ -1132,7 +1127,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use qwt::{QWT256, AccessUnsigned};
+    /// use qwt::{AccessUnsigned, QWT256};
     ///
     /// let data = vec![1u8, 0, 1, 0, 2, 4, 5, 3];
     ///
@@ -1162,7 +1157,7 @@ where
     ///
     /// # Examples
     /// ```
-    /// use qwt::{QWT256, AccessUnsigned};
+    /// use qwt::{AccessUnsigned, QWT256};
     ///
     /// let data = vec![1u8, 0, 1, 0, 2, 4, 5, 3];
     ///
@@ -1210,7 +1205,7 @@ where
     ///
     /// # Examples
     /// ```
-    /// use qwt::{QWT256, SelectUnsigned};
+    /// use qwt::{SelectUnsigned, QWT256};
     ///
     /// let data = vec![1u8, 0, 1, 0, 2, 4, 5, 3];
     ///
@@ -1222,7 +1217,7 @@ where
     /// assert_eq!(qwt.select(1, 0), Some(0));
     /// assert_eq!(qwt.select(5, 0), Some(6));
     /// assert_eq!(qwt.select(6, 1), None);
-    /// ```    
+    /// ```
 
     #[inline(always)]
     fn select(&self, symbol: Self::Item, i: usize) -> Option<usize> {

@@ -4,40 +4,26 @@ pub use mem_dbg;
 
 pub mod perf_and_test_utils;
 pub mod qvector;
-use std::{
-    marker::PhantomData,
-    ops::{Range, RangeBounds},
-};
-
 use num_traits::AsPrimitive;
-pub use qvector::DataLine;
-pub use qvector::QVector;
-pub use qvector::QVectorBuilder;
 pub use qvector::rs_qvector::SuperblockPlain;
-
+pub use qvector::{DataLine, QVector, QVectorBuilder};
+use std::marker::PhantomData;
+use std::ops::{Range, RangeBounds};
 
 pub mod bitvector;
-pub use bitvector::narrow;
-pub use bitvector::wide;
-pub use bitvector::BitVector;
-pub use bitvector::BitVectorMut;
-
 #[deprecated(since = "0.5.0", note = "renamed to `qwt::narrow::RS`")]
 pub use bitvector::narrow::RS as RSNarrow;
 #[deprecated(since = "0.5.0", note = "renamed to `qwt::wide::RS`")]
 pub use bitvector::wide::RS as RSWide;
+pub use bitvector::{narrow, wide, BitVector, BitVectorMut};
 
 pub mod utils;
 
-pub use qvector::rs_qvector::RSQVector;
-pub use qvector::rs_qvector::RSQVector256;
-pub use qvector::rs_qvector::RSQVector512;
+pub use qvector::rs_qvector::{RSQVector, RSQVector256, RSQVector512};
 
 pub mod quadwt;
 pub use quadwt::huffqwt::{HuffQWaveletTree, PrefixCode};
-pub use quadwt::QWaveletTree;
-pub use quadwt::RangeDistinctIter;
-pub use quadwt::WTIndexable;
+pub use quadwt::{QWaveletTree, RangeDistinctIter, WTIndexable};
 
 pub mod binwt;
 pub use binwt::WaveletTree;
@@ -256,7 +242,6 @@ pub trait RankQuad {
     }
 }
 
-
 /// A trait for the support of `select` query over the alphabet [0..3].
 pub trait SelectQuad {
     /// Returns the position in the indexed sequence of the `i+1`th occurrence of `symbol`
@@ -276,7 +261,7 @@ pub trait SelectQuad {
 /// to provide to be used in a Quad Wavelet Tree.
 pub trait WTSupport: AccessQuad + RankQuad + SelectQuad {
     /// Returns the number of occurrences of `symbol` in the indexed sequence,
-    /// `None` if `symbol` is larger than 3, i.e., `symbol` is not valid.  
+    /// `None` if `symbol` is larger than 3, i.e., `symbol` is not valid.
     fn occs(&self, symbol: u8) -> Option<usize>;
 
     /// Returns the number of occurrences of `symbol` in the indexed sequence.
@@ -288,7 +273,7 @@ pub trait WTSupport: AccessQuad + RankQuad + SelectQuad {
 
     /// Returns the number of occurrences of all the symbols smaller than the
     /// input `symbol`, `None` if `symbol` is larger than 3,
-    /// i.e., `symbol` is not valid.  
+    /// i.e., `symbol` is not valid.
     fn occs_smaller(&self, symbol: u8) -> Option<usize>;
 
     /// Returns the rank of `symbol` up to the block that contains the position

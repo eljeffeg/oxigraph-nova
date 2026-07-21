@@ -1,8 +1,6 @@
 use super::*;
 use crate::perf_and_test_utils::gen_sequence;
-use crate::RSQVector512;
-use crate::QWT256;
-use crate::{OccsRangeUnsigned, RankUnsigned};
+use crate::{OccsRangeUnsigned, RSQVector512, RankUnsigned, QWT256};
 use rand::RngExt;
 
 #[test]
@@ -283,7 +281,7 @@ fn test_serialize() {
     assert_eq!(des_qwt, qwt);
 }
 
-// ── range_next_value (Nova E5.7B.1) ────────────────────────────────────────
+// ── range_next_value ─────────────────────────────────────────────────────
 
 fn rnv_scan_oracle(seq: &[u8], range: std::ops::Range<usize>, target: u8) -> Option<u8> {
     let mut best = None;
@@ -354,21 +352,19 @@ fn test_range_next_value_duplicates_and_backtrack() {
 
 #[test]
 fn test_range_next_value_random_vs_scan() {
-    use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
     let mut rng = StdRng::seed_from_u64(0xE57B_0001);
     for trial in 0..40 {
-        let n = rng.gen_range(1..400);
-        let sigma = rng.gen_range(2..200u32);
-        let seq: Vec<u8> = (0..n)
-            .map(|_| rng.gen_range(0..sigma) as u8)
-            .collect();
+        let n = rng.random_range(1..400);
+        let sigma = rng.random_range(2..200u32);
+        let seq: Vec<u8> = (0..n).map(|_| rng.random_range(0..sigma) as u8).collect();
         let qwt = QWT256::from(seq.clone());
         for _ in 0..80 {
-            let a = rng.gen_range(0..=n);
-            let b = rng.gen_range(0..=n);
+            let a = rng.random_range(0..=n);
+            let b = rng.random_range(0..=n);
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            let t = rng.gen_range(0..=(sigma + 5)) as u8;
+            let t = rng.random_range(0..=(sigma + 5)) as u8;
             let native = qwt.range_next_value(lo..hi, t);
             let scan = qwt.range_next_value_scan(lo..hi, t);
             let oracle = rnv_scan_oracle(&seq, lo..hi, t);
@@ -380,18 +376,18 @@ fn test_range_next_value_random_vs_scan() {
 
 #[test]
 fn test_range_next_value_large_alphabet_u32() {
-    use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
     let mut rng = StdRng::seed_from_u64(0xE57B_0032);
     let n = 2000;
     let sigma = 50_000u32;
-    let seq: Vec<u32> = (0..n).map(|_| rng.gen_range(0..sigma)).collect();
+    let seq: Vec<u32> = (0..n).map(|_| rng.random_range(0..sigma)).collect();
     let qwt = QWT256::from(seq.clone());
     for _ in 0..200 {
-        let a = rng.gen_range(0..=n);
-        let b = rng.gen_range(0..=n);
+        let a = rng.random_range(0..=n);
+        let b = rng.random_range(0..=n);
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let t = rng.gen_range(0..=sigma + 10);
+        let t = rng.random_range(0..=sigma + 10);
         let native = qwt.range_next_value(lo..hi, t);
         // local scan oracle for u32
         let mut best = None;
@@ -410,8 +406,7 @@ fn test_range_next_value_large_alphabet_u32() {
     }
 }
 
-
-// ── range_distinct_iter (Nova E5.7C) ───────────────────────────────────────
+// ── range_distinct_iter ──────────────────────────────────────────────────
 
 #[test]
 fn test_range_distinct_iter_matches_occs_and_rnv() {
@@ -432,13 +427,18 @@ fn test_range_distinct_iter_matches_occs_and_rnv() {
         let c = data.iter().filter(|&&x| x == v).count();
         via_rnv.push((v, c));
         t = v.saturating_add(1);
-        if t == 0 { break; }
+        if t == 0 {
+            break;
+        }
     }
     assert_eq!(rdi, via_rnv);
 
     // empty / singleton / subrange
     assert_eq!(qwt.range_distinct_iter(0..0).count(), 0);
-    assert_eq!(qwt.range_distinct_iter(0..1).collect::<Vec<_>>(), vec![(1, 1)]);
+    assert_eq!(
+        qwt.range_distinct_iter(0..1).collect::<Vec<_>>(),
+        vec![(1, 1)]
+    );
     let sub: Vec<_> = qwt.range_distinct_iter(4..8).collect();
     assert_eq!(sub, vec![(2, 1), (3, 1), (4, 1), (5, 1)]);
 }
@@ -446,16 +446,16 @@ fn test_range_distinct_iter_matches_occs_and_rnv() {
 #[test]
 fn test_range_distinct_iter_random_vs_occs() {
     use crate::{OccsRangeUnsigned, QWT256};
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xE57C);
     for _ in 0..40 {
-        let n = rng.gen_range(1..120usize);
-        let sigma = rng.gen_range(1..40u8);
-        let data: Vec<u8> = (0..n).map(|_| rng.gen_range(0..sigma)).collect();
+        let n = rng.random_range(1..120usize);
+        let sigma = rng.random_range(1..40u8);
+        let data: Vec<u8> = (0..n).map(|_| rng.random_range(0..sigma)).collect();
         let qwt = QWT256::from(data.clone());
         for _ in 0..20 {
-            let lo = rng.gen_range(0..=n);
-            let hi = rng.gen_range(lo..=n);
+            let lo = rng.random_range(0..=n);
+            let hi = rng.random_range(lo..=n);
             let rdi: Vec<_> = qwt.range_distinct_iter(lo..hi).collect();
             let mut occs: Vec<_> = qwt.occs_range(lo..hi).unwrap().collect();
             occs.sort_by_key(|(s, _)| *s);
@@ -469,11 +469,11 @@ fn test_range_distinct_iter_random_vs_occs() {
 #[test]
 fn test_range_distinct_iter_large_sigma_u32() {
     use crate::{OccsRangeUnsigned, QWT256};
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
     let n = 200usize;
     let sigma = 5000u32;
-    let data: Vec<u32> = (0..n).map(|_| rng.gen_range(0..sigma)).collect();
+    let data: Vec<u32> = (0..n).map(|_| rng.random_range(0..sigma)).collect();
     let qwt = QWT256::from(data);
     let rdi: Vec<_> = qwt.range_distinct_iter(0..n).collect();
     let mut occs: Vec<_> = qwt.occs_range(0..n).unwrap().collect();

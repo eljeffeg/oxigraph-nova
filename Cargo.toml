@@ -182,8 +182,8 @@ debug           = 1
 split-debuginfo = "off"
 
 
-# Braided Ring — vendored qwt 0.4.0 with public DataLine / rank helpers for mmap.
-# Upstream: https://github.com/rossanoventurini/qwt @ crates.io 0.4.0
+# Braided Ring — vendored qwt 0.5.0 with public DataLine / rank helpers for mmap.
+# Upstream: https://github.com/rossanoventurini/qwt @ crates.io 0.5.0
 [patch.crates-io]
 qwt = { path = "vendor/qwt" }
 

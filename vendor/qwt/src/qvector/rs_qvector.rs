@@ -1,22 +1,17 @@
 //! This module provides support for `rank` and `select` queries on a quad vector.
 
 use super::{QVector, QVectorIterator};
-
 use crate::utils::{prefetch_read_NTA, select_in_word_u128};
-
+// Traits
+use crate::{AccessQuad, RankQuad, SelectQuad, WTSupport};
 use mem_dbg::{MemDbg, MemSize};
 use num_traits::int::PrimInt;
 use num_traits::{AsPrimitive, Unsigned};
-
 use serde::{Deserialize, Serialize};
-
-// Traits
-use crate::{AccessQuad, RankQuad, SelectQuad, WTSupport};
 
 /// Alternative representations to support Rank/Select queries at the level of blocks
 mod rs_support_plain;
 pub use rs_support_plain::{RSSupportPlain, SuperblockPlain};
-
 
 /// Possible specializations which provide different space/time trade-offs.
 pub type RSQVector256 = RSQVector<RSSupportPlain<256>>;
@@ -28,7 +23,7 @@ pub type RSQVector512 = RSQVector<RSSupportPlain<512>>;
 pub struct RSQVector<S> {
     qv: QVector,
     rs_support: S,
-    n_occs_smaller: [usize; 5], // for each symbol c, store the number of occurrences of in qv of symbols smaller than c. We store 5 (instead of 4) counters so we can use them to compute also the number of occurrences of each symbol without branches.
+    n_occs_smaller: [usize; 5], /* for each symbol c, store the number of occurrences of in qv of symbols smaller than c. We store 5 (instead of 4) counters so we can use them to compute also the number of occurrences of each symbol without branches. */
 }
 
 impl<S> RSQVector<S> {
@@ -42,7 +37,7 @@ impl<S> RSQVector<S> {
     /// let rsqv: RSQVector256 = (0..10_u64).into_iter().map(|x| x % 4).collect();
     ///
     /// for (i, v) in rsqv.iter().enumerate() {
-    ///    assert_eq!((i%4) as u8, v);
+    ///     assert_eq!((i % 4) as u8, v);
     /// }
     /// ```
     pub fn iter(&self) -> QVectorIterator<&QVector> {
@@ -226,7 +221,7 @@ impl<S: RSSupport> RSQVector<S> {
     }
 
     /// Intra-block ranks for all four symbols up to `i` (excluded).
-    /// One data-line load shared across symbols (E5.9A rank-all).
+    /// One data-line load shared across symbols (fused 4-way rank).
     #[inline(always)]
     fn rank_intra_block_all(&self, i: usize) -> [usize; 4] {
         debug_assert!(
@@ -270,7 +265,6 @@ impl<S: RSSupport> RSQVector<S> {
         ranks
     }
 
-
     // Returns the number of symbols in the quad vector.
     pub fn len(&self) -> usize {
         self.qv.len()
@@ -281,25 +275,25 @@ impl<S: RSSupport> RSQVector<S> {
         self.qv.len() == 0
     }
 
-    /// Underlying quad vector (E5.10 flatten).
+    /// Underlying quad vector. Exposed for zero-copy / mmap flatten.
     #[inline]
     pub fn qvector(&self) -> &QVector {
         &self.qv
     }
 
-    /// Rank/select support structure (E5.10 flatten).
+    /// Rank/select support structure. Exposed for zero-copy / mmap flatten.
     #[inline]
     pub fn rs_support(&self) -> &S {
         &self.rs_support
     }
 
-    /// Wavelet-matrix child offsets `n_occs_smaller` (E5.10 flatten).
+    /// Wavelet-matrix child offsets `n_occs_smaller`.
+    /// Exposed for zero-copy / mmap flatten.
     #[inline]
     pub fn n_occs_smaller(&self) -> [usize; 5] {
         self.n_occs_smaller
     }
 }
-
 
 impl<S> AccessQuad for RSQVector<S> {
     /// Accesses the `i`-th value in the quad vector.
@@ -310,7 +304,7 @@ impl<S> AccessQuad for RSQVector<S> {
     ///
     /// # Examples
     /// ```
-    /// use qwt::{RSQVector256, AccessQuad};
+    /// use qwt::{AccessQuad, RSQVector256};
     ///
     /// let rsqv: RSQVector256 = (0..10_u64).into_iter().map(|x| x % 4).collect();
     ///
@@ -327,7 +321,7 @@ impl<S> AccessQuad for RSQVector<S> {
     ///
     /// # Examples
     /// ```
-    /// use qwt::{RSQVector256, AccessQuad};
+    /// use qwt::{AccessQuad, RSQVector256};
     ///
     /// let rsqv: RSQVector256 = (0..10_u64).into_iter().map(|x| x % 4).collect();
     ///
@@ -409,7 +403,6 @@ impl<S: RSSupport> RankQuad for RSQVector<S> {
     }
 }
 
-
 impl<S: RSSupport> SelectQuad for RSQVector<S> {
     /// Returns the position of the `i+1`th occurrence of `symbol`, meaning
     /// the position `pos` such that `rank(symbol, pos) = i`
@@ -448,7 +441,7 @@ impl<S: RSSupport> SelectQuad for RSQVector<S> {
     ///
     /// # Safety
     /// Calling this method with a value of `i` which is larger than the number of
-    /// occurrences of the `symbol` or if `symbol is larger than 3 is  
+    /// occurrences of the `symbol` or if `symbol is larger than 3 is
     /// undefined behavior.
     ///
     /// In the current implementation there is no reason to prefer this unsafe select
@@ -465,7 +458,7 @@ impl<S: RSSupport> SelectQuad for RSQVector<S> {
 
 impl<S: RSSupport> WTSupport for RSQVector<S> {
     /// Returns the number of occurrences of `symbol` in the indexed sequence,
-    /// `None` if `symbol` is not in [0..3].  
+    /// `None` if `symbol` is not in [0..3].
     #[inline(always)]
     fn occs(&self, symbol: u8) -> Option<usize> {
         if symbol > 3 {

@@ -7,11 +7,9 @@
 //! This way, we load just one cache line everytime we access a `DataLine`.
 
 use crate::{AccessQuad, RankQuad}; // Traits
-
 use mem_dbg::{MemDbg, MemSize};
 use num_traits::int::PrimInt;
 use num_traits::AsPrimitive;
-
 use serde::{Deserialize, Serialize};
 
 // A quad vector is made of `DataLine`s. Each line consists of
@@ -20,13 +18,12 @@ use serde::{Deserialize, Serialize};
 //
 // We support `access`, `rank`, and `select queries for each line.
 /// One cache-line of 256 two-bit symbols (512 bits).
-/// Public for flatten / mmap layout (byte-identical on-disk).
+/// Public for zero-copy / mmap flatten (byte-identical on-disk layout).
 #[derive(Copy, Clone, Default, Eq, PartialEq, Serialize, MemSize, MemDbg, Deserialize, Debug)]
 #[repr(C, align(64))]
 pub struct DataLine {
     pub words: [u128; 4],
 }
-
 
 impl DataLine {
     const MASK: u128 = 3;
@@ -135,8 +132,8 @@ impl RankQuad for DataLine {
     /// Rank of all four symbols `0..3` up to position `i` (excluded) within this line.
     ///
     /// Loads each data word once and partitions bits by (high, low) pair.
-    /// Used by RDI to avoid four independent `rank_unchecked` passes over the
-    /// same cache line
+    /// Used by range-distinct iteration to avoid four independent
+    /// `rank_unchecked` passes over the same cache line.
     #[inline(always)]
     unsafe fn rank_all_unchecked(&self, i: usize) -> [usize; 4] {
         debug_assert!(i <= 256, "Only positions up to 256 are possible");
@@ -184,7 +181,6 @@ impl RankQuad for DataLine {
     }
 }
 
-
 // The trait SelectQuad is not implemented because RSSupport needs to it by hand :-)
 
 #[derive(Clone, Default, Eq, PartialEq, Serialize, MemSize, MemDbg, Deserialize, Debug)]
@@ -227,29 +223,28 @@ impl QVector {
     /// ```
     /// use qwt::QVector;
     ///
-    /// let qv: QVector = [0, 1, 2, 3].into_iter().cycle().take(100).collect();;
+    /// let qv: QVector = [0, 1, 2, 3].into_iter().cycle().take(100).collect();
     ///
     /// for (i, v) in qv.iter().enumerate() {
-    ///    assert_eq!((i%4) as u8, v);
+    ///     assert_eq!((i % 4) as u8, v);
     /// }
     /// ```
     pub fn iter(&self) -> QVectorIterator<&QVector> {
         QVectorIterator { i: 0, qv: self }
     }
 
-    /// Bit-cursor (`2 * len()`). flatten export.
+    /// Bit-cursor (`2 * len()`). Exposed for zero-copy / mmap flatten.
     #[inline]
     pub fn position_bits(&self) -> usize {
         self.position
     }
 
-    /// Raw data lines for flatten / mmap.
+    /// Raw data lines. Exposed for zero-copy / mmap flatten.
     #[inline]
     pub fn data_lines(&self) -> &[DataLine] {
         &self.data
     }
 }
-
 
 impl AccessQuad for QVector {
     /// Access the `i`th value in the quaternary vector.
@@ -259,7 +254,7 @@ impl AccessQuad for QVector {
     ///
     /// # Examples
     /// ```
-    /// use qwt::{QVector, AccessQuad};
+    /// use qwt::{AccessQuad, QVector};
     ///
     /// let qv: QVector = [0, 1, 2, 3].into_iter().cycle().take(10).collect();
     /// unsafe {
@@ -282,8 +277,7 @@ impl AccessQuad for QVector {
     ///
     /// # Examples
     /// ```
-    /// use qwt::QVector;
-    /// use qwt::AccessQuad;
+    /// use qwt::{AccessQuad, QVector};
     ///
     /// let qv: QVector = [0, 1, 2, 3].into_iter().cycle().take(10).collect();
     ///
@@ -440,7 +434,7 @@ where
         I: IntoIterator<Item = T>,
     {
         for value in iter {
-            //debug_assert!((0..4).contains(&value));
+            // debug_assert!((0..4).contains(&value));
             self.push(value.as_());
         }
     }
