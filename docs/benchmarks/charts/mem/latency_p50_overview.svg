@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="820" height="380" viewBox="0 0 820 380" role="img" aria-label="Query Latency p50 (all queries)">
-<title>Query Latency p50 (all queries)</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="380" viewBox="0 0 820 380" role="img" aria-label="Query Latency p50 (scan / joins / star)">
+<title>Query Latency p50 (scan / joins / star)</title>
 <style>
   .title { fill: #111827; }
   .muted { fill: #6b7280; }
@@ -14,64 +14,58 @@
     .axis  { stroke: #6b7280; }
   }
 </style>
-<text class="title" x="410.0" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="15" font-weight="600">Query Latency p50 (all queries)</text>
-<text class="muted" x="410.0" y="40" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">lower is better</text>
+<text class="title" x="410.0" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="15" font-weight="600">Query Latency p50 (scan / joins / star)</text>
+<text class="muted" x="410.0" y="40" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">lower is better; path_2hop &amp; triangle omitted (see next chart)</text>
 <line class="grid" x1="56" y1="292.0" x2="796" y2="292.0"/>
 <text class="muted" x="48" y="296.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">0.00</text>
 <line class="grid" x1="56" y1="231.0" x2="796" y2="231.0"/>
-<text class="muted" x="48" y="235.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">500.0</text>
+<text class="muted" x="48" y="235.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">37.50</text>
 <line class="grid" x1="56" y1="170.0" x2="796" y2="170.0"/>
-<text class="muted" x="48" y="174.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">1000</text>
+<text class="muted" x="48" y="174.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">75.00</text>
 <line class="grid" x1="56" y1="109.0" x2="796" y2="109.0"/>
-<text class="muted" x="48" y="113.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">1500</text>
+<text class="muted" x="48" y="113.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">112.5</text>
 <line class="grid" x1="56" y1="48.0" x2="796" y2="48.0"/>
-<text class="muted" x="48" y="52.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">2000 ms</text>
+<text class="muted" x="48" y="52.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">150.0 ms</text>
 <line class="axis" x1="56" y1="48" x2="56" y2="292"/>
 <line class="axis" x1="56" y1="292" x2="796" y2="292"/>
-<rect x="100.4" y="285.5" width="12.7" height="6.5" fill="#2563eb" rx="2"><title>Nova (louds) / scan: 53.16 ms</title></rect>
-<rect x="115.1" y="286.6" width="12.7" height="5.4" fill="#7c3aed" rx="2"><title>Nova (ring) / scan: 44.24 ms</title></rect>
-<rect x="129.8" y="286.4" width="12.7" height="5.6" fill="#dc2626" rx="2"><title>Oxigraph / scan: 45.55 ms</title></rect>
-<rect x="144.5" y="280.3" width="12.7" height="11.7" fill="#16a34a" rx="2"><title>QLever / scan: 95.63 ms</title></rect>
-<rect x="159.2" y="277.9" width="12.7" height="14.1" fill="#ea580c" rx="2"><title>Fluree / scan: 115.4 ms</title></rect>
-<text class="label" x="136.2" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">scan</text>
-<rect x="216.3" y="291.8" width="12.7" height="0.2" fill="#2563eb" rx="2"><title>Nova (louds) / 2join: 1.76 ms</title></rect>
-<rect x="231.0" y="291.8" width="12.7" height="0.2" fill="#7c3aed" rx="2"><title>Nova (ring) / 2join: 1.62 ms</title></rect>
-<rect x="245.7" y="291.6" width="12.7" height="0.4" fill="#dc2626" rx="2"><title>Oxigraph / 2join: 3.21 ms</title></rect>
-<rect x="260.5" y="291.7" width="12.7" height="0.3" fill="#16a34a" rx="2"><title>QLever / 2join: 2.72 ms</title></rect>
-<rect x="275.2" y="291.2" width="12.7" height="0.8" fill="#ea580c" rx="2"><title>Fluree / 2join: 6.50 ms</title></rect>
-<text class="label" x="252.1" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">2join</text>
-<rect x="332.3" y="291.9" width="12.7" height="0.1" fill="#2563eb" rx="2"><title>Nova (louds) / feature_lookup: 0.82 ms</title></rect>
-<rect x="347.0" y="291.9" width="12.7" height="0.1" fill="#7c3aed" rx="2"><title>Nova (ring) / feature_lookup: 0.95 ms</title></rect>
-<rect x="361.7" y="291.9" width="12.7" height="0.1" fill="#dc2626" rx="2"><title>Oxigraph / feature_lookup: 1.20 ms</title></rect>
-<rect x="376.4" y="291.9" width="12.7" height="0.1" fill="#16a34a" rx="2"><title>QLever / feature_lookup: 1.14 ms</title></rect>
-<rect x="391.1" y="291.6" width="12.7" height="0.4" fill="#ea580c" rx="2"><title>Fluree / feature_lookup: 3.27 ms</title></rect>
-<text class="label" x="368.0" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">feature_lookup</text>
-<rect x="448.2" y="290.0" width="12.7" height="2.0" fill="#2563eb" rx="2"><title>Nova (louds) / star_with_features: 16.53 ms</title></rect>
-<rect x="462.9" y="289.4" width="12.7" height="2.6" fill="#7c3aed" rx="2"><title>Nova (ring) / star_with_features: 21.00 ms</title></rect>
-<rect x="477.6" y="290.0" width="12.7" height="2.0" fill="#dc2626" rx="2"><title>Oxigraph / star_with_features: 16.76 ms</title></rect>
-<rect x="492.3" y="287.2" width="12.7" height="4.8" fill="#16a34a" rx="2"><title>QLever / star_with_features: 39.43 ms</title></rect>
-<rect x="507.0" y="286.2" width="12.7" height="5.8" fill="#ea580c" rx="2"><title>Fluree / star_with_features: 47.40 ms</title></rect>
-<text class="label" x="484.0" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">star_with_features</text>
-<rect x="564.1" y="227.9" width="12.7" height="64.1" fill="#2563eb" rx="2"><title>Nova (louds) / path_2hop: 525.2 ms</title></rect>
-<rect x="578.8" y="215.3" width="12.7" height="76.7" fill="#7c3aed" rx="2"><title>Nova (ring) / path_2hop: 629.1 ms</title></rect>
-<rect x="593.5" y="230.3" width="12.7" height="61.7" fill="#dc2626" rx="2"><title>Oxigraph / path_2hop: 505.8 ms</title></rect>
-<rect x="608.3" y="133.7" width="12.7" height="158.3" fill="#16a34a" rx="2"><title>QLever / path_2hop: 1297 ms</title></rect>
-<rect x="623.0" y="98.2" width="12.7" height="193.8" fill="#ea580c" rx="2"><title>Fluree / path_2hop: 1588 ms</title></rect>
-<text class="label" x="599.9" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">path_2hop</text>
-<rect x="680.1" y="261.9" width="12.7" height="30.1" fill="#2563eb" rx="2"><title>Nova (louds) / triangle: 246.8 ms</title></rect>
-<rect x="694.8" y="249.1" width="12.7" height="42.9" fill="#7c3aed" rx="2"><title>Nova (ring) / triangle: 351.8 ms</title></rect>
-<rect x="709.5" y="250.6" width="12.7" height="41.4" fill="#dc2626" rx="2"><title>Oxigraph / triangle: 339.7 ms</title></rect>
-<rect x="724.2" y="239.1" width="12.7" height="52.9" fill="#16a34a" rx="2"><title>QLever / triangle: 433.5 ms</title></rect>
-<rect x="738.9" y="208.0" width="12.7" height="84.0" fill="#ea580c" rx="2"><title>Fluree / triangle: 688.3 ms</title></rect>
-<text class="label" x="715.8" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">triangle</text>
-<rect x="169.5" y="343" width="12" height="12" fill="#2563eb" rx="2"/>
-<text class="label" x="187.5" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (louds)</text>
-<rect x="289.5" y="343" width="12" height="12" fill="#7c3aed" rx="2"/>
-<text class="label" x="307.5" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (ring)</text>
-<rect x="402.5" y="343" width="12" height="12" fill="#dc2626" rx="2"/>
-<text class="label" x="420.5" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">Oxigraph</text>
-<rect x="494.5" y="343" width="12" height="12" fill="#16a34a" rx="2"/>
-<text class="label" x="512.5" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">QLever</text>
-<rect x="572.5" y="343" width="12" height="12" fill="#ea580c" rx="2"/>
-<text class="label" x="590.5" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">Fluree</text>
+<rect x="100.4" y="208.0" width="19.9" height="84.0" fill="#2563eb" rx="2"><title>Nova (louds) / scan: 51.64 ms</title></rect>
+<rect x="122.3" y="224.4" width="19.9" height="67.6" fill="#7c3aed" rx="2"><title>Nova (ring) / scan: 41.56 ms</title></rect>
+<rect x="144.2" y="219.2" width="19.9" height="72.8" fill="#dc2626" rx="2"><title>Oxigraph / scan: 44.73 ms</title></rect>
+<rect x="166.2" y="140.2" width="19.9" height="151.8" fill="#16a34a" rx="2"><title>QLever / scan: 93.32 ms</title></rect>
+<rect x="188.1" y="105.8" width="19.9" height="186.2" fill="#ea580c" rx="2"><title>Fluree / scan: 114.5 ms</title></rect>
+<rect x="210.0" y="264.3" width="19.9" height="27.7" fill="#0891b2" rx="2"><title>RDFox / scan: 17.01 ms</title></rect>
+<text class="label" x="165.2" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">scan</text>
+<rect x="274.3" y="289.6" width="19.9" height="2.4" fill="#2563eb" rx="2"><title>Nova (louds) / 2join: 1.49 ms</title></rect>
+<rect x="296.2" y="289.7" width="19.9" height="2.3" fill="#7c3aed" rx="2"><title>Nova (ring) / 2join: 1.38 ms</title></rect>
+<rect x="318.1" y="286.4" width="19.9" height="5.6" fill="#dc2626" rx="2"><title>Oxigraph / 2join: 3.42 ms</title></rect>
+<rect x="340.1" y="287.6" width="19.9" height="4.4" fill="#16a34a" rx="2"><title>QLever / 2join: 2.73 ms</title></rect>
+<rect x="362.0" y="281.2" width="19.9" height="10.8" fill="#ea580c" rx="2"><title>Fluree / 2join: 6.64 ms</title></rect>
+<rect x="383.9" y="291.1" width="19.9" height="0.9" fill="#0891b2" rx="2"><title>RDFox / 2join: 0.53 ms</title></rect>
+<text class="label" x="339.1" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">2join</text>
+<rect x="448.2" y="291.0" width="19.9" height="1.0" fill="#2563eb" rx="2"><title>Nova (louds) / feature_lookup: 0.63 ms</title></rect>
+<rect x="470.1" y="290.6" width="19.9" height="1.4" fill="#7c3aed" rx="2"><title>Nova (ring) / feature_lookup: 0.84 ms</title></rect>
+<rect x="492.0" y="286.4" width="19.9" height="5.6" fill="#dc2626" rx="2"><title>Oxigraph / feature_lookup: 3.44 ms</title></rect>
+<rect x="514.0" y="290.2" width="19.9" height="1.8" fill="#16a34a" rx="2"><title>QLever / feature_lookup: 1.13 ms</title></rect>
+<rect x="535.9" y="286.9" width="19.9" height="5.1" fill="#ea580c" rx="2"><title>Fluree / feature_lookup: 3.12 ms</title></rect>
+<rect x="557.8" y="291.3" width="19.9" height="0.7" fill="#0891b2" rx="2"><title>RDFox / feature_lookup: 0.41 ms</title></rect>
+<text class="label" x="513.0" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">feature_lookup</text>
+<rect x="622.1" y="266.4" width="19.9" height="25.6" fill="#2563eb" rx="2"><title>Nova (louds) / star_with_features: 15.74 ms</title></rect>
+<rect x="644.0" y="259.8" width="19.9" height="32.2" fill="#7c3aed" rx="2"><title>Nova (ring) / star_with_features: 19.78 ms</title></rect>
+<rect x="665.9" y="264.1" width="19.9" height="27.9" fill="#dc2626" rx="2"><title>Oxigraph / star_with_features: 17.15 ms</title></rect>
+<rect x="687.9" y="230.1" width="19.9" height="61.9" fill="#16a34a" rx="2"><title>QLever / star_with_features: 38.04 ms</title></rect>
+<rect x="709.8" y="221.4" width="19.9" height="70.6" fill="#ea580c" rx="2"><title>Fluree / star_with_features: 43.39 ms</title></rect>
+<rect x="731.7" y="284.3" width="19.9" height="7.7" fill="#0891b2" rx="2"><title>RDFox / star_with_features: 4.71 ms</title></rect>
+<text class="label" x="686.9" y="308" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11">star_with_features</text>
+<rect x="134.0" y="343" width="12" height="12" fill="#2563eb" rx="2"/>
+<text class="label" x="152.0" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (louds)</text>
+<rect x="254.0" y="343" width="12" height="12" fill="#7c3aed" rx="2"/>
+<text class="label" x="272.0" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (ring)</text>
+<rect x="367.0" y="343" width="12" height="12" fill="#dc2626" rx="2"/>
+<text class="label" x="385.0" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">Oxigraph</text>
+<rect x="459.0" y="343" width="12" height="12" fill="#16a34a" rx="2"/>
+<text class="label" x="477.0" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">QLever</text>
+<rect x="537.0" y="343" width="12" height="12" fill="#ea580c" rx="2"/>
+<text class="label" x="555.0" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">Fluree</text>
+<rect x="615.0" y="343" width="12" height="12" fill="#0891b2" rx="2"/>
+<text class="label" x="633.0" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="12">RDFox</text>
 </svg>

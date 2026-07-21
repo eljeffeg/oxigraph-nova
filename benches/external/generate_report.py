@@ -437,33 +437,60 @@ def main():
     lines.append("## Latency Results (milliseconds, HTTP round-trip via curl)\n")
     lines.append(
         "One sub-section per query, with each engine as a column and each "
-        "percentile (p50, p95) as a row. Charts use p50 latency (lower is better).\n"
+        "percentile (p50, p95) as a row. Charts use p50 latency (lower is better). "
+        "`path_2hop` and `triangle` are charted separately — their latencies are "
+        "orders of magnitude higher and would crush the scale of the other queries.\n"
     )
 
-    # Overview grouped chart (all queries, p50)
-    series = []
-    for engine in engines:
-        series.append(
-            (
-                ENGINE_SHORT.get(engine, engine),
-                [p50_by_eq[(engine, q)] for q in query_order],
-                ENGINE_COLORS.get(engine, "#6b7280"),
+    # Split overview charts: heavy queries (path_2hop, triangle) dominate the
+    # y-scale and make every other bar unreadable when plotted together.
+    HEAVY_QUERIES = {"path_2hop", "triangle"}
+    light_queries = [q for q in query_order if q not in HEAVY_QUERIES]
+    heavy_queries = [q for q in query_order if q in HEAVY_QUERIES]
+
+    def _latency_series(qnames):
+        out = []
+        for engine in engines:
+            out.append(
+                (
+                    ENGINE_SHORT.get(engine, engine),
+                    [p50_by_eq[(engine, q)] for q in qnames],
+                    ENGINE_COLORS.get(engine, "#6b7280"),
+                )
+            )
+        return out
+
+    if light_queries:
+        lines.append(
+            emit_chart(
+                "latency_p50_overview.svg",
+                grouped_bar_chart(
+                    "Query Latency p50 (scan / joins / star)",
+                    light_queries,
+                    _latency_series(light_queries),
+                    unit="ms",
+                    note="lower is better; path_2hop & triangle omitted (see next chart)",
+                ),
+                "p50 latency by query and engine — light queries (lower is better)",
             )
         )
-    lines.append(
-        emit_chart(
-            "latency_p50_overview.svg",
-            grouped_bar_chart(
-                "Query Latency p50 (all queries)",
-                query_order,
-                series,
-                unit="ms",
-                note="lower is better",
-            ),
-            "p50 latency by query and engine (lower is better)",
+        lines.append("")
+
+    if heavy_queries:
+        lines.append(
+            emit_chart(
+                "latency_p50_heavy.svg",
+                grouped_bar_chart(
+                    "Query Latency p50 (path_2hop / triangle)",
+                    heavy_queries,
+                    _latency_series(heavy_queries),
+                    unit="ms",
+                    note="lower is better; separate scale from lighter queries",
+                ),
+                "p50 latency for path_2hop and triangle (lower is better)",
+            )
         )
-    )
-    lines.append("")
+        lines.append("")
 
     for qname in query_order:
         lines.append(f"### {qname}\n")

@@ -80,9 +80,11 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 
 ## Latency Results (milliseconds, HTTP round-trip via curl)
 
-One sub-section per query, with each engine as a column and each percentile (p50, p95) as a row. Charts use p50 latency (lower is better).
+One sub-section per query, with each engine as a column and each percentile (p50, p95) as a row. Charts use p50 latency (lower is better). `path_2hop` and `triangle` are charted separately — their latencies are orders of magnitude higher and would crush the scale of the other queries.
 
-![p50 latency by query and engine (lower is better)](charts/disk/latency_p50_overview.svg)
+![p50 latency by query and engine — light queries (lower is better)](charts/disk/latency_p50_overview.svg)
+
+![p50 latency for path_2hop and triangle (lower is better)](charts/disk/latency_p50_heavy.svg)
 
 ### scan
 

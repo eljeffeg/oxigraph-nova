@@ -183,8 +183,16 @@ python3 benches/external/generate_report.py ... --charts
 | `RESULTS_MEM.md` | `charts/mem/` |
 | `RESULTS_DISK.md` | `charts/disk/` |
 
-Palette: Nova (louds) blue, Nova (ring) purple, Oxigraph red, QLever green,
-Fluree orange, RDFox cyan. All charts are labeled **lower is better**.
+Latency overview is split into two SVGs so heavy queries do not crush the scale:
+
+| File | Contents |
+|------|----------|
+| `latency_p50_overview.svg` | scan, 2join, feature_lookup, star_with_features |
+| `latency_p50_heavy.svg` | path_2hop, triangle (separate y-scale) |
+
+Per-query charts (`latency_p50_<name>.svg`) are unchanged. Palette: Nova (louds)
+blue, Nova (ring) purple, Oxigraph red, QLever green, Fluree orange, RDFox cyan.
+All charts are labeled **lower is better**.
 
 ## Disk-backed mode (`--disk`)
 
