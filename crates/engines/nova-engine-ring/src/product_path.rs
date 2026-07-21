@@ -11,13 +11,16 @@
 //! - `NOVA_RING_LASTCOL_POLICY` — LastCol open policy (see [`lastcol_scan_policy`]).
 //!   Product default is **MappedRdi** for enumerate-all opens.
 //! - `NOVA_RING_D1_TINY_MERGE` — D1 tiny-range merge threshold T (see
-//!   [`d1_tiny_merge_threshold`]). Default **0** (braided D1 only).
+//!   [`d1_tiny_merge_threshold`]). Default **0** (braided D1 only on generic
+//!   multi_subject path). Prepared wedge closes use
+//!   [`wedge_left_once_threshold`] (default **4**) independently.
 //! - `NOVA_RING_D1_TINY_STRATEGY` — algorithm when T fires (see
 //!   [`d1_tiny_strategy`]). Default **merge** (buffered dual materialize).
 //!   Experimental: `nested` / `probe` / `fixed` / `fused` (max-len≤4 kernels).
-//! - `NOVA_RING_WEDGE_LEFT_ONCE` — PreparedWedge-only fused left-once threshold
-//!   (see [`wedge_left_once_threshold`]). Default **4** (enabled). Does **not**
-//!   change generic [`BraidedD1ObjectScan`] / global T=0.
+//! - `NOVA_RING_WEDGE_LEFT_ONCE` — PreparedWedge SP-D1 close tiny-merge threshold
+//!   (see [`wedge_left_once_threshold`]). Default **4** (enabled on product
+//!   triangle). Does **not** change generic [`BraidedD1ObjectScan`] / global T=0.
+
 //! `NOVA_RING_D1_ASYM` — large-range asymmetric D1 kernel (see
 //!   [`d1_asym_mode`]). Default **off** (braided residual). Experimental A/B
 //!   only; does not change product defaults.

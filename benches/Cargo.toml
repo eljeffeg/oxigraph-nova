@@ -59,3 +59,7 @@ harness = false
 # ── Example: memory footprint estimator ─────────────────────────────────────
 [[example]]
 name = "memory_report"
+
+[[bin]]
+name = "path_tri_inprocess"
+path = "src/bin/path_tri_inprocess.rs"

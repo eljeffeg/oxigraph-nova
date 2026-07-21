@@ -30,7 +30,10 @@
 use crate::facade::BraidedRingIndex;
 use crate::image::BraidedGraphImage;
 use crate::mapped_qwt::{HotQwtColumn, MappedRangeDistinctIter};
-use crate::product_path::{PredAdjacencyMode, SPARQL_PATH, effective_pred_adjacency_mode};
+use crate::product_path::{
+    PredAdjacencyMode, SPARQL_PATH, effective_d1_tiny_merge_threshold,
+    effective_pred_adjacency_mode, effective_wedge_left_once_threshold,
+};
 use crate::ring_nav::RingRef;
 use crate::{Col, RowRange};
 use oxigraph_nova_core::{
@@ -2194,11 +2197,20 @@ pub struct PreparedTwoHopImpl {
 
 impl PreparedTwoHopImpl {
     pub fn prepare(img: Arc<BraidedGraphImage>, p1: u64, p2: u64) -> Option<Self> {
-        let hop1 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p1)?;
-        let hop2 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p2)?;
-        let p2_dense = hop2.pred_dense;
+        // Build P1 adj once and share with hop1 so reset_to_subject is O(1)
+        // (same table style as hop2). Critical on path_2hop: 50k outer subjects.
         let mode = effective_pred_adjacency_mode();
         let universe = img.universe() as usize;
+        let p1_dense = img.remap().to_dense(p1)?;
+        let p1_adj = PredicateAdjacency::build(img.index().ring_ref(), p1_dense, universe, mode)
+            .map(Arc::new);
+        let hop1 = PreparedSpObjectScanImpl::prepare_with_shared_adj(
+            Arc::clone(&img),
+            p1,
+            p1_adj,
+        )?;
+        let hop2 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p2)?;
+        let p2_dense = hop2.pred_dense;
         let p2_adj = PredicateAdjacency::build(img.index().ring_ref(), p2_dense, universe, mode);
         SPARQL_PATH
             .k9_two_hop_prepare
@@ -3071,11 +3083,24 @@ impl PreparedPredObjectIntersect for PreparedPredD1 {
 ///
 /// Unlike [`BraidedD1ObjectScan`] (unbound `range_s`), this closes the wedge
 /// chord under the same predicate as the outer edges.
+///
+/// ## Tiny-merge / left-once fast path
+///
+/// When both SP ranges have `len ≤ T` (product wedge default T=4 via
+/// [`effective_wedge_left_once_threshold`], or global
+/// [`effective_d1_tiny_merge_threshold`]), objects are materialised via O-column
+/// `access` and two-pointer merged. This avoids a full braided
+/// `intersection_next_value2` tree walk on the RESULTS_MEM related-graph shape
+/// (every close is 3×3, |C| ∈ {0,1,2}).
 struct BraidedSpD1ObjectScan {
     img: Arc<BraidedGraphImage>,
     r0: RowRange,
     r1: RowRange,
+    /// Braided mode: next dense O (None = exhausted).
     current: Option<u32>,
+    /// Tiny-merge mode: sorted external O intersection; `tiny_pos` is the cursor.
+    tiny: Option<Vec<u64>>,
+    tiny_pos: usize,
 }
 
 impl BraidedSpD1ObjectScan {
@@ -3085,11 +3110,35 @@ impl BraidedSpD1ObjectScan {
         }
         SPARQL_PATH.d1_open_calls.fetch_add(1, Ordering::Relaxed);
         let t0 = std::time::Instant::now();
+
+        // Product wedge left-once default (4) OR global tiny-merge threshold.
+        // Take the max so either gate can activate the short-c path.
+        let t_wedge = effective_wedge_left_once_threshold();
+        let t_global = effective_d1_tiny_merge_threshold();
+        let t = t_wedge.max(t_global);
+        let max_len = r0.len().max(r1.len());
+        if t > 0 && max_len <= t {
+            let commons = materialize_sp_d1_tiny_merge(&img, r0, r1);
+            SPARQL_PATH
+                .d1_open_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            return Some(Self {
+                img,
+                r0,
+                r1,
+                current: None,
+                tiny: Some(commons),
+                tiny_pos: 0,
+            });
+        }
+
         let mut scan = Self {
             img,
             r0,
             r1,
             current: None,
+            tiny: None,
+            tiny_pos: 0,
         };
         let t_first = std::time::Instant::now();
         scan.current = scan.next_from(0);
@@ -3118,9 +3167,56 @@ impl BraidedSpD1ObjectScan {
     }
 }
 
+/// Materialise distinct dense O ids from a tiny SP row span (sorted by o).
+#[inline]
+fn materialize_sp_o_dense(img: &BraidedGraphImage, range: RowRange) -> Vec<u32> {
+    let ring = img.index().ring_ref();
+    let mut vals = Vec::with_capacity(range.len() as usize);
+    let mut prev: Option<u32> = None;
+    for pos in range.start..range.end {
+        let d = ring.access(Col::O, pos);
+        if prev == Some(d) {
+            continue;
+        }
+        prev = Some(d);
+        vals.push(d);
+    }
+    vals
+}
+
+/// Two-pointer ∩ of two tiny SP object lists → external TermIds (sorted).
+#[inline]
+fn materialize_sp_d1_tiny_merge(
+    img: &BraidedGraphImage,
+    r0: RowRange,
+    r1: RowRange,
+) -> Vec<u64> {
+    let a = materialize_sp_o_dense(img, r0);
+    let b = materialize_sp_o_dense(img, r1);
+    let remap = img.remap();
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                let d = a[i];
+                out.push(remap.to_external(d).unwrap_or(u64::from(d)));
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
 impl TrieIterator for BraidedSpD1ObjectScan {
     #[inline]
     fn key(&self) -> u64 {
+        if let Some(ref vals) = self.tiny {
+            return vals[self.tiny_pos];
+        }
         let d = self
             .current
             .expect("key() on exhausted BraidedSpD1ObjectScan");
@@ -3129,6 +3225,12 @@ impl TrieIterator for BraidedSpD1ObjectScan {
 
     fn seek(&mut self, target: u64) {
         if self.at_end() {
+            return;
+        }
+        if let Some(ref vals) = self.tiny {
+            while self.tiny_pos < vals.len() && vals[self.tiny_pos] < target {
+                self.tiny_pos += 1;
+            }
             return;
         }
         if let Some(cur) = self.current
@@ -3150,6 +3252,10 @@ impl TrieIterator for BraidedSpD1ObjectScan {
     }
 
     fn advance(&mut self) {
+        if let Some(ref vals) = self.tiny {
+            self.tiny_pos = self.tiny_pos.saturating_add(1).min(vals.len());
+            return;
+        }
         if let Some(cur) = self.current {
             if cur == u32::MAX {
                 self.current = None;
@@ -3165,10 +3271,16 @@ impl TrieIterator for BraidedSpD1ObjectScan {
 
     #[inline]
     fn at_end(&self) -> bool {
+        if let Some(ref vals) = self.tiny {
+            return self.tiny_pos >= vals.len();
+        }
         self.current.is_none()
     }
 
     fn remaining_count(&self) -> u64 {
+        if let Some(ref vals) = self.tiny {
+            return (vals.len().saturating_sub(self.tiny_pos)) as u64;
+        }
         u64::from(!self.at_end())
     }
 }
