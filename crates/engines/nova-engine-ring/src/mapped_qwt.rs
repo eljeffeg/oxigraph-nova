@@ -1,10 +1,10 @@
-//! Nova-owned immutable mapped QWT (`NOVAQWT1` + shared QWTA).
+//! Nova-owned immutable mapped QWT (`NOVAQWT1` + shared QWTB section).
 //!
 //! Flatten one vendored `QWT256` into a page-aligned image, open as slice
 //! views (no full deserialize), and serve `access` + level-local `rank` /
 //! `rank_all` + full-symbol `rank` / `select` + native RNV + fixed-stack
 //! RDI with the same arithmetic as qwt block size 256.
-
+//!
 //! **Not** on the LoudsStore path. Feature `cyclic-ring` only.
 //!
 //! Platform: little-endian only (v1).
@@ -14,10 +14,10 @@
 //! ```text
 //! [0..64)   file header (NOVAQWT1)
 //! [64..4096) pad to page
-//! [4096..)  QWTA section (page-aligned)
+//! [4096..)  QWTB section (page-aligned; upstream qwt bytes format)
 //! ```
 //!
-//! The **QWTA section** is also embedded three times inside `NOVARNG1`
+//! The **QWTB section** is also embedded three times inside `NOVARNG1`
 //! (see [`super::mapped_ring`]). W1 reuses [`build_qwta_section`] and
 //! [`MappedQwtSection`] without the single-column file header.
 //!
@@ -38,36 +38,15 @@
 //! | 48  | section_len u64 |
 //! | 56  | reserved [8] |
 //!
-//! ## QWTA section
+//! ## QWT section payload
 //!
-//! | off | field |
-//! |-----|--------|
-//! | 0   | magic `QWTA` |
-//! | 4   | n u64 |
-//! | 12  | n_levels u16 |
-//! | 14  | sigma u32 |
-//! | 18  | reserved [2] |
-//! | 20  | n_occs_smaller level-0 [5×u64] (convenience) |
-//! | 60  | reserved [4] |
-//! | 64  | level dir: n_levels × 128 B |
-//! | …   | payloads (64-aligned): data, superblocks, occs[5], select[4] |
-//!
-//! ## Level dir entry (128 B)
-//!
-//! | off | field |
-//! |-----|--------|
-//! | 0   | off_data u64 |
-//! | 8   | n_data_lines u64 |
-//! | 16  | off_super u64 |
-//! | 24  | n_superblocks u64 |
-//! | 32  | off_select[4] u64 |
-//! | 64  | n_select[4] u32 |
-//! | 80  | qv_position_bits u64 |
-//! | 88  | off_occs u64 (5×u64) |
-//! | 96  | pad to 128 |
+//! The section is the upstream `QWTB` container (`qwt::bytes::qwt256_to_bytes` /
+//! [`QwtView`]). Nova no longer hand-parses level directories; open goes through
+//! [`QwtView::from_bytes`] and POD accessors on [`qwt::bytes::RSQVectorView`].
 //!
 //! Open validates header/bounds/align only — no full-body checksum preload.
 
+use qwt::bytes::{qwt256_to_bytes, LayoutError as QwtLayoutError, QwtView, QWTB_MAGIC};
 use qwt::utils::select_in_word_u128;
 use qwt::{AccessQuad, DataLine, QWT256, RankQuad, SuperblockPlain};
 use std::io::{self, Write};
@@ -79,8 +58,9 @@ const SELECT_NUM_SAMPLES: usize = 1 << 13;
 
 /// Magic for single-column W0 image.
 pub const NOVAQWT1_MAGIC: &[u8; 8] = b"NOVAQWT1";
-/// QWT section magic.
-pub const QWTA_MAGIC: &[u8; 4] = b"QWTA";
+/// QWT section magic — now the upstream `QWTB` container (was Nova-local `QWTA`).
+pub const QWTA_MAGIC: &[u8; 4] = QWTB_MAGIC;
+
 pub const FORMAT_VERSION: u32 = 1;
 pub const PAGE_ALIGN_LOG2: u8 = 12; // 4096
 pub const PAGE_ALIGN: usize = 1 << PAGE_ALIGN_LOG2;
@@ -88,9 +68,6 @@ pub const HEADER_SIZE: usize = 64;
 pub const MAX_LEVELS: usize = 32;
 pub const BLOCK_SIZE: usize = 256;
 pub const BLOCKS_IN_SUPERBLOCK: usize = 8;
-
-/// Directory entry size (bytes), fixed LE fields — see module docs.
-pub(crate) const LEVEL_DIR_V1: usize = 128;
 
 /// Errors opening or validating a mapped QWT image.
 #[derive(Debug, thiserror::Error)]
@@ -2332,13 +2309,14 @@ fn short_range_batch_decode(
     })
 }
 
-// ── Borrowed QWTA section (shared by W0 owned open + W1 mmap Ring) ──────────
+// ── Borrowed QWTB section (shared by W0 owned open + W1 mmap Ring) ──────────
 
-/// Zero-copy view of one QWTA section (no ownership of bytes).
+/// Zero-copy view of one upstream `QWTB` section (no ownership of bytes).
 ///
-/// Lifetime `'m` is the image / mmap lifetime. Level views re-slice on demand
-/// so this type is not self-referential. Prefer [`Self::build_hot`] once at open
-/// and route hot primitives through [`HotQwtColumn`] .
+/// Lifetime `'m` is the image / mmap lifetime. Open validates via
+/// [`QwtView::from_bytes`]; level POD is taken from [`qwt::bytes::RSQVectorView`]
+/// accessors (no Nova-local directory parse). Prefer [`Self::build_hot`] once
+/// at open and route hot primitives through [`HotQwtColumn`].
 #[derive(Clone, Copy)]
 pub struct MappedQwtSection<'m> {
     sec: &'m [u8],
@@ -2348,28 +2326,20 @@ pub struct MappedQwtSection<'m> {
 }
 
 impl<'m> MappedQwtSection<'m> {
-    /// Validate and open a QWTA section slice (dir bounds only; no payload walk).
+    /// Validate and open a `QWTB` section slice via [`QwtView`].
+    ///
+    /// The absolute base of `sec` must be 64-byte aligned (page mmap or
+    /// [`AlignedBuf`]) so POD casts of `DataLine` / `SuperblockPlain` succeed.
     pub fn open(sec: &'m [u8]) -> Result<Self, MappedQwtError> {
-        if sec.len() < 64 || &sec[0..4] != QWTA_MAGIC {
-            return Err(MappedQwtError::Layout("bad section"));
-        }
-        let n = u64::from_le_bytes(sec[4..12].try_into().unwrap()) as usize;
-        let n_levels = u16::from_le_bytes(sec[12..14].try_into().unwrap()) as usize;
-        let sigma = u32::from_le_bytes(sec[14..18].try_into().unwrap());
-        if n_levels > MAX_LEVELS {
-            return Err(MappedQwtError::TooManyLevels(n_levels));
-        }
-        if n_levels > 0 {
-            let dir_end = 64 + n_levels * LEVEL_DIR_V1;
-            if dir_end > sec.len() {
-                return Err(MappedQwtError::Layout("dir OOB"));
-            }
+        let view = QwtView::<u32, 256>::from_bytes(sec).map_err(map_qwt_layout)?;
+        if view.n_levels() > MAX_LEVELS {
+            return Err(MappedQwtError::TooManyLevels(view.n_levels()));
         }
         Ok(Self {
             sec,
-            n,
-            n_levels,
-            sigma,
+            n: view.len(),
+            n_levels: view.n_levels(),
+            sigma: view.sigma_raw(),
         })
     }
 
@@ -2377,48 +2347,33 @@ impl<'m> MappedQwtSection<'m> {
         self.sec
     }
 
+    /// Borrowed upstream view (re-validates layout; cheap header/dir walk).
+    #[inline]
+    fn qwt_view(&self) -> Result<QwtView<'m, u32, 256>, MappedQwtError> {
+        QwtView::<u32, 256>::from_bytes(self.sec).map_err(map_qwt_layout)
+    }
+
     pub fn level_view(&self, level: usize) -> Result<MappedLevel<'m>, MappedQwtError> {
         if level >= self.n_levels {
             return Err(MappedQwtError::Layout("level OOB"));
         }
-        let base = 64 + level * LEVEL_DIR_V1;
-        if base + LEVEL_DIR_V1 > self.sec.len() {
-            return Err(MappedQwtError::Layout("dir OOB"));
-        }
-        let e = &self.sec[base..base + LEVEL_DIR_V1];
-        let off_data = u64::from_le_bytes(e[0..8].try_into().unwrap()) as usize;
-        let n_data = u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize;
-        let off_super = u64::from_le_bytes(e[16..24].try_into().unwrap()) as usize;
-        let n_super = u64::from_le_bytes(e[24..32].try_into().unwrap()) as usize;
-        let mut off_sel = [0usize; 4];
-        let mut n_sel = [0usize; 4];
-        for s in 0..4 {
-            off_sel[s] = u64::from_le_bytes(e[32 + s * 8..40 + s * 8].try_into().unwrap()) as usize;
-            n_sel[s] = u32::from_le_bytes(e[64 + s * 4..68 + s * 4].try_into().unwrap()) as usize;
-        }
-        let qv_pos = u64::from_le_bytes(e[80..88].try_into().unwrap()) as usize;
-        let off_occs = u64::from_le_bytes(e[88..96].try_into().unwrap()) as usize;
-
-        let data = cast_slice::<DataLine>(self.sec, off_data, n_data)?;
-        let superblocks = cast_slice::<SuperblockPlain>(self.sec, off_super, n_super)?;
-        let mut select_samples: [&[u32]; 4] = [&[]; 4];
-        for s in 0..4 {
-            select_samples[s] = cast_u32_slice(self.sec, off_sel[s], n_sel[s])?;
-        }
-        if off_occs
-            .checked_add(40)
-            .map(|e| e > self.sec.len())
-            .unwrap_or(true)
-        {
-            return Err(MappedQwtError::Layout("occs OOB"));
-        }
-
+        let view = self.qwt_view()?;
+        let lv = &view.levels()[level];
+        let data = lv.data_lines();
+        let superblocks = lv.superblocks();
+        let select_samples = [
+            lv.select_samples(0),
+            lv.select_samples(1),
+            lv.select_samples(2),
+            lv.select_samples(3),
+        ];
+        let qv_pos = lv.position_bits();
         Ok(MappedLevel {
             data,
             superblocks,
             select_samples,
             qv_position_bits: qv_pos,
-            n_symbols: qv_pos / 2,
+            n_symbols: lv.len(),
         })
     }
 
@@ -2426,48 +2381,36 @@ impl<'m> MappedQwtSection<'m> {
         if level >= self.n_levels {
             return Err(MappedQwtError::Layout("level OOB"));
         }
-        let base = 64 + level * LEVEL_DIR_V1;
-        let e = &self.sec[base..base + LEVEL_DIR_V1];
-        let off_occs = u64::from_le_bytes(e[88..96].try_into().unwrap()) as usize;
-        if off_occs
-            .checked_add(40)
-            .map(|e| e > self.sec.len())
-            .unwrap_or(true)
-        {
-            return Err(MappedQwtError::Layout("occs OOB"));
-        }
-        let mut o = [0u64; 5];
-        for (i, slot) in o.iter_mut().enumerate() {
-            *slot = u64::from_le_bytes(
-                self.sec[off_occs + i * 8..off_occs + i * 8 + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-        }
-        Ok(o)
+        let view = self.qwt_view()?;
+        let occs = view.levels()[level].n_occs_smaller();
+        Ok([
+            occs[0] as u64,
+            occs[1] as u64,
+            occs[2] as u64,
+            occs[3] as u64,
+            occs[4] as u64,
+        ])
     }
 
-    /// build open-time hot column (validated pointers + native occs).
+    /// Build open-time hot column (validated pointers + native occs).
     ///
-    /// Walks every level once: dir parse, bounds/align cast, occs as `usize`.
-    /// Image bytes unchanged. Callers must keep the owning image alive for the
-    /// lifetime of the returned pointers.
+    /// Walks every level once through [`QwtView`] POD accessors. Image bytes
+    /// unchanged. Callers must keep the owning image alive for the lifetime of
+    /// the returned pointers.
     pub fn build_hot(&self) -> Result<HotQwtColumn, MappedQwtError> {
+        let view = self.qwt_view()?;
         let mut levels = [HotMappedLevel::EMPTY; MAX_LEVELS];
         for (level, slot) in levels.iter_mut().enumerate().take(self.n_levels) {
-            let lv = self.level_view(level)?;
-            let occs_u64 = self.n_occs_smaller_level(level)?;
-            let mut occs = [0usize; 5];
-            for (i, o) in occs.iter_mut().enumerate() {
-                *o = occs_u64[i] as usize;
-            }
+            let lv = &view.levels()[level];
+            let data = lv.data_lines();
+            let superblocks = lv.superblocks();
             *slot = HotMappedLevel {
-                data: lv.data.as_ptr(),
-                superblocks: lv.superblocks.as_ptr(),
-                data_len: lv.data.len(),
-                super_len: lv.superblocks.len(),
-                qv_len: lv.n_symbols,
-                occs,
+                data: data.as_ptr(),
+                superblocks: superblocks.as_ptr(),
+                data_len: data.len(),
+                super_len: superblocks.len(),
+                qv_len: lv.len(),
+                occs: lv.n_occs_smaller(),
             };
         }
         Ok(HotQwtColumn {
@@ -3420,150 +3363,34 @@ impl MappedQwtOwned {
 
 // ── flatten / open ──────────────────────────────────────────────────────────
 
-/// Build a standalone QWTA section from a heap `QWT256` (no file header).
+/// Build a standalone QWT section from a heap `QWT256` (no file header).
 ///
-/// Used by `NOVAQWT1` and by `NOVARNG1` (three sections).
+/// Emits the upstream `QWTB` container via [`qwt256_to_bytes`]. Used by
+/// `NOVAQWT1` and by `NOVARNG1` (three sections). Callers no longer touch
+/// Group B layout fields (`data_lines` / `superblocks` / …).
 pub fn build_qwta_section(qwt: &QWT256<u32>) -> Result<Vec<u8>, MappedQwtError> {
     if !cfg!(target_endian = "little") {
         return Err(MappedQwtError::NotLittleEndian);
     }
-    let n = qwt.len();
-
-    // Empty sequence: minimal QWTA section (n_levels=0), no payload.
-    if n == 0 {
-        let mut sec = vec![0u8; 64];
-        sec[0..4].copy_from_slice(QWTA_MAGIC);
-        return Ok(sec);
+    if qwt.n_levels() > MAX_LEVELS {
+        return Err(MappedQwtError::TooManyLevels(qwt.n_levels()));
     }
-
-    let n_levels = qwt.n_levels();
-    if n_levels > MAX_LEVELS {
-        return Err(MappedQwtError::TooManyLevels(n_levels));
-    }
-    let sigma = qwt.sigma_raw();
-
-    struct LP {
-        data: Vec<u8>,
-        super_b: Vec<u8>,
-        select: [Vec<u8>; 4],
-        occs: [u64; 5],
-        qv_pos: u64,
-        n_data: u64,
-        n_super: u64,
-        n_sel: [u32; 4],
-    }
-
-    let mut lps = Vec::with_capacity(n_levels);
-    for lv in qwt.levels() {
-        let qv = lv.qvector();
-        let rs = lv.rs_support();
-        let data = qv.data_lines();
-        let supers = rs.superblocks();
-        let o = lv.n_occs_smaller();
-        let mut select: [Vec<u8>; 4] = Default::default();
-        let mut n_sel = [0u32; 4];
-        for s in 0..4 {
-            let samples = rs.select_samples(s);
-            n_sel[s] = samples.len() as u32;
-            select[s] = samples.iter().flat_map(|x| x.to_le_bytes()).collect();
-        }
-        lps.push(LP {
-            data: slice_as_bytes(data).to_vec(),
-            super_b: slice_as_bytes(supers).to_vec(),
-            select,
-            occs: [
-                o[0] as u64,
-                o[1] as u64,
-                o[2] as u64,
-                o[3] as u64,
-                o[4] as u64,
-            ],
-            qv_pos: qv.position_bits() as u64,
-            n_data: data.len() as u64,
-            n_super: supers.len() as u64,
-            n_sel,
-        });
-    }
-
-    let sec_hdr = 64usize;
-    let dir_sz = n_levels * LEVEL_DIR_V1;
-    let mut cur = align_up(sec_hdr + dir_sz, 64);
-
-    struct Off {
-        data: usize,
-        super_b: usize,
-        sel: [usize; 4],
-        occs: usize,
-    }
-    let mut offs = Vec::with_capacity(n_levels);
-    for lp in &lps {
-        let data = cur;
-        cur += lp.data.len();
-        cur = align_up(cur, 64);
-        let super_b = cur;
-        cur += lp.super_b.len();
-        cur = align_up(cur, 64);
-        let occs = cur;
-        cur += 40; // 5×u64
-        cur = align_up(cur, 4);
-        let mut sel = [0usize; 4];
-        for (s, sel_off) in sel.iter_mut().enumerate() {
-            *sel_off = cur;
-            cur += lp.select[s].len();
-            cur = align_up(cur, 4);
-        }
-        cur = align_up(cur, 64);
-        offs.push(Off {
-            data,
-            super_b,
-            sel,
-            occs,
-        });
-    }
-
-    let mut sec = vec![0u8; cur.max(64)];
-    sec[0..4].copy_from_slice(QWTA_MAGIC);
-    sec[4..12].copy_from_slice(&(n as u64).to_le_bytes());
-    sec[12..14].copy_from_slice(&(n_levels as u16).to_le_bytes());
-    sec[14..18].copy_from_slice(&sigma.to_le_bytes());
-    if let Some(lp0) = lps.first() {
-        for (i, &v) in lp0.occs.iter().enumerate() {
-            let o = 20 + i * 8;
-            sec[o..o + 8].copy_from_slice(&v.to_le_bytes());
-        }
-    }
-
-    for (li, lp) in lps.iter().enumerate() {
-        let base = sec_hdr + li * LEVEL_DIR_V1;
-        let o = &offs[li];
-        let mut e = [0u8; LEVEL_DIR_V1];
-        e[0..8].copy_from_slice(&(o.data as u64).to_le_bytes());
-        e[8..16].copy_from_slice(&lp.n_data.to_le_bytes());
-        e[16..24].copy_from_slice(&(o.super_b as u64).to_le_bytes());
-        e[24..32].copy_from_slice(&lp.n_super.to_le_bytes());
-        for s in 0..4 {
-            e[32 + s * 8..40 + s * 8].copy_from_slice(&(o.sel[s] as u64).to_le_bytes());
-        }
-        for s in 0..4 {
-            e[64 + s * 4..68 + s * 4].copy_from_slice(&lp.n_sel[s].to_le_bytes());
-        }
-        e[80..88].copy_from_slice(&lp.qv_pos.to_le_bytes());
-        e[88..96].copy_from_slice(&(o.occs as u64).to_le_bytes());
-        sec[base..base + LEVEL_DIR_V1].copy_from_slice(&e);
-
-        sec[o.data..o.data + lp.data.len()].copy_from_slice(&lp.data);
-        sec[o.super_b..o.super_b + lp.super_b.len()].copy_from_slice(&lp.super_b);
-        for (i, &v) in lp.occs.iter().enumerate() {
-            sec[o.occs + i * 8..o.occs + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-        }
-        for s in 0..4 {
-            let b = &lp.select[s];
-            sec[o.sel[s]..o.sel[s] + b.len()].copy_from_slice(b);
-        }
-    }
-
-    Ok(sec)
+    qwt256_to_bytes(qwt).map_err(map_qwt_layout)
 }
+
+#[inline]
+pub(crate) fn map_qwt_layout(e: QwtLayoutError) -> MappedQwtError {
+    match e {
+        QwtLayoutError::NotLittleEndian => MappedQwtError::NotLittleEndian,
+        QwtLayoutError::BadMagic => MappedQwtError::Layout("QWTB bad magic"),
+        QwtLayoutError::BadVersion => MappedQwtError::Layout("QWTB bad version"),
+        QwtLayoutError::Truncated => MappedQwtError::Layout("QWTB truncated"),
+        QwtLayoutError::Misaligned => MappedQwtError::Layout("QWTB misaligned"),
+        QwtLayoutError::PrefetchNotSupported => MappedQwtError::Layout("QWTB prefetch"),
+        QwtLayoutError::Inconsistent { detail } => MappedQwtError::Layout(detail),
+    }
+}
+
 
 /// Flatten a heap `QWT256<u32>` into a `NOVAQWT1` image (owned bytes).
 pub fn write_novaqwt1_v1(qwt: &QWT256<u32>) -> Result<Vec<u8>, MappedQwtError> {
@@ -3634,25 +3461,23 @@ pub fn open_novaqwt1(bytes: &[u8]) -> Result<MappedQwtOwned, MappedQwtError> {
     {
         return Err(MappedQwtError::Layout("section OOB"));
     }
-    // Validate section magic/dir via shared opener, then build hot view from
-    // the *aligned* owned buffer (pointers must alias `AlignedBuf`, not the
-    // temporary input slice).
-    let _ = MappedQwtSection::open(&bytes[sec_off..sec_off + sec_len])?;
+    // Copy into a 64-aligned buffer first: QwtView POD casts need absolute
+    // 64-align of DataLine/Superblock bases (page mmap or AlignedBuf).
     let aligned = AlignedBuf::from_slice(bytes);
-    let sec = MappedQwtSection {
-        sec: &aligned.as_slice()[sec_off..sec_off + sec_len],
-        n,
-        n_levels,
-        sigma,
-    };
+    let sec = MappedQwtSection::open(&aligned.as_slice()[sec_off..sec_off + sec_len])?;
+    // Prefer section metadata (authoritative QWTB header) over outer file header.
+    if sec.n != n || sec.n_levels != n_levels || sec.sigma != sigma {
+        return Err(MappedQwtError::Layout("NOVAQWT1 header/section mismatch"));
+    }
     let hot = sec.build_hot()?;
+    let (sec_n, sec_n_levels, sec_sigma) = (sec.n, sec.n_levels, sec.sigma);
 
     Ok(MappedQwtOwned {
         bytes: aligned,
         hot,
-        n,
-        n_levels,
-        sigma,
+        n: sec_n,
+        n_levels: sec_n_levels,
+        sigma: sec_sigma,
         sec_off,
         sec_len,
     })
@@ -4018,7 +3843,7 @@ impl LineCache {
             // Dummy zeros; never read before write.
             slots: [LoadedLine {
                 index: usize::MAX,
-                value: DataLine { words: [0; 4] },
+                value: DataLine::default(),
             }; 6],
             n: 0,
             loads: 0,
@@ -4059,7 +3884,7 @@ impl SbCache {
         Self {
             slots: [LoadedSuperblock {
                 index: usize::MAX,
-                value: SuperblockPlain { counters: [0; 4] },
+                value: SuperblockPlain::default(),
             }; 6],
             n: 0,
             loads: 0,
@@ -4640,27 +4465,7 @@ pub(crate) fn fnv1a64(data: &[u8]) -> u64 {
     h
 }
 
-fn slice_as_bytes<T>(s: &[T]) -> &[u8] {
-    // SAFETY: T is POD (DataLine / SuperblockPlain); LE host.
-    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
-}
 
-fn cast_slice<T>(sec: &[u8], off: usize, n: usize) -> Result<&[T], MappedQwtError> {
-    let need = n
-        .checked_mul(std::mem::size_of::<T>())
-        .ok_or(MappedQwtError::Layout("overflow"))?;
-    if off.checked_add(need).map(|e| e > sec.len()).unwrap_or(true) {
-        return Err(MappedQwtError::Layout("slice OOB"));
-    }
-    // Absolute pointer alignment (relative off%align is insufficient for
-    // arbitrary Vec bases; AlignedBuf / page mmap guarantee it).
-    let ptr = unsafe { sec.as_ptr().add(off) };
-    if !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
-        return Err(MappedQwtError::Layout("align"));
-    }
-    // SAFETY: absolute alignment checked; T is POD; LE host; bounds checked.
-    Ok(unsafe { std::slice::from_raw_parts(ptr as *const T, n) })
-}
 
 /// 64-byte-aligned owned byte buffer (DataLine / SuperblockPlain cast safe).
 pub(crate) struct AlignedBuf {
@@ -4725,9 +4530,6 @@ impl Clone for AlignedBuf {
     }
 }
 
-fn cast_u32_slice(sec: &[u8], off: usize, n: usize) -> Result<&[u32], MappedQwtError> {
-    cast_slice::<u32>(sec, off, n)
-}
 
 // ── tests ───────────────────────────────────────────────────────────────────
 

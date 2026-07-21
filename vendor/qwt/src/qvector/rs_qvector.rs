@@ -277,23 +277,37 @@ impl<S: RSSupport> RSQVector<S> {
 
     /// Underlying quad vector. Exposed for zero-copy / mmap flatten.
     #[inline]
-    pub fn qvector(&self) -> &QVector {
+    pub(crate) fn qvector(&self) -> &QVector {
         &self.qv
     }
 
     /// Rank/select support structure. Exposed for zero-copy / mmap flatten.
     #[inline]
-    pub fn rs_support(&self) -> &S {
+    pub(crate) fn rs_support(&self) -> &S {
         &self.rs_support
     }
 
     /// Wavelet-matrix child offsets `n_occs_smaller`.
     /// Exposed for zero-copy / mmap flatten.
     #[inline]
-    pub fn n_occs_smaller(&self) -> [usize; 5] {
+    pub(crate) fn n_occs_smaller(&self) -> [usize; 5] {
         self.n_occs_smaller
     }
+
+    /// Build from a quad vector, its rank/select support, and WM child offsets.
+    ///
+    /// Inverse of [`qvector`](Self::qvector) + [`rs_support`](Self::rs_support) +
+    /// [`n_occs_smaller`](Self::n_occs_smaller). Used by zero-copy I/O.
+    #[must_use]
+    pub fn from_parts(qv: QVector, rs_support: S, n_occs_smaller: [usize; 5]) -> Self {
+        Self {
+            qv,
+            rs_support,
+            n_occs_smaller,
+        }
+    }
 }
+
 
 impl<S> AccessQuad for RSQVector<S> {
     /// Accesses the `i`-th value in the quad vector.

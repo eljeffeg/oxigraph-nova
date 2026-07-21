@@ -272,6 +272,45 @@ where
         self.sigma
     }
 
+    /// Assemble a tree from prebuilt levels.
+    ///
+    /// Inverse of [`levels`](Self::levels) + [`len`](Self::len) +
+    /// [`sigma_raw`](Self::sigma_raw). Used by zero-copy I/O.
+    ///
+    /// Prefetch-augmented trees (`WITH_PREFETCH_SUPPORT = true`) are rejected
+    /// in v1 of the byte format.
+    pub fn from_parts(
+        n: usize,
+        n_levels: usize,
+        sigma: T,
+        qvs: Vec<RS>,
+    ) -> Result<Self, crate::bytes::LayoutError> {
+        if WITH_PREFETCH_SUPPORT {
+            return Err(crate::bytes::LayoutError::PrefetchNotSupported);
+        }
+        // Empty-tree convention from `new([])`: n_levels == 0 with a single default qv.
+        if n == 0 {
+            if n_levels != 0 {
+                return Err(crate::bytes::LayoutError::Inconsistent {
+                    detail: "empty tree must have n_levels == 0",
+                });
+            }
+        } else if qvs.len() != n_levels {
+            return Err(crate::bytes::LayoutError::Inconsistent {
+                detail: "n_levels disagrees with qvs length",
+            });
+        }
+        Ok(Self {
+            n,
+            n_levels,
+            sigma,
+            qvs,
+            prefetch_support: None,
+        })
+    }
+
+
+
     /// Smallest symbol in `range` that is `>= target`, or `None` if no such
     /// symbol occurs. Half-open row range `[start, end)`.
     ///

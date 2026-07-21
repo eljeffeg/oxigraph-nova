@@ -314,6 +314,59 @@ where
         &self.codes_decode
     }
 
+    /// Assemble a Huffman QWT from prebuilt levels and code tables.
+    ///
+    /// Inverse of the inspector accessors. Used by zero-copy I/O.
+    /// Prefetch-augmented trees are rejected in v1.
+    pub fn from_parts(
+        n: usize,
+        n_levels: usize,
+        codes_encode: Vec<PrefixCode>,
+        codes_decode: Vec<Vec<(u32, T)>>,
+        qvs: Vec<RS>,
+        lens: Vec<usize>,
+    ) -> Result<Self, crate::bytes::LayoutError> {
+        if WITH_PREFETCH_SUPPORT {
+            return Err(crate::bytes::LayoutError::PrefetchNotSupported);
+        }
+        // Empty-tree convention from `new([])`: n_levels == 0 with a single
+        // default qv and lens=[0]. Callers may pass empty vecs; we normalize.
+        let (qvs, lens) = if n == 0 {
+            if n_levels != 0 {
+                return Err(crate::bytes::LayoutError::Inconsistent {
+                    detail: "empty tree must have n_levels == 0",
+                });
+            }
+            if qvs.is_empty() && lens.is_empty() {
+                (vec![RS::default()], vec![0])
+            } else if qvs.len() == 1 && lens == [0] {
+                (qvs, lens)
+            } else {
+                return Err(crate::bytes::LayoutError::Inconsistent {
+                    detail: "empty tree expects empty or default sentinel levels",
+                });
+            }
+        } else if qvs.len() != n_levels || lens.len() != n_levels {
+            return Err(crate::bytes::LayoutError::Inconsistent {
+                detail: "n_levels disagrees with qvs/lens lengths",
+            });
+        } else {
+            (qvs, lens)
+        };
+        Ok(Self {
+            n,
+            n_levels,
+            codes_encode,
+            codes_decode,
+            qvs,
+            lens,
+            prefetch_support: None,
+            phantom_data: PhantomData,
+        })
+
+    }
+
+
     /// Returns an iterator over the values in the wavelet tree.
     ///
     /// # Examples
