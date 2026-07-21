@@ -604,10 +604,10 @@ where
 #[generic_tests::define]
 mod tests {
     use super::*;
-    use std::iter;
 
     #[test]
     fn test_just_one_data_line<D>()
+
     where
         D: From<QVector> + AccessQuad + RankQuad + SelectQuad + WTSupport,
     {
@@ -691,7 +691,7 @@ mod tests {
         ] {
             // tests blocks and superblocks boundaries
             for symbol in 0..3u8 {
-                let qv: QVector = iter::repeat(symbol).take(n).collect();
+                let qv: QVector = std::iter::repeat_n(symbol, n).collect();
                 let rsqv = D::from(qv.clone());
                 for i in 0..qv.len() + 1 {
                     if i < qv.len() {
