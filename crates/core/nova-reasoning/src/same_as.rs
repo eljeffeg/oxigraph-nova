@@ -48,23 +48,27 @@
 
 use oxigraph_nova_core::Term;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A frozen union-find over RDF terms connected by `owl:sameAs` edges.
 ///
 /// Built once via [`SameAsTracker::build`] and never mutated afterward. An
 /// empty tracker (no `owl:sameAs` triples in the dataset) is the common case
-/// and adds zero overhead: [`SameAsTracker::canonicalize`]/
+/// and adds zero overhead: [`SameAsTracker::canonicalize`],
 /// [`SameAsTracker::class_members`] degenerate to "return the term itself"
 /// whenever the term is not part of any recorded equivalence class.
+///
+/// Equivalence-class members are held as `Arc<Term>` so query-time expand
+/// paths can `Arc::clone` rather than deep-copy Term string content.
 #[derive(Debug, Clone, Default)]
 pub struct SameAsTracker {
     /// Maps every term that is part of a non-trivial equivalence class to
     /// that class's representative (root) term. Terms with no recorded
     /// `owl:sameAs` edges are simply absent from this map.
-    canonical: HashMap<Term, Term>,
+    canonical: HashMap<Term, Arc<Term>>,
     /// Maps every representative (root) term to the full list of terms in
     /// its equivalence class (including the root itself).
-    members: HashMap<Term, Vec<Term>>,
+    members: HashMap<Term, Vec<Arc<Term>>>,
 }
 
 impl SameAsTracker {
@@ -124,16 +128,26 @@ impl SameAsTracker {
         // Finalize: fully compress every entry so `canonical` is a direct
         // term → root map (no further path-following needed at query time),
         // then build the inverse `root → members` map for expansion.
-        let mut canonical: HashMap<Term, Term> = HashMap::new();
+        // Roots are Arc-shared so each class's member list and the canonical
+        // map can share the same root allocation.
+        let mut root_arcs: HashMap<Term, Arc<Term>> = HashMap::new();
         let keys: Vec<Term> = parent.keys().cloned().collect();
+        let mut canonical: HashMap<Term, Arc<Term>> = HashMap::new();
         for k in &keys {
             let root = find(&mut parent, k);
-            canonical.insert(k.clone(), root);
+            let root_arc = root_arcs
+                .entry(root.clone())
+                .or_insert_with(|| Arc::new(root))
+                .clone();
+            canonical.insert(k.clone(), root_arc);
         }
 
-        let mut members: HashMap<Term, Vec<Term>> = HashMap::new();
+        let mut members: HashMap<Term, Vec<Arc<Term>>> = HashMap::new();
         for (term, root) in &canonical {
-            members.entry(root.clone()).or_default().push(term.clone());
+            members
+                .entry(root.as_ref().clone())
+                .or_default()
+                .push(Arc::new(term.clone()));
         }
 
         Self { canonical, members }
@@ -145,20 +159,25 @@ impl SameAsTracker {
     pub fn canonicalize(&self, term: &Term) -> Term {
         self.canonical
             .get(term)
-            .cloned()
+            .map(|r| r.as_ref().clone())
             .unwrap_or_else(|| term.clone())
     }
 
     /// Every term in `term`'s equivalence class, including `term` itself
-    /// (or just `[term.clone()]` if it is not part of any recorded class).
+    /// (or just `[Arc::new(term.clone())]` if it is not part of any recorded
+    /// class). Members are returned as shared `Arc<Term>` so expand paths
+    /// can bump the refcount rather than deep-copy Term string content.
     /// This is the "expand back out" half of query-time canonicalization —
     /// see the module doc comment.
-    pub fn class_members(&self, term: &Term) -> Vec<Term> {
-        let root = self.canonicalize(term);
-        self.members
-            .get(&root)
-            .cloned()
-            .unwrap_or_else(|| vec![root])
+    pub fn class_members(&self, term: &Term) -> Vec<Arc<Term>> {
+        match self.canonical.get(term) {
+            Some(root) => self
+                .members
+                .get(root.as_ref())
+                .map(|v| v.iter().map(Arc::clone).collect())
+                .unwrap_or_else(|| vec![Arc::clone(root)]),
+            None => vec![Arc::new(term.clone())],
+        }
     }
 }
 
@@ -171,13 +190,17 @@ mod tests {
         Term::NamedNode(NamedNode::new_unchecked(s))
     }
 
+    fn member_terms(members: Vec<Arc<Term>>) -> Vec<Term> {
+        members.into_iter().map(|t| (*t).clone()).collect()
+    }
+
     #[test]
     fn empty_tracker_canonicalizes_to_self() {
         let t = SameAsTracker::empty();
         assert!(t.is_empty());
         let x = iri("http://ex/x");
         assert_eq!(t.canonicalize(&x), x);
-        assert_eq!(t.class_members(&x), vec![x]);
+        assert_eq!(member_terms(t.class_members(&x)), vec![x]);
     }
 
     #[test]
@@ -188,7 +211,7 @@ mod tests {
         assert!(!t.is_empty());
         assert_eq!(t.canonicalize(&a), t.canonicalize(&b));
 
-        let mut members = t.class_members(&a);
+        let mut members = member_terms(t.class_members(&a));
         members.sort_by_key(|t| t.to_string());
         let mut expected = vec![a, b];
         expected.sort_by_key(|t| t.to_string());
@@ -203,7 +226,7 @@ mod tests {
         let t = SameAsTracker::build(vec![(a.clone(), b.clone()), (b.clone(), c.clone())]);
 
         assert_eq!(t.canonicalize(&a), t.canonicalize(&c));
-        let mut members = t.class_members(&a);
+        let mut members = member_terms(t.class_members(&a));
         members.sort_by_key(|t| t.to_string());
         let mut expected = vec![a, b, c];
         expected.sort_by_key(|t| t.to_string());
@@ -230,7 +253,7 @@ mod tests {
         let unrelated = iri("http://ex/unrelated");
         let t = SameAsTracker::build(vec![(a, b)]);
         assert_eq!(t.canonicalize(&unrelated), unrelated);
-        assert_eq!(t.class_members(&unrelated), vec![unrelated]);
+        assert_eq!(member_terms(t.class_members(&unrelated)), vec![unrelated]);
     }
 
     #[test]

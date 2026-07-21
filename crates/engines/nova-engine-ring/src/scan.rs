@@ -33,6 +33,7 @@ use crate::mapped_qwt::{HotQwtColumn, MappedRangeDistinctIter};
 use crate::product_path::{
     PredAdjacencyMode, SPARQL_PATH, effective_d1_tiny_merge_threshold,
     effective_pred_adjacency_mode, effective_wedge_left_once_threshold,
+    ring_counters_log_enabled,
 };
 use crate::ring_nav::RingRef;
 use crate::{Col, RowRange};
@@ -2204,11 +2205,7 @@ impl PreparedTwoHopImpl {
         let p1_dense = img.remap().to_dense(p1)?;
         let p1_adj = PredicateAdjacency::build(img.index().ring_ref(), p1_dense, universe, mode)
             .map(Arc::new);
-        let hop1 = PreparedSpObjectScanImpl::prepare_with_shared_adj(
-            Arc::clone(&img),
-            p1,
-            p1_adj,
-        )?;
+        let hop1 = PreparedSpObjectScanImpl::prepare_with_shared_adj(Arc::clone(&img), p1, p1_adj)?;
         let hop2 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p2)?;
         let p2_dense = hop2.pred_dense;
         let p2_adj = PredicateAdjacency::build(img.index().ring_ref(), p2_dense, universe, mode);
@@ -2250,7 +2247,15 @@ impl PreparedTwoHop for PreparedTwoHopImpl {
         } else {
             vec![None; universe.max(1)]
         };
-        let mut seen_b: Vec<bool> = vec![false; universe.max(1)];
+        // Only allocate the universe-sized uniqueness bitset when verbose
+        // path counters are enabled (`NOVA_RING_COUNTERS=1`). On the warm
+        // timed path this avoids a multi-KB zero-fill per execute().
+        let track_unique_b = ring_counters_log_enabled();
+        let mut seen_b: Vec<bool> = if track_unique_b {
+            vec![false; universe.max(1)]
+        } else {
+            Vec::new()
+        };
         let hop2_pred = self.p2_dense;
         let img_ref = Arc::clone(&self.img);
 
@@ -3186,11 +3191,7 @@ fn materialize_sp_o_dense(img: &BraidedGraphImage, range: RowRange) -> Vec<u32> 
 
 /// Two-pointer ∩ of two tiny SP object lists → external TermIds (sorted).
 #[inline]
-fn materialize_sp_d1_tiny_merge(
-    img: &BraidedGraphImage,
-    r0: RowRange,
-    r1: RowRange,
-) -> Vec<u64> {
+fn materialize_sp_d1_tiny_merge(img: &BraidedGraphImage, r0: RowRange, r1: RowRange) -> Vec<u64> {
     let a = materialize_sp_o_dense(img, r0);
     let b = materialize_sp_o_dense(img, r1);
     let remap = img.remap();

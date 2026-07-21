@@ -80,7 +80,9 @@ use std::sync::Arc;
 /// full semantics.
 pub struct ReasoningDataset<D: Dataset> {
     inner: D,
-    inferred: Vec<(Term, Term, Term)>,
+    /// Inferred triples held as shared `Arc<Term>` so every `find_quads`
+    /// match is a refcount bump, not a deep Term/string clone.
+    inferred: Vec<(Arc<Term>, Arc<Term>, Arc<Term>)>,
     diagnostics: Vec<Diagnostic>,
     /// Frozen union-find over `owl:sameAs` pairs — see [`SameAsTracker`]'s
     /// module doc comment for the query-time canonicalize/expand design
@@ -97,13 +99,15 @@ impl<D: Dataset> ReasoningDataset<D> {
     /// to infer is not an error (see [`ReasoningEngine::infer`]).
     pub fn wrap(inner: D, engine: &dyn ReasoningEngine) -> Result<Self> {
         let (inferred_quads, diagnostics) = engine.infer(&inner)?;
+        // Arc-wrap once at construction so every subsequent match is a
+        // refcount bump rather than a deep Term/string clone.
         let inferred = inferred_quads
             .into_iter()
             .map(|q| {
                 (
-                    Term::from(q.subject),
-                    Term::NamedNode(q.predicate),
-                    q.object,
+                    Arc::new(Term::from(q.subject)),
+                    Arc::new(Term::NamedNode(q.predicate)),
+                    Arc::new(q.object),
                 )
             })
             .collect();
@@ -151,21 +155,21 @@ impl<D: Dataset> ReasoningDataset<D> {
 
             let s_ok = match &pattern.subject {
                 PatternTerm::Variable => true,
-                PatternTerm::Bound(v) => v.as_ref() == s,
+                PatternTerm::Bound(v) => v.as_ref() == s.as_ref(),
             };
             let p_ok = match &pattern.predicate {
                 PatternTerm::Variable => true,
-                PatternTerm::Bound(v) => v.as_ref() == p,
+                PatternTerm::Bound(v) => v.as_ref() == p.as_ref(),
             };
             let o_ok = match &pattern.object {
                 PatternTerm::Variable => true,
-                PatternTerm::Bound(v) => v.as_ref() == o,
+                PatternTerm::Bound(v) => v.as_ref() == o.as_ref(),
             };
             if s_ok && p_ok && o_ok {
                 Some(QuadMatch {
-                    subject: Arc::new(s.clone()),
-                    predicate: Arc::new(p.clone()),
-                    object: Arc::new(o.clone()),
+                    subject: Arc::clone(s),
+                    predicate: Arc::clone(p),
+                    object: Arc::clone(o),
                     graph_name: GraphName::DefaultGraph,
                 })
             } else {
@@ -240,21 +244,14 @@ impl<D: Dataset> ReasoningDataset<D> {
         if self.same_as.is_empty() {
             return vec![m];
         }
+        // class_members already returns Arc<Term> — Arc::clone only.
         let subjects: Vec<Arc<Term>> = if matches!(pattern.subject, PatternTerm::Variable) {
-            self.same_as
-                .class_members(m.subject.as_ref())
-                .into_iter()
-                .map(Arc::new)
-                .collect()
+            self.same_as.class_members(m.subject.as_ref())
         } else {
             vec![m.subject.clone()]
         };
         let objects: Vec<Arc<Term>> = if matches!(pattern.object, PatternTerm::Variable) {
-            self.same_as
-                .class_members(m.object.as_ref())
-                .into_iter()
-                .map(Arc::new)
-                .collect()
+            self.same_as.class_members(m.object.as_ref())
         } else {
             vec![m.object.clone()]
         };
@@ -262,9 +259,9 @@ impl<D: Dataset> ReasoningDataset<D> {
         for s in &subjects {
             for o in &objects {
                 out.push(QuadMatch {
-                    subject: s.clone(),
-                    predicate: m.predicate.clone(),
-                    object: o.clone(),
+                    subject: Arc::clone(s),
+                    predicate: Arc::clone(&m.predicate),
+                    object: Arc::clone(o),
                     graph_name: m.graph_name.clone(),
                 });
             }
@@ -324,20 +321,25 @@ impl<D: Dataset> Dataset for ReasoningDataset<D> {
 }
 
 /// Hashable/comparable dedup key for a [`QuadMatch`] — `QuadMatch` itself
-/// derives `PartialEq` but not `Hash`/`Eq`, so a small local key tuple is
-/// used instead — used only by the `owl:sameAs`-expansion dedup pass in
-/// `find_quads` above.
+/// derives `PartialEq` but not `Hash`/`Eq`, so a small local key is used
+/// instead. Hashes Term content via `Arc<Term>` (no `to_string` allocation)
+/// — used only by the `owl:sameAs`-expansion dedup pass in `find_quads`.
 #[derive(PartialEq, Eq, Hash)]
-struct QuadMatchKey(String, String, String, String);
+struct QuadMatchKey {
+    subject: Arc<Term>,
+    predicate: Arc<Term>,
+    object: Arc<Term>,
+    graph_name: GraphName,
+}
 
 impl From<&QuadMatch> for QuadMatchKey {
     fn from(m: &QuadMatch) -> Self {
-        Self(
-            m.subject.to_string(),
-            m.predicate.to_string(),
-            m.object.to_string(),
-            format!("{:?}", m.graph_name),
-        )
+        Self {
+            subject: Arc::clone(&m.subject),
+            predicate: Arc::clone(&m.predicate),
+            object: Arc::clone(&m.object),
+            graph_name: m.graph_name.clone(),
+        }
     }
 }
 

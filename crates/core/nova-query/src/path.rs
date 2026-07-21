@@ -707,12 +707,14 @@ fn product_bfs<D: Dataset>(
     let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
     let mut accept_ids: HashSet<u64> = HashSet::new();
 
+    // Borrow states by reference so high-degree neighbor loops do not
+    // allocate a fresh HashSet per edge target.
     let push = |node_id: u64,
-                states: HashSet<usize>,
+                states: &HashSet<usize>,
                 visited: &mut HashSet<(u64, usize)>,
                 queue: &mut VecDeque<(u64, usize)>,
                 accept_ids: &mut HashSet<u64>| {
-        for st in states {
+        for &st in states {
             if visited.insert((node_id, st)) {
                 queue.push_back((node_id, st));
                 if st == accept_state {
@@ -722,9 +724,10 @@ fn product_bfs<D: Dataset>(
         }
     };
 
+    let start_states = epsilon_closure(nfa, &[start_state]);
     push(
         start_id,
-        epsilon_closure(nfa, &[start_state]),
+        &start_states,
         &mut visited,
         &mut queue,
         &mut accept_ids,
@@ -750,7 +753,7 @@ fn product_bfs<D: Dataset>(
                     while !it.at_end() {
                         push(
                             it.key(),
-                            next_states.clone(),
+                            &next_states,
                             &mut visited,
                             &mut queue,
                             &mut accept_ids,
@@ -768,7 +771,7 @@ fn product_bfs<D: Dataset>(
                     while !it.at_end() {
                         push(
                             it.key(),
-                            next_states.clone(),
+                            &next_states,
                             &mut visited,
                             &mut queue,
                             &mut accept_ids,
@@ -791,7 +794,7 @@ fn product_bfs<D: Dataset>(
                             while !oit.at_end() {
                                 push(
                                     oit.key(),
-                                    next_states.clone(),
+                                    &next_states,
                                     &mut visited,
                                     &mut queue,
                                     &mut accept_ids,
@@ -817,7 +820,7 @@ fn product_bfs<D: Dataset>(
                             while !sit.at_end() {
                                 push(
                                     sit.key(),
-                                    next_states.clone(),
+                                    &next_states,
                                     &mut visited,
                                     &mut queue,
                                     &mut accept_ids,
