@@ -2086,7 +2086,8 @@ mod tests {
             .map(|q| {
                 (
                     Term::from(q.subject.clone()).to_string(),
-                    q.predicate.as_str().to_string(),
+                    // Match StoredQuad.predicate (Arc<Term>) Display, not bare IRI.
+                    Term::NamedNode(q.predicate.clone()).to_string(),
                     q.object.to_string(),
                 )
             })
