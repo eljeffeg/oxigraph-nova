@@ -73,6 +73,7 @@ use oxigraph_nova_query::{
     Dataset, DatasetLftjSource, GraphSelector, PatternTerm, QuadIter, QuadMatch, QuadPattern,
 };
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Wraps a base [`Dataset`] `D` with an in-memory closure computed once (at
 /// construction) by a [`ReasoningEngine`]. See the module doc comment for
@@ -150,21 +151,21 @@ impl<D: Dataset> ReasoningDataset<D> {
 
             let s_ok = match &pattern.subject {
                 PatternTerm::Variable => true,
-                PatternTerm::Bound(v) => v == s,
+                PatternTerm::Bound(v) => v.as_ref() == s,
             };
             let p_ok = match &pattern.predicate {
                 PatternTerm::Variable => true,
-                PatternTerm::Bound(v) => v == p,
+                PatternTerm::Bound(v) => v.as_ref() == p,
             };
             let o_ok = match &pattern.object {
                 PatternTerm::Variable => true,
-                PatternTerm::Bound(v) => v == o,
+                PatternTerm::Bound(v) => v.as_ref() == o,
             };
             if s_ok && p_ok && o_ok {
                 Some(QuadMatch {
-                    subject: s.clone(),
-                    predicate: p.clone(),
-                    object: o.clone(),
+                    subject: Arc::new(s.clone()),
+                    predicate: Arc::new(p.clone()),
+                    object: Arc::new(o.clone()),
                     graph_name: GraphName::DefaultGraph,
                 })
             } else {
@@ -195,18 +196,18 @@ impl<D: Dataset> ReasoningDataset<D> {
         let subjects: Vec<PatternTerm> = match &pattern.subject {
             PatternTerm::Bound(t) => self
                 .same_as
-                .class_members(t)
+                .class_members(t.as_ref())
                 .into_iter()
-                .map(PatternTerm::Bound)
+                .map(PatternTerm::bound)
                 .collect(),
             PatternTerm::Variable => vec![PatternTerm::Variable],
         };
         let objects: Vec<PatternTerm> = match &pattern.object {
             PatternTerm::Bound(t) => self
                 .same_as
-                .class_members(t)
+                .class_members(t.as_ref())
                 .into_iter()
-                .map(PatternTerm::Bound)
+                .map(PatternTerm::bound)
                 .collect(),
             PatternTerm::Variable => vec![PatternTerm::Variable],
         };
@@ -239,13 +240,21 @@ impl<D: Dataset> ReasoningDataset<D> {
         if self.same_as.is_empty() {
             return vec![m];
         }
-        let subjects = if matches!(pattern.subject, PatternTerm::Variable) {
-            self.same_as.class_members(&m.subject)
+        let subjects: Vec<Arc<Term>> = if matches!(pattern.subject, PatternTerm::Variable) {
+            self.same_as
+                .class_members(m.subject.as_ref())
+                .into_iter()
+                .map(Arc::new)
+                .collect()
         } else {
             vec![m.subject.clone()]
         };
-        let objects = if matches!(pattern.object, PatternTerm::Variable) {
-            self.same_as.class_members(&m.object)
+        let objects: Vec<Arc<Term>> = if matches!(pattern.object, PatternTerm::Variable) {
+            self.same_as
+                .class_members(m.object.as_ref())
+                .into_iter()
+                .map(Arc::new)
+                .collect()
         } else {
             vec![m.object.clone()]
         };
@@ -398,8 +407,8 @@ mod tests {
         assert!(reasoning.inferred_len() >= 2);
 
         let pattern = QuadPattern::default_graph(
-            PatternTerm::Bound(Term::NamedNode(nn("http://ex/fido"))),
-            PatternTerm::Bound(Term::NamedNode(rdf_type())),
+            PatternTerm::bound(Term::NamedNode(nn("http://ex/fido"))),
+            PatternTerm::bound(Term::NamedNode(rdf_type())),
             PatternTerm::Variable,
         );
         let mut objects: Vec<String> = reasoning
@@ -490,8 +499,8 @@ mod tests {
         // Expansion: ?x knows carol -> {alice, bob}.
         let pattern = QuadPattern::default_graph(
             PatternTerm::Variable,
-            PatternTerm::Bound(Term::NamedNode(knows.clone())),
-            PatternTerm::Bound(Term::NamedNode(nn("http://ex/carol"))),
+            PatternTerm::bound(Term::NamedNode(knows.clone())),
+            PatternTerm::bound(Term::NamedNode(nn("http://ex/carol"))),
         );
         let mut subjects: Vec<String> = reasoning
             .find_quads(&pattern)
@@ -512,8 +521,8 @@ mod tests {
         // Fan-out: bob knows ?y must still find carol (the fact is stored
         // under alice, bob's sameAs partner).
         let pattern2 = QuadPattern::default_graph(
-            PatternTerm::Bound(Term::NamedNode(nn("http://ex/bob"))),
-            PatternTerm::Bound(Term::NamedNode(knows)),
+            PatternTerm::bound(Term::NamedNode(nn("http://ex/bob"))),
+            PatternTerm::bound(Term::NamedNode(knows)),
             PatternTerm::Variable,
         );
         let objects: Vec<String> = reasoning

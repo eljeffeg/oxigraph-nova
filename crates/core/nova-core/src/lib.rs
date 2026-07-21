@@ -58,26 +58,43 @@ pub type Subject = NamedOrBlankNode;
 ///
 /// ## Memory footprint
 ///
-/// `subject` and `object` are `Arc<Term>` rather than owned `Term`. The
+/// All three term positions are `Arc<Term>` rather than owned values. The
 /// dictionary already stores each interned term as a shared `Arc<Term>`
 /// (see `Dictionary::get_term_arc`), so decoding a matched row can clone
 /// the `Arc` (a cheap refcount bump) instead of deep-cloning the term's
 /// heap-allocated string content. This matters most for join-heavy or
-/// large-result queries, where deep-cloning every subject/object for every
-/// matched row would otherwise be expensive.
+/// large-result queries, where deep-cloning every subject/predicate/object
+/// for every matched row would otherwise be expensive.
+///
+/// `predicate` is always a `Term::NamedNode` for well-formed RDF quads;
+/// use [`StoredQuad::predicate_named_node`] when a `&NamedNode` is required
+/// (e.g. RDF serializers that take `TripleRef`/`QuadRef`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredQuad {
     pub subject: Arc<Term>,
-    pub predicate: NamedNode,
+    pub predicate: Arc<Term>,
     pub object: Arc<Term>,
     pub graph_name: GraphName,
+}
+
+impl StoredQuad {
+    /// Borrow the predicate IRI. Returns `None` only if the quad is
+    /// ill-formed (predicate is not a named node) — production decoders
+    /// never emit such rows.
+    #[inline]
+    pub fn predicate_named_node(&self) -> Option<&NamedNode> {
+        match self.predicate.as_ref() {
+            Term::NamedNode(n) => Some(n),
+            _ => None,
+        }
+    }
 }
 
 impl From<Quad> for StoredQuad {
     fn from(q: Quad) -> Self {
         Self {
             subject: Arc::new(Term::from(q.subject)),
-            predicate: q.predicate,
+            predicate: Arc::new(Term::NamedNode(q.predicate)),
             object: Arc::new(q.object),
             graph_name: q.graph_name,
         }

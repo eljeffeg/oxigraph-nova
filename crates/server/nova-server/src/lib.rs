@@ -205,8 +205,9 @@ use axum::routing::{get, post};
 use oxigraph_nova_core::{QuadStore, TextSearch};
 use oxigraph_nova_cypher::{parse_and_lower, parse_and_lower_update};
 use oxigraph_nova_query::{
-    CancellationToken, EvalLimitError, Evaluator, QueryOptions, QueryResult, ServiceHandler,
-    Solutions, StoreDataset, clear_graph, execute_update,
+    CancellationToken, EvalLimitError, Evaluator, PathTimingBucket, QueryOptions, QueryResult,
+    ServiceHandler, Solutions, StoreDataset, add_path_timing_ns, clear_graph, execute_update,
+    path_timing_snapshot,
 };
 use oxigraph_nova_reasoning::{ReasoningEngine, ReasoningState};
 use oxigraph_nova_shacl::{NativeValidator, ShaclValidator};
@@ -1127,6 +1128,58 @@ async fn metrics_get<S: QuadStore + ?Sized + 'static>(
         oxigraph_nova_query::lftj_fallback_total()
     );
 
+    // E2E path-timing buckets (Parse / Execution / Decode / Serialize).
+    // Consumed by benches/external/run_path_breakdown_ab.sh.
+    let pt = path_timing_snapshot();
+    metric!(
+        "nova_path_parse_ns_total",
+        "Cumulative nanoseconds spent parsing SPARQL text to algebra.",
+        "counter",
+        pt.parse_ns
+    );
+    metric!(
+        "nova_path_parse_samples_total",
+        "Number of parse path-timing samples.",
+        "counter",
+        pt.parse_n
+    );
+    metric!(
+        "nova_path_execution_ns_total",
+        "Cumulative nanoseconds spent in operator walk / join (no term decode).",
+        "counter",
+        pt.execution_ns
+    );
+    metric!(
+        "nova_path_execution_samples_total",
+        "Number of execution path-timing samples.",
+        "counter",
+        pt.execution_n
+    );
+    metric!(
+        "nova_path_decode_ns_total",
+        "Cumulative nanoseconds spent materializing TermId → Arc<Term> solutions.",
+        "counter",
+        pt.decode_ns
+    );
+    metric!(
+        "nova_path_decode_samples_total",
+        "Number of decode path-timing samples.",
+        "counter",
+        pt.decode_n
+    );
+    metric!(
+        "nova_path_serialize_ns_total",
+        "Cumulative nanoseconds spent building SPARQL Results JSON/XML/CSV bodies.",
+        "counter",
+        pt.serialize_ns
+    );
+    metric!(
+        "nova_path_serialize_samples_total",
+        "Number of serialize path-timing samples.",
+        "counter",
+        pt.serialize_n
+    );
+
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -1324,8 +1377,9 @@ async fn store_get<S: QuadStore + ?Sized + 'static>(
                 Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b.clone()),
                 _ => return None,
             };
+            let predicate = sq.predicate_named_node()?.clone();
             let object = Arc::unwrap_or_clone(sq.object);
-            Some(Triple::new(subject, sq.predicate, object))
+            Some(Triple::new(subject, predicate, object))
         })
         .collect();
 
@@ -1501,13 +1555,16 @@ async fn execute_sparql_query<S: QuadStore + ?Sized + 'static>(
     // 1. Parse
     let query = {
         let _span = tracing::info_span!("parse_query").entered();
-        match SparqlParser::new().parse_query(sparql) {
+        let t0 = std::time::Instant::now();
+        let parsed = match SparqlParser::new().parse_query(sparql) {
             Ok(q) => q,
             Err(e) => {
                 return (StatusCode::BAD_REQUEST, format!("SPARQL parse error: {e}"))
                     .into_response();
             }
-        }
+        };
+        add_path_timing_ns(PathTimingBucket::Parse, t0.elapsed().as_nanos() as u64);
+        parsed
     };
 
     // 2. Build per-query options (cancellation token only allocated if a
@@ -1897,6 +1954,7 @@ fn serialize_solutions(variables: &[Variable], solutions: Solutions, accept: &st
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
 
     std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
         let writer = ChannelWriter::new(tx.clone());
         let result: std::io::Result<()> = (|| {
             let mut ser = QueryResultsSerializer::from_format(format)
@@ -1906,13 +1964,15 @@ fn serialize_solutions(variables: &[Variable], solutions: Solutions, accept: &st
                 ser.serialize(
                     variables
                         .iter()
-                        .filter_map(|v| sol.get(v).map(|t| (v.as_ref(), t.as_ref()))),
+                        .filter_map(|v| sol.get(v).map(|t| (v.as_ref(), t))),
                 )?;
             }
             let mut writer = ser.finish()?;
             writer.flush()?;
             Ok(())
         })();
+        // Path-timing Serialize bucket (once per SELECT response body build).
+        add_path_timing_ns(PathTimingBucket::Serialize, t0.elapsed().as_nanos() as u64);
 
         if let Err(e) = result {
             tracing::error!("error while streaming SPARQL solutions: {e}");

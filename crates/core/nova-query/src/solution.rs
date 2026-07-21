@@ -18,8 +18,14 @@
 //! Internally, `Solution` stores its bindings as a **shared, positional**
 //! layout rather than a per-row `HashMap<Variable, Term>` — mirroring
 //! Oxigraph's own `QuerySolution` design (`Arc<[Variable]>` header shared
-//! once per query, plus a `Vec<Option<Term>>` of per-row values indexed by
+//! once per query, plus a `Vec<Option<Arc<Term>>>` of per-row values indexed by
 //! position).
+//!
+//! Binding values are stored as `Arc<Term>` so dictionary-decoded terms can
+//! be shared end-to-end (dictionary → LFTJ emit → Solution → serializer)
+//! without deep-cloning the term's owned `String` content on every row.
+//! Fresh terms produced by expressions (`BIND`, aggregates, `VALUES`) are
+//! wrapped once via `Arc::new` at insert time.
 //!
 //! Paths that don't know their variable set in advance (`BIND`/`EXTEND`,
 //! aggregation, and the nested-loop fallback evaluator) still work
@@ -29,6 +35,11 @@
 //! `Variable` slice, push the new one, rebuild the `Arc`). This is more
 //! expensive than the old `HashMap`'s O(1) insert for that one case, but
 //! those code paths process far fewer rows than the LFTJ hot path.
+//!
+//! The per-row `values` vector is also behind an `Arc`, so `Solution::clone`
+//! (used heavily by nested-loop BGP extension: one clone per candidate
+//! match) is an O(1) pair of refcount bumps. Mutations (`insert`, etc.)
+//! copy-on-write the values buffer only when it is shared.
 // Re-export so calling code can write `oxigraph_nova_query::Variable`.
 pub use oxrdf::Variable as SparqlVariable;
 use oxrdf::{BlankNode, Term, Variable};
@@ -72,7 +83,9 @@ use std::sync::{Arc, OnceLock};
 #[derive(Debug, Clone, Default)]
 pub struct Solution {
     vars: Arc<[Variable]>,
-    values: Vec<Option<Term>>,
+    /// Per-row bindings, shared under `Arc` so nested-loop `sol.clone()` is
+    /// O(1). Mutating methods call [`Self::make_values_mut`] first.
+    values: Arc<Vec<Option<Arc<Term>>>>,
     bnode_cache: OnceLock<Arc<Mutex<HashMap<String, BlankNode>>>>,
 }
 
@@ -107,7 +120,7 @@ impl Solution {
     ///
     /// `values.len()` must equal `vars.len()`; a `None` entry at index `i`
     /// means `vars[i]` is unbound in this row.
-    pub fn positional(vars: Arc<[Variable]>, values: Vec<Option<Term>>) -> Self {
+    pub fn positional(vars: Arc<[Variable]>, values: Vec<Option<Arc<Term>>>) -> Self {
         debug_assert_eq!(
             vars.len(),
             values.len(),
@@ -115,7 +128,7 @@ impl Solution {
         );
         Self {
             vars,
-            values,
+            values: Arc::new(values),
             bnode_cache: OnceLock::new(),
         }
     }
@@ -123,6 +136,13 @@ impl Solution {
     /// Position of `var` in the header, if bound at all (bound or not).
     fn position_of(&self, var: &Variable) -> Option<usize> {
         self.vars.iter().position(|v| v == var)
+    }
+
+    /// Ensure `self.values` is uniquely owned before mutation (COW).
+    #[inline]
+    fn make_values_mut(&mut self) -> &mut Vec<Option<Arc<Term>>> {
+        // `Arc::make_mut` clones the Vec only when strong_count > 1.
+        Arc::make_mut(&mut self.values)
     }
 
     /// Bind `var` to `term`, overwriting any previous binding.
@@ -133,20 +153,36 @@ impl Solution {
     /// this only happens on paths that don't know their full variable set
     /// up front (`BIND`/`EXTEND`, aggregation, nested-loop fallback), never
     /// on the LFTJ hot path (which always uses [`Self::positional`]).
-    pub fn insert(&mut self, var: Variable, term: Term) {
+    pub fn insert(&mut self, var: Variable, term: impl Into<Arc<Term>>) {
+        let term = term.into();
         if let Some(i) = self.position_of(&var) {
-            self.values[i] = Some(term);
+            self.make_values_mut()[i] = Some(term);
         } else {
             let mut new_vars: Vec<Variable> = self.vars.iter().cloned().collect();
             new_vars.push(var);
             self.vars = Arc::from(new_vars);
-            self.values.push(Some(term));
+            self.make_values_mut().push(Some(term));
         }
     }
 
     /// Look up the binding for `var`. Returns `None` if unbound.
+    ///
+    /// Returns a reference into the shared `Arc<Term>` — no clone.
     pub fn get(&self, var: &Variable) -> Option<&Term> {
-        self.position_of(var).and_then(|i| self.values[i].as_ref())
+        self.position_of(var)
+            .and_then(|i| self.values[i].as_ref())
+            .map(|arc| arc.as_ref())
+    }
+
+    /// Look up the binding for `var` as a shared `Arc<Term>`.
+    ///
+    /// Prefer this over `get(...).cloned()` when the caller needs an owned
+    /// handle — `Arc::clone` is an O(1) refcount bump, whereas cloning the
+    /// dereferenced `Term` deep-copies its heap-allocated string content.
+    pub fn get_arc(&self, var: &Variable) -> Option<Arc<Term>> {
+        self.position_of(var)
+            .and_then(|i| self.values[i].as_ref())
+            .map(Arc::clone)
     }
 
     /// Returns `true` if `var` is bound in this solution.
@@ -168,7 +204,15 @@ impl Solution {
         self.vars
             .iter()
             .zip(self.values.iter())
-            .filter_map(|(v, t)| t.as_ref().map(|t| (v, t)))
+            .filter_map(|(v, t)| t.as_ref().map(|t| (v, t.as_ref())))
+    }
+
+    /// Iterate over bound (variable, Arc<Term>) pairs — cheap to clone the Arc.
+    pub fn iter_arc(&self) -> impl Iterator<Item = (&Variable, Arc<Term>)> + '_ {
+        self.vars
+            .iter()
+            .zip(self.values.iter())
+            .filter_map(|(v, t)| t.as_ref().map(|t| (v, Arc::clone(t))))
     }
 
     /// Get or create the blank node associated with `key` (the string value
@@ -208,10 +252,11 @@ impl Solution {
                 return None;
             }
         }
-        // No conflicts — build the union.
+        // No conflicts — build the union. Use Arc::clone so shared dictionary
+        // terms stay shared rather than deep-copied.
         let mut merged = self.clone();
-        for (var, term) in other.iter() {
-            merged.insert(var.clone(), term.clone());
+        for (var, term) in other.iter_arc() {
+            merged.insert(var.clone(), term);
         }
         Some(merged)
     }
@@ -235,16 +280,16 @@ impl Solution {
         // `project()` is called once per emitted row for every SELECT query,
         // so this is on the hot path, not just the COW-extension slow path.
         let mut new_vars: Vec<Variable> = Vec::new();
-        let mut new_values: Vec<Option<Term>> = Vec::new();
+        let mut new_values: Vec<Option<Arc<Term>>> = Vec::new();
         for var in vars {
-            if let Some(term) = self.get(var) {
+            if let Some(term) = self.get_arc(var) {
                 new_vars.push(var.clone());
-                new_values.push(Some(term.clone()));
+                new_values.push(Some(term));
             }
         }
         Solution {
             vars: Arc::from(new_vars),
-            values: new_values,
+            values: Arc::new(new_values),
             bnode_cache: self.bnode_cache.clone(),
         }
     }
@@ -267,16 +312,31 @@ impl FromIterator<(Variable, Term)> for Solution {
     }
 }
 
+impl FromIterator<(Variable, Arc<Term>)> for Solution {
+    fn from_iter<I: IntoIterator<Item = (Variable, Arc<Term>)>>(iter: I) -> Self {
+        let mut s = Solution::new();
+        for (var, term) in iter {
+            s.insert(var, term);
+        }
+        s
+    }
+}
+
 impl IntoIterator for Solution {
-    type Item = (Variable, Term);
-    type IntoIter = std::vec::IntoIter<(Variable, Term)>;
+    type Item = (Variable, Arc<Term>);
+    type IntoIter = std::vec::IntoIter<(Variable, Arc<Term>)>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let pairs: Vec<(Variable, Term)> = self
+        // Prefer moving the Vec out when uniquely owned; otherwise clone slots.
+        let values = match Arc::try_unwrap(self.values) {
+            Ok(v) => v,
+            Err(shared) => (*shared).clone(),
+        };
+        let pairs: Vec<(Variable, Arc<Term>)> = self
             .vars
             .iter()
             .cloned()
-            .zip(self.values)
+            .zip(values)
             .filter_map(|(v, t)| t.map(|t| (v, t)))
             .collect();
         pairs.into_iter()
@@ -423,7 +483,11 @@ mod tests {
     #[test]
     fn positional_constructor_basic_lookup() {
         let vars: Arc<[Variable]> = Arc::from(vec![var("x"), var("y"), var("z")]);
-        let values = vec![Some(iri("http://ex/A")), None, Some(lit("hello"))];
+        let values = vec![
+            Some(Arc::new(iri("http://ex/A"))),
+            None,
+            Some(Arc::new(lit("hello"))),
+        ];
         let s = Solution::positional(Arc::clone(&vars), values);
 
         assert_eq!(s.get(&var("x")), Some(&iri("http://ex/A")));
@@ -440,8 +504,8 @@ mod tests {
         // whole point of the optimization: the header is allocated once
         // per query, not once per row.
         let vars: Arc<[Variable]> = Arc::from(vec![var("x")]);
-        let s1 = Solution::positional(Arc::clone(&vars), vec![Some(iri("http://ex/A"))]);
-        let s2 = Solution::positional(Arc::clone(&vars), vec![Some(iri("http://ex/B"))]);
+        let s1 = Solution::positional(Arc::clone(&vars), vec![Some(Arc::new(iri("http://ex/A")))]);
+        let s2 = Solution::positional(Arc::clone(&vars), vec![Some(Arc::new(iri("http://ex/B")))]);
         // Access the private field via a public-API roundtrip: both solutions
         // must report the same variable position/order (proxy for shared
         // header, since we can't reach into the private `vars` field from
@@ -457,7 +521,8 @@ mod tests {
         // Inserting a variable not already in a positional solution's header
         // must copy-on-write extend it without disturbing existing bindings.
         let vars: Arc<[Variable]> = Arc::from(vec![var("x")]);
-        let mut s = Solution::positional(Arc::clone(&vars), vec![Some(iri("http://ex/A"))]);
+        let mut s =
+            Solution::positional(Arc::clone(&vars), vec![Some(Arc::new(iri("http://ex/A")))]);
         s.insert(var("y"), lit("new"));
         assert_eq!(s.get(&var("x")), Some(&iri("http://ex/A")));
         assert_eq!(s.get(&var("y")), Some(&lit("new")));
@@ -478,7 +543,13 @@ mod tests {
         a.insert(var("y"), lit("hello"));
 
         let vars: Arc<[Variable]> = Arc::from(vec![var("y"), var("x")]);
-        let b = Solution::positional(vars, vec![Some(lit("hello")), Some(iri("http://ex/A"))]);
+        let b = Solution::positional(
+            vars,
+            vec![
+                Some(Arc::new(lit("hello"))),
+                Some(Arc::new(iri("http://ex/A"))),
+            ],
+        );
 
         assert_eq!(a, b);
     }
@@ -486,13 +557,20 @@ mod tests {
     #[test]
     fn into_iter_skips_unbound_positions() {
         let vars: Arc<[Variable]> = Arc::from(vec![var("x"), var("y"), var("z")]);
-        let values = vec![Some(iri("http://ex/A")), None, Some(lit("hello"))];
+        let values = vec![
+            Some(Arc::new(iri("http://ex/A"))),
+            None,
+            Some(Arc::new(lit("hello"))),
+        ];
         let s = Solution::positional(vars, values);
-        let mut pairs: Vec<(Variable, Term)> = s.into_iter().collect();
+        let mut pairs: Vec<(Variable, Arc<Term>)> = s.into_iter().collect();
         pairs.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         assert_eq!(
             pairs,
-            vec![(var("x"), iri("http://ex/A")), (var("z"), lit("hello"))]
+            vec![
+                (var("x"), Arc::new(iri("http://ex/A"))),
+                (var("z"), Arc::new(lit("hello"))),
+            ]
         );
     }
 }

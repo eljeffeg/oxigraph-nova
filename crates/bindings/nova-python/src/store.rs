@@ -199,10 +199,11 @@ impl PyStore {
                     Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b.clone()),
                     _ => return None, // quoted-triple subjects can't round-trip through oxrdf::Quad
                 };
+                let predicate = sq.predicate_named_node()?.clone();
                 let object = sq.object.as_ref().clone();
                 Some(Ok(PyQuad::from(Quad::new(
                     subject,
-                    sq.predicate,
+                    predicate,
                     object,
                     sq.graph_name,
                 ))))

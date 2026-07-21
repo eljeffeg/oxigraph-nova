@@ -498,10 +498,13 @@ fn clear_one_graph<S: QuadStore + ?Sized>(store: &Arc<S>, g: &GraphName) -> Resu
             // via `QuadStore::remove` — skip it.
             _ => continue,
         };
+        let Some(predicate) = sq.predicate_named_node().cloned() else {
+            continue;
+        };
         let object = Arc::unwrap_or_clone(sq.object);
         ops.push(QuadOp::Remove(Quad::new(
             subject,
-            sq.predicate,
+            predicate,
             object,
             sq.graph_name,
         )));

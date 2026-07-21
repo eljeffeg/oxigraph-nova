@@ -99,8 +99,9 @@ impl JsStore {
                     // quoted-triple subjects can't round-trip through oxrdf::Quad
                     _ => return None,
                 };
+                let predicate = sq.predicate_named_node()?.clone();
                 let object = sq.object.as_ref().clone();
-                let quad = Quad::new(subject, sq.predicate, object, sq.graph_name);
+                let quad = Quad::new(subject, predicate, object, sq.graph_name);
                 Some(Ok(from_quad(&self.data_factory, &quad)))
             })
             .collect::<Result<Vec<_>, JsValue>>()?;

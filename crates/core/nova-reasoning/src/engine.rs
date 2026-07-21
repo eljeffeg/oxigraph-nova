@@ -108,6 +108,7 @@ use oxigraph_nova_core::{
 };
 use oxigraph_nova_query::{Dataset, GraphSelector, PatternTerm, QuadPattern};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Distinguishes a merely-informational [`Diagnostic`] (e.g. "skipped a
 /// malformed declaration triple") from an actual OWL 2 RL consistency
@@ -343,7 +344,9 @@ impl<'a> TermResolver<'a> {
         if let Some(t) = self.synthetic.get(&id) {
             return Some(t.clone());
         }
-        self.dataset.lftj_decode_term(id)
+        self.dataset
+            .lftj_decode_term(id)
+            .map(std::sync::Arc::unwrap_or_clone)
     }
 }
 
@@ -391,14 +394,17 @@ impl LftjFixpointEngine {
 fn build_same_as_tracker(dataset: &dyn Dataset) -> Result<SameAsTracker> {
     let pattern = QuadPattern {
         subject: PatternTerm::Variable,
-        predicate: PatternTerm::Bound(Term::NamedNode(owl_same_as())),
+        predicate: PatternTerm::bound(Term::NamedNode(owl_same_as())),
         object: PatternTerm::Variable,
         graph: GraphSelector::Union,
     };
     let mut pairs = Vec::new();
     for m in dataset.find_quads(&pattern)? {
         let m = m?;
-        pairs.push((m.subject, m.object));
+        pairs.push((
+            Arc::unwrap_or_clone(m.subject),
+            Arc::unwrap_or_clone(m.object),
+        ));
     }
     Ok(SameAsTracker::build(pairs))
 }
@@ -649,7 +655,7 @@ impl ReasoningEngine for LftjFixpointEngine {
         ] {
             let pattern = QuadPattern {
                 subject: PatternTerm::Variable,
-                predicate: PatternTerm::Bound(Term::NamedNode(pred)),
+                predicate: PatternTerm::bound(Term::NamedNode(pred)),
                 object: PatternTerm::Variable,
                 graph: graph.clone(),
             };
@@ -688,13 +694,13 @@ impl ReasoningEngine for LftjFixpointEngine {
         ] {
             let pattern = QuadPattern {
                 subject: PatternTerm::Variable,
-                predicate: PatternTerm::Bound(Term::NamedNode(rdf_type())),
-                object: PatternTerm::Bound(Term::NamedNode(decl_class.clone())),
+                predicate: PatternTerm::bound(Term::NamedNode(rdf_type())),
+                object: PatternTerm::bound(Term::NamedNode(decl_class.clone())),
                 graph: graph.clone(),
             };
             for m in dataset.find_quads(&pattern)? {
                 let m = m?;
-                let Term::NamedNode(p_node) = &m.subject else {
+                let Term::NamedNode(p_node) = m.subject.as_ref() else {
                     diagnostics.push(Diagnostic::new(
                         rule_name,
                         format!(
@@ -705,10 +711,10 @@ impl ReasoningEngine for LftjFixpointEngine {
                     ));
                     continue;
                 };
-                let p_id = resolver.resolve(&m.subject);
+                let p_id = resolver.resolve(m.subject.as_ref());
                 let edge_pattern = QuadPattern {
                     subject: PatternTerm::Variable,
-                    predicate: PatternTerm::Bound(Term::NamedNode(p_node.clone())),
+                    predicate: PatternTerm::bound(Term::NamedNode(p_node.clone())),
                     object: PatternTerm::Variable,
                     graph: graph.clone(),
                 };
@@ -737,7 +743,7 @@ impl ReasoningEngine for LftjFixpointEngine {
         if !same_as.is_empty() {
             let diff_pattern = QuadPattern {
                 subject: PatternTerm::Variable,
-                predicate: PatternTerm::Bound(Term::NamedNode(owl_different_from())),
+                predicate: PatternTerm::bound(Term::NamedNode(owl_different_from())),
                 object: PatternTerm::Variable,
                 graph: GraphSelector::Union,
             };
@@ -783,9 +789,9 @@ impl ReasoningEngine for LftjFixpointEngine {
             // `ReasoningDataset`'s documented "each quad appears exactly
             // once" contract.
             let pattern = QuadPattern {
-                subject: PatternTerm::Bound(Term::from(quad.subject.clone())),
-                predicate: PatternTerm::Bound(Term::NamedNode(quad.predicate.clone())),
-                object: PatternTerm::Bound(quad.object.clone()),
+                subject: PatternTerm::bound(Term::from(quad.subject.clone())),
+                predicate: PatternTerm::bound(Term::NamedNode(quad.predicate.clone())), /* oxrdf::Quad */
+                object: PatternTerm::bound(quad.object.clone()),
                 graph: GraphSelector::Union,
             };
             if dataset.find_quads(&pattern)?.next().is_some() {

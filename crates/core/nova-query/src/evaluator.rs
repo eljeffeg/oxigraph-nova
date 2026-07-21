@@ -782,13 +782,13 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                     let mut ok = true;
 
                     if ok {
-                        ok = bind_var(&mut sol, &s_var, &q.subject);
+                        ok = bind_var_arc(&mut sol, &s_var, &q.subject);
                     }
                     if ok {
-                        ok = bind_var(&mut sol, &p_var, &q.predicate);
+                        ok = bind_var_arc(&mut sol, &p_var, &q.predicate);
                     }
                     if ok {
-                        ok = bind_var(&mut sol, &o_var, &q.object);
+                        ok = bind_var_arc(&mut sol, &o_var, &q.object);
                     }
 
                     // ── RDF-star: structural match for quoted-triple patterns ──
@@ -796,10 +796,10 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                     // TermPattern::Triple, so the storage scan is unconstrained.
                     // We post-filter and bind inner variables here.
                     if ok && let TermPattern::Triple(inner_tp) = &tp.subject {
-                        ok = bind_triple_pattern(&mut sol, inner_tp, &q.subject);
+                        ok = bind_triple_pattern(&mut sol, inner_tp, q.subject.as_ref());
                     }
                     if ok && let TermPattern::Triple(inner_tp) = &tp.object {
-                        ok = bind_triple_pattern(&mut sol, inner_tp, &q.object);
+                        ok = bind_triple_pattern(&mut sol, inner_tp, q.object.as_ref());
                     }
 
                     if ok {
@@ -1941,7 +1941,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             let Some(term) = self.dataset.lftj_decode_term(hit.object_id) else {
                 continue;
             };
-            match self.eval_bgp_with_bound_var(patterns, &var, &term, active_graph) {
+            match self.eval_bgp_with_bound_var(patterns, &var, term.as_ref(), active_graph) {
                 Ok(sols) => result.extend(sols),
                 Err(e) => return Some(Err(e)),
             }
@@ -1989,7 +1989,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         let mut sols = self.eval_bgp(&substituted, active_graph)?;
         sols.retain_mut(|sol| match sol.get(var) {
             None => {
-                sol.insert(var.clone(), term.clone());
+                sol.insert(var.clone(), term.clone()); // Term -> Arc via Into
                 true
             }
             Some(bound) => bound == term,
@@ -2031,7 +2031,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         // Product-automaton fast path for composed RPQs (sequence/alternative/
         // negated-property-set/nested Kleene stars) — evaluates the whole
         // expression in a single (node, state) BFS instead of materializing a
-        // full Vec<(Term, Term)> per operator via `path_pairs`.
+        // full Vec<(Arc<Term>, Arc<Term>)> per operator via `path_pairs`.
         if let Some(result) = self.try_rpq_product_automaton(subject, path, object, active_graph) {
             let pairs = result?;
             let mut sols = Vec::new();
@@ -2073,7 +2073,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             for node in extra_nodes {
                 let k = format!("{node}\x00{node}");
                 if !existing.contains(&k) {
-                    pairs.push((node.clone(), node));
+                    pairs.push((Arc::new(node.clone()), Arc::new(node)));
                 }
             }
         }
@@ -2081,8 +2081,8 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         let mut result = Vec::new();
         for (s_term, o_term) in pairs {
             let mut sol = Solution::new();
-            let ok_s = match_term_pattern(subject, &s_term, &mut sol);
-            let ok_o = match_term_pattern(object, &o_term, &mut sol);
+            let ok_s = match_term_pattern(subject, s_term.as_ref(), &mut sol);
+            let ok_o = match_term_pattern(object, o_term.as_ref(), &mut sol);
             if ok_s && ok_o {
                 result.push(sol);
             }
@@ -2102,7 +2102,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         path: &PPE,
         object: &TermPattern,
         ag: &GraphSelector,
-    ) -> Option<Result<Vec<(Term, Term)>>> {
+    ) -> Option<Result<Vec<(Arc<Term>, Arc<Term>)>>> {
         let (pred, include_identity) = match path {
             PPE::OneOrMore(inner) => match inner.as_ref() {
                 PPE::NamedNode(p) => (p, false),
@@ -2172,7 +2172,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         path: &PPE,
         object: &TermPattern,
         ag: &GraphSelector,
-    ) -> Option<Result<Vec<(Term, Term)>>> {
+    ) -> Option<Result<Vec<(Arc<Term>, Arc<Term>)>>> {
         if !self.dataset.supports_lftj() || self.dataset.lftj_has_delta() {
             return None;
         }
@@ -2212,7 +2212,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
     }
 
     /// Enumerate all (subject, object) pairs reachable via `path` in `ag`.
-    fn path_pairs(&self, path: &PPE, ag: &GraphSelector) -> Result<Vec<(Term, Term)>> {
+    fn path_pairs(&self, path: &PPE, ag: &GraphSelector) -> Result<Vec<(Arc<Term>, Arc<Term>)>> {
         match path {
             PPE::NamedNode(p) => {
                 // Ring fast path: O(edges_for_p) via lftj_join_scan vs O(total_triples)
@@ -2227,7 +2227,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 // Fallback: generic find_quads scan.
                 let qp = QuadPattern {
                     subject: PatternTerm::Variable,
-                    predicate: PatternTerm::Bound(Term::NamedNode(p.clone())),
+                    predicate: PatternTerm::bound(Term::NamedNode(p.clone())),
                     object: PatternTerm::Variable,
                     graph: ag.clone(),
                 };
@@ -2245,18 +2245,27 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             PPE::Sequence(left, right) => {
                 let lp = self.path_pairs(left, ag)?;
                 let rp = self.path_pairs(right, ag)?;
-                // Index right by subject (= intermediate node)
-                let mut right_idx: HashMap<String, Vec<Term>> = HashMap::new();
+                // Index right by intermediate-node term content (no Display).
+                let mut right_idx: HashMap<Term, Vec<Arc<Term>>> = HashMap::new();
                 for (m, o) in rp {
-                    right_idx.entry(m.to_string()).or_default().push(o);
+                    right_idx.entry(m.as_ref().clone()).or_default().push(o);
                 }
                 let mut result = Vec::new();
-                let mut seen = std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<(u64, u64)> =
+                    std::collections::HashSet::new();
+                fn fp(t: &Term) -> u64 {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    t.hash(&mut h);
+                    h.finish()
+                }
                 for (s, m) in lp {
-                    if let Some(os) = right_idx.get(&m.to_string()) {
+                    if let Some(os) = right_idx.get(m.as_ref()) {
+                        let sh = fp(&s);
                         for o in os {
-                            if seen.insert(format!("{s}\x00{o}")) {
-                                result.push((s.clone(), o.clone()));
+                            if seen.insert((sh, fp(o))) {
+                                result.push((Arc::clone(&s), Arc::clone(o)));
                             }
                         }
                     }
@@ -2266,19 +2275,38 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             PPE::Alternative(left, right) => {
                 let mut pairs = self.path_pairs(left, ag)?;
                 pairs.extend(self.path_pairs(right, ag)?);
-                let mut seen = std::collections::HashSet::new();
-                pairs.retain(|(s, o)| seen.insert(format!("{s}\x00{o}")));
+                let mut seen: std::collections::HashSet<(u64, u64)> =
+                    std::collections::HashSet::new();
+                fn fp(t: &Term) -> u64 {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    t.hash(&mut h);
+                    h.finish()
+                }
+                pairs.retain(|(s, o)| seen.insert((fp(s), fp(o))));
                 Ok(pairs)
             }
             PPE::ZeroOrOne(inner) => {
                 let mut pairs = self.path_pairs(inner, ag)?;
-                let mut seen: std::collections::HashSet<String> =
-                    pairs.iter().map(|(s, o)| format!("{s}\x00{o}")).collect();
+                let mut seen: std::collections::HashSet<(u64, u64)> =
+                    std::collections::HashSet::new();
+                fn fp(t: &Term) -> u64 {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    t.hash(&mut h);
+                    h.finish()
+                }
+                for (s, o) in &pairs {
+                    seen.insert((fp(s), fp(o)));
+                }
                 // Add (x, x) identity for all graph nodes
                 for node in self.all_terms(ag)? {
-                    let k = format!("{node}\x00{node}");
-                    if seen.insert(k) {
-                        pairs.push((node.clone(), node));
+                    let arc = Arc::new(node);
+                    let h = fp(&arc);
+                    if seen.insert((h, h)) {
+                        pairs.push((Arc::clone(&arc), arc));
                     }
                 }
                 Ok(pairs)
@@ -2295,12 +2323,20 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 let pred_set: std::collections::HashSet<String> =
                     preds.iter().map(|n| n.as_str().to_string()).collect();
                 let mut pairs = Vec::new();
-                let mut seen = std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<(u64, u64)> =
+                    std::collections::HashSet::new();
+                fn fp(t: &Term) -> u64 {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    t.hash(&mut h);
+                    h.finish()
+                }
                 for qr in self.dataset.find_quads(&qp)? {
                     let q = qr?;
-                    let skip = matches!(&q.predicate,
+                    let skip = matches!(q.predicate.as_ref(),
                         Term::NamedNode(p) if pred_set.contains(p.as_str()));
-                    if !skip && seen.insert(format!("{}\x00{}", q.subject, q.object)) {
+                    if !skip && seen.insert((fp(&q.subject), fp(&q.object))) {
                         pairs.push((q.subject, q.object));
                     }
                 }
@@ -2320,7 +2356,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         path: &PPE,
         ag: &GraphSelector,
         include_identity: bool,
-    ) -> Result<Vec<(Term, Term)>> {
+    ) -> Result<Vec<(Arc<Term>, Arc<Term>)>> {
         // Ring-accelerated BFS for simple predicate paths.
         // Reference: "BWT Indexes for Optimal Joins" (OASIcs, Arroyuelo/Navarro et al.)
         if let PPE::NamedNode(pred) = path
@@ -2330,55 +2366,72 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         }
         let direct = self.path_pairs(path, ag)?;
 
-        // Forward adjacency: node_str → Vec<neighbour Term>
-        let mut adj: HashMap<String, Vec<Term>> = HashMap::new();
-        let mut term_map: HashMap<String, Term> = HashMap::new();
+        // Forward adjacency keyed by Term content (Hash+Eq) — no Display
+        // formatting / String allocations on the BFS hot path.
+        let mut adj: HashMap<Term, Vec<Arc<Term>>> = HashMap::new();
+        let mut term_map: HashMap<Term, Arc<Term>> = HashMap::new();
 
         for (s, o) in &direct {
-            adj.entry(s.to_string()).or_default().push(o.clone());
-            term_map.insert(s.to_string(), s.clone());
-            term_map.insert(o.to_string(), o.clone());
+            adj.entry(s.as_ref().clone())
+                .or_default()
+                .push(Arc::clone(o));
+            term_map
+                .entry(s.as_ref().clone())
+                .or_insert_with(|| Arc::clone(s));
+            term_map
+                .entry(o.as_ref().clone())
+                .or_insert_with(|| Arc::clone(o));
         }
 
         // For ZeroOrMore we start from ALL nodes; for OneOrMore just path endpoints.
-        let start_nodes: Vec<Term> = if include_identity {
-            self.all_terms(ag)?
+        let start_nodes: Vec<Arc<Term>> = if include_identity {
+            self.all_terms(ag)?.into_iter().map(Arc::new).collect()
         } else {
             term_map.values().cloned().collect()
         };
 
-        let mut result: Vec<(Term, Term)> = Vec::new();
-        let mut global_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut result: Vec<(Arc<Term>, Arc<Term>)> = Vec::new();
+        // Pair dedup by content hash of (start, nbr) — avoids format! strings.
+        let mut global_seen: std::collections::HashSet<(u64, u64)> =
+            std::collections::HashSet::new();
+
+        fn term_fp(t: &Term) -> u64 {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            t.hash(&mut h);
+            h.finish()
+        }
 
         for start in &start_nodes {
-            let sk = start.to_string();
+            let start_h = term_fp(start);
 
             // Identity pair
-            if include_identity && global_seen.insert(format!("{sk}\x00{sk}")) {
-                result.push((start.clone(), start.clone()));
+            if include_identity && global_seen.insert((start_h, start_h)) {
+                result.push((Arc::clone(start), Arc::clone(start)));
             }
 
-            // BFS
-            let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-            visited.insert(sk.clone());
-            let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-            queue.push_back(sk.clone());
+            // BFS over Arc terms, tracking visited by content fingerprint.
+            let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            visited.insert(start_h);
+            let mut queue: std::collections::VecDeque<Arc<Term>> =
+                std::collections::VecDeque::new();
+            queue.push_back(Arc::clone(start));
 
             while let Some(curr) = queue.pop_front() {
-                if let Some(neighbors) = adj.get(&curr) {
+                if let Some(neighbors) = adj.get(curr.as_ref()) {
                     for nbr in neighbors {
-                        let nk = nbr.to_string();
-                        if visited.insert(nk.clone()) {
-                            queue.push_back(nk.clone());
-                            if global_seen.insert(format!("{sk}\x00{nk}")) {
-                                result.push((start.clone(), nbr.clone()));
+                        let nh = term_fp(nbr);
+                        if visited.insert(nh) {
+                            queue.push_back(Arc::clone(nbr));
+                            if global_seen.insert((start_h, nh)) {
+                                result.push((Arc::clone(start), Arc::clone(nbr)));
                             }
                         }
                     }
                 }
             }
         }
-
         Ok(result)
     }
 
@@ -2393,7 +2446,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         pred: &NamedNode,
         ag: &GraphSelector,
         include_identity: bool,
-    ) -> Option<Result<Vec<(Term, Term)>>> {
+    ) -> Option<Result<Vec<(Arc<Term>, Arc<Term>)>>> {
         if !self.dataset.supports_lftj() || self.dataset.lftj_has_delta() {
             return None;
         }
@@ -2439,7 +2492,7 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             let q = qr?;
             for t in [q.subject, q.object] {
                 if seen.insert(t.to_string()) {
-                    result.push(t);
+                    result.push(Arc::unwrap_or_clone(t));
                 }
             }
         }
@@ -2480,32 +2533,43 @@ fn minus_compatible(ls: &Solution, rs: &Solution) -> bool {
 
 // ── Deduplication key ─────────────────────────────────────────────────────────
 
-fn solution_key(sol: &Solution) -> Vec<(String, String)> {
-    let mut pairs: Vec<_> = sol
-        .iter()
-        .map(|(v, t)| (v.as_str().to_string(), t.to_string()))
-        .collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    pairs
+/// Dedup key for DISTINCT / path pair sets: variable name + term content.
+///
+/// Avoids the previous `t.to_string()` path (which allocated a Display form
+/// per binding per row). `Term` implements `Hash + Eq`, so we hash the
+/// structured term directly. Variable names are interned as owned `String`
+/// once per distinct variable occurrence in the key (typically few vars).
+fn solution_key(sol: &Solution) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut pairs: Vec<(&str, &Term)> = sol.iter().map(|(v, t)| (v.as_str(), t)).collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut h = DefaultHasher::new();
+    pairs.len().hash(&mut h);
+    for (v, t) in pairs {
+        v.hash(&mut h);
+        t.hash(&mut h);
+    }
+    h.finish()
 }
 
 // ── BGP term helpers ──────────────────────────────────────────────────────────
 
 fn term_pattern_with_sol(tp: &TermPattern, sol: &Solution) -> (PatternTerm, Option<Variable>) {
     match tp {
-        TermPattern::NamedNode(n) => (PatternTerm::Bound(Term::NamedNode(n.clone())), None),
-        TermPattern::Literal(l) => (PatternTerm::Bound(Term::Literal(l.clone())), None),
+        TermPattern::NamedNode(n) => (PatternTerm::bound(Term::NamedNode(n.clone())), None),
+        TermPattern::Literal(l) => (PatternTerm::bound(Term::Literal(l.clone())), None),
         TermPattern::BlankNode(b) => {
             let var = Variable::new_unchecked(format!("__bn_{}", b.as_str()));
-            if let Some(t) = sol.get(&var) {
-                (PatternTerm::Bound(t.clone()), None)
+            if let Some(t) = sol.get_arc(&var) {
+                (PatternTerm::Bound(t), None)
             } else {
                 (PatternTerm::Variable, Some(var))
             }
         }
         TermPattern::Variable(v) => {
-            if let Some(t) = sol.get(v) {
-                (PatternTerm::Bound(t.clone()), None)
+            if let Some(t) = sol.get_arc(v) {
+                (PatternTerm::Bound(t), None)
             } else {
                 (PatternTerm::Variable, Some(v.clone()))
             }
@@ -2521,10 +2585,10 @@ fn term_pattern_with_sol(tp: &TermPattern, sol: &Solution) -> (PatternTerm, Opti
 
 fn nn_pattern_with_sol(nnp: &NamedNodePattern, sol: &Solution) -> (PatternTerm, Option<Variable>) {
     match nnp {
-        NamedNodePattern::NamedNode(n) => (PatternTerm::Bound(Term::NamedNode(n.clone())), None),
+        NamedNodePattern::NamedNode(n) => (PatternTerm::bound(Term::NamedNode(n.clone())), None),
         NamedNodePattern::Variable(v) => {
-            if let Some(t) = sol.get(v) {
-                (PatternTerm::Bound(t.clone()), None)
+            if let Some(t) = sol.get_arc(v) {
+                (PatternTerm::Bound(t), None)
             } else {
                 (PatternTerm::Variable, Some(v.clone()))
             }
@@ -2564,14 +2628,14 @@ fn substitute_var_in_term_pattern(tp: &TermPattern, var: &Variable, term: &Term)
     }
 }
 
-fn bind_var(sol: &mut Solution, var: &Option<Variable>, value: &Term) -> bool {
+fn bind_var_arc(sol: &mut Solution, var: &Option<Variable>, value: &Arc<Term>) -> bool {
     match var {
         None => true,
         Some(v) => {
             if let Some(existing) = sol.get(v) {
-                existing == value
+                existing == value.as_ref()
             } else {
-                sol.insert(v.clone(), value.clone());
+                sol.insert(v.clone(), Arc::clone(value));
                 true
             }
         }

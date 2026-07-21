@@ -54,13 +54,13 @@ pub fn ring_pairs_for_pred<D: Dataset>(
     dataset: &D,
     pred: &NamedNode,
     ag: &GraphSelector,
-) -> Option<Result<Vec<(Term, Term)>>> {
+) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
     let p_id = dataset.lftj_intern_term(&Term::NamedNode(pred.clone()), ag)?;
 
     // Subjects with predicate p — PSO depth-1 iterator within P=p_id.
     let mut s_iter = dataset.lftj_join_scan(None, Some(p_id), None, 0, ag)?;
 
-    let mut pairs: Vec<(Term, Term)> = Vec::new();
+    let mut pairs: Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)> = Vec::new();
 
     while !s_iter.at_end() {
         let s_id = s_iter.key();
@@ -160,7 +160,7 @@ pub fn ring_bfs_transitive<D: Dataset>(
     start_ids: &[u64],
     include_identity: bool,
     ag: &GraphSelector,
-) -> Option<Result<Vec<(Term, Term)>>> {
+) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
     ring_bfs_transitive_cancellable(dataset, pred_id, start_ids, include_identity, ag, None)
 }
 
@@ -175,8 +175,8 @@ pub fn ring_bfs_transitive_cancellable<D: Dataset>(
     include_identity: bool,
     ag: &GraphSelector,
     cancellation: Option<&CancellationToken>,
-) -> Option<Result<Vec<(Term, Term)>>> {
-    let mut result: Vec<(Term, Term)> = Vec::new();
+) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
+    let mut result: Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)> = Vec::new();
     // (start_id, reachable_id) deduplication across all BFS roots.
     let mut global_seen: HashSet<(u64, u64)> = HashSet::new();
 
@@ -278,7 +278,7 @@ pub fn ring_bfs_transitive_bound<D: Dataset>(
     target_id: Option<u64>,
     include_identity: bool,
     ag: &GraphSelector,
-) -> Option<Result<Vec<(Term, Term)>>> {
+) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
     ring_bfs_transitive_bound_cancellable(
         dataset,
         pred_id,
@@ -302,7 +302,7 @@ pub fn ring_bfs_transitive_bound_cancellable<D: Dataset>(
     include_identity: bool,
     ag: &GraphSelector,
     cancellation: Option<&CancellationToken>,
-) -> Option<Result<Vec<(Term, Term)>>> {
+) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
     match (source_id, target_id) {
         (Some(s), Some(t)) => {
             match bidirectional_reachable(dataset, pred_id, s, t, ag, cancellation)? {
@@ -350,9 +350,9 @@ fn ring_bfs_transitive_backward<D: Dataset>(
     include_identity: bool,
     ag: &GraphSelector,
     cancellation: Option<&CancellationToken>,
-) -> Option<Result<Vec<(Term, Term)>>> {
+) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
     let target_term = dataset.lftj_decode_term(target_id)?;
-    let mut result: Vec<(Term, Term)> = Vec::new();
+    let mut result: Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
     seen.insert(target_id);
 
@@ -486,7 +486,7 @@ fn bidirectional_reachable<D: Dataset>(
 // using `lftj_join_scan` neighbor lookup at each step. This evaluates the
 // entire RPQ in one traversal with no intermediate pair-set materialization —
 // the only memory cost is the visited `(node, state)` set. (A recursive
-// `path_pairs` approach that materializes `Vec<(Term, Term)>` per operator
+// `path_pairs` approach that materializes `Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>` per operator
 // would pay O(closure) memory at every level of the expression tree.)
 
 /// One transition edge in the compiled path-expression NFA.
@@ -846,7 +846,7 @@ fn product_bfs<D: Dataset>(
 ///   expression forward from a bound `o` yields exactly the set of `s` with
 ///   `(s, o) ∈ L(path)`.
 /// - **Neither bound**: enumerates all graph nodes as BFS roots. This still
-///   avoids the per-operator `Vec<(Term, Term)>` materialization that
+///   avoids the per-operator `Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>` materialization that
 ///   `path_pairs` performs for composed expressions, even though total work
 ///   remains O(nodes × closure) in the worst case.
 ///
@@ -858,7 +858,7 @@ pub fn ring_eval_rpq<D: Dataset>(
     source_id: Option<u64>,
     target_id: Option<u64>,
     ag: &GraphSelector,
-) -> Option<Result<Vec<(Term, Term)>>> {
+) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
     ring_eval_rpq_cancellable(dataset, path, source_id, target_id, ag, None)
 }
 
@@ -874,7 +874,7 @@ pub fn ring_eval_rpq_cancellable<D: Dataset>(
     target_id: Option<u64>,
     ag: &GraphSelector,
     cancellation: Option<&CancellationToken>,
-) -> Option<Result<Vec<(Term, Term)>>> {
+) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
     if is_simple_predicate_path(path) {
         return None;
     }
@@ -1043,11 +1043,10 @@ mod tests {
             }
         }
 
-        fn lftj_decode_term(&self, id: u64) -> Option<Term> {
-            self.dict
-                .iter()
-                .find(|(_, v)| *v == id)
-                .map(|(k, _)| Term::NamedNode(NamedNode::new_unchecked(k.clone())))
+        fn lftj_decode_term(&self, id: u64) -> Option<std::sync::Arc<Term>> {
+            self.dict.iter().find(|(_, v)| *v == id).map(|(k, _)| {
+                std::sync::Arc::new(Term::NamedNode(NamedNode::new_unchecked(k.clone())))
+            })
         }
 
         fn lftj_join_scan(
@@ -1089,8 +1088,8 @@ mod tests {
         NamedNode::new_unchecked(s)
     }
 
-    fn t(s: &str) -> Term {
-        Term::NamedNode(NamedNode::new_unchecked(s))
+    fn t(s: &str) -> std::sync::Arc<Term> {
+        std::sync::Arc::new(Term::NamedNode(NamedNode::new_unchecked(s)))
     }
 
     /// Graph: a→b→c→d (chain) with shortcut a→c, all via predicate p (id=20).

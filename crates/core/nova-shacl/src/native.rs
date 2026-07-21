@@ -116,17 +116,17 @@ fn subclass_closure(data: &dyn Dataset, class: &NamedNode) -> Result<Vec<NamedNo
         // Find every ?sub such that ?sub rdfs:subClassOf current.
         let pattern = QuadPattern {
             subject: PatternTerm::Variable,
-            predicate: PatternTerm::Bound(Term::NamedNode(rdfs_sub_class_of())),
-            object: PatternTerm::Bound(Term::NamedNode(current.clone())),
+            predicate: PatternTerm::bound(Term::NamedNode(rdfs_sub_class_of())),
+            object: PatternTerm::bound(Term::NamedNode(current.clone())),
             graph: GraphSelector::Union,
         };
         for m in data.find_quads(&pattern)? {
             let m = m?;
-            if let Term::NamedNode(sub) = m.subject
+            if let Term::NamedNode(sub) = m.subject.as_ref()
                 && visited.insert(sub.clone())
             {
                 result.push(sub.clone());
-                queue.push_back(sub);
+                queue.push_back(sub.clone());
             }
         }
     }
@@ -139,13 +139,13 @@ fn subclass_closure(data: &dyn Dataset, class: &NamedNode) -> Result<Vec<NamedNo
 fn instances_of(data: &dyn Dataset, class: &NamedNode) -> Result<Vec<Term>> {
     let pattern = QuadPattern {
         subject: PatternTerm::Variable,
-        predicate: PatternTerm::Bound(Term::NamedNode(rdf_type())),
-        object: PatternTerm::Bound(Term::NamedNode(class.clone())),
+        predicate: PatternTerm::bound(Term::NamedNode(rdf_type())),
+        object: PatternTerm::bound(Term::NamedNode(class.clone())),
         graph: GraphSelector::Union,
     };
     let mut out = Vec::new();
     for m in data.find_quads(&pattern)? {
-        out.push(m?.subject);
+        out.push(std::sync::Arc::unwrap_or_clone(m?.subject));
     }
     Ok(out)
 }
@@ -154,14 +154,14 @@ fn instances_of(data: &dyn Dataset, class: &NamedNode) -> Result<Vec<Term>> {
 /// `shape.rs`'s module doc comment).
 fn property_values(data: &dyn Dataset, focus: &Term, path: &NamedNode) -> Result<Vec<Term>> {
     let pattern = QuadPattern {
-        subject: PatternTerm::Bound(focus.clone()),
-        predicate: PatternTerm::Bound(Term::NamedNode(path.clone())),
+        subject: PatternTerm::bound(focus.clone()),
+        predicate: PatternTerm::bound(Term::NamedNode(path.clone())),
         object: PatternTerm::Variable,
         graph: GraphSelector::Union,
     };
     let mut out = Vec::new();
     for m in data.find_quads(&pattern)? {
-        out.push(m?.object);
+        out.push(std::sync::Arc::unwrap_or_clone(m?.object));
     }
     Ok(out)
 }
@@ -172,16 +172,16 @@ fn property_values(data: &dyn Dataset, focus: &Term, path: &NamedNode) -> Result
 /// `shape.rs`'s module doc comment).
 fn satisfies_class(data: &dyn Dataset, value: &Term, class: &NamedNode) -> Result<bool> {
     let pattern = QuadPattern {
-        subject: PatternTerm::Bound(value.clone()),
-        predicate: PatternTerm::Bound(Term::NamedNode(rdf_type())),
+        subject: PatternTerm::bound(value.clone()),
+        predicate: PatternTerm::bound(Term::NamedNode(rdf_type())),
         object: PatternTerm::Variable,
         graph: GraphSelector::Union,
     };
     let descendants: HashSet<NamedNode> = subclass_closure(data, class)?.into_iter().collect();
     for m in data.find_quads(&pattern)? {
         let m = m?;
-        if let Term::NamedNode(asserted) = m.object
-            && descendants.contains(&asserted)
+        if let Term::NamedNode(asserted) = m.object.as_ref()
+            && descendants.contains(asserted)
         {
             return Ok(true);
         }

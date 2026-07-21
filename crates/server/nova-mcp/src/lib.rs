@@ -201,8 +201,8 @@ fn build_data_model_summary(store: &Arc<dyn StorageEngine>) -> AnyResult<String>
         .map_err(|e| anyhow::anyhow!("{e}"))?
     {
         let sq = sq.map_err(|e| anyhow::anyhow!("{e}"))?;
-        predicates.insert(sq.predicate.as_str().to_string());
-        if sq.predicate.as_str() == RDF_TYPE
+        predicates.insert(sq.predicate.to_string());
+        if matches!(sq.predicate.as_ref(), oxigraph_nova_core::Term::NamedNode(n) if n.as_str() == RDF_TYPE)
             && let Term::NamedNode(c) = sq.object.as_ref()
         {
             classes.insert(c.as_str().to_string());

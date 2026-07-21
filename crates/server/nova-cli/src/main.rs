@@ -680,7 +680,11 @@ fn dump_store(
                     _ => continue,
                 };
                 let object = sq.object.as_ref().clone();
-                writer.serialize_triple(oxrdf::TripleRef::new(&subject, &sq.predicate, &object))?;
+                writer.serialize_triple(oxrdf::TripleRef::new(
+                    &subject,
+                    sq.predicate_named_node().unwrap(),
+                    &object,
+                ))?;
             }
         }
         None => {
@@ -699,7 +703,7 @@ fn dump_store(
                     let object = sq.object.as_ref().clone();
                     writer.serialize_quad(oxrdf::QuadRef::new(
                         &subject,
-                        &sq.predicate,
+                        sq.predicate_named_node().unwrap(),
                         &object,
                         g,
                     ))?;

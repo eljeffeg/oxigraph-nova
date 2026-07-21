@@ -743,7 +743,7 @@ fn lftj_step<D: Dataset>(
     // --count-allocs`).
     if unbound.is_empty() {
         LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
-        let values: Vec<Option<oxigraph_nova_core::Term>> = bindings
+        let values: Vec<Option<std::sync::Arc<oxigraph_nova_core::Term>>> = bindings
             .iter()
             .map(|binding| {
                 binding
@@ -902,10 +902,10 @@ fn emit_sp_expansion_solution<D: Dataset>(
     s: u64,
     o: u64,
     // Optional pre-decoded subject term (avoids re-decode per object row).
-    s_term: &Option<Term>,
+    s_term: &Option<std::sync::Arc<Term>>,
     results: &mut Solutions,
 ) {
-    let mut values: Vec<Option<Term>> = vec![None; join_vars.len()];
+    let mut values: Vec<Option<std::sync::Arc<Term>>> = vec![None; join_vars.len()];
     values[s_idx] = s_term.clone().or_else(|| dataset.lftj_decode_term(s));
     values[o_idx] = dataset.lftj_decode_term(o);
     results.push(Solution::positional(Arc::clone(join_vars), values));
@@ -941,7 +941,7 @@ fn eval_sp_expansion_walk<D: Dataset>(
             }
             step += 1;
             LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
-            let s_term = dataset.lftj_decode_term(s);
+            let s_term = dataset.lftj_decode_term(s); // Option<Arc<Term>>
             emit_sp_expansion_solution(
                 dataset,
                 join_vars,
@@ -990,7 +990,7 @@ fn eval_sp_expansion_walk<D: Dataset>(
         step += 1;
         let s = s_scan.key();
         // Decode subject once per s (shared across all objects of this s).
-        let s_term = dataset.lftj_decode_term(s);
+        let s_term = dataset.lftj_decode_term(s); // Option<Arc<Term>>
 
         if let Some(ref mut hop) = prepared {
             if hop.reset_to_subject(s) {
@@ -1055,7 +1055,8 @@ fn emit_two_hop_solution<D: Dataset>(
     results: &mut Solutions,
 ) -> u64 {
     let t_dec = std::time::Instant::now();
-    let mut values: Vec<Option<oxigraph_nova_core::Term>> = vec![None; join_vars.len()];
+    let mut values: Vec<Option<std::sync::Arc<oxigraph_nova_core::Term>>> =
+        vec![None; join_vars.len()];
     values[a_idx] = dataset.lftj_decode_term(a);
     values[b_idx] = dataset.lftj_decode_term(b);
     values[c_idx] = dataset.lftj_decode_term(c);
@@ -1085,7 +1086,7 @@ fn eval_two_hop_walk<D: Dataset>(
 ) -> anyhow::Result<Solutions> {
     TWO_HOP_SHAPE_SEEN.fetch_add(1, Ordering::Relaxed);
 
-    let empty_vals: Vec<Option<Term>> = vec![None; join_vars.len()];
+    let empty_vals: Vec<Option<std::sync::Arc<Term>>> = vec![None; join_vars.len()];
     let mut results: Solutions = Vec::new();
     let mut step: u64 = 0;
     let mut decode_ns: u64 = 0;
@@ -1391,7 +1392,8 @@ fn emit_k_chain_solution<D: Dataset>(
     d: u64,
     results: &mut Solutions,
 ) {
-    let mut values: Vec<Option<oxigraph_nova_core::Term>> = vec![None; join_vars.len()];
+    let mut values: Vec<Option<std::sync::Arc<oxigraph_nova_core::Term>>> =
+        vec![None; join_vars.len()];
     values[a_idx] = dataset.lftj_decode_term(a);
     values[b_idx] = dataset.lftj_decode_term(b);
     values[c_idx] = dataset.lftj_decode_term(c);
@@ -1553,7 +1555,8 @@ fn emit_star_solution<D: Dataset>(
     o3: u64,
     results: &mut Solutions,
 ) {
-    let mut values: Vec<Option<oxigraph_nova_core::Term>> = vec![None; join_vars.len()];
+    let mut values: Vec<Option<std::sync::Arc<oxigraph_nova_core::Term>>> =
+        vec![None; join_vars.len()];
     values[s_idx] = dataset.lftj_decode_term(s);
     values[o1_idx] = dataset.lftj_decode_term(o1);
     values[o2_idx] = dataset.lftj_decode_term(o2);
@@ -1968,9 +1971,11 @@ mod tests {
             }
         }
 
-        fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+        fn lftj_decode_term(&self, id: u64) -> Option<std::sync::Arc<Term>> {
             self.dict.iter().find(|(_, v)| *v == id).map(|(k, _)| {
-                Term::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(k.clone()))
+                std::sync::Arc::new(Term::NamedNode(
+                    oxigraph_nova_core::NamedNode::new_unchecked(k.clone()),
+                ))
             })
         }
 
@@ -2126,7 +2131,7 @@ mod tests {
             fn lftj_intern_term(&self, _: &Term, _: &GraphSelector) -> Option<u64> {
                 None
             }
-            fn lftj_decode_term(&self, _: u64) -> Option<Term> {
+            fn lftj_decode_term(&self, _: u64) -> Option<std::sync::Arc<Term>> {
                 None
             }
             fn lftj_real_count(
@@ -2222,7 +2227,7 @@ mod tests {
                     None
                 }
             }
-            fn lftj_decode_term(&self, _id: u64) -> Option<Term> {
+            fn lftj_decode_term(&self, _id: u64) -> Option<std::sync::Arc<Term>> {
                 None
             }
         }
@@ -2344,9 +2349,11 @@ mod tests {
                 None
             }
         }
-        fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+        fn lftj_decode_term(&self, id: u64) -> Option<std::sync::Arc<Term>> {
             self.dict.iter().find(|(_, v)| *v == id).map(|(k, _)| {
-                Term::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(k.clone()))
+                std::sync::Arc::new(Term::NamedNode(
+                    oxigraph_nova_core::NamedNode::new_unchecked(k.clone()),
+                ))
             })
         }
         fn lftj_join_scan(
@@ -2552,7 +2559,7 @@ mod tests {
             fn lftj_intern_term(&self, term: &Term, g: &GraphSelector) -> Option<u64> {
                 self.inner.lftj_intern_term(term, g)
             }
-            fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+            fn lftj_decode_term(&self, id: u64) -> Option<std::sync::Arc<Term>> {
                 self.inner.lftj_decode_term(id)
             }
             fn lftj_join_scan(
@@ -2678,9 +2685,11 @@ mod tests {
                 None
             }
         }
-        fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+        fn lftj_decode_term(&self, id: u64) -> Option<std::sync::Arc<Term>> {
             self.dict.iter().find(|(_, v)| *v == id).map(|(k, _)| {
-                Term::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(k.clone()))
+                std::sync::Arc::new(Term::NamedNode(
+                    oxigraph_nova_core::NamedNode::new_unchecked(k.clone()),
+                ))
             })
         }
         fn lftj_join_scan(
@@ -2816,7 +2825,7 @@ mod tests {
             fn lftj_intern_term(&self, term: &Term, g: &GraphSelector) -> Option<u64> {
                 self.inner.lftj_intern_term(term, g)
             }
-            fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+            fn lftj_decode_term(&self, id: u64) -> Option<std::sync::Arc<Term>> {
                 self.inner.lftj_decode_term(id)
             }
             fn lftj_join_scan(

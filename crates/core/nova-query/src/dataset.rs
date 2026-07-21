@@ -35,12 +35,24 @@ use std::sync::Arc;
 
 /// A single position in a triple/quad pattern: either a concrete RDF term or
 /// an unbound variable slot (wildcard for lookup purposes).
+///
+/// Bound terms are held as [`Arc<Term>`] so nested-loop BGP evaluation can
+/// re-bind already-decoded solution values without deep-cloning their
+/// string content on every partial-solution × triple-pattern step.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PatternTerm {
-    /// A concrete, bound RDF term.
-    Bound(Term),
+    /// A concrete, bound RDF term (shared).
+    Bound(Arc<Term>),
     /// An unbound variable — matches any term at this position.
     Variable,
+}
+
+impl PatternTerm {
+    /// Wrap an owned or shared term as a bound pattern slot.
+    #[inline]
+    pub fn bound(term: impl Into<Arc<Term>>) -> Self {
+        PatternTerm::Bound(term.into())
+    }
 }
 
 /// Specifies which graph(s) a [`QuadPattern`] searches over.
@@ -105,11 +117,15 @@ impl QuadPattern {
 // ── Match result ─────────────────────────────────────────────────────────────
 
 /// A single quad returned by [`Dataset::find_quads`].
+///
+/// `subject` / `object` (and `predicate`, wrapped once) are held as
+/// [`Arc<Term>`] so dictionary-decoded terms can flow into
+/// [`crate::Solution`] without a deep clone at this boundary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuadMatch {
-    pub subject: Term,
-    pub predicate: Term,
-    pub object: Term,
+    pub subject: Arc<Term>,
+    pub predicate: Arc<Term>,
+    pub object: Arc<Term>,
     pub graph_name: GraphName,
 }
 
@@ -175,8 +191,11 @@ pub trait DatasetLftjSource: Send + Sync {
         None
     }
 
-    /// Decode a numeric TermId back to an RDF Term.
-    fn lftj_decode_term(&self, _id: u64) -> Option<Term> {
+    /// Decode a numeric TermId back to a shared [`Arc<Term>`].
+    ///
+    /// Prefer the `Arc` form so dictionary-interned terms can be shared into
+    /// solutions without deep-cloning string content on every emit.
+    fn lftj_decode_term(&self, _id: u64) -> Option<Arc<Term>> {
         None
     }
 
@@ -298,9 +317,9 @@ pub trait Dataset: Send + Sync + DatasetLftjSource {
             GraphSelector::Named(g.clone())
         };
         let pattern = QuadPattern {
-            subject: PatternTerm::Bound(s.clone()),
-            predicate: PatternTerm::Bound(p.clone()),
-            object: PatternTerm::Bound(o.clone()),
+            subject: PatternTerm::bound(s.clone()),
+            predicate: PatternTerm::bound(p.clone()),
+            object: PatternTerm::bound(o.clone()),
             graph,
         };
         Ok(self.find_quads(&pattern)?.next().is_some())
@@ -318,7 +337,7 @@ pub trait Dataset: Send + Sync + DatasetLftjSource {
 fn term_matches(pattern: &PatternTerm, value: &Term) -> bool {
     match pattern {
         PatternTerm::Variable => true,
-        PatternTerm::Bound(v) => v == value,
+        PatternTerm::Bound(v) => v.as_ref() == value,
     }
 }
 
@@ -376,9 +395,9 @@ impl Dataset for InMemoryDataset {
             })
             .map(|(s, p, o, g)| {
                 Ok(QuadMatch {
-                    subject: s.clone(),
-                    predicate: p.clone(),
-                    object: o.clone(),
+                    subject: Arc::new(s.clone()),
+                    predicate: Arc::new(p.clone()),
+                    object: Arc::new(o.clone()),
                     graph_name: g.clone(),
                 })
             });
@@ -420,14 +439,18 @@ impl<S: QuadStore + ?Sized> StoreDataset<S> {
 
 fn to_named_node(pt: &PatternTerm) -> Option<oxrdf::NamedNode> {
     match pt {
-        PatternTerm::Bound(Term::NamedNode(n)) => Some(n.clone()),
-        _ => None,
+        PatternTerm::Bound(t) => match t.as_ref() {
+            Term::NamedNode(n) => Some(n.clone()),
+            _ => None,
+        },
+        PatternTerm::Variable => None,
     }
 }
 
-fn to_term(pt: &PatternTerm) -> Option<Term> {
+/// Borrow the bound term without cloning — store APIs take `Option<&Term>`.
+fn to_term_ref(pt: &PatternTerm) -> Option<&Term> {
     match pt {
-        PatternTerm::Bound(t) => Some(t.clone()),
+        PatternTerm::Bound(t) => Some(t.as_ref()),
         PatternTerm::Variable => None,
     }
 }
@@ -451,7 +474,7 @@ impl<S: QuadStore + ?Sized + 'static> DatasetLftjSource for StoreDataset<S> {
         self.store.lftj_intern_term(term)
     }
 
-    fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+    fn lftj_decode_term(&self, id: u64) -> Option<Arc<Term>> {
         self.store.lftj_decode_term(id)
     }
 
@@ -567,9 +590,9 @@ impl<S: QuadStore + ?Sized + 'static> Dataset for StoreDataset<S> {
     fn find_quads<'a>(&'a self, pattern: &QuadPattern) -> Result<QuadIter<'a>> {
         // Use to_term for subject so Term::Triple patterns are passed through
         // to the store (which now accepts Option<&Term> for subject).
-        let subject = to_term(&pattern.subject);
+        let subject = to_term_ref(&pattern.subject);
         let predicate = to_named_node(&pattern.predicate);
-        let object = to_term(&pattern.object);
+        let object = to_term_ref(&pattern.object);
 
         // Pass a specific graph to the store when we can — lets indexed
         // backends avoid a full scan.  AnyNamed / Union pass None so the
@@ -587,12 +610,7 @@ impl<S: QuadStore + ?Sized + 'static> Dataset for StoreDataset<S> {
 
         let store_iter = self
             .store
-            .quads_for_pattern(
-                subject.as_ref(),
-                predicate.as_ref(),
-                object.as_ref(),
-                graph_filter.as_ref(),
-            )
+            .quads_for_pattern(subject, predicate.as_ref(), object, graph_filter.as_ref())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let graph_sel = pattern.graph.clone();
@@ -603,16 +621,12 @@ impl<S: QuadStore + ?Sized + 'static> Dataset for StoreDataset<S> {
                 Ok(sq) => graph_matches(&graph_sel, &sq.graph_name),
             })
             .map(|r| {
-                // StoredQuad.subject/object are Arc<Term>: the tight
-                // quads_for_pattern loop shares dictionary Arc
-                // allocations instead of deep-cloning every matched term. We
-                // unwrap/clone back to an owned `Term` exactly once here, at
-                // the StoredQuad → QuadMatch boundary, rather than doing the
-                // (much more numerous) deep clones inside that hot loop.
+                // StoredQuad terms are already Arc<Term> (including predicate);
+                // move them straight into QuadMatch with no re-wrap.
                 r.map(|sq| QuadMatch {
-                    subject: Arc::unwrap_or_clone(sq.subject),
-                    predicate: Term::NamedNode(sq.predicate),
-                    object: Arc::unwrap_or_clone(sq.object),
+                    subject: sq.subject,
+                    predicate: sq.predicate,
+                    object: sq.object,
                     graph_name: sq.graph_name,
                 })
                 .map_err(|e| anyhow::anyhow!("{e}"))
@@ -718,7 +732,7 @@ mod tests {
             .collect::<Result<Vec<_>>>()
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].object, lit("named"));
+        assert_eq!(results[0].object.as_ref(), &lit("named"));
     }
 
     #[test]

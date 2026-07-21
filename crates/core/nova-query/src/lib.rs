@@ -25,6 +25,10 @@ pub use lftj::{
     reset_collapse_counters,
 };
 pub use options::{CancellationToken, EvalLimitError, QueryOptions};
+pub use path_timing::{
+    PathTimingBucket, PathTimingSnapshot, add_path_timing_ns, path_timing_snapshot,
+    reset_path_timing,
+};
 pub use select_vars::projected_variables;
 #[cfg(feature = "http-client")]
 pub use service::HttpServiceHandler;

@@ -79,7 +79,7 @@ use oxigraph_nova_fulltext::FulltextIndex;
 use oxigraph_nova_storage::dict_snapshot;
 use oxigraph_nova_storage::manifest::{self, Manifest};
 use oxigraph_nova_storage::wal::{self, WalRecord, WalWriter};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -175,6 +175,11 @@ impl Drop for Flusher {
 }
 
 // ── Inner state ───────────────────────────────────────────────────────────────
+
+/// Immutable TermId → Arc<Term> table published outside the store mutex
+/// after compaction (mirrors RingStore W3 decode path). Lets LFTJ emit
+/// decode without taking `inner` when the delta is empty.
+type DecodeSnapshot = std::sync::Arc<Vec<Option<std::sync::Arc<Term>>>>;
 
 struct LoudsStoreInner {
     /// Bidirectional Term ↔ TermId / GraphName ↔ GraphId mapping.
@@ -516,20 +521,6 @@ impl LoudsStoreInner {
         Ok(())
     }
 
-    /// If this is a persistent store and the delta has crossed
-    /// `auto_compact_threshold`, compact inline (see module docs for the
-    /// "stalls writers" trade-off this accepts). No-op otherwise (including
-    /// always for in-memory stores, since `data_dir == None`). Auto-compaction
-    /// cannot be disabled for a persistent store — only its threshold is
-    /// configurable (see `LoudsStore::set_auto_compact_threshold`) — so that
-    /// memory-efficient defaults can't be accidentally left off.
-    fn maybe_auto_compact(&mut self) -> Result<(), Oxigraph> {
-        if self.data_dir.is_some() && self.delta.len() >= self.auto_compact_threshold {
-            self.compact_locked()?;
-        }
-        Ok(())
-    }
-
     /// Crash-safe compaction commit: serialize `new_graphs` to a
     /// fresh snapshot generation, rotate the WAL to a fresh segment, commit
     /// both atomically via the MANIFEST, delete now-obsolete snapshot/WAL
@@ -673,6 +664,8 @@ fn build_graphs_from_triples(
 /// ```
 pub struct LoudsStore {
     inner: Mutex<LoudsStoreInner>,
+    /// Post-compact TermId→Term table outside `inner` (None while delta dirty).
+    decode_snap: RwLock<Option<DecodeSnapshot>>,
 }
 
 impl LoudsStore {
@@ -682,6 +675,7 @@ impl LoudsStore {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(LoudsStoreInner::new()),
+            decode_snap: RwLock::new(None),
         }
     }
 
@@ -790,8 +784,14 @@ impl LoudsStore {
         // previous run's cleanup step).
         manifest::cleanup_orphans(dir, inner.snapshot_gen, inner.wal_seq);
 
+        let snap = if inner.delta.is_empty() {
+            Some(build_decode_snapshot_from_dict(&inner.dict))
+        } else {
+            None
+        };
         Ok(Self {
             inner: Mutex::new(inner),
+            decode_snap: RwLock::new(snap),
         })
     }
 
@@ -988,7 +988,12 @@ impl LoudsStore {
     /// crosses a configurable threshold — see `set_auto_compact_threshold`.
     pub fn compact(&self) -> Result<(), Oxigraph> {
         let mut inner = self.inner.lock();
-        inner.compact_locked()
+        inner.compact_locked()?;
+        // Delta cleared by compact — publish decode snapshot outside mutex.
+        let snap = build_decode_snapshot_from_dict(&inner.dict);
+        drop(inner);
+        *self.decode_snap.write() = Some(snap);
+        Ok(())
     }
 
     /// Configure the delta-size threshold (number of live entries) that
@@ -1105,6 +1110,9 @@ impl LoudsStore {
         // nothing else ever triggers compaction for a one-shot bulk load.
         inner.dict.compact()?;
         inner.commit_compaction(new_graphs, false)?;
+        let snap = build_decode_snapshot_from_dict(&inner.dict);
+        drop(inner);
+        *self.decode_snap.write() = Some(snap);
         Ok(count)
     }
 
@@ -1310,17 +1318,34 @@ fn decode_stored_quad(
         Term::NamedNode(_) | Term::BlankNode(_) | Term::Triple(_) => {}
         Term::Literal(_) => return None,
     };
-    let predicate: NamedNode = match p_term.as_ref() {
-        Term::NamedNode(n) => n.clone(),
-        _ => return None, // predicates must be IRIs
-    };
+    // Predicates must be IRIs; keep the shared Arc rather than extracting
+    // and deep-cloning the NamedNode (same sharing as subject/object).
+    if !matches!(p_term.as_ref(), Term::NamedNode(_)) {
+        return None; // predicates must be IRIs
+    }
 
     Some(StoredQuad {
         subject: s_term,
-        predicate,
+        predicate: p_term,
         object: o_term,
         graph_name,
     })
+}
+
+fn build_decode_snapshot_from_dict(dict: &Dictionary) -> DecodeSnapshot {
+    let n = dict.len();
+    let mut table = Vec::with_capacity(n);
+    for raw in 0..n as u64 {
+        let tid = match TermId::new(raw) {
+            Ok(t) => t,
+            Err(_) => {
+                table.push(None);
+                continue;
+            }
+        };
+        table.push(dict.get_term_arc(tid));
+    }
+    std::sync::Arc::new(table)
 }
 
 // ── LftjSource impl ───────────────────────────────────────────────────────────
@@ -1346,10 +1371,22 @@ impl LftjSource for LoudsStore {
         inner.dict.get_id(term).map(|id| id.as_u64())
     }
 
-    fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+    fn lftj_decode_term(&self, id: u64) -> Option<std::sync::Arc<Term>> {
+        // Prefer post-compact snapshot outside `inner` (no store mutex).
+        {
+            let guard = self.decode_snap.read();
+            if let Some(ref table) = *guard {
+                let idx = id as usize;
+                if let Some(Some(arc)) = table.get(idx) {
+                    return Some(std::sync::Arc::clone(arc));
+                }
+                return None;
+            }
+        }
+        // Delta dirty / pre-compact: decode under store lock.
         let inner = self.inner.lock();
         let tid = oxigraph_nova_core::TermId::new(id).ok()?;
-        inner.dict.get_term_arc(tid).map(|arc| arc.as_ref().clone())
+        inner.dict.get_term_arc(tid)
     }
 
     fn lftj_graph_id(&self, graph: &GraphName) -> Option<u8> {
@@ -1435,7 +1472,25 @@ impl QuadStore for LoudsStore {
         // always be recovered by replaying the WAL (see wal.rs module docs).
         inner.wal_append(&WalRecord::InsertQuad(quad.clone()))?;
         let result = inner.apply_insert(quad)?;
-        inner.maybe_auto_compact()?;
+        let did_compact =
+            if inner.data_dir.is_some() && inner.delta.len() >= inner.auto_compact_threshold {
+                inner.compact_locked()?;
+                true
+            } else {
+                false
+            };
+        let new_snap = if did_compact {
+            Some(build_decode_snapshot_from_dict(&inner.dict))
+        } else {
+            None
+        };
+        drop(inner);
+        if did_compact {
+            *self.decode_snap.write() = new_snap;
+        } else if result {
+            // Successful mutating write with residual delta — drop snapshot.
+            *self.decode_snap.write() = None;
+        }
         Ok(result)
     }
 
@@ -1444,7 +1499,24 @@ impl QuadStore for LoudsStore {
 
         inner.wal_append(&WalRecord::RemoveQuad(quad.clone()))?;
         let result = inner.apply_remove(quad)?;
-        inner.maybe_auto_compact()?;
+        let did_compact =
+            if inner.data_dir.is_some() && inner.delta.len() >= inner.auto_compact_threshold {
+                inner.compact_locked()?;
+                true
+            } else {
+                false
+            };
+        let new_snap = if did_compact {
+            Some(build_decode_snapshot_from_dict(&inner.dict))
+        } else {
+            None
+        };
+        drop(inner);
+        if did_compact {
+            *self.decode_snap.write() = new_snap;
+        } else if result {
+            *self.decode_snap.write() = None;
+        }
         Ok(result)
     }
 
@@ -1702,7 +1774,29 @@ impl QuadStore for LoudsStore {
                 count += 1;
             }
         }
-        inner.maybe_auto_compact()?;
+        let did_compact =
+            if inner.data_dir.is_some() && inner.delta.len() >= inner.auto_compact_threshold {
+                inner.compact_locked()?;
+                true
+            } else {
+                false
+            };
+        let new_snap = if did_compact {
+            Some(build_decode_snapshot_from_dict(&inner.dict))
+        } else if !inner.delta.is_empty() {
+            None
+        } else {
+            // delta empty without compact this call — keep existing snap
+            // signal via Option::None + special: use a flag
+            None
+        };
+        let delta_empty = inner.delta.is_empty();
+        drop(inner);
+        if did_compact {
+            *self.decode_snap.write() = new_snap;
+        } else if !delta_empty {
+            *self.decode_snap.write() = None;
+        }
         Ok(count)
     }
 
@@ -1738,7 +1832,29 @@ impl QuadStore for LoudsStore {
                 }
             }
         }
-        inner.maybe_auto_compact()?;
+        let did_compact =
+            if inner.data_dir.is_some() && inner.delta.len() >= inner.auto_compact_threshold {
+                inner.compact_locked()?;
+                true
+            } else {
+                false
+            };
+        let new_snap = if did_compact {
+            Some(build_decode_snapshot_from_dict(&inner.dict))
+        } else if !inner.delta.is_empty() {
+            None
+        } else {
+            // delta empty without compact this call — keep existing snap
+            // signal via Option::None + special: use a flag
+            None
+        };
+        let delta_empty = inner.delta.is_empty();
+        drop(inner);
+        if did_compact {
+            *self.decode_snap.write() = new_snap;
+        } else if !delta_empty {
+            *self.decode_snap.write() = None;
+        }
         Ok((inserted, removed))
     }
 }

@@ -5,6 +5,7 @@
 //! completely decoupled from storage internals.
 
 use crate::{GraphName, NamedNode, Oxigraph, Quad, StoredQuad, Term};
+use std::sync::Arc;
 
 // ── prepared fixed-P object intersection (product wedge) ────────────────
 
@@ -206,8 +207,12 @@ pub trait LftjSource: Send + Sync {
         None
     }
 
-    /// Decode a numeric TermId back to a Term (inverse of `lftj_intern_term`).
-    fn lftj_decode_term(&self, _id: u64) -> Option<Term> {
+    /// Decode a numeric TermId back to a shared [`Arc<Term>`] (inverse of `lftj_intern_term`).
+    ///
+    /// Returning `Arc` lets dictionary-interned terms be shared end-to-end
+    /// through LFTJ emit and SPARQL solution materialization, avoiding a deep
+    /// `String` clone per emitted binding.
+    fn lftj_decode_term(&self, _id: u64) -> Option<Arc<Term>> {
         None
     }
 

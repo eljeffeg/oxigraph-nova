@@ -167,13 +167,14 @@ fn decode_stored_quad(
         Term::NamedNode(_) | Term::BlankNode(_) | Term::Triple(_) => {}
         Term::Literal(_) => return None,
     };
-    let predicate: NamedNode = match p_term.as_ref() {
-        Term::NamedNode(n) => n.clone(),
-        _ => return None,
-    };
+    // Predicates must be IRIs; keep the shared Arc rather than extracting
+    // and deep-cloning the NamedNode (same sharing as subject/object).
+    if !matches!(p_term.as_ref(), Term::NamedNode(_)) {
+        return None;
+    }
     Some(StoredQuad {
         subject: s_term,
-        predicate,
+        predicate: p_term,
         object: o_term,
         graph_name,
     })
@@ -1175,16 +1176,17 @@ impl LftjSource for RingStore {
         inner.dict.get_id(term).map(|id| id.as_u64())
     }
 
-    fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+    fn lftj_decode_term(&self, id: u64) -> Option<std::sync::Arc<Term>> {
         SPARQL_PATH.decode_calls.fetch_add(1, Ordering::Relaxed);
         // W3: compact-time snapshot lives outside `inner` — never take the
         // store mutex on the hot LFTJ emit path when delta is empty.
+        // Return Arc clones (O(1) refcount) rather than deep Term clones.
         {
             let guard = self.decode_snap.read();
             if let Some(ref table) = *guard {
                 let idx = id as usize;
                 if let Some(Some(arc)) = table.get(idx) {
-                    return Some(arc.as_ref().clone());
+                    return Some(std::sync::Arc::clone(arc));
                 }
                 // Snapshot present but id missing: term not in dict.
                 return None;
@@ -1193,7 +1195,7 @@ impl LftjSource for RingStore {
         // No snapshot (delta dirty / pre-compact): fall back under store lock.
         let inner = self.inner.lock();
         let tid = TermId::new(id).ok()?;
-        inner.dict.get_term_arc(tid).map(|arc| arc.as_ref().clone())
+        inner.dict.get_term_arc(tid)
     }
 
     fn lftj_graph_id(&self, graph: &GraphName) -> Option<u8> {
@@ -1871,7 +1873,7 @@ mod tests {
             "W3: compact must publish decode_snap outside mutex"
         );
         let decoded = store.lftj_decode_term(id).unwrap();
-        assert_eq!(decoded, o);
+        assert_eq!(decoded.as_ref(), &o);
         // Write clears snapshot.
         store
             .insert(&make_quad("http://s2", "http://p", "o2", dg()))
@@ -2072,7 +2074,7 @@ mod tests {
                 let sq = r.unwrap();
                 (
                     sq.subject.to_string(),
-                    sq.predicate.as_str().to_string(),
+                    sq.predicate.to_string(),
                     sq.object.to_string(),
                 )
             })

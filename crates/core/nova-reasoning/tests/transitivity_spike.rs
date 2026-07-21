@@ -132,9 +132,12 @@ fn subclassof_transitivity_end_to_end_over_ringstore() {
 
     let graph = inference_graph();
     for [s, p, o] in &derived {
-        let s_term = store.lftj_decode_term(*s).expect("decode subject");
-        let p_term = store.lftj_decode_term(*p).expect("decode predicate");
-        let o_term = store.lftj_decode_term(*o).expect("decode object");
+        let s_term =
+            std::sync::Arc::unwrap_or_clone(store.lftj_decode_term(*s).expect("decode subject"));
+        let p_term =
+            std::sync::Arc::unwrap_or_clone(store.lftj_decode_term(*p).expect("decode predicate"));
+        let o_term =
+            std::sync::Arc::unwrap_or_clone(store.lftj_decode_term(*o).expect("decode object"));
         let Term::NamedNode(s_nn) = s_term else {
             panic!("subject must decode to a NamedNode")
         };

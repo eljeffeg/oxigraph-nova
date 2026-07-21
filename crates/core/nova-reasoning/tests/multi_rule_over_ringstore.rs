@@ -112,7 +112,7 @@ fn type_propagation_through_transitive_subclass_over_ringstore() {
         .into_iter()
         .filter_map(|sq| {
             let s = store.lftj_intern_term(sq.subject.as_ref())?;
-            let p = store.lftj_intern_term(&Term::NamedNode(sq.predicate.clone()))?;
+            let p = store.lftj_intern_term(sq.predicate.as_ref())?;
             let o = store.lftj_intern_term(sq.object.as_ref())?;
             Some([s, p, o])
         })

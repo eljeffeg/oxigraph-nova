@@ -1,5 +1,5 @@
 # Oxigraph Nova
-<p align="center" style="background-color:rgba(0, 0, 0, 0.2);"><img src="docs/nova.png" style="width: 400px;" alt="Banner"></p>
+<p align="center" style="background-color:rgba(0, 0, 0, 0.2);"><img src="docs/nova-title.png" style="width: 400px;" alt="Banner"></p>
 
 **A Rust-native RDF 1.2 / SPARQL 1.2 triple store with a novel succinct index and worst-case optimal joins.**
 

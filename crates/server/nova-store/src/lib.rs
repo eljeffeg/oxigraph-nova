@@ -462,7 +462,11 @@ impl Store {
                         continue;
                     };
                     let object = sq.object.as_ref().clone();
-                    writer.serialize_triple(TripleRef::new(&subject, &sq.predicate, &object))?;
+                    writer.serialize_triple(TripleRef::new(
+                        &subject,
+                        sq.predicate_named_node().unwrap(),
+                        &object,
+                    ))?;
                 }
             }
             None => {
@@ -475,7 +479,12 @@ impl Store {
                             continue;
                         };
                         let object = sq.object.as_ref().clone();
-                        writer.serialize_quad(QuadRef::new(&subject, &sq.predicate, &object, g))?;
+                        writer.serialize_quad(QuadRef::new(
+                            &subject,
+                            sq.predicate_named_node().unwrap(),
+                            &object,
+                            g,
+                        ))?;
                     }
                 }
             }
