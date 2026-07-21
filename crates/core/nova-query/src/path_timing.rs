@@ -3,7 +3,7 @@
 //! These counters are process-wide and always compiled in. They exist so a
 //! LOUDS-vs-Ring comparison over the *same* HTTP endpoint can answer:
 //!
-//! - Is Phase L's prepared operator actually used? (Execution drops on Ring)
+//! - Is the prepared operator actually used? (Execution drops on Ring)
 //! - Does decode/serialize dominate? (Decode/Serialize large on both)
 //!
 //! Buckets are intentionally **non-overlapping**:

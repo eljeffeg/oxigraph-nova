@@ -1,4 +1,4 @@
-//! E5.9B Phase 4 — mapped Huffman QWT section (`HQWA`) for **C_p only**.
+//! mapped Huffman QWT section (`HQWA`) for **C_p only**.
 //!
 //! Feature-gated: `ring-huffman-cp`. Embeds a locally densified `HQWT256`
 //! (alphabet `[0, np)`) plus `p_base` into a page-aligned section used as the

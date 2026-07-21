@@ -1,6 +1,6 @@
 //! Two-hop chain shape: `?a P1 ?b . ?b P2 ?c`
 //!
-//! K9 path_2hop — directed chain of two edges over three distinct join vars.
+//! path_2hop — directed chain of two edges over three distinct join vars.
 //! Wedges (`?a P1 ?b . ?a P2 ?c`) are rejected.
 
 use super::{ShapeId, ShapePlan, ShapeRecognizer};

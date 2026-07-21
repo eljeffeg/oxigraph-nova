@@ -28,7 +28,7 @@ ring-backend = [
     "oxigraph-nova-engine-ring/cyclic-ring",
     "oxigraph-nova-engine-ring/ring-huffman-cp",
 ]
-# Alias: same as ring-backend (Huffman is product default as of Phase 1D).
+# Alias: same as ring-backend (Huffman is the product default).
 ring-huffman-cp = ["ring-backend"]
 # A/B only: RingStore with plain QWT256 C_p (no Huffman).
 #   cargo build -p oxigraph-nova-server --release --features ring-backend-qwt --bin nova_serve

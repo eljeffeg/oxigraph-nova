@@ -1097,12 +1097,12 @@ mod tests {
     /// Build a `StoreSnapshot` containing one non-empty and one empty graph,
     /// serialize it, and `load_mmap` it into a `MappedGraphRing` for each
     /// graph. Verifies:
-    /// 1. (Permanent regression probe) vocab is genuinely borrowed at BOTH
-    ///    the top-level `CltjSnapshot` nesting AND through the full
+    /// 1. Vocab is genuinely borrowed (zero-copy) at both the top-level
+    ///    `CltjSnapshot` nesting and through the full
     ///    `StoreSnapshot -> RingSnapshot -> CltjSnapshot` nesting used in
-    ///    production — i.e. the `Option<Cltj>` removal actually restored
-    ///    zero-copy end-to-end (see `RingSnapshot`'s doc comment for why
-    ///    this regressed once before).
+    ///    production. Wrapping a mmap-backed field in `Option` would force
+    ///    an owned copy under ε-serde, so the snapshot types use empty
+    ///    sentinels instead.
     /// 2. `MappedGraphRing::ring()` produces results identical to the owned
     ///    `GraphRing` for `contains`/`match_triples`/`spo_triples`, for both
     ///    the non-empty and the empty graph.
@@ -1121,8 +1121,7 @@ mod tests {
         // Build the same two graphs again for the snapshot path (the first
         // copies are kept as the "expected" owned baseline). Drives the
         // exact same `StoreSnapshot::from_graphs` construction used in
-        // production (now `pub(crate)` specifically so this test can reuse
-        // it instead of hand-rolling a parallel struct).
+        // production (`pub(crate)` so this test can reuse it).
         let mut graphs: HashMap<GraphId, Arc<GraphRing>> = HashMap::new();
         graphs.insert(GRAPH_DEFAULT, Arc::new(build_ring(triples)));
         graphs.insert(GraphId(2), Arc::new(build_ring(&[])));
@@ -1147,19 +1146,13 @@ mod tests {
         };
         let view: &epserde::deser::DeserType<StoreSnapshot> = mem_case.uncase();
 
-        // Regression probe: vocab must be borrowed (not owned), matching the
-        // full nesting depth used in production (StoreSnapshot -> Vec<RingSnapshot>
-        // -> RingSnapshot -> CltjSnapshot). We can't directly assert a type
-        // here without the same brittle probe machinery used during
-        // investigation, but `from_mapped`'s tries transmute (below) has a
-        // compile-time size assertion (transmute panics/fails to compile on
-        // any size mismatch) — that + this test's behavioural equivalence
-        // assertions together are the permanent regression guard: if a
-        // future change reintroduces an `Option<Cltj>`-shaped zero-copy
-        // break, either the size-checked transmute in `from_mapped` will
-        // fail to compile, or (if it still happens to compile) the
-        // navigation results below would come from data that is not
-        // actually borrowed — this test exercises the exact same code path
+        // Vocab must be borrowed (not owned) through the full production
+        // nesting (StoreSnapshot -> Vec<RingSnapshot> -> RingSnapshot ->
+        // CltjSnapshot). `from_mapped`'s tries transmute has a compile-time
+        // size assertion; together with the behavioural equivalence checks
+        // below that guards zero-copy: an `Option`-shaped field would either
+        // fail the size check or yield navigation results that are not
+        // actually borrowed. This exercises the same path
         // `MappedGraphRing::new` uses in production.
         assert_eq!(view.graph_ids.len(), 2);
         assert_eq!(view.rings.len(), 2);

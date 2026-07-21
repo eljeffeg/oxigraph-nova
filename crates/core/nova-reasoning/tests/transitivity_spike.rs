@@ -1,18 +1,17 @@
-//! End-to-end spike: `rdfs:subClassOf` transitivity over a real `LoudsStore`.
+//! End-to-end integration: `rdfs:subClassOf` transitivity over a real
+//! `LoudsStore`.
 //!
-//! This is the integration test that de-risks the whole
-//! `SortedVecTrie` + heterogeneous-source `leapfrog_join` + semi-naive
-//! `transitive_closure` combination against Nova's actual storage backend
-//! (note this test predates and is independent of the project's current
-//! default reasoning path, `oxigraph_nova_reasoning::ReasoningDataset`),
-//! not just synthetic `[u64; 3]` fixtures (see the unit tests in
-//! `fixpoint.rs`/`join.rs`/`sorted_vec_trie.rs` for those).
+//! Exercises `SortedVecTrie` + heterogeneous-source `leapfrog_join` +
+//! semi-naive `transitive_closure` against Nova's storage backend (not just
+//! synthetic `[u64; 3]` fixtures — see unit tests in
+//! `fixpoint.rs`/`join.rs`/`sorted_vec_trie.rs` for those). Independent of
+//! the production overlay path `oxigraph_nova_reasoning::ReasoningDataset`.
 //!
-//! ## What this proves
+//! ## Coverage
 //!
 //! 1. Base facts loaded into a `LoudsStore` and compacted can be read back
 //!    out as `TermId`s via `LftjSource::lftj_intern_term` (the same
-//!    interning path the real LFTJ evaluator uses).
+//!    interning path the LFTJ evaluator uses).
 //! 2. `fixpoint::transitive_closure` computes the exact expected transitive
 //!    closure over those `TermId`s.
 //! 3. The derived closure can be decoded back to `Term`s
@@ -20,17 +19,14 @@
 //!    new quads in a dedicated inference graph, then read back out via the
 //!    ordinary `QuadStore::quads_for_pattern` path and matches exactly.
 //!
-//! ## Simplification vs. the production design
+//! ## Named-graph writeback
 //!
-//! There is no reserved `GraphId` for OWL 2 RL inference output — per the
-//! project's current design (see
-//! `oxigraph_nova_reasoning::ReasoningDataset`), the default reasoning path
-//! is an in-memory overlay that never writes derived quads back into the
-//! store at all. This test predates that design and simply writes its
-//! derived closure into an ordinary dedicated named graph
-//! (`urn:nova:inference-spike`), assigned whatever `GraphId`
-//! `Dictionary::intern_graph` happens to hand out — the insert/compact
-//! mechanics being exercised here don't depend on which id that is.
+//! There is no reserved `GraphId` for OWL 2 RL inference output —
+//! `ReasoningDataset` keeps derived facts as an in-memory overlay and never
+//! writes them back. This test instead writes its derived closure into an
+//! ordinary dedicated named graph (`urn:nova:inference`), assigned whatever
+//! `GraphId` `Dictionary::intern_graph` hands out — the insert/compact
+//! mechanics don't depend on which id that is.
 
 use oxigraph_nova_core::{GraphName, LftjSource, NamedNode, Quad, QuadStore, Term};
 use oxigraph_nova_engine_ring::LoudsStore;
@@ -48,7 +44,7 @@ fn sub_class_of() -> NamedNode {
 }
 
 fn inference_graph() -> GraphName {
-    GraphName::NamedNode(NamedNode::new("urn:nova:inference-spike").unwrap())
+    GraphName::NamedNode(NamedNode::new("urn:nova:inference").unwrap())
 }
 
 /// Insert `sub ⊑ sup` (`sub rdfs:subClassOf sup`) into the store's default

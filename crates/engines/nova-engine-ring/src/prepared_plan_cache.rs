@@ -1,4 +1,4 @@
-//! Phase L — product prepared physical-operator cache.
+//! product prepared physical-operator cache.
 //!
 //! Holds specialized BGP physical plans (two-hop, wedge, …) across evaluations
 //! so repeated SPARQL/HTTP requests do not rebuild adjacency every `evaluate()`.
@@ -9,7 +9,7 @@
 //! BGP → shape recognizer → physical operator → prepared operator → reusable exec
 //! ```
 //!
-//! Two-hop (K9/K10) and wedge (K11) are variants of one [`PhysicalOpKind`] /
+//! Two-hop and wedge are variants of one [`PhysicalOpKind`] /
 //! [`PreparedPhysicalOp`] space. Future stars, chains, diamonds extend the same
 //! key + enum without a second cache.
 //!
@@ -46,18 +46,18 @@ pub const PREPARED_PLAN_CACHE_CAP: usize = 32;
 
 // ── Shape identity ───────────────────────────────────────────────────────────
 
-/// Discriminator for specialized BGP physical operators (Phase L).
+/// Discriminator for specialized BGP physical operators.
 ///
 /// Extending the product path for a new motif means adding a variant here and
 /// a prepare branch — not a second cache type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PhysicalOpKind {
-    /// Chain: `?a P1 ?b . ?b P2 ?c` (K9/K10).
+    /// Chain: `?a P1 ?b. ?b P2 ?c`.
     TwoHop {
         p1: u64,
         p2: u64,
     },
-    /// Wedge / triangle: `?a P ?b . ?b P ?c . ?a P ?c` (K11).
+    /// Wedge / triangle: `?a P ?b. ?b P ?c. ?a P ?c`.
     Wedge {
         pred: u64,
     },
@@ -200,7 +200,7 @@ impl PhysicalOpPlanKey {
     }
 }
 
-/// Historical two-hop key shape (K10). Convertible to [`PhysicalOpPlanKey`].
+/// Historical two-hop key shape. Convertible to [`PhysicalOpPlanKey`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TwoHopPlanKey {
     pub snapshot_version: u64,
@@ -223,7 +223,7 @@ impl From<TwoHopPlanKey> for PhysicalOpPlanKey {
     }
 }
 
-/// Historical wedge key shape (K11). Convertible to [`PhysicalOpPlanKey`].
+/// Historical wedge key shape. Convertible to [`PhysicalOpPlanKey`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WedgePlanKey {
     pub snapshot_version: u64,
@@ -251,7 +251,7 @@ struct CacheEntry {
     plan: PreparedPhysicalOp,
 }
 
-/// Small mutex-guarded LRU of prepared physical operators (Phase L).
+/// Small mutex-guarded LRU of prepared physical operators.
 pub struct PhysicalOpPreparedPlanCache {
     cap: usize,
     map: HashMap<PhysicalOpPlanKey, CacheEntry>,
@@ -331,9 +331,9 @@ impl PhysicalOpPreparedPlanCache {
     }
 }
 
-/// K10 name for the unified cache (same type).
+/// name for the unified cache (same type).
 pub type TwoHopPreparedPlanCache = PhysicalOpPreparedPlanCache;
-/// K11 name for the unified cache (same type).
+/// name for the unified cache (same type).
 pub type WedgePreparedPlanCache = PhysicalOpPreparedPlanCache;
 
 // ── Guard ────────────────────────────────────────────────────────────────────
@@ -363,9 +363,9 @@ impl PreparedPhysicalOperator for CachedPhysicalOpGuard {
     }
 }
 
-/// Historical alias (K10).
+/// Historical alias.
 pub type CachedTwoHopGuard = CachedPhysicalOpGuard;
-/// Historical alias (K11).
+/// Historical alias.
 pub type CachedWedgeGuard = CachedPhysicalOpGuard;
 
 // ── get_or_prepare ───────────────────────────────────────────────────────────
@@ -467,7 +467,7 @@ pub fn get_or_prepare_wedge(
 
 /// Resolve or prepare an SP-expansion / 2join plan via the product cache.
 ///
-/// `expand_adj` is the optional shared K9.4 adjacency for `p_expand` (from the
+/// `expand_adj` is the optional shared adjacency for `p_expand` (from the
 /// store-level SpAdjCache). When `None`, prepare builds adj once on cold miss.
 pub fn get_or_prepare_sp_expansion(
     cache: &Arc<Mutex<PhysicalOpPreparedPlanCache>>,

@@ -1,4 +1,4 @@
-//! E5.7 — Paper-faithful **cyclic Ring A** primitive spike.
+//! Paper-faithful **cyclic Ring A** primitives.
 //!
 //! Feature-gated: compile with `--features cyclic-ring`.
 //! **Not** on the default `LoudsStore` execution path.
@@ -12,8 +12,8 @@
 //! A_o, A_p, A_s cumulative arrays
 //! ```
 //!
-//! Ring B / URing are E5.8 **DROP** speed-oracle only (`diagnostics` feature).
-//! E5.10: [`mapped_qwt`] — `NOVAQWT1` flatten / open (W0); no LoudsStore cutover.
+//! Ring B / URing are diagnostics-only speed oracles (`diagnostics` feature).
+//! [`mapped_qwt`] flattens/opens `NOVAQWT1`; not a LoudsStore cutover.
 //! No SPARQL, no production LoudsStore replacement. Product path is Ring A + D2.
 
 //! # Indexing convention
@@ -53,7 +53,7 @@
 //!
 //! `range_next_value` uses galloping + binary search over `get` only.
 //! It never materializes all distinct symbols (`occs_range` is forbidden
-//! on the hot path — see E5.5).
+//! on the hot path
 
 #[cfg(feature = "ring-huffman-cp")]
 use crate::huff_cp::HuffColP;
@@ -61,7 +61,7 @@ use qwt::mem_dbg::{MemSize, SizeFlags};
 use qwt::{AccessUnsigned, QWT256, RankUnsigned, SelectUnsigned};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// ── Predicate column substrate (E5.9B Phase 3) ───────────────────────────────
+// ── Predicate column substrate ───────────────────────────────
 
 /// Last-column substrate for **C_p only**.
 ///
@@ -229,7 +229,7 @@ pub struct GlobalCounters {
     pub rnv_native_backtracks: AtomicU64,
     /// Deprecated alias kept for harnesses that still read `rnv_get_probes`.
     pub rnv_get_probes: AtomicU64,
-    // ── range_distinct_iter (E5.7C stateful enumerator) ───────────────────
+    // ── range_distinct_iter ( stateful enumerator) ───────────────────
     pub rdi_calls: AtomicU64,
     pub rdi_symbols: AtomicU64,
     pub rdi_rank_probes: AtomicU64,
@@ -324,7 +324,7 @@ impl CounterSnapshot {
 
 // ── CyclicRing ───────────────────────────────────────────────────────────────
 
-/// Componentized Ring A footprint (E5.6 / Phase-0 regression card).
+/// Componentized Ring A footprint breakdown.
 ///
 /// `total()` matches historical [`CyclicRing::mem_bytes`] (QWT MemSize + A + 136 shell).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -335,7 +335,7 @@ pub struct RingMemBreakdown {
     pub a_o: usize,
     pub a_p: usize,
     pub a_s: usize,
-    /// Struct shell / padding allowance (fixed 136 in E5.6 accounting).
+    /// Struct shell / padding allowance (fixed 136 in accounting).
     pub shell: usize,
     pub n: u32,
     pub universe: u32,
@@ -564,7 +564,7 @@ impl CyclicRing {
     /// Same shared-alphabet remap as [`Self::build_from_role_local`].
     ///
     /// Cyclic class: OPS → SOP → PSO (last columns C_s, C_p, C_o).
-    /// DROP (E5.8): research/applications/oracle only — requires `diagnostics` feature.
+    /// Diagnostics-only; requires the `diagnostics` feature.
     #[cfg(any(test, feature = "diagnostics"))]
     pub fn build_ring_b_from_role_local(triples: &[[u32; 3]], ns: u32, np: u32, no: u32) -> Self {
         let s_base = 0u32;
@@ -595,7 +595,7 @@ impl CyclicRing {
     /// - `lead_range(P)` partitions T_pso by p
     /// - `lead_range(O)` partitions T_ops by o
     ///
-    /// DROP (E5.8): research/applications/oracle only — requires `diagnostics` feature.
+    /// Diagnostics-only; requires the `diagnostics` feature.
     #[cfg(any(test, feature = "diagnostics"))]
     pub fn build_ring_b_shared(triples: &[[u32; 3]], universe: u32) -> Self {
         let n = triples.len() as u32;
@@ -635,12 +635,12 @@ impl CyclicRing {
         }
     }
 
-    /// Exact complete bytes (qwt MemSize + A arrays + shell), matching E5.6 accounting.
+    /// Exact complete bytes (qwt MemSize + A arrays + shell), matching accounting.
     pub fn mem_bytes(&self) -> usize {
         self.mem_breakdown().total()
     }
 
-    /// Componentized footprint (E5.6 / Phase-0 regression card discipline).
+    /// Componentized footprint breakdown.
     pub fn mem_breakdown(&self) -> RingMemBreakdown {
         let c_o = self.c_o.mem_size(SizeFlags::default());
         let c_p = self.c_p.mem_bytes();
@@ -703,7 +703,7 @@ impl CyclicRing {
         }
     }
 
-    /// Public QWT column accessor for E5.10 flatten / differential gates.
+    /// Public QWT column accessor for flatten / differential gates.
     ///
     /// Returns `None` for `Col::P` when C_p is the Huffman arm (cannot flatten
     /// HQWT into `NOVARNG1` QWTA sections — in-memory experiment only).
@@ -716,7 +716,7 @@ impl CyclicRing {
         }
     }
 
-    /// Public A-array accessor for E5.10 flatten / differential gates.
+    /// Public A-array accessor for flatten / differential gates.
     #[inline]
     pub fn col_a_slice(&self, col: Col) -> &[u32] {
         self.col_a(col)
@@ -858,7 +858,7 @@ impl CyclicRing {
         self.backward_step(col, r, symbol)
     }
 
-    /// Default RNV: **native** guided O(log σ) (E5.7B.1). Prefer explicit
+    /// Default RNV: **native** guided O(log σ) . Prefer explicit
     /// `range_next_value_native` / `range_next_value_scan` in gate harnesses
     /// so results remain attributable.
     #[inline]
@@ -867,7 +867,7 @@ impl CyclicRing {
     }
 
     /// Diagnostic oracle: row-scan via `access`. O(|range| · log σ).
-    /// **Rejected for LFTJ** (E5.7); kept only for differential correctness.
+    /// **Rejected for LFTJ** ; kept only for differential correctness.
     pub fn range_next_value_scan(&self, col: Col, r: RowRange, target: u32) -> Option<u32> {
         self.bump(|c| {
             c.range_next_value.fetch_add(1, Ordering::Relaxed);
@@ -932,7 +932,7 @@ impl CyclicRing {
         }
     }
 
-    /// Stateful distinct-symbol enumeration over a column range (E5.7C / E5.9A).
+    /// Stateful distinct-symbol enumeration over a column range.
     ///
     /// On Qwt columns: opens wavelet RDI once (O(log σ) scratch).
     /// On Huffman C_p: materializes O(σ_P) scan into a small vec (σ_P schema-sized)
@@ -1123,13 +1123,13 @@ impl CyclicRing {
     /// (first column). The set {F_o(i): i in R} is NOT necessarily one
     /// interval in T_osp (different o's).
     ///
-    /// For the primitive spike we implement SP range via:
+    /// SP range is implemented via:
     ///   lead on T_pso / reverse orientation — but we only have Ring A.
     ///   Ring A tables: spo, osp, pos.
     ///   SP prefix is native to T_spo. Children p under s: the paper's leap
     ///   uses range_next_value on an *implicit* sequence of p values.
     ///
-    /// Practical E5.7 approach for SP:
+    /// Practical approach for SP:
     ///   Use T_pos? No.
     ///   Store nothing extra; for correctness tests of SP, compare against
     ///   sorted table. For navigation microbench, use range_next_value on
@@ -1151,7 +1151,7 @@ impl CyclicRing {
     }
 }
 
-// ── URing speed oracle (E5.8) — DROP; research/applications/oracle only ───────────────
+// ── URing speed oracle (diagnostics only) ───────────
 #[cfg(any(test, feature = "diagnostics"))]
 mod uring_oracle {
     use super::*;
@@ -1165,7 +1165,7 @@ mod uring_oracle {
         B,
     }
 
-    /// Process-wide orientation counters for E5.8 (which ring served the work).
+    /// Process-wide orientation counters for (which ring served the work).
     #[derive(Default)]
     pub struct OrientationCounters {
         pub a_ops: AtomicU64,
@@ -1269,7 +1269,7 @@ mod uring_oracle {
 #[cfg(any(test, feature = "diagnostics"))]
 pub use uring_oracle::{Orientation, OrientationCounters, URing};
 
-// ── Stateful distinct iterator wrapper (E5.7C / E5.9A) ───────────────────────
+// ── Stateful distinct iterator wrapper ───────────────────────
 
 // Qwt RangeDistinctIter is ~4KB of fixed stack state; boxing would add a heap
 // alloc on every RDI open on the LFTJ hot path. Prefer stack layout.

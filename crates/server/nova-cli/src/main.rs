@@ -1,10 +1,9 @@
 //! `oxigraph` — standalone offline CLI tooling for Oxigraph Nova.
 //!
-//! Mirrors a subset of `oxigraph-cli`'s subcommands (see
-//! `./research/applications/oxigraph/cli`), adapted to Nova's own `LoudsStore`/`Server`
-//! API surface, and shipped under
-//! the same binary name (`oxigraph`) so scripts/muscle memory written
-//! against upstream `oxigraph-cli` work unchanged. Nine subcommands total:
+//! Mirrors a subset of upstream `oxigraph-cli`'s subcommands, adapted to
+//! Nova's own `LoudsStore`/`Server` API surface, and shipped under the same
+//! binary name (`oxigraph`) so scripts/muscle memory written against upstream
+//! `oxigraph-cli` work unchanged. Nine subcommands total:
 //!
 //! - `oxigraph load --location <dir> [--file <path>]... [--format F] \
 //!   [--graph G] [--base IRI]` — bulk-load directly into a persistent

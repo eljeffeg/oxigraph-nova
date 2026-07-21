@@ -1,18 +1,18 @@
-//! End-to-end spike: two interacting rules — `rdfs:subClassOf` transitivity
-//! plus `rdf:type` propagation through the subclass hierarchy — evaluated
-//! directly over a real, compacted `LoudsStore`'s LOUDS index via
+//! End-to-end integration: two interacting rules — `rdfs:subClassOf`
+//! transitivity plus `rdf:type` propagation through the subclass hierarchy —
+//! evaluated directly over a real, compacted `LoudsStore`'s LOUDS index via
 //! [`StoreAtomSource`], not copied `Vec` fixtures.
 //!
-//! This is the increment beyond `transitivity_spike.rs` that actually
-//! exercises the production-shaped entry point: `fixpoint::closure_over_store`
-//! + `StoreAtomSource` + `CombinedSource`.
+//! Exercises the production-shaped entry point:
+//! `fixpoint::closure_over_store` + `StoreAtomSource` + `CombinedSource`
+//! (companion to `transitivity_spike.rs`, which covers the single-rule path).
 //!
 //! Every "Total" scan a rule body atom performs is answered by the store's
 //! real LOUDS tries (via `LftjSource::lftj_join_scan`) unioned on the fly
 //! with whatever has been derived so far this run — the base relation is
 //! never materialized into a `Vec` up front.
 //!
-//! ## What this proves
+//! ## Coverage
 //!
 //! 1. `RuleSet` correctly dispatches two interacting rules (`transitive` +
 //!    `type_propagation`) sharing one semi-naive fixpoint loop.

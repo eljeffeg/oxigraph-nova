@@ -322,10 +322,10 @@ mod tests {
         assert_eq!(hits[0].object_id, 3);
     }
 
-    /// Fix #1 regression: re-indexing the exact same `quad_key` (e.g. a
-    /// stale-marker rebuild re-processing a quad already in the index, or a
-    /// remove-then-reinsert between compactions) must replace the existing
-    /// document, never leave a duplicate behind.
+    /// Re-indexing the exact same `quad_key` (e.g. a stale-marker rebuild
+    /// re-processing a quad already in the index, or a remove-then-reinsert
+    /// between compactions) must replace the existing document, never leave
+    /// a duplicate behind.
     #[test]
     fn reinsert_same_quad_key_replaces_not_duplicates() {
         let idx = FulltextIndex::create_in_ram().unwrap();
@@ -347,9 +347,9 @@ mod tests {
         );
     }
 
-    /// Fix #2 regression: `clear()` must remove every document, so a
-    /// subsequent rebuild starting from a cleared index never sees stale
-    /// documents from a previous population.
+    /// `clear()` must remove every document, so a subsequent rebuild
+    /// starting from a cleared index never sees stale documents from a
+    /// previous population.
     #[test]
     fn clear_removes_all_documents() {
         let idx = FulltextIndex::create_in_ram().unwrap();

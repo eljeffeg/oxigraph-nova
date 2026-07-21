@@ -38,43 +38,43 @@ pub use oxigraph_nova_engine_louds::*;
 #[cfg(feature = "cyclic-ring")]
 pub mod cyclic;
 
-/// Phase 4 ID-level facade + differential oracles (not QuadStore / not SPARQL).
+/// ID-level facade + differential oracles (not QuadStore / not SPARQL).
 #[cfg(feature = "cyclic-ring")]
 pub mod facade;
-/// E5.9B Phase 2/3 — column-local Huffman for C_p (`HuffColP`) +
+/// Column-local Huffman for C_p (`HuffColP`) +
 /// [`PredicateColumn`] substrate on in-memory [`CyclicRing::c_p`].
-/// Enabled by product `ring-backend` (Phase 1D default). Research builds may
-/// enable `ring-huffman-cp` alone. Without the feature, C_p is plain QWT256
-/// (`*_qwt_cp` builders / `ring-backend-qwt`). See e5.9b-qwt-substrate-matrix.md.
+/// Enabled by product `ring-backend` by default. Builds may enable
+/// `ring-huffman-cp` alone. Without the feature, C_p is plain QWT256
+/// (`*_qwt_cp` builders / `ring-backend-qwt`).
 #[cfg(feature = "ring-huffman-cp")]
 pub mod huff_cp;
-/// Phase 4b per-graph read-only canonical-ID image adapter.
+/// Per-graph read-only canonical-ID image adapter.
 #[cfg(feature = "cyclic-ring")]
 pub mod image;
-/// E5.10 W0 — immutable mapped QWT (`NOVAQWT1`).
+/// Immutable mapped QWT (`NOVAQWT1`).
 #[cfg(feature = "cyclic-ring")]
 pub mod mapped_qwt;
-/// E5.10 W1 — mmap-backed Ring A shell (`NOVARNG1` / `MappedRingA`).
+/// Mmap-backed Ring A shell (`NOVARNG1` / `MappedRingA`).
 #[cfg(feature = "cyclic-ring")]
 pub mod mapped_ring;
-/// Phase L — product prepared physical-operator cache (two-hop, wedge, …).
+/// Prepared physical-operator cache (two-hop, wedge, …).
 #[cfg(feature = "cyclic-ring")]
 pub mod prepared_plan_cache;
-/// E5.11 → SPARQL product wire: env flags + path counters (W0).
+/// SPARQL product-path wire: env flags + path counters.
 #[cfg(feature = "cyclic-ring")]
 pub mod product_path;
-/// Unified heap/mmap navigation view (Phase 1A single residency).
+/// Unified heap/mmap navigation view (single residency).
 #[cfg(feature = "cyclic-ring")]
 pub mod ring_nav;
-/// Phase 5 in-memory QuadStore: Dictionary + Delta + BraidedGraphImage.
+/// In-memory QuadStore: Dictionary + Delta + BraidedGraphImage.
 #[cfg(feature = "cyclic-ring")]
 pub mod ring_store;
-/// Phase 4b ID-level LFTJ join/scan seam (`TrieIterator`, not QuadStore).
+/// ID-level LFTJ join/scan seam (`TrieIterator`, not QuadStore).
 #[cfg(feature = "cyclic-ring")]
 pub mod scan;
 #[cfg(feature = "ring-huffman-cp")]
 pub use huff_cp::{HuffColP, HuffCpCounterSnapshot, HuffCpCounters};
-/// E5.9B Phase 4 — mapped Huffman C_p section (`HQWA`) for NOVARNG1 v2.
+/// Mapped Huffman C_p section (`HQWA`) for NOVARNG1 v2.
 #[cfg(feature = "ring-huffman-cp")]
 pub mod mapped_hqwt;
 #[cfg(feature = "cyclic-ring")]

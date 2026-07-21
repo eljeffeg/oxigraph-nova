@@ -6,7 +6,7 @@
 # using nova_serve /metrics nova_path_* counters.
 #
 # Interprets:
-#   A — Phase L works (Execution drops on Ring vs LOUDS)
+#   A — prepared operators used (Execution drops on Ring vs LOUDS)
 #   B — prepared operator not used (Execution same)
 #   C — decode/materialize dominates (Execution small/same; Decode/Serialize large)
 #

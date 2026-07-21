@@ -32,9 +32,8 @@ serde                   = { workspace = true }
 serde_json              = { workspace = true }
 mimalloc = "0.1.52"
 sparesults = { workspace = true }
-# Optional direct qwt dependency for E5.9B research harnesses that compare
-# QWT256/HQWT256 directly (hqwt_vs_qwt_fair, e59b_hqwt_feasibility,
-# e59b_huffcolp_prototype). Version must match vendor/qwt/Cargo.toml so the
+# Optional direct qwt dependency for archived harnesses that compare
+# QWT256/HQWT256 directly. Version must match vendor/qwt/Cargo.toml so the
 # root [patch.crates-io] actually applies (see nova-engine-ring/Cargo.toml).
 qwt = { version = "0.5.0", optional = true }
 

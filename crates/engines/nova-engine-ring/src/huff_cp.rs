@@ -1,26 +1,24 @@
-//! E5.9B Phase 2 (research/notes/e5.9b-qwt-substrate-matrix.md §7/§8) —
-//! column-local Huffman substrate prototype for **C_p only**.
+//! Column-local Huffman substrate for **C_p only**.
 //!
 //! Feature-gated: `ring-huffman-cp` (implies `cyclic-ring`). Product
-//! `ring-backend` enables this by default (Phase 1D). Wired into
+//! `ring-backend` enables this by default. Wired into
 //! [`crate::cyclic::CyclicRing`] as `PredicateColumn::Huff` and NOVARNG1 HQWA.
 //!
 //! # Why C_p only
 //!
-//! §6/§6.1 of the substrate matrix note structurally **excludes** HQWT for
-//! C_o/C_s: the vendored `HuffOccsRangeIter` has undefined symbol order
-//! (breaks Nova's numeric-ordered RDI) and Huffman code ranges are not
-//! contiguous wavelet subtrees (breaks log-time numeric RNV), forcing an
-//! O(σ) probe fallback — prohibitive when σ≈U≈10⁵.
+//! HQWT is structurally unsuitable for C_o/C_s: the vendored
+//! `HuffOccsRangeIter` has undefined symbol order (breaks Nova's
+//! numeric-ordered RDI) and Huffman code ranges are not contiguous wavelet
+//! subtrees (breaks log-time numeric RNV), forcing an O(σ) probe fallback —
+//! prohibitive when σ≈U≈10⁵.
 //!
 //! C_p is different: its alphabet is **schema-sized** (`np` distinct
 //! predicates, typically tens), so an O(σ_P) linear-scan RDI/RNV fallback
-//! is cheap. §7.2 additionally showed `Col::P` *is* reachable as an
-//! RDI/RNV target (predicate-unbound `SELECT DISTINCT ?p` query shapes via
-//! `dense_scan_kind`), so this fallback is required for correctness, not
-//! just theoretical completeness.
+//! is cheap. `Col::P` *is* reachable as an RDI/RNV target (predicate-unbound
+//! `SELECT DISTINCT ?p` query shapes via `dense_scan_kind`), so this
+//! fallback is required for correctness, not just theoretical completeness.
 //!
-//! # Local densification (refinement over the §6.1 harness)
+//! # Local densification
 //!
 //! The archived `hqwt_vs_qwt_fair` harness built `HQWT256` directly over
 //! **shared-alphabet** P values (offset into `[ns, ns+np)`), which inflates
@@ -506,7 +504,7 @@ mod tests {
 
     #[test]
     fn lf_cycle_style_composition_matches_across_substrates() {
-        // Not a full CyclicRing integration (Phase 2 is standalone), but
+        // Not a full CyclicRing integration ( is standalone), but
         // verifies the F(i) = A[c] + rank(c, i+1) - 1 formula produces
         // identical results whether rank/access come from HuffColP or
         // QWT256, given the same external A_p cumulative array.

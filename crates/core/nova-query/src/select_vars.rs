@@ -4,10 +4,9 @@
 //! its column headers without re-deriving them from each row (Nova's
 //! `Solution` supports lookup by `&Variable` but not "list every variable in
 //! this query's SELECT clause") — currently `nova-server`'s HTTP result
-//! serialization and `nova-python`'s `PyStore::query`/`QuerySolutions`. Both
-//! previously carried their own copy of this logic; centralizing it here
-//! means there is exactly one place that has to track spargebra's `Query`/
-//! `GraphPattern` shape.
+//! serialization and `nova-python`'s `PyStore::query`/`QuerySolutions`. One
+//! shared helper means there is exactly one place that has to track
+//! spargebra's `Query`/`GraphPattern` shape.
 
 use spargebra::Query;
 use spargebra::algebra::GraphPattern;

@@ -1,9 +1,9 @@
 //! `clap` argument definitions for the `oxigraph` binary.
 //!
 //! Subcommand/flag names deliberately mirror upstream `oxigraph-cli`
-//! (see `./research/applications/oxigraph/cli/src/cli.rs`) wherever Nova's feature surface
-//! overlaps — this binary is even named `oxigraph`, so scripts/muscle
-//! memory written against one carry over to the other. Nova ships 11
+//! wherever Nova's feature surface overlaps — this binary is even named
+//! `oxigraph`, so scripts/muscle memory written against one carry over to
+//! the other. Nova ships 11
 //! subcommands: `load`, `backup`, `serve`, `query`, `update`, `dump`,
 //! `convert`, `optimize`, `serve-read-only`, `validate`, `mcp` — matching
 //! upstream's full subcommand surface plus Nova's own SHACL `validate` and

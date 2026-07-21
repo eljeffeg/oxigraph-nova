@@ -1,15 +1,15 @@
-//! ID-level Braided Ring facade (Phase 4 / 4b).
+//! ID-level Braided Ring facade.
 //!
 //! Thin ownership wrapper over optional heap [`CyclicRing`] and optional mmap
 //! [`MappedRingA`]. This is **not** a [`oxigraph_nova_core::QuadStore`]: no
 //! dictionary, no SPARQL cutover, no live writes. Callers build from
 //! shared-alphabet `u32` triples and use navigation / D2 primitives.
 //!
-//! Phase 4b adds [`BraidedRingIndex::join_scan`] (see `scan` module) — an
+//! Also exposes [`BraidedRingIndex::join_scan`] (see `scan` module) — an
 //! ID-level `TrieIterator` seam matching `LftjSource::lftj_join_scan`
 //! semantics, still without dictionary/delta/`QuadStore`.
 //!
-//! ## Dual residency (Phase 1A)
+//! ## Dual residency
 //!
 //! After a successful [`Self::materialize_mapped`], the product path **drops**
 //! the heap QWT/A payloads by default so process RSS is not charged twice for
@@ -120,7 +120,7 @@ impl BraidedRingIndex {
 
     /// Flatten heap → `NOVARNG1` bytes, write to `path`, open mmap.
     ///
-    /// By default drops the heap payload after a successful open (Phase 1A).
+    /// By default drops the heap payload after a successful open.
     /// Set `NOVA_RING_KEEP_HEAP=1` to retain both for differentials.
     pub fn materialize_mapped(&mut self, path: &Path) -> Result<(), MappedRingError> {
         self.materialize_mapped_ex(path, ring_keep_heap())

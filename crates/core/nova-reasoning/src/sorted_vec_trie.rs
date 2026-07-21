@@ -104,7 +104,7 @@ impl SortedVecTrie {
 
     /// Binary search within `self.range` for the first row index whose
     /// `col`-value is `>= target`. Mirrors `&[u64]`'s `partition_point`
-    /// (Hard-Won Lesson #1: SIMD-eligible, no bit-packing).
+    /// (SIMD-eligible over plain `u64` rows — bit-packing would regress `seek`).
     #[inline]
     fn lower_bound(&self, target: u64) -> usize {
         let (lo, hi) = self.range;

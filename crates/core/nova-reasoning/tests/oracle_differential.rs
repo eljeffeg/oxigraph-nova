@@ -306,7 +306,7 @@ fn subproperty_propagation_matches_reasonable_oracle() {
     // ⟹ alice hasParent bob. Unlike subPropertyOf *transitivity* (no
     // standalone rule in `reasonable`, see the test above), `reasonable`
     // does implement `prp-spo1` itself (see
-    // `research/applications/reasonable/lib/src/reasoner.rs` around line 1523), so this
+    // the `reasonable` reasoner), so this
     // is a genuine cross-engine oracle comparison.
     let ex = "http://example.org/";
     let sp = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
@@ -361,7 +361,7 @@ fn domain_and_range_propagation_matches_reasonable_oracle() {
     // prp-dom/prp-rng: hasParent rdfs:domain Person, hasParent rdfs:range
     // Person, alice hasParent bob ⟹ alice rdf:type Person (domain) and
     // bob rdf:type Person (range). `reasonable` implements both `prp-dom`
-    // and `prp-rng` itself (see `research/applications/reasonable/lib/src/reasoner.rs`
+    // and `prp-rng` itself (see the `reasonable` reasoner
     // around lines 1278/1290), so this is a genuine cross-engine oracle
     // comparison, mirroring `subproperty_propagation_matches_reasonable_oracle`.
     //
@@ -481,7 +481,7 @@ fn generic_transitive_property_matches_reasonable_oracle() {
     // unrelated to rdfs:subClassOf/subPropertyOf) must derive the
     // transitive edge across a chain of its own facts. `reasonable`
     // implements `prp-trp` itself (see
-    // `research/applications/reasonable/lib/src/reasoner.rs` around line 1679), so this
+    // the `reasonable` reasoner), so this
     // is a genuine cross-engine oracle comparison.
     let ex = "http://example.org/";
     let ty = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -548,7 +548,7 @@ fn generic_transitive_property_matches_reasonable_oracle() {
 fn generic_symmetric_property_matches_reasonable_oracle() {
     // prp-symp: a user-declared owl:SymmetricProperty (`knows`) must derive
     // the reverse edge. `reasonable` implements `prp-symp` itself (see
-    // `research/applications/reasonable/lib/src/reasoner.rs`), so this is a genuine
+    // the `reasonable` reasoner), so this is a genuine
     // cross-engine oracle comparison.
     let ex = "http://example.org/";
     let ty = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -647,7 +647,7 @@ fn equivalent_property_matches_reasonable_oracle() {
     // `equivalent_class_matches_reasonable_oracle`), `reasonable`'s
     // `prp-eqp` never materializes an `rdfs:subPropertyOf` schema triple:
     // it only uses the equivalence internally to propagate *instance-level*
-    // facts directly (`research/applications/reasonable/lib/src/reasoner.rs` around
+    // facts directly (the `reasonable` reasoner around
     // line 1696, joining `equivalent_properties`/`equivalent_properties_2`
     // against `pso`, producing `(x, p2, y)`/`(x, p1, y)` data facts, never a
     // `(p1, rdfs:subPropertyOf, p2)` triple). `LftjFixpointEngine`, by

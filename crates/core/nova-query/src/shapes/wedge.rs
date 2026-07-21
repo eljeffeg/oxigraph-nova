@@ -1,4 +1,4 @@
-//! Fixed-P undirected triangle (K7.1 / K11 wedge):
+//! Fixed-P undirected triangle ( wedge):
 //! `?a P ?b . ?b P ?c . ?a P ?c`
 //!
 //! Three directed edges under one predicate that cover the three pairs among

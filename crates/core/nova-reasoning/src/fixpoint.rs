@@ -180,9 +180,8 @@ fn project_head(head: &RuleAtom, binding: &[u64]) -> [u64; 3] {
     [resolve(&head.s), resolve(&head.p), resolve(&head.o)]
 }
 
-/// Convenience wrapper: run a single transitivity [`Rule`] to closure (the
-/// original spike's entry point, kept for the existing integration test and
-/// as the simplest possible usage example).
+/// Convenience wrapper: run a single transitivity [`Rule`] to closure.
+/// Kept for the existing integration test and as the simplest usage example.
 pub fn transitive_closure(rule: Rule, base_triples: &[[u64; 3]]) -> Vec<[u64; 3]> {
     let rules = RuleSet::new(vec![rule]);
     closure(&rules, base_triples)

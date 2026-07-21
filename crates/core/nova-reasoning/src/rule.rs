@@ -1,12 +1,11 @@
 //! Rules-as-data for the semi-naive fixpoint driver.
 //!
 //! A [`Rule`] is a conjunction of body [`RuleAtom`]s plus a single head atom,
-//! all sharing a common variable space (`0..num_vars`). This directly
-//! generalizes the original single-shape spike (one hardcoded transitivity
-//! join) to arbitrary N-atom rule bodies, so the full OWL 2 RL / RDFS rule
-//! table (`cax-sco`, `scm-sco`, `scm-spo`, `prp-spo1`, `prp-dom`, `prp-rng`,
-//! `prp-trp`, `prp-symp`, `prp-inv1`/`prp-inv2`, ...) can be expressed as
-//! plain data rather than bespoke Rust functions.
+//! all sharing a common variable space (`0..num_vars`). Arbitrary N-atom rule
+//! bodies let the full OWL 2 RL / RDFS rule table (`cax-sco`, `scm-sco`,
+//! `scm-spo`, `prp-spo1`, `prp-dom`, `prp-rng`, `prp-trp`, `prp-symp`,
+//! `prp-inv1`/`prp-inv2`, ...) be expressed as plain data rather than
+//! bespoke Rust functions.
 //!
 //! [`RuleSet`] groups many [`Rule`]s together and provides predicate-indexed
 //! dispatch (`active_rules`): given a round's newly-derived `delta` facts,

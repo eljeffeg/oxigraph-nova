@@ -2,7 +2,7 @@
 //!
 //! Generalizes [`super::sp_expansion::SpExpansionPlan`] (one filter + one open
 //! arm) to three open object arms under distinct predicates on a shared
-//! subject. Longer stars (k > 3) stay on the roadmap until the plan grows
+//! subject. Longer stars (k > 3) are not recognized yet; the plan would need
 //! variable arity.
 //!
 //! Prepared physical bodies are optional: the walker always has a fixed-order

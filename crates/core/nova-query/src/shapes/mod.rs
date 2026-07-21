@@ -5,7 +5,7 @@
 //! 1. **Shape** (this module) — pure structural predicate over [`PatternSpec`]
 //! 2. **Physical strategy** — `eval_*_walk` in `lftj.rs`
 //! 3. **Engine capability** — [`oxigraph_nova_core::LftjSource::lftj_prepare_shape`]
-//!    (Phase 2: one entry point, match on [`oxigraph_nova_core::PhysicalShape`])
+//!    (one entry point, match on [`oxigraph_nova_core::PhysicalShape`])
 //!
 //! Recognizers are tried in specificity order (most specific first). A miss
 //! falls through to generic VEO LFTJ. Adding a shape means adding a recognizer
@@ -14,14 +14,14 @@
 //! Nesting (`ShapePlan` trees) is intentionally deferred until a real nested
 //! case (e.g. `star_with_features`) needs it.
 //!
-//! ## Live catalog (Phase 1–3 + KChain k=3 + Star k=3)
+//! ## Live catalog
 //!
 //! - [`ShapeId::SpExpansion`] / [`ShapeId::TwoHop`] / [`ShapeId::Wedge`] /
 //!   [`ShapeId::KChain`] (k = 3) / [`ShapeId::Star`] (k = 3)
 //!
-//! ## Roadmap shapes (guideposts — ids only until recognizers land)
+//! ## Reserved shape ids (no recognizer / walk yet)
 //!
-//! See [`ShapeId`] variants marked *roadmap*. When implementing one:
+//! See [`ShapeId`] variants marked *reserved*. When implementing one:
 //! 1. Add `*Plan` + `ShapeRecognizer` in its own module
 //! 2. Register in [`CATALOG`] (specificity order)
 //! 3. Add `ShapePlan` variant + `eval_*_walk` dispatch
@@ -46,8 +46,8 @@ pub use wedge::WedgePlan;
 /// Stable identifier for a recognized BGP shape.
 ///
 /// Used for observability (`shape_selected[ShapeId]`) and engine capability
-/// advertisement. Roadmap variants exist so counters / capability tables can
-/// name future motifs before recognizers are wired.
+/// advertisement. Reserved variants exist so counters / capability tables can
+/// name known motifs before recognizers are wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShapeId {
     // ── Live (catalog-selected today) ────────────────────────────────────
@@ -58,23 +58,23 @@ pub enum ShapeId {
     /// `?a P ?b . ?b P ?c . ?a P ?c` — fixed-P undirected triangle (3 patterns, 3 vars).
     Wedge,
     /// `?a P1 ?b . ?b P2 ?c . ?c P3 ?d` — 3-hop chain (3 patterns, 4 vars).
-    /// Live for k = 3 only; longer chains (k > 3) remain roadmap work on the
-    /// same id once the plan grows variable arity.
+    /// Recognized for k = 3 only; longer chains would reuse this id once the
+    /// plan grows variable arity.
     KChain,
     /// `?s P1 ?o1 . ?s P2 ?o2 . ?s P3 ?o3` — subject-star k-way fan-out
-    /// (3 patterns, 4 vars). Live for k = 3 only; longer stars (k > 3) remain
-    /// roadmap work on the same id once the plan grows variable arity.
+    /// (3 patterns, 4 vars). Recognized for k = 3 only; longer stars would
+    /// reuse this id once the plan grows variable arity.
     /// Generalizes [`Self::SpExpansion`].
     Star,
 
-    // ── Roadmap (not in catalog; no ShapePlan / walk yet) ────────────────
-    /// *Roadmap.* Directed 3-cycle, mixed predicates allowed:
+    // ── Reserved (not in catalog; no ShapePlan / walk yet) ───────────────
+    /// *Reserved.* Directed 3-cycle, mixed predicates allowed:
     /// `?a P1 ?b . ?b P2 ?c . ?c P3 ?a` (distinct from fixed-P [`Self::Wedge`]).
     DirectedTriangle,
-    /// *Roadmap.* Two paths a→…→d sharing endpoints:
+    /// *Reserved.* Two paths a→…→d sharing endpoints:
     /// `?a→?b→?d` and `?a→?c→?d` (diamond / multi-path meet).
     Diamond,
-    /// *Roadmap.* Shared-object reverse fan:
+    /// *Reserved.* Shared-object reverse fan:
     /// `?a P1 ?o . ?b P2 ?o . …` (inverse of [`Self::Star`]).
     ObjectStar,
 }
@@ -93,7 +93,7 @@ impl ShapeId {
         )
     }
 
-    /// All known shape ids (live + roadmap), for capability / counter tables.
+    /// All known shape ids (live + reserved), for capability / counter tables.
     pub const ALL: &'static [ShapeId] = &[
         ShapeId::SpExpansion,
         ShapeId::TwoHop,
@@ -552,10 +552,10 @@ mod tests {
         assert!(recognize_shape(&specs, 3).is_none());
     }
 
-    // ── Roadmap guideposts ──────────────────────────────────────────────────
+    // ── Reserved shape ids ──────────────────────────────────────────────────
 
     #[test]
-    fn roadmap_shape_ids_are_not_live() {
+    fn reserved_shape_ids_are_not_live() {
         assert!(ShapeId::SpExpansion.is_live());
         assert!(ShapeId::TwoHop.is_live());
         assert!(ShapeId::Wedge.is_live());
@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn roadmap_motifs_fall_through_until_recognizers_land() {
+    fn reserved_motifs_fall_through_until_recognizers_land() {
         // Directed cycle with mixed P — future ShapeId::DirectedTriangle.
         let cycle = [
             spec(jv(0), c(1), jv(1)),

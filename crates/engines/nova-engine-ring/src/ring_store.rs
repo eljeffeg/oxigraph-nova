@@ -1,4 +1,4 @@
-//! Cyclic QWT [`RingStore`] `QuadStore` (Phase 5).
+//! Cyclic QWT [`RingStore`] `QuadStore`.
 //!
 //! Wires term dictionary + live LSM delta + per-graph
 //! [`BraidedGraphImage`] into [`QuadStore`] / [`LftjSource`].
@@ -100,7 +100,7 @@ impl Drop for Flusher {
     }
 }
 
-/// Cross-request SP→O adjacency tables (K9.4), keyed by
+/// Cross-request SP→O adjacency tables, keyed by
 /// (snapshot_version, graph_id, predicate). Built once on cold miss; warm
 /// HTTP 2join reuses `Arc` without the ~50–100 ms universe walk.
 struct SpAdjCache {
@@ -639,9 +639,9 @@ pub struct RingStore {
     decode_snap: RwLock<Option<DecodeSnapshot>>,
     /// B: compacted graphs when delta empty (None while dirty / pre-compact).
     graphs_snap: RwLock<Option<GraphsSnapshot>>,
-    /// Phase L: reusable prepared physical operators (two-hop, wedge, …).
+    /// reusable prepared physical operators (two-hop, wedge, …).
     physical_op_cache: Arc<Mutex<PhysicalOpPreparedPlanCache>>,
-    /// Cross-request SP→O K9.4 adjacency (warm HTTP 2join).
+    /// Cross-request SP→O adjacency (warm HTTP 2join).
     sp_adj_cache: Mutex<SpAdjCache>,
     /// Bumped on write/compact so cache keys cannot outlive store identity.
     snapshot_version: AtomicU64,
@@ -957,7 +957,7 @@ impl RingStore {
     fn clear_compact_snaps(&self) {
         self.clear_decode();
         self.clear_graphs_snap();
-        // Phase L: drop prepared physical ops keyed by the prior snapshot generation.
+        // drop prepared physical ops keyed by the prior snapshot generation.
         self.physical_op_cache.lock().clear();
         self.sp_adj_cache.lock().clear();
         self.snapshot_version.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1144,7 +1144,7 @@ impl RingStore {
         !inner.graphs.is_empty() && inner.graphs.values().all(|g| g.has_mapped())
     }
 
-    /// Default-graph Braided image when delta is empty (Phase-2 cost harness).
+    /// Default-graph Braided image when delta is empty (cost harness).
     ///
     /// Returns `None` while dirty / pre-compact. Diagnostic only — not a
     /// stable product API for query engines (use `LftjSource` instead).
@@ -1329,7 +1329,7 @@ impl LftjSource for RingStore {
     ) -> Option<Box<dyn PreparedSpObjectScan>> {
         let img = self.graph_from_snap(graph_id)?;
         let ver = self.snapshot_version.load(AtomicOrdering::Relaxed);
-        // Warm HTTP 2join: reuse K9.4 adj across requests. Cold miss builds once
+        // Warm HTTP 2join: reuse adj across requests. Cold miss builds once
         // (amortized over warmup + timed iters). Never rebuild per evaluate.
         let adj = self
             .sp_adj_cache

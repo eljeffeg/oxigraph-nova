@@ -1,4 +1,4 @@
-//! ID-level LFTJ join/scan seam for Braided Ring (Phase 4b / streaming).
+//! ID-level LFTJ join/scan seam for Braided Ring.
 //!
 //! Provides a [`TrieIterator`]-compatible `join_scan` over shared-alphabet
 //! `u32` triples **without** dictionary, delta, or `QuadStore`.
@@ -11,14 +11,14 @@
 //!
 //! ## Why this must stream (not materialize)
 //!
-//! LOUDS `join_scan` returns a lazy LOUDS trie cursor. The previous Ring path
-//! collected **all** distinct target IDs into a `Vec` on every open, and
-//! `lftj_real_count` re-did the same work for every VEO probe. On 2-join /
-//! high-cardinality patterns that is still a hang — just a later one.
+//! LOUDS `join_scan` returns a lazy LOUDS trie cursor. Materializing **all**
+//! distinct target IDs into a `Vec` on every open (and re-doing that work in
+//! `lftj_real_count` for every VEO probe) hangs on 2-join / high-cardinality
+//! patterns.
 //!
 //! This module streams with the primitives that already beat LOUDS in
 //! microbenches:
-//! - **mapped RDI** (E5.11 B1/B2) for LastCol when `NOVARNG1` is open (W2)
+//! - **mapped RDI** for LastCol when `NOVARNG1` is open
 //! - heap [`CyclicRing::range_next_value`] (RNV) fallback — O(log σ) successor
 //! - lead-range restriction + binary search on sorted middle runs (T_spo / T_osp / T_pos)
 //!
@@ -649,7 +649,7 @@ fn middle_rows_heuristic(ring: RingRef<'_>, range: RowRange, n_bound: u64) -> u6
 /// Cache key for MiddleRuns VEO estimates that do not depend on outer LFTJ
 /// bindings (e.g. bound-P → target O). Adaptive VEO re-probes every depth with
 /// the same (range, mid); without a cache, path_2hop walked up to
-/// `VEO_MIDDLE_EXACT_RUN_BUDGET` runs × 50k outer subjects (Phase K0 hang).
+/// `VEO_MIDDLE_EXACT_RUN_BUDGET` runs × 50k outer subjects ( hang).
 ///
 /// Keyed by ring identity (n, universe) + range + middle kind. Process-wide;
 /// assumes one active compacted graph per process (RESULTS_MEM). Cap
@@ -703,7 +703,7 @@ const VEO_MIDDLE_CACHE_CAP: usize = 4096;
 /// - **MiddleRuns** (default): exact distinct-run count up to
 ///   [`VEO_MIDDLE_EXACT_RUN_BUDGET`]; fall back to row-span heuristic if budget
 ///   exceeded. Results are **cached** per (range, mid) so adaptive VEO does
-///   not re-walk the same middle on every outer binding (Phase K0).
+/// not re-walk the same middle on every outer binding.
 ///   `NOVA_RING_VEO_OLD_HEURISTIC=1` forces the old row-span path (A/B).
 /// - **LastCol**: min(row-span, vocab heuristic) — LOUDS-style, no full RDI.
 ///
@@ -868,14 +868,11 @@ impl TrieIterator for BraidedStreamingScan {
     }
 }
 
-// ── Mapped LastCol RDI streaming scan (W2 / E5.11 star kernel) ────────────────
+// ── Mapped LastCol RDI streaming scan (star kernel) ───────────────────
 //
-// Design (research/plans/BRAIDED_RING.md + notes/e5.11-sparql-product-wire.md W2 +
-// benches e511_ring_perf_profile star_mmap):
-//
-//   Product star/scan kernel = mmap hot QWT + **stateful RDI**
-//     (`MappedRangeDistinctIter` / `range_distinct_iter`) — same as G2.
-//   Product successor primitive = **RNV** (`range_next_value`) — O(log σ).
+// Product star/scan kernel = mmap hot QWT + **stateful RDI**
+//   (`MappedRangeDistinctIter` / `range_distinct_iter`).
+// Product successor primitive = **RNV** (`range_next_value`) — O(log σ).
 //
 // LFTJ contract (nova-query): monotonic `seek` / `advance` on a scan opened
 // once per pattern×depth. So:
@@ -885,13 +882,13 @@ impl TrieIterator for BraidedStreamingScan {
 //                 Large gap / after RNV-only: stay on RNV (path_2hop leapfrog).
 //   • Heap RNV-only remains the no-mmap fallback (`BraidedStreamingScan`).
 //
-// Forbidden regression: `resync_from` that rebuilds RDI at range.start and
-// rescans every seek — O(|distinct|) per seek → path_2hop ~40× LOUDS.
+// Do not rebuild RDI at range.start and rescan on every seek — that is
+// O(|distinct|) per seek and makes path_2hop ~40× slower than LOUDS.
 
 /// How LastCol navigation is served after open / seek.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LastColMode {
-    /// Stateful mapped RDI (E5.11 star kernel).
+    /// Stateful mapped RDI (star kernel).
     Rdi,
     /// Mapped RNV only (leapfrog / large seek).
     Rnv,
@@ -995,7 +992,7 @@ impl BraidedMappedLastColScan {
         }
     }
 
-    /// K9.3 R2: rebind an existing LastCol cursor to a new SP range in-place.
+    /// rebind an existing LastCol cursor to a new SP range in-place.
     ///
     /// Prefers RDI bounds reset (no Arc re-open). Falls back to RNV mode for
     /// Huffman C_p (no Qwt RDI stack).
@@ -1091,7 +1088,7 @@ impl TrieIterator for BraidedMappedLastColScan {
         };
         match self.mode {
             LastColMode::Rdi => {
-                // E5.11 star kernel: stateful RDI next.
+                // star kernel: stateful RDI next.
                 self.current = self.rdi.next_symbol().map(|(s, _)| s);
             }
             LastColMode::Rnv => {
@@ -1118,7 +1115,7 @@ impl TrieIterator for BraidedMappedLastColScan {
     }
 }
 
-// ── D1 two-range object intersection scan (W4b / E5.11) ──────────────────────
+// ── D1 two-range object intersection scan ──────────────────────
 
 /// Streaming D1 common-object scan under two subject ranges.
 ///
@@ -1223,11 +1220,11 @@ impl TrieIterator for BraidedD1ObjectScan {
     }
 }
 
-// ── D2 three-range object intersection scan (W4 / E5.11 triangle kernel) ─────
+// ── D2 three-range object intersection scan (triangle kernel) ─────
 
 /// Streaming D2 common-object scan under three subject ranges.
 ///
-/// Product triangle shape (RESULTS_MEM / E5.11 G3): distinct objects present
+/// Product triangle shape (RESULTS_MEM): distinct objects present
 /// under subjects `s0`, `s1`, `s2` via `intersection_next_value3` on Col::O.
 ///
 /// Not selected automatically by LFTJ leapfrog (three independent iterators);
@@ -1504,7 +1501,7 @@ impl BraidedGraphImage {
                 Box::new(BraidedStreamingScan::new(img, kind))
             }
             DenseScanKind::LastCol { col, range } if img.has_mapped() => {
-                // W2: mapped hot RDI (E5.11 star / large lead-range kernel).
+                // mapped hot RDI ( star / large lead-range kernel).
                 SPARQL_PATH.path_mapped_rdi.fetch_add(1, Ordering::Relaxed);
                 match BraidedMappedLastColScan::open(Arc::clone(&img), col, range) {
                     Some(scan) => Box::new(scan),
@@ -1592,7 +1589,7 @@ impl BraidedGraphImage {
     /// `subjects` are **external** TermIds already bound as subjects of active
     /// patterns that all target the object field. Uses D1 for 2 subjects and
     /// D2 for ≥3 (product triangle kernel). Predicate bind is currently ignored
-    /// at the range layer (subject lead ranges on Col::O) — same as E5.11 G3
+    /// at the range layer (subject lead ranges on Col::O) — same as
     /// harness which seeds `range_s` only; SP-restricted ranges can be layered
     /// later without changing the LFTJ API.
     ///
@@ -1716,21 +1713,21 @@ pub fn oracle_join_scan(
     vals
 }
 
-// ── K9 prepared resettable SP→O scanner + two-hop plan ───────────────────────
+// ── prepared resettable SP→O scanner + two-hop plan ───────────────────────
 //
-// Restored from K9/K10 product path (stash braided-ring-productize). Adapted to
-// RingRef (Phase 1A mmap-only residency) + Huffman C_p product default.
+// Prepared scanners for the product path.
+// RingRef ( mmap-only residency) + Huffman C_p product default.
 //
 // Hot path before prepare (per subject under fixed P):
 //   graph snap + remap(s) + remap(P) + range_sp + open_lastcol + Box<dyn>
 //
-// PreparedSpObjectScan (K9.2):
+// PreparedSpObjectScan:
 //   prepare once: img + dense P
 //   reset_to_subject: remap(s) + range_sp + rebind RDI cursor only
 //
-// PreparedTwoHop (K9.1–K9.4):
+// PreparedTwoHop:
 //   hop1 + hop2 prepared scanners; execute nested a→b→c walk
-//   R1 middle-b range cache; R2 cheap hit rebind; K9.4 pred adjacency
+// R1 middle-b range cache; R2 cheap hit rebind; pred adjacency
 
 /// Max SP row-span that materialises objects via `access` instead of opening a
 /// mapped LastCol RDI. Tuned for subject-star 2join where BSBM P131 degree is 1
@@ -1754,9 +1751,9 @@ enum SpObjectBody {
     Mapped(BraidedMappedLastColScan),
 }
 
-/// Resettable SP→O scanner for a fixed predicate (K9.2).
+/// Resettable SP→O scanner for a fixed predicate.
 ///
-/// Prepare once: img + dense P + optional shared K9.4 adjacency (`Arc`).
+/// Prepare once: img + dense P + optional shared adjacency (`Arc`).
 ///
 /// **Adjacency policy:** never build a universe-sized adj table *inside*
 /// bare [`prepare`] — SP-expansion prepares once per HTTP request and that
@@ -1769,7 +1766,7 @@ enum SpObjectBody {
 pub struct PreparedSpObjectScanImpl {
     img: Arc<BraidedGraphImage>,
     pred_dense: u32,
-    /// Shared K9.4 dense subject → SP(RowRange). `None` ⇒ live `range_sp`.
+    /// Shared dense subject → SP(RowRange). `None` ⇒ live `range_sp`.
     adj: Option<Arc<PredicateAdjacency>>,
     body: SpObjectBody,
     /// Retained mapped cursor across large-range resets (cheap rebind).
@@ -1807,7 +1804,7 @@ impl PreparedSpObjectScanImpl {
         })
     }
 
-    /// Build a K9.4 adjacency table for `predicate` (dense). Expensive —
+    /// Build a adjacency table for `predicate` (dense). Expensive
     /// intended for the store-level SP adj cache cold path only.
     pub fn build_shared_adj(
         img: &BraidedGraphImage,
@@ -1975,7 +1972,7 @@ impl PreparedSpObjectScan for PreparedSpObjectScanImpl {
             .k9_sp_remap_ns
             .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-        // Shared K9.4 adj (warm HTTP) → O(1); else live range_sp.
+        // Shared adj (warm HTTP) → O(1); else live range_sp.
         let range = if let Some(adj) = self.adj.as_ref() {
             match adj.range_for_subject(s_dense) {
                 Some(r) => {
@@ -2062,7 +2059,7 @@ impl PreparedSpObjectScan for PreparedSpObjectScanImpl {
     }
 }
 
-/// K9.4: dense subject→SP(RowRange) table for a fixed predicate.
+/// dense subject→SP(RowRange) table for a fixed predicate.
 ///
 /// Shared across HTTP requests via the store-level SP adj cache (`Arc`).
 pub struct PredicateAdjacency {
@@ -2185,7 +2182,7 @@ impl PredicateAdjacency {
     }
 }
 
-/// Ring PreparedTwoHop body (K9.1–K9.4) — product path_2hop kernel.
+/// Ring PreparedTwoHop body — product path_2hop kernel.
 pub struct PreparedTwoHopImpl {
     img: Arc<BraidedGraphImage>,
     p1: u64,
@@ -2724,7 +2721,7 @@ pub struct PreparedSpExpansionImpl {
     img: Arc<BraidedGraphImage>,
     /// Dense subjects of pattern A (P_filter, O_filter → S), external order.
     outer_subjects_dense: Vec<u32>,
-    /// K9.4 adj for P_expand (dense subject → SP RowRange).
+    /// adj for P_expand (dense subject → SP RowRange).
     expand_adj: Option<Arc<PredicateAdjacency>>,
     expand_pred_dense: u32,
 }
@@ -2917,12 +2914,12 @@ impl PreparedPhysicalOperator for PreparedSpExpansionImpl {
     }
 }
 
-// ── K7.2 / K11 fixed-P wedge (prepared D1 body) ───────────────────────────────
+// ── fixed-P wedge (prepared D1 body) ───────────────────────────────
 //
 // Shape: `?a P ?b . ?b P ?c . ?a P ?c` under one predicate.
 //
 // Plan:
-//   1. Prepare once: densify P + optional K9.4 adj (SP range O(1) per subject)
+// 1. Prepare once: densify P + optional adj (SP range O(1) per subject)
 //   2. Enumerate outer a under P (join_scan subjects)
 //   3. For each a: objects b under SP(a,P) via PreparedSpObjectScan
 //   4. Close c via SP-restricted D1: ∩ Col::O over ranges SP(a,P) and SP(b,P)
@@ -2931,7 +2928,7 @@ impl PreparedPhysicalOperator for PreparedSpExpansionImpl {
 // Requires mmap (same as TwoHop / SpExpansion). No mmap → prepare returns None
 // and the query walker keeps its nested multi-subject / join_scan fallback.
 
-/// Opaque prepared fixed-predicate D1 context (K7.2 left-once).
+/// Opaque prepared fixed-predicate D1 context ( left-once).
 ///
 /// Holds densified P + optional adj so each `bind_left` only remaps the outer
 /// subject and looks up SP(a,P).
@@ -3176,7 +3173,7 @@ impl TrieIterator for BraidedSpD1ObjectScan {
     }
 }
 
-/// Ring prepared wedge body (K11) — outer a→b under P, close via SP-restricted D1.
+/// Ring prepared wedge body — outer a→b under P, close via SP-restricted D1.
 pub struct PreparedWedgeImpl {
     img: Arc<BraidedGraphImage>,
     predicate: u64,

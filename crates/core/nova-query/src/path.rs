@@ -480,17 +480,14 @@ fn bidirectional_reachable<D: Dataset>(
 
 // ── Product-automaton RPQ evaluation ─────────────────────────────────────────
 //
-// Composed path expressions (e.g. `(p/q)+`, `p|q`, `!(p|q)`) previously went
-// through `path_pairs`, which recursively materializes a full
-// `Vec<(Term, Term)>` *per operator* and joins/unions them — O(closure)
-// *memory* at every level of the expression tree, not just once per query.
-//
-// Instead, we compile the `PropertyPathExpression` into a small Thompson-style
-// NFA (states proportional to *expression size*, not data size) and run a
-// single BFS over `(node_id, nfa_state)` product pairs, using the existing
-// `lftj_join_scan` neighbor lookup at each step. This evaluates the entire
-// RPQ in one traversal with no intermediate pair-set materialization — the
-// only memory cost is the visited `(node, state)` set.
+// Composed path expressions (e.g. `(p/q)+`, `p|q`, `!(p|q)`) compile into a
+// small Thompson-style NFA (states proportional to *expression size*, not
+// data size) and run a single BFS over `(node_id, nfa_state)` product pairs,
+// using `lftj_join_scan` neighbor lookup at each step. This evaluates the
+// entire RPQ in one traversal with no intermediate pair-set materialization —
+// the only memory cost is the visited `(node, state)` set. (A recursive
+// `path_pairs` approach that materializes `Vec<(Term, Term)>` per operator
+// would pay O(closure) memory at every level of the expression tree.)
 
 /// One transition edge in the compiled path-expression NFA.
 ///

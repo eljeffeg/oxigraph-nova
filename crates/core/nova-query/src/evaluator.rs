@@ -3355,7 +3355,7 @@ fn tz_str_to_duration(tz: &str) -> String {
 /// `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown` (no OS
 /// clock is available there) — use the `Date.now()` ECMAScript API via
 /// `js_sys` instead on that target, matching how upstream oxigraph-js's
-/// `oxsdatatypes` handles this (see `research/applications/oxigraph/lib/oxsdatatypes/src/date_time.rs`).
+/// `oxsdatatypes` handles this.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn current_datetime_string() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};

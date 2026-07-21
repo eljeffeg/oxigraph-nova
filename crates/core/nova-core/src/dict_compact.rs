@@ -50,15 +50,14 @@
 //! pattern used throughout `nova-engine-ring`'s `louds.rs`/`cltj.rs`/
 //! `snapshot.rs`.
 //!
-//! The block-keyed binary search previously used a `Vec<(u8, Vec<u8>)>`
-//! (`block_first_keys`) — not directly ε-serde-friendly, since epserde does
-//! not support tuples or `Vec<Vec<u8>>` directly. This is flattened into
-//! three parallel arrays instead, mirroring `SidecarCore`'s
-//! "flatten variable-length payloads into parallel `Vec` + offset arrays"
-//! pattern: `block_tags` (one tag per block), `key_flat` (concatenated
-//! first-key primary-string bytes for every block), and `key_offsets` (the
-//! starting offset of each block's key within `key_flat`; a block's key ends
-//! at the next block's offset, or at `key_flat`'s end for the last block).
+//! Block-keyed binary search stores first-keys as three parallel arrays
+//! (epserde does not support tuples or `Vec<Vec<u8>>` directly), mirroring
+//! `SidecarCore`'s "flatten variable-length payloads into parallel `Vec` +
+//! offset arrays" pattern: `block_tags` (one tag per block), `key_flat`
+//! (concatenated first-key primary-string bytes for every block), and
+//! `key_offsets` (the starting offset of each block's key within `key_flat`;
+//! a block's key ends at the next block's offset, or at `key_flat`'s end for
+//! the last block).
 
 use crate::Oxigraph;
 use epserde::Epserde;

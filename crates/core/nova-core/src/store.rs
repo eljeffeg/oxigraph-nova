@@ -6,7 +6,7 @@
 
 use crate::{GraphName, NamedNode, Oxigraph, Quad, StoredQuad, Term};
 
-// ── K7.2 prepared fixed-P object intersection (product wedge) ────────────────
+// ── prepared fixed-P object intersection (product wedge) ────────────────
 
 /// Opaque prepared fixed-predicate context for multi-subject object ∩.
 ///
@@ -29,9 +29,9 @@ pub trait PreparedLeftIntersect: Send {
     fn intersect_right(&self, subject_b: u64) -> Option<Box<dyn crate::trie::TrieIterator>>;
 }
 
-// ── K9 prepared SP→O scan + two-hop plan ─────────────────────────────────────
+// ── prepared SP→O scan + two-hop plan ─────────────────────────────────────
 
-/// Resettable subject-predicate → object scanner (K9.2).
+/// Resettable subject-predicate → object scanner.
 ///
 /// Built once per fixed predicate. Each logical open becomes
 /// [`reset_to_subject`](Self::reset_to_subject) instead of a full
@@ -63,23 +63,23 @@ pub trait PreparedSpObjectScan: Send {
     }
 }
 
-// ── L: unified prepared physical operators ───────────────────────────────────
+// ── Unified prepared physical operators ──────────────────────────────────────
 //
 // Pipeline:
 //   BGP → shape recognizer → physical operator → prepared operator → reusable exec
 //
-// Two-hop (K9/K10) and wedge/triangle (K11) are instances of one abstraction.
+// Two-hop and wedge/triangle are instances of one abstraction.
 // Future stars, longer chains, diamonds extend the same trait + cache key space.
 
-/// Prepared physical operator for a specialized BGP shape (Phase L).
+/// Prepared physical operator for a specialized BGP shape.
 ///
 /// Built once per recognized motif (and optionally retained across requests via
 /// a store-scoped, snapshot-keyed cache). `execute` streams external TermId
 /// tuples; the query engine decodes or counts as needed (id_only COUNT path).
 ///
 /// Concrete product shapes today:
-/// - **two-hop** `?a P1 ?b . ?b P2 ?c` — emit `[a, b, c]` (K9/K10)
-/// - **wedge**   `?a P ?b . ?b P ?c . ?a P ?c` — emit `[a, b, c]` (K11)
+/// - **two-hop** `?a P1 ?b . ?b P2 ?c` — emit `[a, b, c]`
+/// - **wedge** `?a P ?b . ?b P ?c . ?a P ?c` — emit `[a, b, c]`
 /// - **sp-expansion / 2join** `?s P1 O1 . ?s P2 ?o` — emit `[s, o]`
 /// - **k-chain (k=3)** `?a P1 ?b . ?b P2 ?c . ?c P3 ?d` — emit `[a, b, c, d]`
 ///
@@ -101,10 +101,10 @@ pub trait PreparedPhysicalOperator: Send {
     fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()>;
 }
 
-/// Historical name for chain-path prepared ops (K9/K10). Same as
+/// Historical name for chain-path prepared ops. Same as
 /// [`PreparedPhysicalOperator`].
 pub use PreparedPhysicalOperator as PreparedTwoHop;
-/// Historical name for wedge/triangle prepared ops (K11). Same as
+/// Historical name for wedge/triangle prepared ops. Same as
 /// [`PreparedPhysicalOperator`].
 pub use PreparedPhysicalOperator as PreparedWedge;
 /// SP-expansion / 2join prepared ops. Same as [`PreparedPhysicalOperator`]
@@ -134,7 +134,7 @@ pub use PreparedPhysicalOperator as PreparedStar;
 /// [`Star`](Self::Star) (k = 3) — engines should implement prepare for these
 /// (or return `None` and let the walker use nested-scan fallback).
 ///
-/// ## Roadmap (planner `ShapeId` only today)
+/// ## Reserved (planner `ShapeId` only today)
 ///
 /// Future constants-only binds will extend this enum when recognizers land:
 /// - **Star k>3** — more than three fixed predicates on a shared subject
@@ -317,7 +317,7 @@ pub trait LftjSource: Send + Sync {
         None
     }
 
-    /// K7.2: prepare fixed-P D1 context once per wedge query.
+    /// prepare fixed-P D1 context once per wedge query.
     ///
     /// Default `None` — only Ring (mmap) implements this. Callers fall back to
     /// [`lftj_multi_subject_object_intersect`] per `(a,b)` pair.
@@ -329,7 +329,7 @@ pub trait LftjSource: Send + Sync {
         None
     }
 
-    /// K9.2: prepare a resettable SP→O scanner for a fixed predicate.
+    /// prepare a resettable SP→O scanner for a fixed predicate.
     ///
     /// Default `None` — Ring implements this. Callers fall back to repeated
     /// `lftj_join_scan(Some(s), Some(p), None, 2, …)`.

@@ -1,9 +1,9 @@
-//! E5.10 W0/W1 — Nova-owned immutable mapped QWT (`NOVAQWT1` + shared QWTA).
+//! Nova-owned immutable mapped QWT (`NOVAQWT1` + shared QWTA).
 //!
 //! Flatten one vendored `QWT256` into a page-aligned image, open as slice
 //! views (no full deserialize), and serve `access` + level-local `rank` /
-//! `rank_all` + full-symbol `rank` / `select` (W2) + native RNV + fixed-stack
-//! RDI (W3) with the same arithmetic as qwt block size 256 / E5.9A.
+//! `rank_all` + full-symbol `rank` / `select` + native RNV + fixed-stack
+//! RDI with the same arithmetic as qwt block size 256.
 
 //! **Not** on the LoudsStore path. Feature `cyclic-ring` only.
 //!
@@ -123,9 +123,9 @@ pub struct MappedLevel<'m> {
     pub n_symbols: usize,
 }
 
-// ── E5.11 B1: open-time validated hot views ──────────────────────────────────
+// ──: open-time validated hot views ──────────────────────────────────
 
-/// Compact native hot view for one wavelet level (E5.11 B1).
+/// Compact native hot view for one wavelet level .
 ///
 /// Built once at open after bounds/align validation. Hot primitives
 /// (`level_rank` / `rank_all` / `range_expand` / RDI / RNV / full-symbol rank)
@@ -398,7 +398,7 @@ impl HotQwtColumn {
         None
     }
 
-    /// E5.11 D1: braided two-range intersection successor.
+    /// braided two-range intersection successor.
     ///
     /// Smallest symbol `v ≥ target` that occurs in **both** `left` and `right`.
     /// Synchronized 4-ary symbol-prefix descent: a child is entered only if
@@ -419,7 +419,7 @@ impl HotQwtColumn {
     }
 
     /// Like [`Self::intersection_next_value2`] with software counters for the
-    /// E5.11 D1 harness (levels, expands, one-side empty skips).
+    /// harness (levels, expands, one-side empty skips).
     pub fn intersection_next_value2_counted(
         &self,
         left: Range<usize>,
@@ -601,7 +601,7 @@ impl HotQwtColumn {
         None
     }
 
-    /// E5.11 D2: braided three-range intersection successor.
+    /// braided three-range intersection successor.
     ///
     /// Returns the smallest symbol `v >= target` present in all three row
     /// ranges.  This is the product-triangle form of D1: all three projected
@@ -1446,14 +1446,14 @@ impl HotQwtColumn {
 
     /// Fixed-stack ordered distinct-symbol iterator over a hot column.
     ///
-    /// E5.11 C1: ranges of length ≤ [`c1_batch_k`] use level-batched short-range
+    /// ranges of length ≤ [`c1_batch_k`] use level-batched short-range
     /// decode (fixed stack, no empty-branch exploration); longer ranges fall
     /// back to generic RDI.
     pub fn range_distinct_iter(&self, range: Range<usize>) -> MappedRangeDistinctIter<'_> {
         MappedRangeDistinctIter::new(self, range)
     }
 
-    /// E5.11 C1: decode all symbols in a short range via level-batched access,
+    /// decode all symbols in a short range via level-batched access,
     /// then sort + RLE. Returns `None` if range is empty or longer than `k`.
     ///
     /// Algebraically identical to one full-symbol `get` per row followed by
@@ -1469,7 +1469,7 @@ impl HotQwtColumn {
     }
 }
 
-// ── E5.11 D1: two-range braided intersection stats ──────────────────────────
+// ──: two-range braided intersection stats ──────────────────────────
 
 /// Software counters for [`HotQwtColumn::intersection_next_value2_counted`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -1610,7 +1610,7 @@ pub(crate) enum Expand3Path {
     General,
 }
 
-// ── E5.11 E1: concentric presence summaries (transient oracle) ──────────────
+// ──: concentric presence summaries (transient oracle) ──────────────
 
 /// Cell size for child-digit presence masks (symbols per summary cell).
 ///
@@ -2151,12 +2151,12 @@ impl Iterator for IntersectionIter3<'_> {
     }
 }
 
-// ── E5.11 C1: level-batched short-range decode ──────────────────────────────
+// ──: level-batched short-range decode ──────────────────────────────
 
 /// Max fixed-stack batch size (K ≤ this). Compile-time bound; no heap.
 pub const C1_MAX_BATCH: usize = 64;
 
-/// Default C1 threshold after E5.11 measure: **0 (disabled)**.
+/// Default C1 threshold after measure: **0 (disabled)**.
 ///
 /// K=32 regressed star ~65% on N=20k realistic (all ranges hit batch; ≈1
 /// distinct/row so sort/RLE buys nothing vs RDI). K=16 only +4.5% and mostly
@@ -2193,7 +2193,7 @@ pub struct ShortRangeBatchResult {
     pub dedup_merges: u32,
 }
 
-/// Fixed-scratch level-batched short-range distinct decoder (E5.11 C1).
+/// Fixed-scratch level-batched short-range distinct decoder .
 ///
 /// For `len = end - start` with `0 < len ≤ k ≤ C1_MAX_BATCH`:
 /// 1. Seed positions `[start .. end)`.
@@ -2338,7 +2338,7 @@ fn short_range_batch_decode(
 ///
 /// Lifetime `'m` is the image / mmap lifetime. Level views re-slice on demand
 /// so this type is not self-referential. Prefer [`Self::build_hot`] once at open
-/// and route hot primitives through [`HotQwtColumn`] (E5.11 B1).
+/// and route hot primitives through [`HotQwtColumn`] .
 #[derive(Clone, Copy)]
 pub struct MappedQwtSection<'m> {
     sec: &'m [u8],
@@ -2447,7 +2447,7 @@ impl<'m> MappedQwtSection<'m> {
         Ok(o)
     }
 
-    /// E5.11 B1: build open-time hot column (validated pointers + native occs).
+    /// build open-time hot column (validated pointers + native occs).
     ///
     /// Walks every level once: dir parse, bounds/align cast, occs as `usize`.
     /// Image bytes unchanged. Callers must keep the owning image alive for the
@@ -2612,7 +2612,7 @@ impl<'m> MappedQwtSection<'m> {
         Some(result)
     }
 
-    // ── W3: native RNV + fixed-stack RDI (E5.9A algorithms, mapped) ───────
+    // ──: native RNV + fixed-stack RDI ( algorithms, mapped) ───────
 
     /// Native guided `range_next_value` — O(log σ) rank work, independent of
     /// range length. Faithful fixed-stack port of vendored
@@ -2722,7 +2722,7 @@ impl<'m> MappedQwtSection<'m> {
         None
     }
 
-    /// Fixed-stack ordered distinct-symbol iterator (E5.9A RDI).
+    /// Fixed-stack ordered distinct-symbol iterator ( RDI).
     ///
     /// Builds a hot column once, then runs RDI through open-time pointers (B1).
     pub fn range_distinct_iter(&self, range: Range<usize>) -> MappedRangeDistinctIter<'m> {
@@ -2731,14 +2731,14 @@ impl<'m> MappedQwtSection<'m> {
     }
 }
 
-// ── W3 RDI (E5.11 B1: hot column + B2 fused expand) ─────────────────────────
+// ── W3 RDI (: hot column + B2 fused expand) ─────────────────────────
 
 /// Fixed-stack distinct-symbol iterator over a mapped QWT row range.
 ///
-/// Port of vendored `RangeDistinctIter` (E5.7C / E5.9A): rank-all-4, unary
+/// Port of vendored `RangeDistinctIter`: rank-all-4, unary
 /// path collapse, endpoint prefetch. No heap allocation on the hot path.
 ///
-/// E5.11 C1: if the initial range length ≤ [`c1_batch_k`], symbols are produced
+/// if the initial range length ≤ [`c1_batch_k`], symbols are produced
 /// by level-batched short-range decode (fixed stack); otherwise generic RDI.
 ///
 /// Holds a [`HotQwtColumn`] (open-time validated pointers). Lifetime `'a` is
@@ -2763,7 +2763,7 @@ pub struct MappedRangeDistinctIter<'a> {
     pub symbols_yielded: u64,
     pub unary_collapses: u64,
     pub prefetch_attempts: u64,
-    // E5.11 B2 path counters (mapped-only; not compared to heap)
+    // path counters (mapped-only; not compared to heap)
     pub range_counts_calls: u64,
     pub same_line_hits: u64,
     pub same_superblock_hits: u64,
@@ -2771,7 +2771,7 @@ pub struct MappedRangeDistinctIter<'a> {
     pub same_line_symbols: u64,
     pub data_line_loads: u64,
     pub superblock_loads: u64,
-    // E5.11 C1 batch counters
+    // batch counters
     pub batch_attempts: u64,
     pub batch_hits: u64,
     pub batch_fallbacks: u64,
@@ -2887,7 +2887,7 @@ impl MappedRangeDistinctIter<'_> {
         }
     }
 
-    /// K9.3 R2: cheap in-place bounds reset for a live RDI cursor.
+    /// cheap in-place bounds reset for a live RDI cursor.
     ///
     /// Reuses existing iterator storage (stack / batch buffers / hot alias)
     /// instead of constructing a fresh `MappedRangeDistinctIter`. Diagnostic
@@ -2946,7 +2946,7 @@ impl MappedRangeDistinctIter<'_> {
     /// Next distinct symbol and its occurrence count in the range (lex order).
     #[inline]
     pub fn next_symbol(&mut self) -> Option<(u32, usize)> {
-        // E5.11 C1 batch emit path
+        // batch emit path
         if self.batch_n_out > 0 {
             if self.batch_emit_i < self.batch_n_out {
                 let i = self.batch_emit_i;
@@ -2978,7 +2978,7 @@ impl MappedRangeDistinctIter<'_> {
                 }
                 let lv = self.hot.level(cur.level);
 
-                // E5.11 B2 fused expand over B1 hot pointers.
+                // fused expand over B1 hot pointers.
                 // Logical rank_probes stays +2 for heap identity; path stats separate.
                 let exp = hot_level_range_expand(lv, cur.start, cur.end);
                 self.rank_probes += 2;
@@ -3027,7 +3027,7 @@ impl MappedRangeDistinctIter<'_> {
                     break;
                 }
 
-                // Unary path collapse (E5.9A lever B).
+                // Unary path collapse ( lever B).
                 if nc == 1 {
                     cur.start = cand_s[0];
                     cur.end = cand_e[0];
@@ -3072,9 +3072,9 @@ impl Iterator for MappedRangeDistinctIter<'_> {
     }
 }
 
-// ── E5.11 B5: prefetch policy matrix ────────────────────────────────────────
+// ──: prefetch policy matrix ────────────────────────────────────────
 
-/// Endpoint prefetch policy for mapped RDI General path (E5.11 B5).
+/// Endpoint prefetch policy for mapped RDI General path .
 ///
 /// Star expands are ~96.9% SameLine (no prefetch); only General (~0.3%) hits
 /// this. Matrix: None / T0 / T1 / NTA. Keep only if star/RDI gain ≥3–5%.
@@ -3115,11 +3115,11 @@ impl PrefetchPolicy {
 }
 
 /// Process-wide B5 policy (harness sweeps via [`set_prefetch_policy`]).
-/// Default: **Nta** — E5.11 B5 matrix keep (≈3–5% RDI/star on N=20k realistic).
+/// Default: **Nta** — matrix keep (≈3–5% RDI/star on N=20k realistic).
 static PREFETCH_POLICY: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(PrefetchPolicy::Nta as u8);
 
-/// Set process-wide mapped RDI endpoint prefetch policy (E5.11 B5).
+/// Set process-wide mapped RDI endpoint prefetch policy .
 /// Mutation knob for harness matrices; product path leaves NTA default.
 #[cfg(any(test, feature = "diagnostics"))]
 pub fn set_prefetch_policy(p: PrefetchPolicy) {
@@ -3136,7 +3136,7 @@ pub fn prefetch_policy() -> PrefetchPolicy {
     }
 }
 
-/// Hot-path endpoint prefetch via raw pointers (E5.11 B1 + B5 policy).
+/// Hot-path endpoint prefetch via raw pointers ( + B5 policy).
 #[inline]
 fn hot_level_prefetch_endpoints(lv: &HotMappedLevel, start: usize, end: usize) {
     let policy = prefetch_policy();
@@ -3206,7 +3206,7 @@ fn hot_prefetch<T>(p: *const T, policy: PrefetchPolicy) {
     let _ = (_p, policy);
 }
 
-/// Owned image with open-time hot column (E5.11 B1).
+/// Owned image with open-time hot column .
 ///
 /// Bytes live in a **64-byte-aligned** heap buffer so `DataLine` /
 /// `SuperblockPlain` casts are valid (same absolute alignment as a page
@@ -3286,7 +3286,7 @@ impl MappedQwtOwned {
         self.hot.range_next_value(range, target)
     }
 
-    /// E5.11 D1: braided two-range intersection successor via hot column.
+    /// braided two-range intersection successor via hot column.
     pub fn intersection_next_value2(
         &self,
         left: Range<usize>,
@@ -3296,7 +3296,7 @@ impl MappedQwtOwned {
         self.hot.intersection_next_value2(left, right, target)
     }
 
-    /// E5.11 D1: braided intersection with software counters.
+    /// braided intersection with software counters.
     #[cfg(any(test, feature = "diagnostics"))]
     pub fn intersection_next_value2_counted(
         &self,
@@ -3319,7 +3319,7 @@ impl MappedQwtOwned {
             .intersection_next_value2_dual_rnv(left, right, target)
     }
 
-    /// E5.11 D2: braided three-range intersection successor via the hot column.
+    /// braided three-range intersection successor via the hot column.
     pub fn intersection_next_value3(
         &self,
         first: Range<usize>,
@@ -3713,7 +3713,7 @@ pub(crate) fn level_rank_all(lv: &MappedLevel<'_>, i: usize) -> [usize; 4] {
     ]
 }
 
-// ── E5.11 D4: three-range expand locality helpers ───────────────────────────
+// ──: three-range expand locality helpers ───────────────────────────
 
 #[derive(Clone, Copy, Debug)]
 struct RangeTouchIds {
@@ -3784,7 +3784,7 @@ fn lines_overlap(x: RangeTouchIds, y: RangeTouchIds) -> bool {
     x.line_s <= y.line_e && y.line_s <= x.line_e
 }
 
-// ── E5.11 B1: hot-pointer level arithmetic ──────────────────────────────────
+// ──: hot-pointer level arithmetic ──────────────────────────────────
 
 /// Access 2-bit symbol at position `i` via open-time validated pointers.
 #[inline(always)]
@@ -3988,7 +3988,7 @@ fn hot_level_range_expand(lv: &HotMappedLevel, start: usize, end: usize) -> Rang
     }
 }
 
-// ── E5.11 D4-C: true unique-load three-range expand ─────────────────────────
+// ──: true unique-load three-range expand ─────────────────────────
 
 /// Fixed local cache entry for a loaded DataLine (by index).
 #[derive(Clone, Copy)]
@@ -4347,7 +4347,7 @@ fn hot_level_range_expand3(
     }
 }
 
-// ── E5.11 B2: fused range_counts4 (same-line / same-SB / general) ───────────
+// ──: fused range_counts4 (same-line / same-SB / general) ───────────
 
 /// Which physical path `level_range_expand` took (mapped RDI diagnostics).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4372,7 +4372,7 @@ pub(crate) struct RangeExpand {
     pub superblock_loads: u64,
 }
 
-/// Fused four-symbol range expand for RDI (E5.11 B2).
+/// Fused four-symbol range expand for RDI .
 ///
 /// Algebraically identical to two `level_rank_all` probes, but reuses a single
 /// superblock / data-line load when endpoints share a block or superblock.
@@ -4975,7 +4975,7 @@ mod tests {
         set_c1_batch_k(C1_K_DEFAULT);
     }
 
-    /// E5.11 C1: short-range batch matches heap RDI symbols/counts; hits batch path.
+    /// short-range batch matches heap RDI symbols/counts; hits batch path.
     ///
     /// Uses `short_range_batch_decode` / explicit K (not process-wide atomic) for
     /// symbol identity so parallel tests cannot race the global `c1_batch_k`.
@@ -5030,7 +5030,7 @@ mod tests {
         set_c1_batch_k(C1_K_DEFAULT);
     }
 
-    /// E5.11 B2: fused expand algebraically matches two rank_all probes, and
+    /// fused expand algebraically matches two rank_all probes, and
     /// path classification matches block/superblock geometry.
     #[test]
     fn b2_range_counts4_matches_dual_rank_all() {
@@ -5087,7 +5087,7 @@ mod tests {
         }
     }
 
-    /// E5.11 D1: braided intersection matches dual-RNV leapfrog on random pairs.
+    /// braided intersection matches dual-RNV leapfrog on random pairs.
     #[test]
     fn d1_intersection_next_value2_matches_dual_rnv() {
         let data: Vec<u32> = (0..5_000).map(|i| ((i * 23 + 11) % 300) as u32).collect();
@@ -5141,7 +5141,7 @@ mod tests {
         assert!(st.expands >= 2);
     }
 
-    /// E5.11 D2: braided three-range intersection matches the independent
+    /// braided three-range intersection matches the independent
     /// three-RNV leapfrog oracle, including successive streaming seeks.
     #[test]
     fn d2_intersection_next_value3_matches_dual_rnv() {

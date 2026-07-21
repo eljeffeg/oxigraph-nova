@@ -77,18 +77,18 @@ use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// K9 path_2hop shape counters
+// path_2hop shape counters
 static TWO_HOP_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
 static TWO_HOP_SELECTED: AtomicU64 = AtomicU64::new(0);
 static TWO_HOP_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static SP_EXPANSION_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
 static SP_EXPANSION_SELECTED: AtomicU64 = AtomicU64::new(0);
 static SP_EXPANSION_FALLBACK: AtomicU64 = AtomicU64::new(0);
-// K7.1 / K11 fixed-P triangle wedge
+// fixed-P triangle wedge
 static WEDGE_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
 static WEDGE_SELECTED: AtomicU64 = AtomicU64::new(0);
 static WEDGE_FALLBACK: AtomicU64 = AtomicU64::new(0);
-// K10 path_3hop (k=3 chain)
+// path_3hop (k=3 chain)
 static K_CHAIN_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
 static K_CHAIN_SELECTED: AtomicU64 = AtomicU64::new(0);
 static K_CHAIN_FALLBACK: AtomicU64 = AtomicU64::new(0);
@@ -541,9 +541,9 @@ fn build_spec<D: Dataset>(
 /// Min-count VEO binds `?region` first → ~50k subject probes under each region
 /// then class0 filter (~50× slower). Binding `?s` first is O(class0 subjects).
 /// LOUDS's coarse vocab heuristic accidentally preferred `?s`; Ring's exact
-/// MiddleRuns/LastCol estimates exposed the bug (Phase J1 census, 2026-07).
+/// MiddleRuns/LastCol estimates make the multi-constant preference necessary.
 ///
-/// **Fix:** scale each pattern's count by `1/(n_bound+1)²` where `n_bound` is
+/// Scale each pattern's count by `1/(n_bound+1)²` where `n_bound` is
 /// the number of already-bound/const fields in the probe (not the target).
 /// Multi-constant patterns (P31+class0) beat single-constant ones (P131 alone)
 /// even when raw distinct is slightly larger. Falls back to first-appearance
@@ -1068,7 +1068,7 @@ fn emit_two_hop_solution<D: Dataset>(
     ns
 }
 
-/// K9 physical two-hop: prepared scanners when available, else nested join_scan.
+/// physical two-hop: prepared scanners when available, else nested join_scan.
 ///
 /// Always returns `Some` once the shape is recognized (specialized nested
 /// fallback still beats generic VEO LFTJ on this shape).
@@ -1090,7 +1090,7 @@ fn eval_two_hop_walk<D: Dataset>(
     let mut step: u64 = 0;
     let mut decode_ns: u64 = 0;
 
-    // Prefer prepared two-hop body (K9.1 + K9.2 resettable SP scanners).
+    // Prefer prepared two-hop body ( + resettable SP scanners).
     if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
         TWO_HOP_SELECTED.fetch_add(1, Ordering::Relaxed);
         let t_wall = std::time::Instant::now();
@@ -1218,7 +1218,7 @@ fn eval_two_hop_walk<D: Dataset>(
     Ok(results)
 }
 
-/// K7.1 fixed-P triangle: prepared wedge when available, else D1-style nested walk.
+/// fixed-P triangle: prepared wedge when available, else D1-style nested walk.
 ///
 /// Plan orientation is a→b, b→c, a→c under one predicate. Nested fallback:
 /// enumerate `(a,b)` via join_scan, close `c` with
@@ -1406,7 +1406,7 @@ fn emit_k_chain_solution<D: Dataset>(
     results.push(Solution::positional(Arc::clone(join_vars), values));
 }
 
-/// K10 physical 3-hop chain: prepared body when available, else nested join_scan.
+/// physical 3-hop chain: prepared body when available, else nested join_scan.
 ///
 /// Prepared ops emit `[a,b,c,d]` via the multi-var slice emit API. When prepare
 /// returns `None`, nested join_scan under (p1,p2,p3) still beats generic VEO.
@@ -1731,7 +1731,7 @@ fn eval_star_walk<D: Dataset>(
 /// - A pattern contains blank nodes (not internable).
 /// - A constant term in a pattern is not in the dictionary (returns empty directly).
 ///
-/// ## K7.1 wedge fast path
+/// ## wedge fast path
 ///
 /// When the BGP is the fixed-P undirected triangle
 /// (`?a P ?b . ?b P ?c . ?a P ?c`), the shape catalog selects

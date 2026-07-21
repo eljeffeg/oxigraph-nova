@@ -1,4 +1,4 @@
-//! E5.11 → SPARQL product wire (W0): flags + path counters.
+//! SPARQL product-path wire: env flags + path counters.
 //!
 //! Env (pilot defaults **on** unless noted):
 //! - `NOVA_RING_MMAP=0|1` — materialize `NOVARNG1` after compact/bulk_load
@@ -9,7 +9,7 @@
 //! - `NOVA_RING_VEO_OLD_HEURISTIC=1` — A/B only: MiddleRuns VEO uses row-span
 //!   heuristic (pre-exact-run fix). Default **off** (exact distinct-run with budget).
 //! - `NOVA_RING_LASTCOL_POLICY` — LastCol open policy (see [`lastcol_scan_policy`]).
-//!   K7.4 product default is **MappedRdi** for enumerate-all opens.
+//!   Product default is **MappedRdi** for enumerate-all opens.
 //! - `NOVA_RING_D1_TINY_MERGE` — D1 tiny-range merge threshold T (see
 //!   [`d1_tiny_merge_threshold`]). Default **0** (braided D1 only).
 //! - `NOVA_RING_D1_TINY_STRATEGY` — algorithm when T fires (see
@@ -18,7 +18,7 @@
 //! - `NOVA_RING_WEDGE_LEFT_ONCE` — PreparedWedge-only fused left-once threshold
 //!   (see [`wedge_left_once_threshold`]). Default **4** (enabled). Does **not**
 //!   change generic [`BraidedD1ObjectScan`] / global T=0.
-//! - `NOVA_RING_D1_ASYM` — E5.12 large-range asymmetric D1 kernel (see
+//! `NOVA_RING_D1_ASYM` — large-range asymmetric D1 kernel (see
 //!   [`d1_asym_mode`]). Default **off** (braided residual). Experimental A/B
 //!   only; does not change product defaults.
 
@@ -47,7 +47,7 @@ pub struct SparqlPathCounters {
     pub veo_middle_fallback: AtomicU64,
     /// Cumulative nanoseconds spent in estimate_join_count (planning only).
     pub veo_plan_ns: AtomicU64,
-    // ── K7.2 D1 construction breakdown (product wedge / multi_subject) ────
+    // ── D1 construction breakdown (product wedge / multi_subject) ────────
     /// Times a D1 (or prepared D1) open was attempted.
     pub d1_open_calls: AtomicU64,
     /// Cumulative ns for full D1 open (remap + range_sp + first next).
@@ -62,7 +62,7 @@ pub struct SparqlPathCounters {
     pub d1_left_range_reuse: AtomicU64,
     /// Times a prepared fixed-P context was built (once per wedge query).
     pub d1_pred_prepare: AtomicU64,
-    // ── K9 two-hop path (prepared SP scanners / range reuse) ──────────────
+    // ── two-hop path (prepared SP scanners / range reuse) ──────────────
     /// Times a prepared SP→O scanner was built (once per hop predicate).
     pub k9_sp_prepare: AtomicU64,
     /// Times `reset_to_subject` was called on a prepared SP scanner.
@@ -91,7 +91,7 @@ pub struct SparqlPathCounters {
     pub k9_p2_range_derivations: AtomicU64,
     /// Hop2 range-cache hits (`k9_second_hop_range_reuse_hits`).
     pub k9_p2_range_reuse_hits: AtomicU64,
-    // ── K9.3 R2 hit/miss rebind + walk split ──────────────────────────────
+    // ── hit/miss rebind + walk split ──────────────────────────────
     /// Cumulative ns for cheap in-place RDI bounds reset on hop2 cache hits.
     pub k9_p2_hit_rebind_ns: AtomicU64,
     /// Cumulative ns for fresh LastCol open on hop2 cache misses.
@@ -104,7 +104,7 @@ pub struct SparqlPathCounters {
     pub k9_p2_values_from_hits: AtomicU64,
     /// Objects walked from hop2 opens that missed (first-touch range_sp).
     pub k9_p2_values_from_misses: AtomicU64,
-    // ── K9.4 predicate-scoped adjacency ───────────────────────────────────
+    // ── predicate-scoped adjacency ───────────────────────────────────
     /// Times a predicate adjacency table was built (query-local prepare).
     pub k9_adj_prepare: AtomicU64,
     /// Cumulative ns building the adjacency table.
@@ -119,7 +119,7 @@ pub struct SparqlPathCounters {
     pub k9_adj_direct_hits: AtomicU64,
     /// Build mode tag: 0=off/R1, 1=eager range_sp, 2=native sequential.
     pub k9_adj_mode: AtomicU64,
-    // ── K10 product prepared-plan cache (two-hop) ─────────────────────────
+    // ── product prepared-plan cache (two-hop) ─────────────────────────
     /// Cache lookup hit (reused PreparedTwoHop + adjacency).
     pub prepared_plan_cache_hit: AtomicU64,
     /// Cache lookup miss (will prepare + insert).
@@ -128,7 +128,7 @@ pub struct SparqlPathCounters {
     pub prepared_plan_cache_insert: AtomicU64,
     /// Cache cleared (store mutation / compact / disable).
     pub prepared_plan_cache_invalidate: AtomicU64,
-    // ── K10 end-to-end timing buckets (ns, cumulative process-wide) ────────
+    // ── end-to-end timing buckets (ns, cumulative process-wide) ────────
     /// SPARQL parse + algebra setup (HTTP / evaluator entry).
     pub query_parse_plan_ns: AtomicU64,
     /// Physical prepare (PreparedTwoHop::prepare including adj build).
@@ -290,7 +290,7 @@ pub struct SparqlPathSnapshot {
     pub veo_middle_exact: u64,
     pub veo_middle_fallback: u64,
     pub veo_plan_ns: u64,
-    // K7.2 D1 construction breakdown
+    // D1 construction breakdown
     pub d1_open_calls: u64,
     pub d1_open_ns: u64,
     pub d1_remap_ns: u64,
@@ -298,7 +298,7 @@ pub struct SparqlPathSnapshot {
     pub d1_first_next_ns: u64,
     pub d1_left_range_reuse: u64,
     pub d1_pred_prepare: u64,
-    // K9 two-hop
+    // two-hop
     pub k9_sp_prepare: u64,
     pub k9_sp_reset: u64,
     pub k9_sp_empty_range: u64,
@@ -313,14 +313,14 @@ pub struct SparqlPathSnapshot {
     pub k9_p2_unique_b: u64,
     pub k9_p2_range_derivations: u64,
     pub k9_p2_range_reuse_hits: u64,
-    // K9.3 R2 hit/miss split
+    // hit/miss split
     pub k9_p2_hit_rebind_ns: u64,
     pub k9_p2_miss_rebind_ns: u64,
     pub k9_p2_hit_cursor_ns: u64,
     pub k9_p2_miss_cursor_ns: u64,
     pub k9_p2_values_from_hits: u64,
     pub k9_p2_values_from_misses: u64,
-    // K9.4 adjacency
+    // adjacency
     pub k9_adj_prepare: u64,
     pub k9_adj_prepare_ns: u64,
     pub k9_adj_execute_ns: u64,
@@ -328,12 +328,12 @@ pub struct SparqlPathSnapshot {
     pub k9_adj_bytes: u64,
     pub k9_adj_direct_hits: u64,
     pub k9_adj_mode: u64,
-    // K10 prepared-plan cache
+    // prepared-plan cache
     pub prepared_plan_cache_hit: u64,
     pub prepared_plan_cache_miss: u64,
     pub prepared_plan_cache_insert: u64,
     pub prepared_plan_cache_invalidate: u64,
-    // K10 e2e timing buckets
+    // e2e timing buckets
     pub query_parse_plan_ns: u64,
     pub physical_prepare_ns: u64,
     pub execution_ns: u64,
@@ -423,7 +423,7 @@ pub fn ring_mmap_enabled() -> bool {
 }
 
 /// When true, keep heap CyclicRing after NOVARNG1 mmap materialize (dual residency).
-/// Default **off** (Phase 1A): product path drops heap after successful mmap.
+/// Default **off**: product path drops heap after successful mmap.
 /// Escape: `NOVA_RING_KEEP_HEAP=1` or tests via `materialize_mapped_ex(..., true)`.
 pub fn ring_keep_heap() -> bool {
     match std::env::var("NOVA_RING_KEEP_HEAP") {
@@ -458,7 +458,7 @@ pub fn ring_counters_log_enabled() -> bool {
 
 /// A/B: force pre-fix MiddleRuns VEO heuristic (row-span). Default **off**.
 ///
-/// Use only for Phase-1 comparison: Ring old VEO vs corrected VEO vs LOUDS.
+/// A/B only: Ring old VEO vs corrected VEO vs LOUDS.
 #[inline]
 pub fn ring_veo_old_heuristic() -> bool {
     match std::env::var("NOVA_RING_VEO_OLD_HEURISTIC") {
@@ -470,11 +470,11 @@ pub fn ring_veo_old_heuristic() -> bool {
     }
 }
 
-// ── K7.4 LastCol operation semantics ─────────────────────────────────────────
+// ── LastCol operation semantics ─────────────────────────────────────────────
 
 /// What the consumer intends to do with a LastCol cursor.
 ///
-/// K7.4: select the physical LastCol implementation from **operation semantics**,
+/// Select the physical LastCol implementation from **operation semantics**,
 /// not from range length alone. `join_scan` opens are enumerate-all; leapfrog
 /// seeks inside an already-open MappedRdi cursor may switch to mapped RNV
 /// (see `BraidedMappedLastColScan::seek`). Membership / singleton is not a
@@ -492,7 +492,7 @@ pub enum LastColOperation {
 
 /// Product LastCol open policy for `join_scan` (enumerate-all opens).
 ///
-/// ## K7.4 product default
+/// ## Product default
 ///
 /// `AlwaysMappedRdi` — enumerate-all LastCol opens use mapped RDI when mmap is
 /// present. Range-length → heap RNV (`ShortHeap`) is **experimental only**
@@ -508,9 +508,9 @@ pub enum LastColOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LastColScanPolicy {
     /// Experimental: heap RNV when `range.len() <= thresh`, else mapped RDI.
-    /// Not the product default (K7.4); keep for A/B and corpus threshold tests.
+    /// Not the product default; keep for A/B and corpus threshold tests.
     ShortHeap { thresh: u32 },
-    /// Always mapped RDI when mmap is present (K7.4 product default).
+    /// Always mapped RDI when mmap is present (product default).
     AlwaysMappedRdi,
     /// Always mapped RNV successor stream (no RDI open, no heap materialize).
     AlwaysMappedRnv,
@@ -518,7 +518,7 @@ pub enum LastColScanPolicy {
     AlwaysHeapRnv,
 }
 
-/// Historical short-range heap-RNV threshold (W2 product default; K7.4 demoted).
+/// Historical short-range heap-RNV threshold (demoted from product default).
 pub const LASTCOL_SHORT_HEAP_DEFAULT: u32 = 16;
 
 /// Map an operation to the preferred open policy (semantic dispatch table).
@@ -540,7 +540,7 @@ pub fn lastcol_policy_for_operation(op: LastColOperation) -> LastColScanPolicy {
 /// Resolve LastCol open policy from env.
 ///
 /// `NOVA_RING_LASTCOL_POLICY`:
-/// - unset / `auto` / `semantic` — **K7.4 product default: AlwaysMappedRdi**
+/// - unset / `auto` / `semantic` — **product default: AlwaysMappedRdi**
 ///   (enumerate-all semantics; no range-length heap divert)
 /// - `mapped_rdi` / `rdi` — always mapped RDI
 /// - `mapped_rnv` / `rnv` — always mapped RNV
@@ -591,7 +591,7 @@ pub fn lastcol_scan_policy() -> LastColScanPolicy {
             return LastColScanPolicy::ShortHeap { thresh: n };
         }
     }
-    // K7.4: product default = enumerate-all → MappedRdi.
+    // Product default = enumerate-all → MappedRdi.
     LastColScanPolicy::AlwaysMappedRdi
 }
 
@@ -659,7 +659,7 @@ pub fn set_lastcol_scan_policy_override(p: Option<LastColScanPolicy>) {
     }
 }
 
-// ── K9.4 predicate adjacency mode ────────────────────────────────────────────
+// ── predicate adjacency mode ────────────────────────────────────────────
 
 /// How PreparedTwoHop builds the hop2 subject→SP-range table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -675,7 +675,7 @@ pub enum PredAdjacencyMode {
 }
 
 /// `NOVA_RING_K9_ADJ`:
-/// - unset / `1` / `auto` / `native` — **Native** (K9.4 product attempt)
+/// unset / `1` / `auto` / `native` — **Native** ( product attempt)
 /// - `eager` — Eager range_sp table
 /// - `0` / `off` / `r1` — Off (R1/R2 baseline)
 #[inline]
@@ -704,7 +704,7 @@ pub fn pred_adjacency_mode() -> PredAdjacencyMode {
             return PredAdjacencyMode::Native;
         }
     }
-    // K9.4 product default: native sequential adjacency.
+    // product default: native sequential adjacency.
     PredAdjacencyMode::Native
 }
 
@@ -731,7 +731,7 @@ pub fn set_pred_adjacency_mode_override(m: Option<PredAdjacencyMode>) {
     ADJ_MODE_OVERRIDE.store(tag, Ordering::Relaxed);
 }
 
-// ── E5.11 Phase B: D1 tiny-range merge threshold ─────────────────────────────
+// ──: D1 tiny-range merge threshold ─────────────────────────────
 
 /// Max SP range length eligible for the D1 tiny-merge path (matches C1 batch cap).
 pub const D1_TINY_MERGE_MAX: u32 = 64;
@@ -801,7 +801,7 @@ pub fn set_d1_tiny_merge_threshold_override(t: Option<u32>) {
     }
 }
 
-// ── E5.11 Phase B: D1 tiny intersection strategy ─────────────────────────────
+// ──: D1 tiny intersection strategy ─────────────────────────────
 
 /// Fixed-size kernel cap: nested/probe/fixed only dispatch when
 /// `max(|L|, |R|) ≤ D1_TINY_FIXED_MAX` (corpus is uniformly 3×3).
@@ -1065,7 +1065,7 @@ pub fn set_wedge_left_once_threshold_override(t: Option<u32>) {
     }
 }
 
-// ── E5.12 asymmetric large-range D1 kernel (product-off gate) ────────────────
+// ── asymmetric large-range D1 kernel (product-off gate) ────────────────
 //
 // Measurement (2026-07-19): 77.3% of large closes have one side ≤4; dominant
 // cell L=17–32 × R≤4. Kernel: decode shorter, probe/gallop longer. Product
@@ -1080,7 +1080,7 @@ pub const D1_ASYM_LONG_MIN: u32 = 5;
 /// Hard cap on the long side (stack / probe budget). Beyond this → braided.
 pub const D1_ASYM_LONG_MAX: u32 = D1_TINY_MERGE_MAX;
 
-/// E5.12 asymmetric large-range D1 strategy.
+/// asymmetric large-range D1 strategy.
 ///
 /// Product default: [`D1AsymMode::Off`]. Enable only via env/harness override.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1176,7 +1176,7 @@ pub fn set_d1_asym_mode_override(m: Option<D1AsymMode>) {
     }
 }
 
-// ── E5.12 asymmetric D1 diagnostics ──────────────────────────────────────────
+// ── asymmetric D1 diagnostics ──────────────────────────────────────────
 
 /// Shape bins for short×long reporting (max side when min ≤ 4).
 #[repr(u8)]
@@ -1228,7 +1228,7 @@ pub static D1_ASYM_SHAPE_BIN: [AtomicU64; 4] = [
     AtomicU64::new(0),
 ];
 
-/// Snapshot of E5.12 asymmetric D1 counters.
+/// Snapshot of asymmetric D1 counters.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct D1AsymCounters {
     pub eligible: u64,
@@ -1280,10 +1280,10 @@ pub fn reset_d1_asym_counters() {
     }
 }
 
-// ── K10 product prepared-plan cache enable ───────────────────────────────────
+// ── product prepared-plan cache enable ───────────────────────────────────
 
 /// `NOVA_RING_PREPARED_PLAN_CACHE`:
-/// - unset / `1` / `on` / `true` — **enabled** (K10 product default)
+/// unset / `1` / `on` / `true` — **enabled** ( product default)
 /// - `0` / `off` / `false` — disabled (rung A baseline: prepare every request)
 #[inline]
 pub fn prepared_plan_cache_enabled() -> bool {
@@ -1335,7 +1335,7 @@ pub fn add_timing_ns(bucket: TimingBucket, ns: u64) {
     a.fetch_add(ns, Ordering::Relaxed);
 }
 
-/// Named end-to-end timing buckets for K10 accounting of the HTTP path.
+/// Named end-to-end timing buckets for accounting of the HTTP path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimingBucket {
     QueryParsePlan,

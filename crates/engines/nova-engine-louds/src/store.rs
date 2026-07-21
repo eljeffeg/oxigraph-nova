@@ -1992,14 +1992,14 @@ mod tests {
             assert!(store.text_search_ready());
         }
 
-        /// Fix #6 regression: a Tantivy I/O error during `compact_locked`'s
-        /// fulltext step must not abort the core Ring/Dictionary/WAL
-        /// compaction. We force a real I/O error by making the on-disk
-        /// `fulltext/` directory read-only (so Tantivy's segment/commit
-        /// writes fail), then confirm `compact()` still returns `Ok(())`,
-        /// the core data is still correctly compacted/committed, and
-        /// `text_search_ready()` degrades to `false` (rather than the store
-        /// silently serving a now-stale index under `Some(fulltext)`).
+        /// A Tantivy I/O error during `compact_locked`'s fulltext step must
+        /// not abort the core Ring/Dictionary/WAL compaction. Force a real
+        /// I/O error by making the on-disk `fulltext/` directory read-only
+        /// (so Tantivy's segment/commit writes fail), then confirm
+        /// `compact()` still returns `Ok(())`, the core data is still
+        /// correctly compacted/committed, and `text_search_ready()` degrades
+        /// to `false` (rather than the store silently serving a stale index
+        /// under `Some(fulltext)`).
         #[test]
         #[cfg(unix)]
         fn fulltext_io_error_during_compaction_does_not_abort_core_compaction() {

@@ -1,8 +1,7 @@
 //! [`StoreAtomSource`] — an [`AtomSource`] adapter over
 //! `oxigraph_nova_core::LftjSource`, so rule-body atoms can scan a real
 //! store's compacted LOUDS tries directly instead of first copying base
-//! facts into a `Vec` (which is what the original single-rule spike test
-//! did).
+//! facts into a `Vec`.
 //!
 //! This mirrors `oxigraph-nova-query`'s `StoreDataset<S: QuadStore>` adapter
 //! (`crates/core/nova-query/src/dataset.rs`) — same idea (thin wrapper resolving

@@ -1,4 +1,4 @@
-//! Per-graph read-only canonical-ID image adapter (Phase 4b).
+//! Per-graph read-only canonical-ID image adapter.
 //!
 //! Layers identity remapping, deduplication, and mmap-only reopen over
 //! [`BraidedRingIndex`] **without** dictionary, live delta, or `QuadStore`.
@@ -25,9 +25,8 @@
 //! appear in the graph: dense ids in `[0, |symbols|)`, assigned in ascending
 //! external order. Do **not** wire global TermId identity (`dense == TermId`)
 //! into this path — that widens the QWT, can add levels, grow the mapped image,
-//! and loses role-contiguous ranges. Phase-4 A/B for identity IDs lives as a
-//! separate experimental commit/branch only (see
-//! `research/notes/identity-ids-experiment.md`).
+//! and loses role-contiguous ranges. Identity-ID alphabets are an
+//! experimental non-product mode only.
 
 use crate::facade::BraidedRingIndex;
 use crate::{MappedRingA, MappedRingError, open_novarng1_mmap};
@@ -55,9 +54,8 @@ const DENSE_MISSING: u32 = u32::MAX;
 ///
 /// Hot path is O(1) like LOUDS `vocab[local]`: external TermIds from the
 /// dictionary are dense `0..dict_len` after compact, so `to_dense` is a direct
-/// Vec index (not a BTreeMap walk). Risk table mitigation from
-/// `e5.11-sparql-product-wire.md`: "External remap dominates → Dense-only /
-/// O(1) remap".
+/// Vec index (not a BTreeMap walk). Dense-only O(1) remap keeps external
+/// TermId lookup off the LFTJ hot path.
 ///
 /// Product alphabet is always compact `[0, |symbols|)`. Identity-global IDs are
 /// not a product mode (see module docs).

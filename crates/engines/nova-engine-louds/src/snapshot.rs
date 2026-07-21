@@ -346,21 +346,19 @@ mod tests {
         assert!(loaded.is_empty());
     }
 
-    /// Probe: real `load_mmap` round-trip of a whole [`StoreSnapshot`] (not
-    /// just a single [`crate::cltj::CltjSnapshot`] as
-    /// `cltj_snapshot_load_mmap_probe` in `cltj.rs` already proves) to a temp
-    /// file, confirming that the generic-with-defaults threading on
-    /// [`StoreSnapshot`]/[`RingSnapshot`] produces a navigable, zero-copy
-    /// `DeserType` view all the way down through
+    /// Real `load_mmap` round-trip of a whole [`StoreSnapshot`] (not just a
+    /// single [`crate::cltj::CltjSnapshot`]) to a temp file, confirming that
+    /// the generic-with-defaults threading on [`StoreSnapshot`]/
+    /// [`RingSnapshot`] produces a navigable, zero-copy `DeserType` view all
+    /// the way down through
     /// `StoreSnapshot -> RingSnapshot -> CltjSnapshot`, with vocab slices and
     /// tries still directly inspectable/borrowed at the innermost layer.
     ///
-    /// This is deliberately scoped to *inspecting* the borrowed view (not
-    /// constructing a navigable `GraphRing<BorrowedLouds, VocabRepr>` from
-    /// it, which `GraphRing::from_mapped` in `ring.rs` handles) — this
-    /// probe's job is only to de-risk the type-level plumbing.
+    /// Scoped to *inspecting* the borrowed view (not constructing a navigable
+    /// `GraphRing<BorrowedLouds, VocabRepr>` from it — that is
+    /// `GraphRing::from_mapped` in `ring.rs`).
     #[test]
-    fn store_snapshot_load_mmap_probe() {
+    fn store_snapshot_load_mmap_roundtrip() {
         use epserde::deser::Flags;
 
         let mut graphs: HashMap<GraphId, Arc<GraphRing>> = HashMap::new();

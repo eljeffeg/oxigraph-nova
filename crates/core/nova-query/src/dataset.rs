@@ -242,7 +242,7 @@ pub trait DatasetLftjSource: Send + Sync {
     ) -> Option<Box<dyn oxigraph_nova_core::TrieIterator>> {
         None
     }
-    /// K7.2: prepare fixed-P D1 context once per wedge query.
+    /// prepare fixed-P D1 context once per wedge query.
     fn lftj_prepare_pred_object_intersect(
         &self,
         _predicate: u64,
@@ -251,7 +251,7 @@ pub trait DatasetLftjSource: Send + Sync {
         None
     }
 
-    /// K9.2: prepare a resettable SP→O scanner for a fixed predicate.
+    /// prepare a resettable SP→O scanner for a fixed predicate.
     fn lftj_prepare_sp_object_scan(
         &self,
         _predicate: u64,

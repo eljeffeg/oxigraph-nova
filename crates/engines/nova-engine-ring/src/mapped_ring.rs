@@ -1,4 +1,4 @@
-//! E5.10 W1 — mmap-backed Ring A shell (`NOVARNG1`).
+//! mmap-backed Ring A shell (`NOVARNG1`).
 //!
 //! Flatten pilot [`CyclicRing`] (3× `QWT256` + A arrays) into a page-aligned
 //! immutable image and open via **`memmap2::Mmap`** with borrowed section views
@@ -9,13 +9,13 @@
 //! **W2 scope:** full-symbol `rank` / `select` / `F` / `F_inv` / `backward_step`
 //! / `lead_range` over mmap views.
 //! **W3 scope:** native `range_next_value` + fixed-stack `range_distinct_iter`
-//! (E5.9A algorithms: rank-all-4, unary collapse, endpoint prefetch).
+//! ( algorithms: rank-all-4, unary collapse, endpoint prefetch).
 //! **W4 scope:** `enumerate_spo` / `range_s|o|p`; full product-format gate
 //! (tuple differential, bytes, residency, star/triangle vs heap + LOUDS).
 
 //! **Not** on the LoudsStore path. Feature `cyclic-ring` only.
 //!
-//! Platform: little-endian only (v1). Substrate: **QWT256** (E5.9B locked).
+//! Platform: little-endian only (v1). Substrate: **QWT256** ( locked).
 //!
 //! # File layout (`NOVARNG1` v1)
 //!
@@ -51,7 +51,7 @@
 //! | 120 | len_co, len_cp, len_cs : u64  (section byte lengths) |
 //! | 144 | reserved → 256 |
 //!
-//! Dual-format (E5.9B Phase 4, feature `ring-huffman-cp`): product default still
+//! Dual-format (, feature `ring-huffman-cp`): product default still
 //! writes QWTA C_p with `flags=0`. Huffman C_p writes an HQWA section and sets
 //! `flags |= RNG_FLAG_HUFF_CP`. Open branches on the flag (and C_p section magic).
 
@@ -126,7 +126,7 @@ pub struct Novarng1Header {
 /// Open path validates header + directory bounds only — **no** full-body
 /// checksum and **no** QWT payload materialization into `Vec`.
 ///
-/// E5.11 B1: open-time [`HotQwtColumn`] for O/P/S (validated raw pointers into
+/// open-time [`HotQwtColumn`] for O/P/S (validated raw pointers into
 /// the mmap). Hot primitives (access/rank/RNV/RDI) route through these; select
 /// and cold section views stay on the re-open path.
 pub struct MappedRingA {
@@ -221,7 +221,7 @@ impl MappedRingA {
         }
     }
 
-    /// Open-time Qwt hot column for `col` (E5.11 B1).
+    /// Open-time Qwt hot column for `col` .
     ///
     /// For `Col::P` on a Huffman image this returns a dummy empty hot column;
     /// use [`Self::access`] / [`Self::rank`] / [`Self::range_next_value`] which
@@ -395,7 +395,7 @@ impl MappedRingA {
             .range_next_value(r.start as usize..r.end as usize, target)
     }
 
-    /// E5.11 D1: braided two-range intersection successor on column `col`.
+    /// braided two-range intersection successor on column `col`.
     ///
     /// Smallest symbol `v ≥ target` present in **both** row ranges. Uses
     /// synchronized 4-ary descent (mask AND) rather than alternating dual RNV.
@@ -421,7 +421,7 @@ impl MappedRingA {
         )
     }
 
-    /// E5.11 D1: braided intersection with software counters.
+    /// braided intersection with software counters.
     #[inline]
     #[cfg(any(test, feature = "diagnostics"))]
     pub fn intersection_next_value2_counted(
@@ -465,7 +465,7 @@ impl MappedRingA {
         }
     }
 
-    /// E5.11 D2: braided three-range intersection successor on `col`.
+    /// braided three-range intersection successor on `col`.
     ///
     /// All three row ranges are descended together and only symbol-prefixes
     /// present in every range are visited. This is the zero-allocation product
@@ -660,7 +660,7 @@ impl MappedRingA {
 
     /// Ordered distinct-symbol iterator on column `col`.
     ///
-    /// Qwt columns use the fixed-stack mapped RDI (E5.11 B1). Huffman C_p uses
+    /// Qwt columns use the fixed-stack mapped RDI . Huffman C_p uses
     /// an O(σ_P) numeric scan materialised once (schema-sized).
     #[inline]
     pub fn range_distinct_iter(&self, col: Col, r: RowRange) -> Option<MappedColDistinctIter<'_>> {
@@ -940,7 +940,7 @@ pub fn open_novarng1_from_mmap(mmap: Mmap) -> Result<MappedRingA, MappedRingErro
     let h = parse_header(&mmap)?;
     validate_directory(&mmap, &h)?;
 
-    // Open O/S QWT sections once: validate magic/dir + build E5.11 B1 hot columns.
+    // Open O/S QWT sections once: validate magic/dir + build hot columns.
     let sec_o = MappedQwtSection::open(slice_range(&mmap, h.off_co, h.len_co)?)?;
     let sec_s = MappedQwtSection::open(slice_range(&mmap, h.off_cs, h.len_cs)?)?;
     let hot_o = sec_o.build_hot()?;

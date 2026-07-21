@@ -991,7 +991,7 @@ mod tests {
 
     /// Same OWL 2 RL subclass-transitivity check as
     /// [`reasoning_infers_subclass_transitivity`], but on a RingStore-backed
-    /// [`Store`] — verifies `with_reasoning` is no longer a no-op on ring.
+    /// [`Store`] — verifies `with_reasoning` actually runs the fixpoint on ring.
     #[cfg(feature = "ring-backend")]
     #[test]
     fn ring_reasoning_infers_subclass_transitivity() {

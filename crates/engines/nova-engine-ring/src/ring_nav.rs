@@ -1,8 +1,8 @@
 //! Unified navigation view over heap [`CyclicRing`] or mmap [`MappedRingA`].
 //!
-//! Phase 1A: after successful `materialize_mapped`, product paths may drop the
-//! heap QWT/A payloads. Callers that previously took `&CyclicRing` should use
-//! [`RingRef`] so MiddleRuns / match / VEO keep working on mmap-only residency.
+//! After successful `materialize_mapped`, product paths may drop the heap
+//! QWT/A payloads. Callers use [`RingRef`] so MiddleRuns / match / VEO keep
+//! working on mmap-only residency.
 
 use crate::{Col, CyclicRing, MappedRingA, RowRange};
 
@@ -79,7 +79,7 @@ impl<'a> RingRef<'a> {
 
     /// Cumulative A array for column `col` (length = universe+1).
     ///
-    /// Used by Native predicate-adjacency build (K9.4) to walk subject partitions
+    /// Used by Native predicate-adjacency build to walk subject partitions
     /// without per-subject `lead_range` lookups.
     #[inline]
     pub fn col_a(self, col: Col) -> Option<&'a [u32]> {

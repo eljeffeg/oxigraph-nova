@@ -1,8 +1,8 @@
 //! k-chain shape (k = 3): `?a P1 ?b . ?b P2 ?c . ?c P3 ?d`
 //!
 //! Generalizes [`super::two_hop::TwoHopPlan`] (path length 2) to path length 3
-//! over four distinct join vars. Longer chains (k > 3) stay on the roadmap
-//! until the recognizer grows a variable-arity plan.
+//! over four distinct join vars. Longer chains (k > 3) are not recognized
+//! yet; the recognizer would need a variable-arity plan.
 //!
 //! Prepared physical bodies are optional: the walker always has a fixed-order
 //! nested `join_scan` fallback. Engines may return `None` from
