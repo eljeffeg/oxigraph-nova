@@ -68,7 +68,8 @@ use crate::ring::{GraphRing, GraphRingHandle, RingBuilder, SortOrder};
 use crate::snapshot::StoreSnapshot;
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, LftjSource, NamedNode, Oxigraph,
-    Quad, QuadOp, QuadStore, StoredQuad, Subject, Term, TermId,
+    PhysicalShape, PreparedPhysicalOperator, Quad, QuadOp, QuadStore, StoredQuad, Subject, Term,
+    TermId,
 };
 #[cfg(feature = "fulltext")]
 use oxigraph_nova_fulltext::FulltextIndex;
@@ -1428,6 +1429,19 @@ impl LftjSource for LoudsStore {
 
     fn lftj_has_delta(&self) -> bool {
         !self.inner.lock().delta.is_empty()
+    }
+
+    fn lftj_prepare_shape(
+        &self,
+        shape: PhysicalShape,
+        graph_id: u8,
+    ) -> Option<Box<dyn PreparedPhysicalOperator>> {
+        let inner = self.inner.lock();
+        let g_id = GraphId(graph_id);
+        // Clone Arc-backed handle so execute runs without holding the store mutex.
+        let ring = inner.graphs.get(&g_id)?.clone();
+        drop(inner);
+        crate::prepared_shape::prepare_shape(ring, shape)
     }
 }
 

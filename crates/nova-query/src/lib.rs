@@ -6,8 +6,10 @@ pub mod options;
 pub mod path;
 pub mod select_vars;
 pub mod service;
+pub mod shapes;
 pub mod solution;
 pub mod update;
+
 
 pub use dataset::{
     Dataset, DatasetLftjSource, GraphSelector, InMemoryDataset, PatternTerm, QuadIter, QuadMatch,

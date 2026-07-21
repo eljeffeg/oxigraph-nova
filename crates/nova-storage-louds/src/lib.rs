@@ -55,6 +55,7 @@ pub mod delta;
 mod fulltext;
 pub mod louds;
 pub mod ring;
+mod prepared_shape;
 mod snapshot;
 pub mod store;
 

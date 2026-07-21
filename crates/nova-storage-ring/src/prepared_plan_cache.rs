@@ -28,7 +28,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use oxigraph_nova_core::{
-    PreparedPhysicalOperator, PreparedSpExpansion, PreparedTwoHop, PreparedWedge,
+    PreparedKChain, PreparedPhysicalOperator, PreparedSpExpansion, PreparedStar, PreparedTwoHop,
+    PreparedWedge,
 };
 use parking_lot::Mutex;
 
@@ -38,8 +39,9 @@ use crate::product_path::{
     PredAdjacencyMode, TimingBucket, SPARQL_PATH,
 };
 use crate::scan::{
-    PreparedSpExpansionImpl, PreparedSpObjectScanImpl, PreparedTwoHopImpl, PreparedWedgeImpl,
-    PredicateAdjacency,
+    PreparedKChainImpl, PreparedSpExpansionImpl, PreparedSpObjectScanImpl, PreparedStarImpl,
+    PreparedTwoHopImpl,
+    PreparedWedgeImpl, PredicateAdjacency,
 };
 
 /// Default LRU capacity (bounded; not a general prepared-statement framework).
@@ -63,6 +65,9 @@ pub enum PhysicalOpKind {
         o_filter: u64,
         p_expand: u64,
     },
+    /// 3-hop chain: `?a P1 ?b . ?b P2 ?c . ?c P3 ?d`.
+    KChain { p1: u64, p2: u64, p3: u64 },
+    Star { p1: u64, p2: u64, p3: u64 },
 }
 
 /// Concrete prepared bodies owned by the cache.
@@ -70,17 +75,18 @@ pub enum PreparedPhysicalOp {
     TwoHop(PreparedTwoHopImpl),
     Wedge(PreparedWedgeImpl),
     SpExpansion(PreparedSpExpansionImpl),
+    KChain(PreparedKChainImpl),
+    Star(PreparedStarImpl),
 }
 
 impl PreparedPhysicalOperator for PreparedPhysicalOp {
-    fn execute(
-        &mut self,
-        emit: &mut dyn FnMut(u64, u64, u64) -> Result<(), ()>,
-    ) -> Result<u64, ()> {
+    fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
         match self {
             PreparedPhysicalOp::TwoHop(p) => p.execute(emit),
             PreparedPhysicalOp::Wedge(p) => p.execute(emit),
             PreparedPhysicalOp::SpExpansion(p) => p.execute(emit),
+            PreparedPhysicalOp::KChain(p) => p.execute(emit),
+            PreparedPhysicalOp::Star(p) => p.execute(emit),
         }
     }
 }
@@ -146,6 +152,40 @@ impl PhysicalOpPlanKey {
                 o_filter,
                 p_expand,
             },
+            adj_mode,
+        }
+    }
+
+    #[inline]
+    pub fn k_chain(
+        snapshot_version: u64,
+        graph_id: u8,
+        p1: u64,
+        p2: u64,
+        p3: u64,
+        adj_mode: u8,
+    ) -> Self {
+        Self {
+            snapshot_version,
+            graph_id,
+            kind: PhysicalOpKind::KChain { p1, p2, p3 },
+            adj_mode,
+        }
+    }
+
+    #[inline]
+    pub fn star(
+        snapshot_version: u64,
+        graph_id: u8,
+        p1: u64,
+        p2: u64,
+        p3: u64,
+        adj_mode: u8,
+    ) -> Self {
+        Self {
+            snapshot_version,
+            graph_id,
+            kind: PhysicalOpKind::Star { p1, p2, p3 },
             adj_mode,
         }
     }
@@ -304,10 +344,7 @@ impl Drop for CachedPhysicalOpGuard {
 }
 
 impl PreparedPhysicalOperator for CachedPhysicalOpGuard {
-    fn execute(
-        &mut self,
-        emit: &mut dyn FnMut(u64, u64, u64) -> Result<(), ()>,
-    ) -> Result<u64, ()> {
+    fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
         let plan = self.plan.as_mut().expect("plan present during execute");
         plan.execute(emit)
     }
@@ -448,3 +485,50 @@ pub fn get_or_prepare_sp_expansion(
     })
 }
 
+/// Resolve or prepare a k-chain (k=3) plan via the product cache.
+pub fn get_or_prepare_k_chain(
+    cache: &Arc<Mutex<PhysicalOpPreparedPlanCache>>,
+    snapshot_version: u64,
+    graph_id: u8,
+    img: Arc<BraidedGraphImage>,
+    p1: u64,
+    p2: u64,
+    p3: u64,
+) -> Option<Box<dyn PreparedKChain>> {
+    let mode = effective_pred_adjacency_mode();
+    let key = PhysicalOpPlanKey::k_chain(
+        snapshot_version,
+        graph_id,
+        p1,
+        p2,
+        p3,
+        PhysicalOpPlanKey::adj_mode_tag(mode),
+    );
+    cache_lookup_or_prepare(cache, key, || {
+        PreparedKChainImpl::prepare(img, p1, p2, p3).map(PreparedPhysicalOp::KChain)
+    })
+}
+
+/// Resolve or prepare a subject-star (k=3) plan via the product cache.
+pub fn get_or_prepare_star(
+    cache: &Arc<Mutex<PhysicalOpPreparedPlanCache>>,
+    snapshot_version: u64,
+    graph_id: u8,
+    img: Arc<BraidedGraphImage>,
+    p1: u64,
+    p2: u64,
+    p3: u64,
+) -> Option<Box<dyn PreparedStar>> {
+    let mode = effective_pred_adjacency_mode();
+    let key = PhysicalOpPlanKey::star(
+        snapshot_version,
+        graph_id,
+        p1,
+        p2,
+        p3,
+        PhysicalOpPlanKey::adj_mode_tag(mode),
+    );
+    cache_lookup_or_prepare(cache, key, || {
+        PreparedStarImpl::prepare(img, p1, p2, p3).map(PreparedPhysicalOp::Star)
+    })
+}

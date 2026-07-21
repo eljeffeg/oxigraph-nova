@@ -22,22 +22,19 @@
 
 use crate::image::BraidedGraphImage;
 use crate::prepared_plan_cache::{
-    get_or_prepare_sp_expansion, get_or_prepare_two_hop, get_or_prepare_wedge,
-    PhysicalOpPreparedPlanCache, PREPARED_PLAN_CACHE_CAP,
+    get_or_prepare_k_chain, get_or_prepare_sp_expansion, get_or_prepare_star,
+    get_or_prepare_two_hop, get_or_prepare_wedge, PhysicalOpPreparedPlanCache,
+    PREPARED_PLAN_CACHE_CAP,
 };
 use crate::product_path::{
     SPARQL_PATH, bump_mmap_ok, log_mmap_fail_once, ring_counters_log_enabled, ring_d2_enabled,
     ring_image_dir, ring_mmap_enabled,
 };
 use crate::scan::{PreparedPredD1, PreparedSpObjectScanImpl, PredicateAdjacency};
-use oxigraph_nova_core::{
-    PreparedPredObjectIntersect, PreparedSpExpansion, PreparedSpObjectScan, PreparedTwoHop,
-    PreparedWedge,
-};
-
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use oxigraph_nova_core::{
     Dictionary, EmptyTrieIter, GRAPH_DEFAULT, GraphId, GraphName, LftjSource, NamedNode, Oxigraph,
+    PhysicalShape, PreparedPhysicalOperator, PreparedPredObjectIntersect, PreparedSpObjectScan,
     Quad, QuadOp, QuadStore, StoredQuad, Subject, Term, TermId, TrieIterator,
 };
 use oxigraph_nova_storage_louds::delta::Delta;
@@ -716,55 +713,51 @@ impl LftjSource for RingStore {
     }
 
 
-    fn lftj_prepare_two_hop(
+    fn lftj_prepare_shape(
         &self,
-        p1: u64,
-        p2: u64,
+        shape: PhysicalShape,
         graph_id: u8,
-    ) -> Option<Box<dyn PreparedTwoHop>> {
+    ) -> Option<Box<dyn PreparedPhysicalOperator>> {
         let img = self.graph_from_snap(graph_id)?;
         let ver = self.snapshot_version.load(AtomicOrdering::Relaxed);
-        get_or_prepare_two_hop(&self.physical_op_cache, ver, graph_id, img, p1, p2)
-    }
-
-    fn lftj_prepare_wedge(
-        &self,
-        predicate: u64,
-        graph_id: u8,
-    ) -> Option<Box<dyn PreparedWedge>> {
-        let img = self.graph_from_snap(graph_id)?;
-        let ver = self.snapshot_version.load(AtomicOrdering::Relaxed);
-        get_or_prepare_wedge(&self.physical_op_cache, ver, graph_id, img, predicate)
-    }
-
-    fn lftj_prepare_sp_expansion(
-        &self,
-        p_filter: u64,
-        o_filter: u64,
-        p_expand: u64,
-        graph_id: u8,
-    ) -> Option<Box<dyn PreparedSpExpansion>> {
-        let img = self.graph_from_snap(graph_id)?;
-        let ver = self.snapshot_version.load(AtomicOrdering::Relaxed);
-        // Warm expand adj from SpAdjCache (same table as prepared SP scan).
-        let adj = self
-            .sp_adj_cache
-            .lock()
-            .get_or_insert((ver, graph_id, p_expand), || {
-                PreparedSpObjectScanImpl::build_shared_adj(&img, p_expand)
-            });
-        get_or_prepare_sp_expansion(
-            &self.physical_op_cache,
-            ver,
-            graph_id,
-            img,
-            p_filter,
-            o_filter,
-            p_expand,
-            adj,
-        )
+        match shape {
+            PhysicalShape::TwoHop { p1, p2 } => {
+                get_or_prepare_two_hop(&self.physical_op_cache, ver, graph_id, img, p1, p2)
+            }
+            PhysicalShape::Wedge { predicate } => {
+                get_or_prepare_wedge(&self.physical_op_cache, ver, graph_id, img, predicate)
+            }
+            PhysicalShape::SpExpansion {
+                p_filter,
+                o_filter,
+                p_expand,
+            } => {
+                // Warm expand adj from SpAdjCache (same table as prepared SP scan).
+                let adj = self.sp_adj_cache.lock().get_or_insert(
+                    (ver, graph_id, p_expand),
+                    || PreparedSpObjectScanImpl::build_shared_adj(&img, p_expand),
+                );
+                get_or_prepare_sp_expansion(
+                    &self.physical_op_cache,
+                    ver,
+                    graph_id,
+                    img,
+                    p_filter,
+                    o_filter,
+                    p_expand,
+                    adj,
+                )
+            }
+            PhysicalShape::KChain { p1, p2, p3 } => {
+                get_or_prepare_k_chain(&self.physical_op_cache, ver, graph_id, img, p1, p2, p3)
+            }
+            PhysicalShape::Star { p1, p2, p3 } => {
+                get_or_prepare_star(&self.physical_op_cache, ver, graph_id, img, p1, p2, p3)
+            }
+        }
     }
 }
+
 
 
 // ── QuadStore ─────────────────────────────────────────────────────────────────

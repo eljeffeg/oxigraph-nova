@@ -46,3 +46,4 @@ profile.json.gz
 /benches/src
 /benches/archive
 /vendor/qwt/.git_disabled
+/.vscode

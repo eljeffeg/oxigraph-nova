@@ -70,11 +70,13 @@
 
 use crate::dataset::{Dataset, GraphSelector};
 use crate::options::CancellationToken;
+use crate::shapes::{KChainPlan, ShapePlan, SpExpansionPlan, StarPlan, TwoHopPlan, WedgePlan};
 use crate::solution::{Solution, Solutions};
 use oxigraph_nova_core::{GraphName, Term, Variable};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
 
 // K9 path_2hop shape counters
 static TWO_HOP_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -83,6 +85,18 @@ static TWO_HOP_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static SP_EXPANSION_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
 static SP_EXPANSION_SELECTED: AtomicU64 = AtomicU64::new(0);
 static SP_EXPANSION_FALLBACK: AtomicU64 = AtomicU64::new(0);
+// K7.1 / K11 fixed-P triangle wedge
+static WEDGE_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
+static WEDGE_SELECTED: AtomicU64 = AtomicU64::new(0);
+static WEDGE_FALLBACK: AtomicU64 = AtomicU64::new(0);
+// K10 path_3hop (k=3 chain)
+static K_CHAIN_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
+static K_CHAIN_SELECTED: AtomicU64 = AtomicU64::new(0);
+static K_CHAIN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+// Subject-star (k=3)
+static STAR_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
+static STAR_SELECTED: AtomicU64 = AtomicU64::new(0);
+static STAR_FALLBACK: AtomicU64 = AtomicU64::new(0);
 
 
 // ── LFTJ vs nested-loop fallback counters (process-wide) ──────────────────────
@@ -136,7 +150,7 @@ static LFTJ_DEPTH_ENTER: AtomicU64 = AtomicU64::new(0);
 static LFTJ_DEPTH_LEAF: AtomicU64 = AtomicU64::new(0);
 static LFTJ_SCAN_OPEN: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot of W4b collapse / LFTJ depth counters for diagnostics harnesses.
+/// Snapshot of W4b collapse / LFTJ depth / shape-walk counters for diagnostics.
 #[derive(Clone, Debug, Default)]
 pub struct CollapseCounterSnapshot {
     pub triangle_shape_seen: u64,
@@ -151,9 +165,21 @@ pub struct CollapseCounterSnapshot {
     pub lftj_depth_enter: u64,
     pub lftj_depth_leaf: u64,
     pub lftj_scan_open: u64,
+    /// KChain (k=3) specialized walk entered (catalog hit).
+    pub k_chain_shape_seen: u64,
+    /// KChain prepared body used (multi-var emit SELECTED path).
+    pub k_chain_selected: u64,
+    /// KChain nested `join_scan` fallback taken.
+    pub k_chain_fallback: u64,
+    /// Star (k=3) specialized walk entered (catalog hit).
+    pub star_shape_seen: u64,
+    /// Star prepared body used (multi-var emit SELECTED path).
+    pub star_selected: u64,
+    /// Star nested `join_scan` fallback taken.
+    pub star_fallback: u64,
 }
 
-/// Zero all collapse / depth counters (harness use).
+/// Zero all collapse / depth / shape-walk counters (harness use).
 pub fn reset_collapse_counters() {
     for a in [
         &TRIANGLE_SHAPE_SEEN,
@@ -168,12 +194,18 @@ pub fn reset_collapse_counters() {
         &LFTJ_DEPTH_ENTER,
         &LFTJ_DEPTH_LEAF,
         &LFTJ_SCAN_OPEN,
+        &K_CHAIN_SHAPE_SEEN,
+        &K_CHAIN_SELECTED,
+        &K_CHAIN_FALLBACK,
+        &STAR_SHAPE_SEEN,
+        &STAR_SELECTED,
+        &STAR_FALLBACK,
     ] {
         a.store(0, Ordering::Relaxed);
     }
 }
 
-/// Read collapse / depth counters.
+/// Read collapse / depth / shape-walk counters.
 pub fn collapse_counters_snapshot() -> CollapseCounterSnapshot {
     CollapseCounterSnapshot {
         triangle_shape_seen: TRIANGLE_SHAPE_SEEN.load(Ordering::Relaxed),
@@ -188,14 +220,24 @@ pub fn collapse_counters_snapshot() -> CollapseCounterSnapshot {
         lftj_depth_enter: LFTJ_DEPTH_ENTER.load(Ordering::Relaxed),
         lftj_depth_leaf: LFTJ_DEPTH_LEAF.load(Ordering::Relaxed),
         lftj_scan_open: LFTJ_SCAN_OPEN.load(Ordering::Relaxed),
+        k_chain_shape_seen: K_CHAIN_SHAPE_SEEN.load(Ordering::Relaxed),
+        k_chain_selected: K_CHAIN_SELECTED.load(Ordering::Relaxed),
+        k_chain_fallback: K_CHAIN_FALLBACK.load(Ordering::Relaxed),
+        star_shape_seen: STAR_SHAPE_SEEN.load(Ordering::Relaxed),
+        star_selected: STAR_SELECTED.load(Ordering::Relaxed),
+        star_fallback: STAR_FALLBACK.load(Ordering::Relaxed),
     }
 }
+
 
 // ── Field specification ────────────────────────────────────────────────────────
 
 /// How a single s/p/o field in a triple pattern is classified for LFTJ.
+///
+/// `pub(crate)` so the shape catalog (`shapes/`) can pattern-match fields
+/// without re-classifying patterns.
 #[derive(Clone, Debug)]
-enum FieldSpec {
+pub(crate) enum FieldSpec {
     /// A constant term, already interned to its TermId.
     Const(u64),
     /// A join variable at the given stable index in the `join_vars` array.
@@ -207,11 +249,15 @@ enum FieldSpec {
 }
 
 /// The fully-classified version of one triple pattern.
-struct PatternSpec {
-    s: FieldSpec,
-    p: FieldSpec,
-    o: FieldSpec,
+///
+/// `pub(crate)` for the shape catalog recognizers.
+#[derive(Clone, Debug)]
+pub(crate) struct PatternSpec {
+    pub(crate) s: FieldSpec,
+    pub(crate) p: FieldSpec,
+    pub(crate) o: FieldSpec,
 }
+
 
 impl PatternSpec {
     /// Is this pattern active for `var_idx`?
@@ -826,27 +872,10 @@ fn lftj_step<D: Dataset>(
     }
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
-/// Try to evaluate a BGP using Leapfrog Triejoin with adaptive VEO.
-///
-/// Returns:
-/// - `None` — LFTJ is not applicable; caller should fall back to nested-loop.
-/// - `Some(Ok(solutions))` — LFTJ succeeded.
-/// - `Some(Err(e))` — unrecoverable error (reserved for future I/O errors).
-///
-/// ## Fallback conditions
-///
-/// LFTJ is skipped and `None` is returned when:
-/// - The dataset does not support LFTJ (`supports_lftj() == false`).
-/// - The delta is non-empty — Ring is stale and may be missing recent writes.
-/// - The graph selector is `AnyNamed` or `Union` (multi-graph iteration).
-/// - A pattern contains blank nodes (not internable).
-/// - A constant term in a pattern is not in the dictionary (returns empty directly).
-
-
+/// Field helpers for the shape catalog (`shapes/`).
 #[inline]
-fn field_as_join(f: &FieldSpec) -> Option<usize> {
+pub(crate) fn field_as_join(f: &FieldSpec) -> Option<usize> {
+
     match f {
         FieldSpec::JoinVar(i) => Some(*i),
         _ => None,
@@ -854,89 +883,22 @@ fn field_as_join(f: &FieldSpec) -> Option<usize> {
 }
 
 #[inline]
-fn field_as_const(f: &FieldSpec) -> Option<u64> {
+pub(crate) fn field_as_const(f: &FieldSpec) -> Option<u64> {
     match f {
         FieldSpec::Const(v) => Some(*v),
         _ => None,
     }
 }
 
-
-// ── 2join / subject-star SP-expansion (RESULTS_MEM 2join shape) ──────────────
+// ── Shape physical strategies ─────────────────────────────────────────────────
 //
-//   ?s P_filter O_const .   // A: bound P+O → distinct subjects
-//   ?s P_expand ?o          // B: for each s, SP→O under fixed P_expand
-//
-// Not a 3-var two-hop chain. Generic LFTJ opens a fresh LastCol RDI per subject
-// on pattern B; this plan reuses PreparedSpObjectScan (one prepare + cheap
-// reset_to_subject per s).
-
-struct SpExpansionPlan {
-    /// Bound predicate on the filter pattern (P31).
-    p_filter: u64,
-    /// Bound object on the filter pattern (class0).
-    o_filter: u64,
-    /// Bound predicate on the expansion pattern (P131).
-    p_expand: u64,
-    /// Join-var index of the shared subject (?s).
-    s_idx: usize,
-    /// Join-var index of the expansion object (?region).
-    o_idx: usize,
-}
-
-/// Recognize `?s P1 O1 . ?s P2 ?o` (or pattern order swapped).
-///
-/// Requires exactly 2 patterns and 2 join vars.
-fn try_recognize_sp_expansion(specs: &[PatternSpec], n_vars: usize) -> Option<SpExpansionPlan> {
-    if specs.len() != 2 || n_vars != 2 {
-        return None;
-    }
-    // Classify each pattern:
-    //   filter:  JoinVar(s) Const(P) Const(O)
-    //   expand:  JoinVar(s) Const(P) JoinVar(o)   with s != o
-    let mut filter: Option<(usize, u64, u64)> = None; // (s_idx, p, o)
-    let mut expand: Option<(usize, u64, usize)> = None; // (s_idx, p, o_idx)
-
-    for sp in specs {
-        let s = field_as_join(&sp.s)?;
-        let p = field_as_const(&sp.p)?;
-        match (&sp.o, field_as_join(&sp.o), field_as_const(&sp.o)) {
-            (_, Some(o_jv), _) if o_jv != s => {
-                // expand form
-                if expand.is_some() {
-                    return None;
-                }
-                expand = Some((s, p, o_jv));
-            }
-            (_, None, Some(o_c)) => {
-                if filter.is_some() {
-                    return None;
-                }
-                filter = Some((s, p, o_c));
-            }
-            _ => return None,
-        }
-    }
-    let (fs, p_filter, o_filter) = filter?;
-    let (es, p_expand, o_idx) = expand?;
-    if fs != es {
-        return None; // must share subject var
-    }
-    // Both join-var indices must appear (s and o).
-    if fs >= 2 || o_idx >= 2 || fs == o_idx {
-        return None;
-    }
-    Some(SpExpansionPlan {
-        p_filter,
-        o_filter,
-        p_expand,
-        s_idx: fs,
-        o_idx,
-    })
-}
+// Recognition lives in `shapes/`. Walkers call `lftj_prepare_shape` with a
+// `PhysicalShape` derived from the plan; nested-scan fallbacks remain when the
+// engine returns None.
 
 #[inline]
 fn emit_sp_expansion_solution<D: Dataset>(
+
     dataset: &D,
     join_vars: &Arc<[Variable]>,
     s_idx: usize,
@@ -968,11 +930,14 @@ fn eval_sp_expansion_walk<D: Dataset>(
 
     // Prefer dense prepared SP-expansion (Ring): outer subjects cached,
     // expand stays dense — no per-subject external↔dense remap.
-    if let Some(mut prepared) =
-        dataset.lftj_prepare_sp_expansion(plan.p_filter, plan.o_filter, plan.p_expand, graph)
-    {
+    if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
+
         SP_EXPANSION_SELECTED.fetch_add(1, Ordering::Relaxed);
-        let emit_result = prepared.execute(&mut |s, o, _| {
+        let emit_result = prepared.execute(&mut |ids| {
+            // SP-expansion emits [s, o]
+            debug_assert!(ids.len() >= 2);
+            let s = ids[0];
+            let o = ids[1];
             if let Some(tok) = cancellation {
                 if step.is_multiple_of(4096) && tok.is_cancelled() {
                     return Err(());
@@ -1083,62 +1048,8 @@ fn eval_sp_expansion_walk<D: Dataset>(
 }
 
 
-struct TwoHopPlan {
-    p1: u64,
-    p2: u64,
-    a: usize,
-    b: usize,
-    c: usize,
-}
-
-/// Try to recognize the two-hop chain BGP shape on classified specs.
-///
-/// Requires exactly 2 patterns, exactly 3 join vars, both patterns of the form
-/// `JoinVar(s) Const(P) JoinVar(o)`, directed edges forming a chain a→b→c
-/// (not a two-edge wedge or self-loop). P1 and P2 may be the same or different.
-fn try_recognize_two_hop(specs: &[PatternSpec], n_vars: usize) -> Option<TwoHopPlan> {
-    if specs.len() != 2 || n_vars != 3 {
-        return None;
-    }
-    let mut edges: Vec<(usize, usize, u64)> = Vec::with_capacity(2);
-    for sp in specs {
-        let s = field_as_join(&sp.s)?;
-        let p = field_as_const(&sp.p)?;
-        let o = field_as_join(&sp.o)?;
-        if s == o || s >= 3 || o >= 3 {
-            return None;
-        }
-        edges.push((s, o, p));
-    }
-    // Distinct directed edges.
-    if edges[0].0 == edges[1].0 && edges[0].1 == edges[1].1 {
-        return None;
-    }
-
-    // Find chain a→b→c: edge1 head = edge2 tail, three distinct vars.
-    for i in 0..2 {
-        let (a, b, p1) = edges[i];
-        let (b2, c, p2) = edges[1 - i];
-        if b != b2 {
-            continue;
-        }
-        if a == b || b == c || a == c {
-            continue;
-        }
-        // All three join-var indices must appear.
-        let mut seen = [false; 3];
-        seen[a] = true;
-        seen[b] = true;
-        seen[c] = true;
-        if !seen.iter().all(|&x| x) {
-            continue;
-        }
-        return Some(TwoHopPlan { p1, p2, a, b, c });
-    }
-    None
-}
-
 /// Emit one decoded solution from three bound TermIds (two-hop path).
+
 ///
 /// Returns nanoseconds spent in decode+materialize for path timing.
 #[inline]
@@ -1195,10 +1106,15 @@ fn eval_two_hop_walk<D: Dataset>(
     let mut decode_ns: u64 = 0;
 
     // Prefer prepared two-hop body (K9.1 + K9.2 resettable SP scanners).
-    if let Some(mut prepared) = dataset.lftj_prepare_two_hop(plan.p1, plan.p2, graph) {
+    if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
+
         TWO_HOP_SELECTED.fetch_add(1, Ordering::Relaxed);
         let t_wall = std::time::Instant::now();
-        let emit_result = prepared.execute(&mut |a, b, c| {
+        let emit_result = prepared.execute(&mut |ids| {
+            debug_assert!(ids.len() >= 3);
+            let a = ids[0];
+            let b = ids[1];
+            let c = ids[2];
             if let Some(tok) = cancellation {
                 if step.is_multiple_of(4096) && tok.is_cancelled() {
                     return Err(());
@@ -1322,7 +1238,502 @@ fn eval_two_hop_walk<D: Dataset>(
 }
 
 
+/// K7.1 fixed-P triangle: prepared wedge when available, else D1-style nested walk.
+///
+/// Plan orientation is a→b, b→c, a→c under one predicate. Nested fallback:
+/// enumerate `(a,b)` via join_scan, close `c` with
+/// `lftj_multi_subject_object_intersect([a,b], Some(P))` (Ring D1), else a
+/// third join_scan on `(a,P,?c)` filtered by membership in `b`'s objects.
+fn eval_wedge_walk<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    graph: &GraphSelector,
+    plan: &WedgePlan,
+    cancellation: Option<&CancellationToken>,
+) -> anyhow::Result<Solutions> {
+    WEDGE_SHAPE_SEEN.fetch_add(1, Ordering::Relaxed);
+    // Same observability bucket as in-step collapse (≥3 object targets).
+    TRIANGLE_SHAPE_SEEN.fetch_add(1, Ordering::Relaxed);
+
+    let mut results: Solutions = Vec::new();
+    let mut step: u64 = 0;
+
+    // Prefer prepared wedge body when the engine implements it.
+    if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
+        WEDGE_SELECTED.fetch_add(1, Ordering::Relaxed);
+        let emit_result = prepared.execute(&mut |ids| {
+            debug_assert!(ids.len() >= 3);
+            let a = ids[0];
+            let b = ids[1];
+            let c = ids[2];
+            if let Some(tok) = cancellation {
+                if step.is_multiple_of(4096) && tok.is_cancelled() {
+                    return Err(());
+                }
+            }
+            step += 1;
+            LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+            let _ = emit_two_hop_solution(
+                dataset,
+                join_vars,
+                plan.a,
+                plan.b,
+                plan.c,
+                a,
+                b,
+                c,
+                &mut results,
+            );
+            Ok(())
+        });
+        return match emit_result {
+            Ok(_) => Ok(results),
+            Err(()) => Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            )),
+        };
+    }
+
+    // Nested D1-style walk (fixed a→b outer, close via multi-subject ∩).
+    WEDGE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    let p = plan.predicate;
+
+    let mut a_scan = match dataset.lftj_join_scan(None, Some(p), None, 0, graph) {
+        Some(s) => s,
+        None => return Ok(results),
+    };
+    LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+
+    while !a_scan.at_end() {
+        if let Some(tok) = cancellation {
+            if step.is_multiple_of(4096) && tok.is_cancelled() {
+                return Err(anyhow::Error::from(
+                    crate::options::EvalLimitError::Cancelled,
+                ));
+            }
+        }
+        step += 1;
+        let a = a_scan.key();
+        let mut b_scan = match dataset.lftj_join_scan(Some(a), Some(p), None, 2, graph) {
+            Some(s) => s,
+            None => {
+                a_scan.advance();
+                continue;
+            }
+        };
+        LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+        while !b_scan.at_end() {
+            step += 1;
+            let b = b_scan.key();
+            // Prefer braided multi-subject object ∩ (Ring D1) for closing edge.
+            if let Some(mut c_scan) =
+                dataset.lftj_multi_subject_object_intersect(&[a, b], Some(p), graph)
+            {
+                LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+                while !c_scan.at_end() {
+                    let c = c_scan.key();
+                    // Closing edge a→c and b→c both required; D1 already ∩'s
+                    // objects of a and b under P. Skip a==b==c degenerate if any.
+                    if c != a && c != b {
+                        LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+                        let _ = emit_two_hop_solution(
+                            dataset,
+                            join_vars,
+                            plan.a,
+                            plan.b,
+                            plan.c,
+                            a,
+                            b,
+                            c,
+                            &mut results,
+                        );
+                    }
+                    c_scan.advance();
+                }
+            } else if let Some(mut c_scan) =
+                dataset.lftj_join_scan(Some(a), Some(p), None, 2, graph)
+            {
+                // Last-resort: objects of a under P, probe (b,P,c) existence via
+                // a second scan would be O(|Na|*|Nb|); instead materialize b's
+                // objects once and filter.
+                LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+                let mut b_objs: Vec<u64> = Vec::new();
+                if let Some(mut bo) =
+                    dataset.lftj_join_scan(Some(b), Some(p), None, 2, graph)
+                {
+                    LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+                    while !bo.at_end() {
+                        b_objs.push(bo.key());
+                        bo.advance();
+                    }
+                }
+                b_objs.sort_unstable();
+                while !c_scan.at_end() {
+                    let c = c_scan.key();
+                    if c != a && c != b && b_objs.binary_search(&c).is_ok() {
+                        LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+                        let _ = emit_two_hop_solution(
+                            dataset,
+                            join_vars,
+                            plan.a,
+                            plan.b,
+                            plan.c,
+                            a,
+                            b,
+                            c,
+                            &mut results,
+                        );
+                    }
+                    c_scan.advance();
+                }
+            }
+            b_scan.advance();
+        }
+        a_scan.advance();
+    }
+
+    Ok(results)
+}
+
+/// Emit one decoded solution from four bound TermIds (3-hop chain).
+#[inline]
+fn emit_k_chain_solution<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    a_idx: usize,
+    b_idx: usize,
+    c_idx: usize,
+    d_idx: usize,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    results: &mut Solutions,
+) {
+    let mut values: Vec<Option<oxigraph_nova_core::Term>> = vec![None; join_vars.len()];
+    values[a_idx] = dataset.lftj_decode_term(a);
+    values[b_idx] = dataset.lftj_decode_term(b);
+    values[c_idx] = dataset.lftj_decode_term(c);
+    values[d_idx] = dataset.lftj_decode_term(d);
+    if values[a_idx].is_none()
+        || values[b_idx].is_none()
+        || values[c_idx].is_none()
+        || values[d_idx].is_none()
+    {
+        return;
+    }
+    results.push(Solution::positional(Arc::clone(join_vars), values));
+}
+
+/// K10 physical 3-hop chain: prepared body when available, else nested join_scan.
+///
+/// Prepared ops emit `[a,b,c,d]` via the multi-var slice emit API. When prepare
+/// returns `None`, nested join_scan under (p1,p2,p3) still beats generic VEO.
+fn eval_k_chain_walk<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    graph: &GraphSelector,
+    plan: &KChainPlan,
+    cancellation: Option<&CancellationToken>,
+) -> anyhow::Result<Solutions> {
+    K_CHAIN_SHAPE_SEEN.fetch_add(1, Ordering::Relaxed);
+
+    let mut results: Solutions = Vec::new();
+    let mut step: u64 = 0;
+
+    if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
+        K_CHAIN_SELECTED.fetch_add(1, Ordering::Relaxed);
+        let emit_result = prepared.execute(&mut |ids| {
+            debug_assert!(ids.len() >= 4, "KChain emit arity");
+            let a = ids[0];
+            let b = ids[1];
+            let c = ids[2];
+            let d = ids[3];
+            if let Some(tok) = cancellation {
+                if step.is_multiple_of(4096) && tok.is_cancelled() {
+                    return Err(());
+                }
+            }
+            step += 1;
+            LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+            emit_k_chain_solution(
+                dataset,
+                join_vars,
+                plan.a,
+                plan.b,
+                plan.c,
+                plan.d,
+                a,
+                b,
+                c,
+                d,
+                &mut results,
+            );
+            Ok(())
+        });
+        return match emit_result {
+            Ok(_) => Ok(results),
+            Err(()) => Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            )),
+        };
+    }
+
+    K_CHAIN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+
+
+
+    // Nested join_scan: a under P1 (target S) → b under (a,P1) O →
+    // c under (b,P2) O → d under (c,P3) O.
+    let mut a_scan = match dataset.lftj_join_scan(None, Some(plan.p1), None, 0, graph) {
+        Some(s) => s,
+        None => return Ok(results),
+    };
+    LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+
+    while !a_scan.at_end() {
+        if let Some(tok) = cancellation {
+            if step.is_multiple_of(4096) && tok.is_cancelled() {
+                return Err(anyhow::Error::from(
+                    crate::options::EvalLimitError::Cancelled,
+                ));
+            }
+        }
+        step += 1;
+        let a = a_scan.key();
+        let mut b_scan =
+            match dataset.lftj_join_scan(Some(a), Some(plan.p1), None, 2, graph) {
+                Some(s) => s,
+                None => {
+                    a_scan.advance();
+                    continue;
+                }
+            };
+        LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+        while !b_scan.at_end() {
+            step += 1;
+            let b = b_scan.key();
+            let mut c_scan =
+                match dataset.lftj_join_scan(Some(b), Some(plan.p2), None, 2, graph) {
+                    Some(s) => s,
+                    None => {
+                        b_scan.advance();
+                        continue;
+                    }
+                };
+            LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+            while !c_scan.at_end() {
+                step += 1;
+                let c = c_scan.key();
+                if let Some(mut d_scan) =
+                    dataset.lftj_join_scan(Some(c), Some(plan.p3), None, 2, graph)
+                {
+                    LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+                    while !d_scan.at_end() {
+                        let d = d_scan.key();
+                        LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+                        emit_k_chain_solution(
+                            dataset,
+                            join_vars,
+                            plan.a,
+                            plan.b,
+                            plan.c,
+                            plan.d,
+                            a,
+                            b,
+                            c,
+                            d,
+                            &mut results,
+                        );
+                        d_scan.advance();
+                    }
+                }
+                c_scan.advance();
+            }
+            b_scan.advance();
+        }
+        a_scan.advance();
+    }
+
+    Ok(results)
+}
+
+/// Emit one decoded solution from four bound TermIds (subject-star k=3).
+#[inline]
+fn emit_star_solution<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    s_idx: usize,
+    o1_idx: usize,
+    o2_idx: usize,
+    o3_idx: usize,
+    s: u64,
+    o1: u64,
+    o2: u64,
+    o3: u64,
+    results: &mut Solutions,
+) {
+    let mut values: Vec<Option<oxigraph_nova_core::Term>> = vec![None; join_vars.len()];
+    values[s_idx] = dataset.lftj_decode_term(s);
+    values[o1_idx] = dataset.lftj_decode_term(o1);
+    values[o2_idx] = dataset.lftj_decode_term(o2);
+    values[o3_idx] = dataset.lftj_decode_term(o3);
+    if values[s_idx].is_none()
+        || values[o1_idx].is_none()
+        || values[o2_idx].is_none()
+        || values[o3_idx].is_none()
+    {
+        return;
+    }
+    results.push(Solution::positional(Arc::clone(join_vars), values));
+}
+
+/// Subject-star (k=3): prepared body when available, else nested join_scan.
+///
+/// Prepared ops emit `[s, o1, o2, o3]` via the multi-var slice emit API. When
+/// prepare returns `None`, nested join_scan under (p1,p2,p3) still beats
+/// generic VEO: outer subjects under p1, then Cartesian objects under each arm.
+fn eval_star_walk<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    graph: &GraphSelector,
+    plan: &StarPlan,
+    cancellation: Option<&CancellationToken>,
+) -> anyhow::Result<Solutions> {
+    STAR_SHAPE_SEEN.fetch_add(1, Ordering::Relaxed);
+
+    let mut results: Solutions = Vec::new();
+    let mut step: u64 = 0;
+
+    if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
+        STAR_SELECTED.fetch_add(1, Ordering::Relaxed);
+        let emit_result = prepared.execute(&mut |ids| {
+            debug_assert!(ids.len() >= 4, "Star emit arity");
+            let s = ids[0];
+            let o1 = ids[1];
+            let o2 = ids[2];
+            let o3 = ids[3];
+            if let Some(tok) = cancellation {
+                if step.is_multiple_of(4096) && tok.is_cancelled() {
+                    return Err(());
+                }
+            }
+            step += 1;
+            LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+            emit_star_solution(
+                dataset,
+                join_vars,
+                plan.s,
+                plan.o1,
+                plan.o2,
+                plan.o3,
+                s,
+                o1,
+                o2,
+                o3,
+                &mut results,
+            );
+            Ok(())
+        });
+        return match emit_result {
+            Ok(_) => Ok(results),
+            Err(()) => Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            )),
+        };
+    }
+
+    STAR_FALLBACK.fetch_add(1, Ordering::Relaxed);
+
+    // Nested join_scan: subjects under P1 → objects under (s,P1), (s,P2), (s,P3).
+    // Cartesian product of the three object arms for each subject that has all
+    // three predicates present (empty arm → skip subject).
+    let mut s_scan = match dataset.lftj_join_scan(None, Some(plan.p1), None, 0, graph) {
+        Some(s) => s,
+        None => return Ok(results),
+    };
+    LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+
+    while !s_scan.at_end() {
+        if let Some(tok) = cancellation {
+            if step.is_multiple_of(4096) && tok.is_cancelled() {
+                return Err(anyhow::Error::from(
+                    crate::options::EvalLimitError::Cancelled,
+                ));
+            }
+        }
+        step += 1;
+        let s = s_scan.key();
+
+        // Materialize objects under each arm; skip if any arm is empty.
+        let mut o1s: Vec<u64> = Vec::new();
+        if let Some(mut sc) = dataset.lftj_join_scan(Some(s), Some(plan.p1), None, 2, graph) {
+            LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+            while !sc.at_end() {
+                o1s.push(sc.key());
+                sc.advance();
+            }
+        }
+        if o1s.is_empty() {
+            s_scan.advance();
+            continue;
+        }
+
+        let mut o2s: Vec<u64> = Vec::new();
+        if let Some(mut sc) = dataset.lftj_join_scan(Some(s), Some(plan.p2), None, 2, graph) {
+            LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+            while !sc.at_end() {
+                o2s.push(sc.key());
+                sc.advance();
+            }
+        }
+        if o2s.is_empty() {
+            s_scan.advance();
+            continue;
+        }
+
+        let mut o3s: Vec<u64> = Vec::new();
+        if let Some(mut sc) = dataset.lftj_join_scan(Some(s), Some(plan.p3), None, 2, graph) {
+            LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+            while !sc.at_end() {
+                o3s.push(sc.key());
+                sc.advance();
+            }
+        }
+        if o3s.is_empty() {
+            s_scan.advance();
+            continue;
+        }
+
+        for &o1 in &o1s {
+            for &o2 in &o2s {
+                for &o3 in &o3s {
+                    LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+                    emit_star_solution(
+                        dataset,
+                        join_vars,
+                        plan.s,
+                        plan.o1,
+                        plan.o2,
+                        plan.o3,
+                        s,
+                        o1,
+                        o2,
+                        o3,
+                        &mut results,
+                    );
+                }
+            }
+        }
+        s_scan.advance();
+    }
+
+    Ok(results)
+}
+
+
 // ── Public entry point ────────────────────────────────────────────────────────
+
 
 
 /// Try to evaluate a BGP using Leapfrog Triejoin with adaptive VEO.
@@ -1344,10 +1755,11 @@ fn eval_two_hop_walk<D: Dataset>(
 /// ## K7.1 wedge fast path
 ///
 /// When the BGP is the fixed-P undirected triangle
-/// (`?a P ?b . ?b P ?c . ?a P ?c`), evaluation uses a dedicated D1-walk plan
+/// (`?a P ?b . ?b P ?c . ?a P ?c`), the shape catalog selects
+/// [`ShapePlan::Wedge`] and evaluation uses a dedicated D1-walk plan
 /// (outer a→b, close via `lftj_multi_subject_object_intersect`) instead of
-/// generic 3-var LFTJ. Counters: `triangle_shape_seen`, `d1_selected`,
-/// `fallback_generic` on [`collapse_counters_snapshot`].
+/// generic 3-var LFTJ. In-step multi-subject collapse still applies to other
+/// BGPs; counters: `triangle_shape_seen` on [`collapse_counters_snapshot`].
 pub fn eval_bgp_lftj<D: Dataset>(
     dataset: &D,
     patterns: &[TriplePattern],
@@ -1409,36 +1821,61 @@ pub fn eval_bgp_lftj_cancellable<D: Dataset>(
         }
     }
 
-    // ── Run LFTJ with adaptive VEO ─────────────────────────────────────────
+    // ── Shape catalog dispatch ───────────────────────────────────────────────
+    //
+    // Recognizers are pure (planner-side). On a hit we always take the shape's
+    // specialized walk. Walkers call `lftj_prepare_shape` with a PhysicalShape
+    // (via plan constants / to_physical); when prepare returns None they keep
+    // nested-scan fallbacks (still better than generic VEO on these shapes).
+    // Miss → generic path below.
+    if let Some(plan) = crate::shapes::recognize_shape(&specs, join_vars.len()) {
+        return Some(match plan {
+            ShapePlan::SpExpansion(sp_exp) => eval_sp_expansion_walk(
+                dataset,
+                &join_vars,
+                active_graph,
+                &sp_exp,
+                cancellation,
+            ),
+            ShapePlan::TwoHop(two_hop) => eval_two_hop_walk(
+                dataset,
+                &join_vars,
+                active_graph,
+                &two_hop,
+                cancellation,
+                false,
+            ),
+            ShapePlan::Wedge(wedge) => eval_wedge_walk(
+                dataset,
+                &join_vars,
+                active_graph,
+                &wedge,
+                cancellation,
+            ),
+            ShapePlan::KChain(k_chain) => eval_k_chain_walk(
+                dataset,
+                &join_vars,
+                active_graph,
+                &k_chain,
+                cancellation,
+            ),
+            ShapePlan::Star(star) => eval_star_walk(
+                dataset,
+                &join_vars,
+                active_graph,
+                &star,
+                cancellation,
+            ),
+        });
+    }
+
+
+    // ── Generic adaptive-VEO LFTJ ────────────────────────────────────────────
     //
     // `bindings[var_idx]` = Some(val) once that variable is bound; None until then.
     // `unbound` starts as all var indices 0..k; VEO re-sorts at each depth.
-
-
-    // ── 2join SP-expansion (subject star) ───────────────────────────────────
-    if let Some(sp_exp) = try_recognize_sp_expansion(&specs, join_vars.len()) {
-        return Some(eval_sp_expansion_walk(
-            dataset,
-            &join_vars,
-            active_graph,
-            &sp_exp,
-            cancellation,
-        ));
-    }
-
-    // ── K9: two-hop chain → prepared / nested walk ───────────────────────────
-    if let Some(two_hop) = try_recognize_two_hop(&specs, join_vars.len()) {
-        return Some(eval_two_hop_walk(
-            dataset,
-            &join_vars,
-            active_graph,
-            &two_hop,
-            cancellation,
-            false,
-        ));
-    }
-
     let mut bindings: Vec<Option<u64>> = vec![None; join_vars.len()];
+
     let unbound: Vec<usize> = (0..join_vars.len()).collect();
     let mut results: Solutions = Vec::new();
     let mut aborted = false;
@@ -1882,4 +2319,615 @@ mod tests {
             "a fully-ground triple that was never asserted must yield zero solutions"
         );
     }
+
+    // ── KChain (k=3) execution tests ──────────────────────────────────────────
+    //
+    // Recognizer unit tests live in `shapes/`. These exercise the full path:
+    // classify BGP → catalog hit → `eval_k_chain_walk` nested join_scan →
+    // positional emit. The stub is predicate-aware (unlike `StubDataset`).
+
+    /// Predicate-aware triple store for shape walk execution tests.
+    struct ChainDataset {
+        /// Sorted (s, p, o) triples.
+        triples: Vec<[u64; 3]>,
+        dict: Vec<(String, u64)>,
+    }
+
+    impl ChainDataset {
+        /// Data:
+        ///   a --p1--> b --p2--> c --p3--> d     (one full 3-hop chain)
+        ///   a --p1--> b2                        (dead-end under p1)
+        ///   x --p9--> y                         (unrelated edge, different P)
+        fn with_chain() -> Self {
+            Self {
+                triples: vec![
+                    [1, 10, 2],  // a p1 b
+                    [1, 10, 5],  // a p1 b2 (dead-end)
+                    [2, 11, 3],  // b p2 c
+                    [3, 12, 4],  // c p3 d
+                    [6, 99, 7],  // x p9 y (noise)
+                ],
+                dict: vec![
+                    ("http://ex/a".into(), 1),
+                    ("http://ex/b".into(), 2),
+                    ("http://ex/c".into(), 3),
+                    ("http://ex/d".into(), 4),
+                    ("http://ex/b2".into(), 5),
+                    ("http://ex/x".into(), 6),
+                    ("http://ex/y".into(), 7),
+                    ("http://ex/p1".into(), 10),
+                    ("http://ex/p2".into(), 11),
+                    ("http://ex/p3".into(), 12),
+                    ("http://ex/p9".into(), 99),
+                ],
+            }
+        }
+
+        fn id_of(&self, uri: &str) -> Option<u64> {
+            self.dict.iter().find(|(k, _)| k == uri).map(|(_, v)| *v)
+        }
+    }
+
+
+    impl DatasetLftjSource for ChainDataset {
+        fn supports_lftj(&self) -> bool {
+            true
+        }
+        fn lftj_has_delta(&self) -> bool {
+            false
+        }
+        fn lftj_intern_term(&self, term: &Term, _: &GraphSelector) -> Option<u64> {
+            if let Term::NamedNode(n) = term {
+                self.id_of(n.as_str())
+            } else {
+                None
+            }
+        }
+        fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+            self.dict.iter().find(|(_, v)| *v == id).map(|(k, _)| {
+                Term::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(k.clone()))
+            })
+        }
+        fn lftj_join_scan(
+            &self,
+            s: Option<u64>,
+            p: Option<u64>,
+            o: Option<u64>,
+            target_field: usize,
+            _: &GraphSelector,
+        ) -> Option<Box<dyn TrieIterator>> {
+            let mut vals: Vec<u64> = self
+                .triples
+                .iter()
+                .filter(|t| s.is_none_or(|sv| t[0] == sv))
+                .filter(|t| p.is_none_or(|pv| t[1] == pv))
+                .filter(|t| o.is_none_or(|ov| t[2] == ov))
+                .map(|t| t[target_field])
+                .collect();
+            vals.sort_unstable();
+            vals.dedup();
+            Some(Box::new(VecTrieIter { vals, pos: 0 }))
+        }
+    }
+
+    impl Dataset for ChainDataset {
+        fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+    }
+
+    fn var(name: &str) -> Variable {
+        Variable::new_unchecked(name)
+    }
+
+    fn tp(s: TermPattern, p: NamedNodePattern, o: TermPattern) -> TriplePattern {
+        TriplePattern {
+            subject: s,
+            predicate: p,
+            object: o,
+        }
+    }
+
+    fn jv(name: &str) -> TermPattern {
+        TermPattern::Variable(var(name))
+    }
+
+    fn nn_const(uri: &str) -> NamedNodePattern {
+        NamedNodePattern::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(uri))
+    }
+
+    fn uri_of(t: &Term) -> &str {
+
+        match t {
+            Term::NamedNode(n) => n.as_str(),
+            _ => panic!("expected NamedNode"),
+        }
+    }
+
+    /// `?a p1 ?b . ?b p2 ?c . ?c p3 ?d` must emit exactly one chain solution
+    /// and bump the KChain SEEN/FALLBACK counters (`ChainDataset` has no prepare).
+    ///
+    /// Counter checks use before/after *positive deltas* only: process-wide
+    /// atomics race under `cargo test` parallelism, so equality on the
+    /// complementary counter (SELECTED) is not reliable here.
+    #[test]
+    fn k_chain_walk_emits_single_path() {
+        let ds = ChainDataset::with_chain();
+        let patterns = [
+            tp(jv("a"), nn_const("http://ex/p1"), jv("b")),
+            tp(jv("b"), nn_const("http://ex/p2"), jv("c")),
+            tp(jv("c"), nn_const("http://ex/p3"), jv("d")),
+        ];
+        let before = collapse_counters_snapshot();
+        let sols = eval_bgp_lftj(&ds, &patterns, &GraphSelector::Default)
+            .expect("LFTJ applicable")
+            .expect("no error");
+        assert_eq!(sols.len(), 1, "exactly one 3-hop path a→b→c→d");
+        let s = &sols[0];
+        assert_eq!(uri_of(s.get(&var("a")).unwrap()), "http://ex/a");
+        assert_eq!(uri_of(s.get(&var("b")).unwrap()), "http://ex/b");
+        assert_eq!(uri_of(s.get(&var("c")).unwrap()), "http://ex/c");
+        assert_eq!(uri_of(s.get(&var("d")).unwrap()), "http://ex/d");
+
+        let after = collapse_counters_snapshot();
+        assert!(
+            after.k_chain_shape_seen > before.k_chain_shape_seen,
+            "walker must bump SEEN"
+        );
+        assert!(
+            after.k_chain_fallback > before.k_chain_fallback,
+            "ChainDataset has no prepare → nested FALLBACK"
+        );
+    }
+
+    /// Pattern order hop3, hop1, hop2 still orients a→b→c→d correctly.
+    #[test]
+    fn k_chain_walk_permuted_pattern_order() {
+        let ds = ChainDataset::with_chain();
+        let patterns = [
+            tp(jv("c"), nn_const("http://ex/p3"), jv("d")),
+            tp(jv("a"), nn_const("http://ex/p1"), jv("b")),
+            tp(jv("b"), nn_const("http://ex/p2"), jv("c")),
+        ];
+        let before = collapse_counters_snapshot().k_chain_shape_seen;
+        let sols = eval_bgp_lftj(&ds, &patterns, &GraphSelector::Default)
+            .expect("LFTJ applicable")
+            .expect("no error");
+        assert_eq!(sols.len(), 1);
+        let s = &sols[0];
+        assert_eq!(uri_of(s.get(&var("a")).unwrap()), "http://ex/a");
+        assert_eq!(uri_of(s.get(&var("b")).unwrap()), "http://ex/b");
+        assert_eq!(uri_of(s.get(&var("c")).unwrap()), "http://ex/c");
+        assert_eq!(uri_of(s.get(&var("d")).unwrap()), "http://ex/d");
+        assert!(collapse_counters_snapshot().k_chain_shape_seen > before);
+    }
+
+    /// Dead-end under p1 (a→b2) must not produce a spurious solution; empty
+    /// when no full path exists for the requested predicates.
+    #[test]
+    fn k_chain_walk_no_match_returns_empty() {
+        let ds = ChainDataset::with_chain();
+        // p9 has no 3-hop continuation.
+        let patterns = [
+            tp(jv("a"), nn_const("http://ex/p9"), jv("b")),
+            tp(jv("b"), nn_const("http://ex/p2"), jv("c")),
+            tp(jv("c"), nn_const("http://ex/p3"), jv("d")),
+        ];
+        let before = collapse_counters_snapshot().k_chain_shape_seen;
+        let sols = eval_bgp_lftj(&ds, &patterns, &GraphSelector::Default)
+            .expect("LFTJ applicable (shape still recognized)")
+            .expect("no error");
+        assert!(
+            sols.is_empty(),
+            "no complete 3-hop under p9/p2/p3 — got {} sols",
+            sols.len()
+        );
+        // Shape is still recognized (catalog hit) even when the walk yields 0.
+        assert!(collapse_counters_snapshot().k_chain_shape_seen > before);
+    }
+
+
+    /// Subject-star BGP on the chain fixture must hit the Star walker (not
+    /// KChain) and yield empty — no subject fans out under p1/p2/p3.
+    #[test]
+    fn k_chain_star_bgp_yields_empty_not_chain() {
+        let ds = ChainDataset::with_chain();
+        // ?s p1 ?a . ?s p2 ?b . ?s p3 ?c  — star, not chain
+        let patterns = [
+            tp(jv("s"), nn_const("http://ex/p1"), jv("a")),
+            tp(jv("s"), nn_const("http://ex/p2"), jv("b")),
+            tp(jv("s"), nn_const("http://ex/p3"), jv("c")),
+        ];
+        let before = collapse_counters_snapshot();
+        let sols = eval_bgp_lftj(&ds, &patterns, &GraphSelector::Default)
+            .expect("LFTJ applicable (Star shape)")
+            .expect("no error");
+        assert!(
+            sols.is_empty(),
+            "star on chain fixture must be empty (got {})",
+            sols.len()
+        );
+        let after = collapse_counters_snapshot();
+        assert!(
+            after.star_shape_seen > before.star_shape_seen,
+            "must take Star walker, not KChain"
+        );
+    }
+
+    /// Prepared multi-var emit path: SELECTED↑ and the same chain row.
+    ///
+    /// Only asserts a positive SELECTED delta (not FALLBACK equality): other
+    /// k_chain tests running in parallel may bump FALLBACK on the shared
+    /// process-wide atomics.
+    #[test]
+    fn k_chain_selected_prepared_body() {
+        /// Wraps [`ChainDataset`] and returns a canned KChain prepared op.
+        struct PreparedChainDataset {
+            inner: ChainDataset,
+        }
+
+        struct FakeKChainOp {
+            row: [u64; 4],
+        }
+
+        impl oxigraph_nova_core::PreparedPhysicalOperator for FakeKChainOp {
+            fn execute(
+                &mut self,
+                emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>,
+            ) -> Result<u64, ()> {
+                emit(&self.row)?;
+                Ok(1)
+            }
+        }
+
+        impl DatasetLftjSource for PreparedChainDataset {
+            fn supports_lftj(&self) -> bool {
+                true
+            }
+            fn lftj_has_delta(&self) -> bool {
+                false
+            }
+            fn lftj_intern_term(&self, term: &Term, g: &GraphSelector) -> Option<u64> {
+                self.inner.lftj_intern_term(term, g)
+            }
+            fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+                self.inner.lftj_decode_term(id)
+            }
+            fn lftj_join_scan(
+                &self,
+                s: Option<u64>,
+                p: Option<u64>,
+                o: Option<u64>,
+                target_field: usize,
+                g: &GraphSelector,
+            ) -> Option<Box<dyn TrieIterator>> {
+                self.inner.lftj_join_scan(s, p, o, target_field, g)
+            }
+            fn lftj_prepare_shape(
+                &self,
+                shape: oxigraph_nova_core::PhysicalShape,
+                _: &GraphSelector,
+            ) -> Option<Box<dyn oxigraph_nova_core::PreparedPhysicalOperator>> {
+                match shape {
+                    oxigraph_nova_core::PhysicalShape::KChain { .. } => {
+                        // a=1, b=2, c=3, d=4 — same as ChainDataset fixture path
+                        Some(Box::new(FakeKChainOp {
+                            row: [1, 2, 3, 4],
+                        }))
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        impl Dataset for PreparedChainDataset {
+            fn find_quads<'a>(&'a self, p: &QuadPattern) -> Result<QuadIter<'a>> {
+                self.inner.find_quads(p)
+            }
+            fn named_graphs<'a>(
+                &'a self,
+            ) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+                self.inner.named_graphs()
+            }
+        }
+
+        let ds = PreparedChainDataset {
+            inner: ChainDataset::with_chain(),
+        };
+        let patterns = [
+            tp(jv("a"), nn_const("http://ex/p1"), jv("b")),
+            tp(jv("b"), nn_const("http://ex/p2"), jv("c")),
+            tp(jv("c"), nn_const("http://ex/p3"), jv("d")),
+        ];
+        let before = collapse_counters_snapshot();
+        let sols = eval_bgp_lftj(&ds, &patterns, &GraphSelector::Default)
+            .expect("LFTJ applicable")
+            .expect("no error");
+        assert_eq!(sols.len(), 1);
+        let s = &sols[0];
+        assert_eq!(uri_of(s.get(&var("a")).unwrap()), "http://ex/a");
+        assert_eq!(uri_of(s.get(&var("b")).unwrap()), "http://ex/b");
+        assert_eq!(uri_of(s.get(&var("c")).unwrap()), "http://ex/c");
+        assert_eq!(uri_of(s.get(&var("d")).unwrap()), "http://ex/d");
+
+        let after = collapse_counters_snapshot();
+        assert!(after.k_chain_shape_seen > before.k_chain_shape_seen);
+        assert!(
+            after.k_chain_selected > before.k_chain_selected,
+            "prepared body must bump SELECTED"
+        );
+    }
+
+    // ── Star (k=3) execution tests ────────────────────────────────────────────
+
+    /// Subject-star fixture for Star walk tests.
+    struct StarDataset {
+        triples: Vec<[u64; 3]>,
+        dict: Vec<(String, u64)>,
+    }
+
+    impl StarDataset {
+        /// Data:
+        ///   s --p1--> o1, s --p2--> o2, s --p3--> o3   (one full star)
+        ///   s --p1--> o1b                               (extra arm under p1 → 2 sols)
+        ///   t --p1--> o1                                (incomplete star, missing p2/p3)
+        ///   x --p9--> y                                 (noise)
+        fn with_star() -> Self {
+            Self {
+                triples: vec![
+                    [1, 10, 2], // s p1 o1
+                    [1, 10, 5], // s p1 o1b
+                    [1, 11, 3], // s p2 o2
+                    [1, 12, 4], // s p3 o3
+                    [6, 10, 2], // t p1 o1 (incomplete)
+                    [7, 99, 8], // x p9 y
+                ],
+                dict: vec![
+                    ("http://ex/s".into(), 1),
+                    ("http://ex/o1".into(), 2),
+                    ("http://ex/o2".into(), 3),
+                    ("http://ex/o3".into(), 4),
+                    ("http://ex/o1b".into(), 5),
+                    ("http://ex/t".into(), 6),
+                    ("http://ex/x".into(), 7),
+                    ("http://ex/y".into(), 8),
+                    ("http://ex/p1".into(), 10),
+                    ("http://ex/p2".into(), 11),
+                    ("http://ex/p3".into(), 12),
+                    ("http://ex/p9".into(), 99),
+                ],
+            }
+        }
+
+        fn id_of(&self, uri: &str) -> Option<u64> {
+            self.dict.iter().find(|(k, _)| k == uri).map(|(_, v)| *v)
+        }
+    }
+
+    impl DatasetLftjSource for StarDataset {
+        fn supports_lftj(&self) -> bool {
+            true
+        }
+        fn lftj_has_delta(&self) -> bool {
+            false
+        }
+        fn lftj_intern_term(&self, term: &Term, _: &GraphSelector) -> Option<u64> {
+            if let Term::NamedNode(n) = term {
+                self.id_of(n.as_str())
+            } else {
+                None
+            }
+        }
+        fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+            self.dict.iter().find(|(_, v)| *v == id).map(|(k, _)| {
+                Term::NamedNode(oxigraph_nova_core::NamedNode::new_unchecked(k.clone()))
+            })
+        }
+        fn lftj_join_scan(
+            &self,
+            s: Option<u64>,
+            p: Option<u64>,
+            o: Option<u64>,
+            target_field: usize,
+            _: &GraphSelector,
+        ) -> Option<Box<dyn TrieIterator>> {
+            let mut vals: Vec<u64> = self
+                .triples
+                .iter()
+                .filter(|t| s.is_none_or(|sv| t[0] == sv))
+                .filter(|t| p.is_none_or(|pv| t[1] == pv))
+                .filter(|t| o.is_none_or(|ov| t[2] == ov))
+                .map(|t| t[target_field])
+                .collect();
+            vals.sort_unstable();
+            vals.dedup();
+            Some(Box::new(VecTrieIter { vals, pos: 0 }))
+        }
+    }
+
+    impl Dataset for StarDataset {
+        fn find_quads<'a>(&'a self, _: &QuadPattern) -> Result<QuadIter<'a>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn named_graphs<'a>(&'a self) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+    }
+
+    /// `?s p1 ?o1 . ?s p2 ?o2 . ?s p3 ?o3` emits two solutions (o1 and o1b)
+    /// and bumps Star SEEN/FALLBACK.
+    #[test]
+    fn star_walk_emits_cartesian_arms() {
+        let ds = StarDataset::with_star();
+        let patterns = [
+            tp(jv("s"), nn_const("http://ex/p1"), jv("o1")),
+            tp(jv("s"), nn_const("http://ex/p2"), jv("o2")),
+            tp(jv("s"), nn_const("http://ex/p3"), jv("o3")),
+        ];
+        let before = collapse_counters_snapshot();
+        let sols = eval_bgp_lftj(&ds, &patterns, &GraphSelector::Default)
+            .expect("LFTJ applicable")
+            .expect("no error");
+        assert_eq!(sols.len(), 2, "two objects under p1 × one each under p2/p3");
+        // Both solutions share s/o2/o3; o1 differs.
+        for sol in &sols {
+            assert_eq!(uri_of(sol.get(&var("s")).unwrap()), "http://ex/s");
+            assert_eq!(uri_of(sol.get(&var("o2")).unwrap()), "http://ex/o2");
+            assert_eq!(uri_of(sol.get(&var("o3")).unwrap()), "http://ex/o3");
+        }
+        let o1s: Vec<&str> = sols
+            .iter()
+            .map(|s| uri_of(s.get(&var("o1")).unwrap()))
+            .collect();
+        assert!(o1s.contains(&"http://ex/o1"));
+        assert!(o1s.contains(&"http://ex/o1b"));
+
+        let after = collapse_counters_snapshot();
+        assert!(after.star_shape_seen > before.star_shape_seen);
+        assert!(
+            after.star_fallback > before.star_fallback,
+            "StarDataset has no prepare → nested FALLBACK"
+        );
+    }
+
+    /// Pattern order arm3, arm1, arm2 still binds correctly.
+    #[test]
+    fn star_walk_permuted_pattern_order() {
+        let ds = StarDataset::with_star();
+        let patterns = [
+            tp(jv("s"), nn_const("http://ex/p3"), jv("o3")),
+            tp(jv("s"), nn_const("http://ex/p1"), jv("o1")),
+            tp(jv("s"), nn_const("http://ex/p2"), jv("o2")),
+        ];
+        let before = collapse_counters_snapshot().star_shape_seen;
+        let sols = eval_bgp_lftj(&ds, &patterns, &GraphSelector::Default)
+            .expect("LFTJ applicable")
+            .expect("no error");
+        assert_eq!(sols.len(), 2);
+        assert!(collapse_counters_snapshot().star_shape_seen > before);
+    }
+
+    /// Incomplete subjects (missing an arm) must not emit.
+    #[test]
+    fn star_walk_incomplete_subject_skipped() {
+        let ds = StarDataset::with_star();
+        // Query under p9/p2/p3 — no subject has all three.
+        let patterns = [
+            tp(jv("s"), nn_const("http://ex/p9"), jv("o1")),
+            tp(jv("s"), nn_const("http://ex/p2"), jv("o2")),
+            tp(jv("s"), nn_const("http://ex/p3"), jv("o3")),
+        ];
+        let before = collapse_counters_snapshot().star_shape_seen;
+        let sols = eval_bgp_lftj(&ds, &patterns, &GraphSelector::Default)
+            .expect("LFTJ applicable")
+            .expect("no error");
+        assert!(sols.is_empty());
+        assert!(collapse_counters_snapshot().star_shape_seen > before);
+    }
+
+    /// Prepared multi-var emit path: SELECTED↑ and one canned star row.
+    #[test]
+    fn star_selected_prepared_body() {
+        struct PreparedStarDataset {
+            inner: StarDataset,
+        }
+
+        struct FakeStarOp {
+            row: [u64; 4],
+        }
+
+        impl oxigraph_nova_core::PreparedPhysicalOperator for FakeStarOp {
+            fn execute(
+                &mut self,
+                emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>,
+            ) -> Result<u64, ()> {
+                emit(&self.row)?;
+                Ok(1)
+            }
+        }
+
+        impl DatasetLftjSource for PreparedStarDataset {
+            fn supports_lftj(&self) -> bool {
+                true
+            }
+            fn lftj_has_delta(&self) -> bool {
+                false
+            }
+            fn lftj_intern_term(&self, term: &Term, g: &GraphSelector) -> Option<u64> {
+                self.inner.lftj_intern_term(term, g)
+            }
+            fn lftj_decode_term(&self, id: u64) -> Option<Term> {
+                self.inner.lftj_decode_term(id)
+            }
+            fn lftj_join_scan(
+                &self,
+                s: Option<u64>,
+                p: Option<u64>,
+                o: Option<u64>,
+                target_field: usize,
+                g: &GraphSelector,
+            ) -> Option<Box<dyn TrieIterator>> {
+                self.inner.lftj_join_scan(s, p, o, target_field, g)
+            }
+            fn lftj_prepare_shape(
+                &self,
+                shape: oxigraph_nova_core::PhysicalShape,
+                _: &GraphSelector,
+            ) -> Option<Box<dyn oxigraph_nova_core::PreparedPhysicalOperator>> {
+                match shape {
+                    oxigraph_nova_core::PhysicalShape::Star { .. } => {
+                        // s=1, o1=2, o2=3, o3=4
+                        Some(Box::new(FakeStarOp {
+                            row: [1, 2, 3, 4],
+                        }))
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        impl Dataset for PreparedStarDataset {
+            fn find_quads<'a>(&'a self, p: &QuadPattern) -> Result<QuadIter<'a>> {
+                self.inner.find_quads(p)
+            }
+            fn named_graphs<'a>(
+                &'a self,
+            ) -> Result<Box<dyn Iterator<Item = Result<GraphName>> + 'a>> {
+                self.inner.named_graphs()
+            }
+        }
+
+        let ds = PreparedStarDataset {
+            inner: StarDataset::with_star(),
+        };
+        let patterns = [
+            tp(jv("s"), nn_const("http://ex/p1"), jv("o1")),
+            tp(jv("s"), nn_const("http://ex/p2"), jv("o2")),
+            tp(jv("s"), nn_const("http://ex/p3"), jv("o3")),
+        ];
+        let before = collapse_counters_snapshot();
+        let sols = eval_bgp_lftj(&ds, &patterns, &GraphSelector::Default)
+            .expect("LFTJ applicable")
+            .expect("no error");
+        assert_eq!(sols.len(), 1);
+        let s = &sols[0];
+        assert_eq!(uri_of(s.get(&var("s")).unwrap()), "http://ex/s");
+        assert_eq!(uri_of(s.get(&var("o1")).unwrap()), "http://ex/o1");
+        assert_eq!(uri_of(s.get(&var("o2")).unwrap()), "http://ex/o2");
+        assert_eq!(uri_of(s.get(&var("o3")).unwrap()), "http://ex/o3");
+
+        let after = collapse_counters_snapshot();
+        assert!(after.star_shape_seen > before.star_shape_seen);
+        assert!(
+            after.star_selected > before.star_selected,
+            "prepared body must bump SELECTED"
+        );
+    }
 }
+
+
+
+

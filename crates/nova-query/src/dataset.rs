@@ -260,33 +260,14 @@ pub trait DatasetLftjSource: Send + Sync {
         None
     }
 
-    /// K9: prepare a two-hop path plan `?a P1 ?b . ?b P2 ?c`.
-    fn lftj_prepare_two_hop(
+    /// Prepare a specialized physical operator for a recognized BGP shape.
+    ///
+    /// See [`oxigraph_nova_core::LftjSource::lftj_prepare_shape`].
+    fn lftj_prepare_shape(
         &self,
-        _p1: u64,
-        _p2: u64,
+        _shape: oxigraph_nova_core::PhysicalShape,
         _graph: &GraphSelector,
-    ) -> Option<Box<dyn oxigraph_nova_core::PreparedTwoHop>> {
-        None
-    }
-
-    /// K11: prepare a fixed-P wedge plan.
-    fn lftj_prepare_wedge(
-        &self,
-        _predicate: u64,
-        _graph: &GraphSelector,
-    ) -> Option<Box<dyn oxigraph_nova_core::PreparedWedge>> {
-        None
-    }
-
-    /// Prepare SP-expansion / 2join: `?s P_filter O_filter . ?s P_expand ?o`.
-    fn lftj_prepare_sp_expansion(
-        &self,
-        _p_filter: u64,
-        _o_filter: u64,
-        _p_expand: u64,
-        _graph: &GraphSelector,
-    ) -> Option<Box<dyn oxigraph_nova_core::PreparedSpExpansion>> {
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedPhysicalOperator>> {
         None
     }
 }
@@ -569,47 +550,17 @@ impl<S: QuadStore + 'static> DatasetLftjSource for StoreDataset<S> {
         self.store.lftj_prepare_sp_object_scan(predicate, graph_id)
     }
 
-    fn lftj_prepare_two_hop(
+    fn lftj_prepare_shape(
         &self,
-        p1: u64,
-        p2: u64,
+        shape: oxigraph_nova_core::PhysicalShape,
         graph: &GraphSelector,
-    ) -> Option<Box<dyn oxigraph_nova_core::PreparedTwoHop>> {
+    ) -> Option<Box<dyn oxigraph_nova_core::PreparedPhysicalOperator>> {
         let graph_id: u8 = match graph {
             GraphSelector::Default => 0u8,
             GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
             _ => return None,
         };
-        self.store.lftj_prepare_two_hop(p1, p2, graph_id)
-    }
-
-    fn lftj_prepare_wedge(
-        &self,
-        predicate: u64,
-        graph: &GraphSelector,
-    ) -> Option<Box<dyn oxigraph_nova_core::PreparedWedge>> {
-        let graph_id: u8 = match graph {
-            GraphSelector::Default => 0u8,
-            GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
-            _ => return None,
-        };
-        self.store.lftj_prepare_wedge(predicate, graph_id)
-    }
-
-    fn lftj_prepare_sp_expansion(
-        &self,
-        p_filter: u64,
-        o_filter: u64,
-        p_expand: u64,
-        graph: &GraphSelector,
-    ) -> Option<Box<dyn oxigraph_nova_core::PreparedSpExpansion>> {
-        let graph_id: u8 = match graph {
-            GraphSelector::Default => 0u8,
-            GraphSelector::Named(gn) => self.store.lftj_graph_id(gn)?,
-            _ => return None,
-        };
-        self.store
-            .lftj_prepare_sp_expansion(p_filter, o_filter, p_expand, graph_id)
+        self.store.lftj_prepare_shape(shape, graph_id)
     }
 }
 

@@ -2233,10 +2233,7 @@ impl PreparedTwoHopImpl {
 }
 
 impl PreparedTwoHop for PreparedTwoHopImpl {
-    fn execute(
-        &mut self,
-        emit: &mut dyn FnMut(u64, u64, u64) -> Result<(), ()>,
-    ) -> Result<u64, ()> {
+    fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
         SPARQL_PATH.k9_two_hop_execute.fetch_add(1, Ordering::Relaxed);
         let t_exec = std::time::Instant::now();
 
@@ -2332,7 +2329,7 @@ impl PreparedTwoHop for PreparedTwoHopImpl {
                     }
                     while !self.hop2.at_end() {
                         let c = self.hop2.key();
-                        emit(a, b, c)?;
+                        emit(&[a, b, c])?;
                         rows += 1;
                         self.hop2.advance();
                         if !self.hop2.at_end() {
@@ -2361,9 +2358,342 @@ impl PreparedTwoHop for PreparedTwoHopImpl {
     }
 }
 
+
+// ── Prepared k-chain (k=3) ────────────────────────────────────────────────────
+//
+// Shape: `?a P1 ?b . ?b P2 ?c . ?c P3 ?d`
+//
+// Three resettable SP→O scanners (hop1 under P1, hop2 under P2, hop3 under P3)
+// plus an outer subject scan under P1. Mirrors PreparedTwoHopImpl with one
+// extra hop; hop2/hop3 use the same adj/range-cache pattern as hop2 in two-hop.
+
+/// Prepared 3-hop chain body. Emits `[a, b, c, d]` external TermIds.
+pub struct PreparedKChainImpl {
+    img: Arc<BraidedGraphImage>,
+    p1: u64,
+    hop1: PreparedSpObjectScanImpl,
+    hop2: PreparedSpObjectScanImpl,
+    hop3: PreparedSpObjectScanImpl,
+    p2_dense: u32,
+    p3_dense: u32,
+    p2_adj: Option<PredicateAdjacency>,
+    p3_adj: Option<PredicateAdjacency>,
+}
+
+impl PreparedKChainImpl {
+    pub fn prepare(img: Arc<BraidedGraphImage>, p1: u64, p2: u64, p3: u64) -> Option<Self> {
+        let hop1 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p1)?;
+        let hop2 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p2)?;
+        let hop3 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p3)?;
+        let p2_dense = hop2.pred_dense;
+        let p3_dense = hop3.pred_dense;
+        let mode = effective_pred_adjacency_mode();
+        let universe = img.universe() as usize;
+        let p2_adj = PredicateAdjacency::build(img.index().ring_ref(), p2_dense, universe, mode);
+        let p3_adj = PredicateAdjacency::build(img.index().ring_ref(), p3_dense, universe, mode);
+        Some(Self {
+            img,
+            p1,
+            hop1,
+            hop2,
+            hop3,
+            p2_dense,
+            p3_dense,
+            p2_adj,
+            p3_adj,
+        })
+    }
+
+    /// Reset hop scanner to objects of `subject` under the hop's predicate,
+    /// preferring adj / range-cache when available.
+    #[inline]
+    fn reset_hop(
+        hop: &mut PreparedSpObjectScanImpl,
+        adj: Option<&PredicateAdjacency>,
+        range_cache: &mut [Option<RowRange>],
+        img: &BraidedGraphImage,
+        subject_ext: u64,
+        pred_dense: u32,
+    ) -> bool {
+        let Some(s_dense) = img.remap().to_dense(subject_ext) else {
+            return false;
+        };
+        let si = s_dense as usize;
+        if let Some(adj) = adj {
+            return match adj.range_for_subject(s_dense) {
+                Some(range) => hop.reset_from_range(range, true),
+                None => false,
+            };
+        }
+        if si < range_cache.len() {
+            if let Some(cached) = range_cache[si] {
+                return hop.reset_from_range(cached, true);
+            }
+            let range = range_sp(img.index().ring_ref(), s_dense, pred_dense);
+            range_cache[si] = Some(range);
+            return hop.reset_from_range(range, false);
+        }
+        hop.reset_to_subject(subject_ext)
+    }
+}
+
+impl PreparedPhysicalOperator for PreparedKChainImpl {
+    fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
+        let mut a_scan = BraidedGraphImage::join_scan_streaming(
+            Arc::clone(&self.img),
+            None,
+            Some(self.p1),
+            None,
+            0,
+        );
+        SPARQL_PATH.join_scan_open.fetch_add(1, Ordering::Relaxed);
+
+        let mut rows = 0u64;
+        let universe = self.img.universe() as usize;
+        let use_p2_adj = self.p2_adj.is_some();
+        let use_p3_adj = self.p3_adj.is_some();
+        let mut p2_cache: Vec<Option<RowRange>> = if use_p2_adj {
+            Vec::new()
+        } else {
+            vec![None; universe.max(1)]
+        };
+        let mut p3_cache: Vec<Option<RowRange>> = if use_p3_adj {
+            Vec::new()
+        } else {
+            vec![None; universe.max(1)]
+        };
+        let img_ref = Arc::clone(&self.img);
+
+        while !a_scan.at_end() {
+            let a = a_scan.key();
+            if !self.hop1.reset_to_subject(a) {
+                a_scan.advance();
+                continue;
+            }
+            while !self.hop1.at_end() {
+                let b = self.hop1.key();
+                let hop2_ok = Self::reset_hop(
+                    &mut self.hop2,
+                    self.p2_adj.as_ref(),
+                    &mut p2_cache,
+                    &img_ref,
+                    b,
+                    self.p2_dense,
+                );
+                if hop2_ok {
+                    while !self.hop2.at_end() {
+                        let c = self.hop2.key();
+                        let hop3_ok = Self::reset_hop(
+                            &mut self.hop3,
+                            self.p3_adj.as_ref(),
+                            &mut p3_cache,
+                            &img_ref,
+                            c,
+                            self.p3_dense,
+                        );
+                        if hop3_ok {
+                            while !self.hop3.at_end() {
+                                let d = self.hop3.key();
+                                emit(&[a, b, c, d])?;
+                                rows += 1;
+                                self.hop3.advance();
+                            }
+                        }
+                        self.hop2.advance();
+                    }
+                }
+                self.hop1.advance();
+            }
+            a_scan.advance();
+        }
+        Ok(rows)
+    }
+}
+
+// ── Prepared subject-star (k=3) ───────────────────────────────────────────────
+//
+// Shape: `?s P1 ?o1 . ?s P2 ?o2 . ?s P3 ?o3`
+// Outer subjects under P1; Cartesian product of objects under each arm.
+// Subjects missing any arm are skipped. Emit `[s, o1, o2, o3]`.
+
+/// Prepared subject-star body (k=3).
+///
+/// Three SP→O hop scanners + optional adj for p2/p3 (same machinery as KChain).
+pub struct PreparedStarImpl {
+    img: Arc<BraidedGraphImage>,
+    p1: u64,
+    hop1: PreparedSpObjectScanImpl,
+    hop2: PreparedSpObjectScanImpl,
+    hop3: PreparedSpObjectScanImpl,
+    p2_dense: u32,
+    p3_dense: u32,
+    p2_adj: Option<PredicateAdjacency>,
+    p3_adj: Option<PredicateAdjacency>,
+}
+
+impl PreparedStarImpl {
+    pub fn prepare(img: Arc<BraidedGraphImage>, p1: u64, p2: u64, p3: u64) -> Option<Self> {
+        let hop1 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p1)?;
+        let hop2 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p2)?;
+        let hop3 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p3)?;
+        let p2_dense = hop2.pred_dense;
+        let p3_dense = hop3.pred_dense;
+        let mode = effective_pred_adjacency_mode();
+        let universe = img.universe() as usize;
+        let p2_adj = PredicateAdjacency::build(img.index().ring_ref(), p2_dense, universe, mode);
+        let p3_adj = PredicateAdjacency::build(img.index().ring_ref(), p3_dense, universe, mode);
+        Some(Self {
+            img,
+            p1,
+            hop1,
+            hop2,
+            hop3,
+            p2_dense,
+            p3_dense,
+            p2_adj,
+            p3_adj,
+        })
+    }
+
+    #[inline]
+    fn reset_hop(
+        hop: &mut PreparedSpObjectScanImpl,
+        adj: Option<&PredicateAdjacency>,
+        range_cache: &mut [Option<RowRange>],
+        img: &BraidedGraphImage,
+        subject_ext: u64,
+        pred_dense: u32,
+    ) -> bool {
+        let Some(s_dense) = img.remap().to_dense(subject_ext) else {
+            return false;
+        };
+        let si = s_dense as usize;
+        if let Some(adj) = adj {
+            return match adj.range_for_subject(s_dense) {
+                Some(range) => hop.reset_from_range(range, true),
+                None => false,
+            };
+        }
+        if si < range_cache.len() {
+            if let Some(cached) = range_cache[si] {
+                return hop.reset_from_range(cached, true);
+            }
+            let range = range_sp(img.index().ring_ref(), s_dense, pred_dense);
+            range_cache[si] = Some(range);
+            return hop.reset_from_range(range, false);
+        }
+        hop.reset_to_subject(subject_ext)
+    }
+}
+
+impl PreparedPhysicalOperator for PreparedStarImpl {
+    fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
+        let mut s_scan = BraidedGraphImage::join_scan_streaming(
+            Arc::clone(&self.img),
+            None,
+            Some(self.p1),
+            None,
+            0,
+        );
+        SPARQL_PATH.join_scan_open.fetch_add(1, Ordering::Relaxed);
+
+        let mut rows = 0u64;
+        let universe = self.img.universe() as usize;
+        let use_p2_adj = self.p2_adj.is_some();
+        let use_p3_adj = self.p3_adj.is_some();
+        let mut p2_cache: Vec<Option<RowRange>> = if use_p2_adj {
+            Vec::new()
+        } else {
+            vec![None; universe.max(1)]
+        };
+        let mut p3_cache: Vec<Option<RowRange>> = if use_p3_adj {
+            Vec::new()
+        } else {
+            vec![None; universe.max(1)]
+        };
+        let img_ref = Arc::clone(&self.img);
+
+        // Collect o1/o2/o3 per subject then Cartesian emit (same semantics as
+        // walker FALLBACK / LOUDS prepared star).
+        while !s_scan.at_end() {
+            let s = s_scan.key();
+            // Arm 1 (p1): always via hop1 reset.
+            if !self.hop1.reset_to_subject(s) {
+                s_scan.advance();
+                continue;
+            }
+            let mut o1s: Vec<u64> = Vec::new();
+            while !self.hop1.at_end() {
+                o1s.push(self.hop1.key());
+                self.hop1.advance();
+            }
+            if o1s.is_empty() {
+                s_scan.advance();
+                continue;
+            }
+
+            let hop2_ok = Self::reset_hop(
+                &mut self.hop2,
+                self.p2_adj.as_ref(),
+                &mut p2_cache,
+                &img_ref,
+                s,
+                self.p2_dense,
+            );
+            if !hop2_ok {
+                s_scan.advance();
+                continue;
+            }
+            let mut o2s: Vec<u64> = Vec::new();
+            while !self.hop2.at_end() {
+                o2s.push(self.hop2.key());
+                self.hop2.advance();
+            }
+            if o2s.is_empty() {
+                s_scan.advance();
+                continue;
+            }
+
+            let hop3_ok = Self::reset_hop(
+                &mut self.hop3,
+                self.p3_adj.as_ref(),
+                &mut p3_cache,
+                &img_ref,
+                s,
+                self.p3_dense,
+            );
+            if !hop3_ok {
+                s_scan.advance();
+                continue;
+            }
+            let mut o3s: Vec<u64> = Vec::new();
+            while !self.hop3.at_end() {
+                o3s.push(self.hop3.key());
+                self.hop3.advance();
+            }
+            if o3s.is_empty() {
+                s_scan.advance();
+                continue;
+            }
+
+            for &o1 in &o1s {
+                for &o2 in &o2s {
+                    for &o3 in &o3s {
+                        emit(&[s, o1, o2, o3])?;
+                        rows += 1;
+                    }
+                }
+            }
+            s_scan.advance();
+        }
+        Ok(rows)
+    }
+}
+
 // ── Prepared SP-expansion / 2join (dense-internal) ────────────────────────────
 //
 // Shape: `?s P_filter O_filter . ?s P_expand ?o`
+
 //
 // Gap vs LOUDS after Singleton + warm SpAdjCache (~1.24×): outer PO→S still
 // streams external keys, then each subject does external→dense remap before
@@ -2534,10 +2864,7 @@ enum ExpandDenseBody {
 }
 
 impl PreparedPhysicalOperator for PreparedSpExpansionImpl {
-    fn execute(
-        &mut self,
-        emit: &mut dyn FnMut(u64, u64, u64) -> Result<(), ()>,
-    ) -> Result<u64, ()> {
+    fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
         let t_exec = std::time::Instant::now();
         let mut rows = 0u64;
         let outer = std::mem::take(&mut self.outer_subjects_dense);
@@ -2548,7 +2875,7 @@ impl PreparedPhysicalOperator for PreparedSpExpansionImpl {
                 ExpandDenseBody::Empty => {}
                 ExpandDenseBody::Singleton(o_dense) => {
                     let o_ext = self.to_external(o_dense);
-                    emit(s_ext, o_ext, 0)?;
+                    emit(&[s_ext, o_ext])?;
                     rows += 1;
                 }
                 ExpandDenseBody::Small(vals) => {
@@ -2559,7 +2886,7 @@ impl PreparedPhysicalOperator for PreparedSpExpansionImpl {
                                 .fetch_add(1, Ordering::Relaxed);
                         }
                         let o_ext = self.to_external(o_dense);
-                        emit(s_ext, o_ext, 0)?;
+                        emit(&[s_ext, o_ext])?;
                         rows += 1;
                     }
                 }
@@ -2575,70 +2902,341 @@ impl PreparedPhysicalOperator for PreparedSpExpansionImpl {
     }
 }
 
-// ── K7.2 / K11 stubs (wedge path — full body deferred; two-hop is the path_2hop gap) ─
+// ── K7.2 / K11 fixed-P wedge (prepared D1 body) ───────────────────────────────
+//
+// Shape: `?a P ?b . ?b P ?c . ?a P ?c` under one predicate.
+//
+// Plan:
+//   1. Prepare once: densify P + optional K9.4 adj (SP range O(1) per subject)
+//   2. Enumerate outer a under P (join_scan subjects)
+//   3. For each a: objects b under SP(a,P) via PreparedSpObjectScan
+//   4. Close c via SP-restricted D1: ∩ Col::O over ranges SP(a,P) and SP(b,P)
+//      (braided intersection_next_value2 — not unbound range_s multi-subject)
+//
+// Requires mmap (same as TwoHop / SpExpansion). No mmap → prepare returns None
+// and the query walker keeps its nested multi-subject / join_scan fallback.
 
-
-/// Opaque prepared fixed-predicate D1 context (wedge). Currently a thin shell —
-/// wedge recognition falls back to generic multi-subject when execute is empty.
+/// Opaque prepared fixed-predicate D1 context (K7.2 left-once).
+///
+/// Holds densified P + optional adj so each `bind_left` only remaps the outer
+/// subject and looks up SP(a,P).
 pub struct PreparedPredD1 {
-    _img: Arc<BraidedGraphImage>,
-    _pred_dense: u32,
+    img: Arc<BraidedGraphImage>,
+    pred_dense: u32,
+    adj: Option<Arc<PredicateAdjacency>>,
 }
 
 impl PreparedPredD1 {
     pub fn prepare(img: Arc<BraidedGraphImage>, predicate: u64) -> Option<Self> {
-        use crate::product_path::ring_d2_enabled;
-        if !ring_d2_enabled() || !img.has_mapped() {
+        if !img.has_mapped() {
             return None;
         }
         let pred_dense = img.remap().to_dense(predicate)?;
+        let mode = effective_pred_adjacency_mode();
+        let universe = img.universe() as usize;
+        let adj = PredicateAdjacency::build(img.index().ring_ref(), pred_dense, universe, mode)
+            .map(Arc::new);
+        SPARQL_PATH.d1_pred_prepare.fetch_add(1, Ordering::Relaxed);
         Some(Self {
-            _img: img,
-            _pred_dense: pred_dense,
+            img,
+            pred_dense,
+            adj,
         })
+    }
+
+    #[inline]
+    fn sp_range(&self, s_dense: u32) -> RowRange {
+        if let Some(adj) = self.adj.as_ref() {
+            match adj.range_for_subject(s_dense) {
+                Some(r) => {
+                    SPARQL_PATH.k9_adj_direct_hits.fetch_add(1, Ordering::Relaxed);
+                    r
+                }
+                None => RowRange::empty(),
+            }
+        } else {
+            let t = std::time::Instant::now();
+            let r = range_sp(self.img.index().ring_ref(), s_dense, self.pred_dense);
+            SPARQL_PATH
+                .d1_range_sp_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            r
+        }
+    }
+}
+
+/// Left-bound handle: SP(a,P) range fixed; each right subject does one D1 open.
+struct PreparedLeftD1 {
+    img: Arc<BraidedGraphImage>,
+    pred_dense: u32,
+    left_range: RowRange,
+    adj: Option<Arc<PredicateAdjacency>>,
+}
+
+impl PreparedLeftD1 {
+    #[inline]
+    fn right_range(&self, s_dense: u32) -> RowRange {
+        if let Some(adj) = self.adj.as_ref() {
+            match adj.range_for_subject(s_dense) {
+                Some(r) => {
+                    SPARQL_PATH.k9_adj_direct_hits.fetch_add(1, Ordering::Relaxed);
+                    r
+                }
+                None => RowRange::empty(),
+            }
+        } else {
+            range_sp(self.img.index().ring_ref(), s_dense, self.pred_dense)
+        }
+    }
+}
+
+impl PreparedLeftIntersect for PreparedLeftD1 {
+    fn intersect_right(&self, subject_b: u64) -> Option<Box<dyn TrieIterator>> {
+        let t_remap = std::time::Instant::now();
+        let b_dense = self.img.remap().to_dense(subject_b)?;
+        SPARQL_PATH
+            .d1_remap_ns
+            .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let r1 = self.right_range(b_dense);
+        if self.left_range.is_empty() || r1.is_empty() {
+            return None;
+        }
+        SPARQL_PATH.d1_left_range_reuse.fetch_add(1, Ordering::Relaxed);
+        Some(Box::new(BraidedSpD1ObjectScan::open(
+            Arc::clone(&self.img),
+            self.left_range,
+            r1,
+        )?))
     }
 }
 
 impl PreparedPredObjectIntersect for PreparedPredD1 {
-    fn bind_left(&self, _subject_a: u64) -> Option<Box<dyn PreparedLeftIntersect>> {
-        None
+    fn bind_left(&self, subject_a: u64) -> Option<Box<dyn PreparedLeftIntersect>> {
+        let t_remap = std::time::Instant::now();
+        let a_dense = self.img.remap().to_dense(subject_a)?;
+        SPARQL_PATH
+            .d1_remap_ns
+            .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let left_range = self.sp_range(a_dense);
+        if left_range.is_empty() {
+            return None;
+        }
+        Some(Box::new(PreparedLeftD1 {
+            img: Arc::clone(&self.img),
+            pred_dense: self.pred_dense,
+            left_range,
+            adj: self.adj.clone(),
+        }))
     }
+
     fn intersect2(
         &self,
-        _subject_a: u64,
-        _subject_b: u64,
+        subject_a: u64,
+        subject_b: u64,
     ) -> Option<Box<dyn TrieIterator>> {
-        None
+        let t_remap = std::time::Instant::now();
+        let a_dense = self.img.remap().to_dense(subject_a)?;
+        let b_dense = self.img.remap().to_dense(subject_b)?;
+        SPARQL_PATH
+            .d1_remap_ns
+            .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let r0 = self.sp_range(a_dense);
+        let r1 = self.sp_range(b_dense);
+        if r0.is_empty() || r1.is_empty() {
+            return None;
+        }
+        Some(Box::new(BraidedSpD1ObjectScan::open(
+            Arc::clone(&self.img),
+            r0,
+            r1,
+        )?))
     }
 }
 
-/// Ring prepared wedge body (K11) — stub until left-once D1 helpers are restored.
+/// Streaming D1 object ∩ over two **SP-restricted** row ranges (fixed P).
+///
+/// Unlike [`BraidedD1ObjectScan`] (unbound `range_s`), this closes the wedge
+/// chord under the same predicate as the outer edges.
+struct BraidedSpD1ObjectScan {
+    img: Arc<BraidedGraphImage>,
+    r0: RowRange,
+    r1: RowRange,
+    current: Option<u32>,
+}
+
+impl BraidedSpD1ObjectScan {
+    fn open(img: Arc<BraidedGraphImage>, r0: RowRange, r1: RowRange) -> Option<Self> {
+        if !img.has_mapped() || r0.is_empty() || r1.is_empty() {
+            return None;
+        }
+        SPARQL_PATH.d1_open_calls.fetch_add(1, Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        let mut scan = Self {
+            img,
+            r0,
+            r1,
+            current: None,
+        };
+        let t_first = std::time::Instant::now();
+        scan.current = scan.next_from(0);
+        SPARQL_PATH
+            .d1_first_next_ns
+            .fetch_add(t_first.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPARQL_PATH
+            .d1_open_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Some(scan)
+    }
+
+    #[inline]
+    fn next_from(&self, target: u32) -> Option<u32> {
+        self.img
+            .index()
+            .intersection_next_value2(Col::O, self.r0, self.r1, target)
+    }
+
+    #[inline]
+    fn external_key(&self, dense: u32) -> u64 {
+        self.img
+            .remap()
+            .to_external(dense)
+            .unwrap_or(u64::from(dense))
+    }
+}
+
+impl TrieIterator for BraidedSpD1ObjectScan {
+    #[inline]
+    fn key(&self) -> u64 {
+        let d = self.current.expect("key() on exhausted BraidedSpD1ObjectScan");
+        self.external_key(d)
+    }
+
+    fn seek(&mut self, target: u64) {
+        if self.at_end() {
+            return;
+        }
+        if let Some(cur) = self.current {
+            if self.external_key(cur) >= target {
+                return;
+            }
+        }
+        let dense_target = match self.img.remap().to_dense(target) {
+            Some(d) => d,
+            None => match self.img.remap().dense_ceil(target) {
+                Some(d) => d,
+                None => {
+                    self.current = None;
+                    return;
+                }
+            },
+        };
+        self.current = self.next_from(dense_target);
+    }
+
+    fn advance(&mut self) {
+        if let Some(cur) = self.current {
+            if cur == u32::MAX {
+                self.current = None;
+            } else {
+                self.current = self.next_from(cur.saturating_add(1));
+            }
+        }
+    }
+
+    fn open(&self) -> Box<dyn TrieIterator> {
+        Box::new(EmptyTrieIter)
+    }
+
+    #[inline]
+    fn at_end(&self) -> bool {
+        self.current.is_none()
+    }
+
+    fn remaining_count(&self) -> u64 {
+        u64::from(!self.at_end())
+    }
+}
+
+/// Ring prepared wedge body (K11) — outer a→b under P, close via SP-restricted D1.
 pub struct PreparedWedgeImpl {
-    _img: Arc<BraidedGraphImage>,
-    _pred: u64,
+    img: Arc<BraidedGraphImage>,
+    predicate: u64,
+    /// Outer a→b scanner under P.
+    hop: PreparedSpObjectScanImpl,
+    /// Fixed-P D1 context (left-once SP ranges).
+    d1: PreparedPredD1,
 }
 
 impl PreparedWedgeImpl {
+    /// Prepare fixed-P triangle body. Requires mmap + densifiable predicate.
+    ///
+    /// Returns `None` when the kernel cannot run so walkers keep nested fallback
+    /// (never an empty execute that would drop triangle rows).
     pub fn prepare(img: Arc<BraidedGraphImage>, predicate: u64) -> Option<Self> {
-        use crate::product_path::ring_d2_enabled;
-        if !ring_d2_enabled() || !img.has_mapped() {
+        if !img.has_mapped() {
             return None;
         }
-        let _ = img.remap().to_dense(predicate)?;
+        let hop = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), predicate)?;
+        // PreparedPredD1::prepare already bumps d1_pred_prepare.
+        let d1 = PreparedPredD1::prepare(Arc::clone(&img), predicate)?;
         Some(Self {
-            _img: img,
-            _pred: predicate,
+            img,
+            predicate,
+            hop,
+            d1,
         })
     }
 }
 
 impl PreparedWedge for PreparedWedgeImpl {
-    fn execute(
-        &mut self,
-        _emit: &mut dyn FnMut(u64, u64, u64) -> Result<(), ()>,
-    ) -> Result<u64, ()> {
-        // Stub: return 0 so recognizer falls back to generic LFTJ path.
-        Ok(0)
+    fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
+        let t_exec = std::time::Instant::now();
+        let mut rows = 0u64;
+
+        // Outer subjects of P.
+        let mut a_scan = BraidedGraphImage::join_scan_streaming(
+            Arc::clone(&self.img),
+            None,
+            Some(self.predicate),
+            None,
+            0,
+        );
+        SPARQL_PATH.join_scan_open.fetch_add(1, Ordering::Relaxed);
+
+        while !a_scan.at_end() {
+            let a = a_scan.key();
+            // Bind left SP(a,P) once for all b under this a.
+            let Some(left) = self.d1.bind_left(a) else {
+                a_scan.advance();
+                continue;
+            };
+            if !self.hop.reset_to_subject(a) {
+                a_scan.advance();
+                continue;
+            }
+            while !self.hop.at_end() {
+                let b = self.hop.key();
+                if b != a {
+                    if let Some(mut c_scan) = left.intersect_right(b) {
+                        while !c_scan.at_end() {
+                            let c = c_scan.key();
+                            if c != a && c != b {
+                                emit(&[a, b, c])?;
+                                rows += 1;
+                            }
+                            c_scan.advance();
+                        }
+                    }
+                }
+                self.hop.advance();
+            }
+            a_scan.advance();
+        }
+
+        SPARQL_PATH
+            .k9_adj_execute_ns
+            .fetch_add(t_exec.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Ok(rows)
     }
 }
 
@@ -3163,6 +3761,97 @@ mod tests {
         let second = prep.key();
         assert_ne!(first, 0);
         assert_ne!(second, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Fixed-P wedge (oriented triangles) must match a nested SP-filter oracle.
+    ///
+    /// Graph under external P=10: triangle 100→101→102→100 plus chord 100→102,
+    /// and a non-closing edge 103→100. Emits (a,b,c) with a≠b≠c and edges
+    /// aP b, bP c, aP c.
+    #[test]
+    fn prepared_wedge_fixed_p_triangle_matches_oracle() {
+        // Dense-friendly external ids: nodes 100..103, predicate 10.
+        let ext: Vec<[u64; 3]> = vec![
+            [100, 10, 101], // a→b
+            [101, 10, 102], // b→c
+            [100, 10, 102], // a→c chord
+            [102, 10, 100], // c→a (extra oriented close)
+            [103, 10, 100], // dangling; no triangle through 103 as a with distinct b,c
+            [101, 10, 100], // b→a
+        ];
+        let mut img = BraidedGraphImage::from_external_triples(&ext);
+        let path = std::env::temp_dir().join(format!(
+            "braided_wedge_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        img.materialize_mapped(&path).expect("mmap");
+        let img = Arc::new(img);
+
+        // No-mmap prepare must fail closed (walker fallback contract).
+        let heap = Arc::new(BraidedGraphImage::from_external_triples(&ext));
+        assert!(
+            PreparedWedgeImpl::prepare(Arc::clone(&heap), 10).is_none(),
+            "wedge prepare requires mmap"
+        );
+
+        let mut prep =
+            PreparedWedgeImpl::prepare(Arc::clone(&img), 10).expect("prepare wedge under mmap");
+
+        let mut got: Vec<(u64, u64, u64)> = Vec::new();
+        let n = prep
+            .execute(&mut |ids| {
+                assert_eq!(ids.len(), 3);
+                got.push((ids[0], ids[1], ids[2]));
+                Ok(())
+            })
+            .expect("execute");
+        assert_eq!(n as usize, got.len());
+
+        // Oracle: all oriented (a,b,c) with distinct endpoints and three edges under P.
+        let p = 10u64;
+        let edge = |s: u64, o: u64| ext.iter().any(|t| t[0] == s && t[1] == p && t[2] == o);
+        let nodes = {
+            let mut v: Vec<u64> = ext.iter().flat_map(|t| [t[0], t[2]]).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let mut want: Vec<(u64, u64, u64)> = Vec::new();
+        for &a in &nodes {
+            for &b in &nodes {
+                if a == b || !edge(a, b) {
+                    continue;
+                }
+                for &c in &nodes {
+                    if c == a || c == b {
+                        continue;
+                    }
+                    if edge(b, c) && edge(a, c) {
+                        want.push((a, b, c));
+                    }
+                }
+            }
+        }
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want, "prepared wedge vs nested SP oracle");
+        assert!(
+            !got.is_empty(),
+            "fixture must contain at least one oriented triangle"
+        );
+
+        // SP-restricted D1 (not unbound multi_subject) must have opened.
+        let snap = crate::product_path::SPARQL_PATH.snapshot();
+        assert!(
+            snap.d1_open_calls >= 1 || snap.d1_left_range_reuse >= 1,
+            "wedge execute should exercise SP-restricted D1"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

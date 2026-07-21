@@ -95,24 +95,26 @@ pub trait PreparedSpObjectScan: Send {
 ///
 /// Built once per recognized motif (and optionally retained across requests via
 /// a store-scoped, snapshot-keyed cache). `execute` streams external TermId
-/// triples; the query engine decodes or counts as needed (id_only COUNT path).
+/// tuples; the query engine decodes or counts as needed (id_only COUNT path).
 ///
 /// Concrete product shapes today:
-/// - **two-hop** `?a P1 ?b . ?b P2 ?c` (K9/K10)
-/// - **wedge**   `?a P ?b . ?b P ?c . ?a P ?c` (K11)
-/// - **sp-expansion / 2join** `?s P1 O1 . ?s P2 ?o` — emit `(s, o, 0)`
+/// - **two-hop** `?a P1 ?b . ?b P2 ?c` — emit `[a, b, c]` (K9/K10)
+/// - **wedge**   `?a P ?b . ?b P ?c . ?a P ?c` — emit `[a, b, c]` (K11)
+/// - **sp-expansion / 2join** `?s P1 O1 . ?s P2 ?o` — emit `[s, o]`
+/// - **k-chain (k=3)** `?a P1 ?b . ?b P2 ?c . ?c P3 ?d` — emit `[a, b, c, d]`
+///
+/// Emit arity is shape-defined (slice length). Walkers map ids onto solution
+/// columns; engines never need join-var indices.
 pub trait PreparedPhysicalOperator: Send {
     /// Run the prepared physical plan.
     ///
-    /// `emit(a, b, c)` is invoked once per result triple (TermIds).
-    /// For SP-expansion / 2join, `c` is unused (`0`) and `emit(s, o, 0)`.
-    /// Return `Err(())` from `emit` to abort early (cancellation).
+    /// `emit(ids)` is invoked once per result row with external TermIds.
+    /// Slice length is shape-defined (2 for SP-expansion, 3 for two-hop/wedge,
+    /// 4 for k-chain k=3). Return `Err(())` from `emit` to abort early
+    /// (cancellation).
     ///
-    /// Returns the number of emitted triples, or `Err` if aborted.
-    fn execute(
-        &mut self,
-        emit: &mut dyn FnMut(u64, u64, u64) -> Result<(), ()>,
-    ) -> Result<u64, ()>;
+    /// Returns the number of emitted rows, or `Err` if aborted.
+    fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()>;
 }
 
 /// Historical name for chain-path prepared ops (K9/K10). Same as
@@ -124,8 +126,71 @@ pub use PreparedPhysicalOperator as PreparedTwoHop;
 pub use PreparedPhysicalOperator as PreparedWedge;
 
 /// SP-expansion / 2join prepared ops. Same as [`PreparedPhysicalOperator`]
-/// (`emit(s, o, 0)`).
+/// (`emit(&[s, o])`).
 pub use PreparedPhysicalOperator as PreparedSpExpansion;
+
+/// K-chain (k=3) prepared ops. Same as [`PreparedPhysicalOperator`]
+/// (`emit(&[a, b, c, d])`).
+pub use PreparedPhysicalOperator as PreparedKChain;
+
+/// Subject-star (k=3) prepared ops. Same as [`PreparedPhysicalOperator`]
+/// (`emit(&[s, o1, o2, o3])`).
+pub use PreparedPhysicalOperator as PreparedStar;
+
+/// Store-layer bound physical shape (predicates / constants only).
+///
+/// Produced by the query engine from a planner-side `ShapePlan` (which also
+/// carries join-var indices for solution materialization). Engines implement
+/// [`LftjSource::lftj_prepare_shape`] once and match on this enum — no
+/// per-shape `lftj_prepare_*` methods.
+///
+/// Join-var indices are intentionally absent: prepared ops emit TermIds only;
+/// the walker maps them onto solution columns.
+///
+/// ## Live variants
+///
+/// [`TwoHop`](Self::TwoHop), [`Wedge`](Self::Wedge),
+/// [`SpExpansion`](Self::SpExpansion), [`KChain`](Self::KChain) (k = 3),
+/// [`Star`](Self::Star) (k = 3) — engines should implement prepare for these
+/// (or return `None` and let the walker use nested-scan fallback).
+///
+/// ## Roadmap (planner `ShapeId` only today)
+///
+/// Future constants-only binds will extend this enum when recognizers land:
+/// - **Star k>3** — more than three fixed predicates on a shared subject
+/// - **KChain k>3** — longer ordered predicate paths (k = 3 is live)
+/// - **DirectedTriangle** — three (possibly distinct) predicates on a cycle
+/// - **Diamond** — two path predicates pairs meeting at endpoints
+/// - **ObjectStar** — k fixed predicates into a shared object
+///
+/// Until then, do not add dead match arms in engines — extend only when a
+/// `ShapePlan` variant calls `to_physical()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PhysicalShape {
+    /// `?a P1 ?b . ?b P2 ?c` — emit `(a, b, c)`.
+    TwoHop { p1: u64, p2: u64 },
+    /// `?a P ?b . ?b P ?c . ?a P ?c` — emit `(a, b, c)`.
+    Wedge { predicate: u64 },
+    /// `?s P_filter O_filter . ?s P_expand ?o` — emit `[s, o]`.
+    SpExpansion {
+        p_filter: u64,
+        o_filter: u64,
+        p_expand: u64,
+    },
+    /// `?a P1 ?b . ?b P2 ?c . ?c P3 ?d` — 3-hop chain (k = 3); emit `[a,b,c,d]`.
+    ///
+    /// Engines should prepare a body that emits four TermIds. Returning `None`
+    /// keeps the walker's nested `join_scan` fallback.
+    KChain { p1: u64, p2: u64, p3: u64 },
+    /// `?s P1 ?o1 . ?s P2 ?o2 . ?s P3 ?o3` — subject-star (k = 3); emit
+    /// `[s, o1, o2, o3]`.
+    ///
+    /// Generalizes SP-expansion to three open object arms under distinct
+    /// predicates on a shared subject. Returning `None` keeps the walker's
+    /// nested `join_scan` fallback.
+    Star { p1: u64, p2: u64, p3: u64 },
+}
+
 
 pub trait LftjSource: Send + Sync {
     /// Returns `true` if this store supports Leapfrog Triejoin acceleration.
@@ -279,46 +344,20 @@ pub trait LftjSource: Send + Sync {
         None
     }
 
-    /// K9: prepare a two-hop path plan `?a P1 ?b . ?b P2 ?c`.
+    /// Prepare a specialized physical operator for a recognized BGP shape.
     ///
-    /// Default `None` — Ring implements with resettable hop scanners.
-    /// The query engine falls back to generic LFTJ when unavailable.
-    fn lftj_prepare_two_hop(
+    /// Collapses the former per-shape entry points (`lftj_prepare_two_hop`,
+    /// `lftj_prepare_wedge`, `lftj_prepare_sp_expansion`) into one dispatch.
+    ///
+    /// Default `None` — only Ring currently implements specialized bodies.
+    /// Callers keep their shape-specific nested-scan fallbacks when this
+    /// returns `None` (specialized nested walk still beats generic VEO LFTJ
+    /// on these shapes).
+    fn lftj_prepare_shape(
         &self,
-        _p1: u64,
-        _p2: u64,
+        _shape: PhysicalShape,
         _graph_id: u8,
-    ) -> Option<Box<dyn PreparedTwoHop>> {
-        None
-    }
-
-    /// K11: prepare a fixed-P wedge plan `?a P ?b . ?b P ?c . ?a P ?c`.
-    ///
-    /// Default `None` — Ring implements with predicate adjacency + D1.
-    /// The query engine falls back to the K7.2 bind_left / multi_subject path.
-    fn lftj_prepare_wedge(
-        &self,
-        _predicate: u64,
-        _graph_id: u8,
-    ) -> Option<Box<dyn PreparedWedge>> {
-        None
-    }
-
-    /// Prepare SP-expansion / 2join: `?s P_filter O_filter . ?s P_expand ?o`.
-    ///
-    /// Default `None` — Ring implements a dense-internal plan that:
-    /// - materializes outer subjects of (P_filter, O_filter) once (cached)
-    /// - expands each subject under P_expand via K9.4 adj + Singleton O access
-    /// - emits external `(s, o, 0)` without per-subject external↔dense remap
-    ///
-    /// Query engine falls back to `lftj_prepare_sp_object_scan` + outer join_scan.
-    fn lftj_prepare_sp_expansion(
-        &self,
-        _p_filter: u64,
-        _o_filter: u64,
-        _p_expand: u64,
-        _graph_id: u8,
-    ) -> Option<Box<dyn PreparedSpExpansion>> {
+    ) -> Option<Box<dyn PreparedPhysicalOperator>> {
         None
     }
 }
