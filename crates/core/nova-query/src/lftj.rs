@@ -1138,8 +1138,8 @@ fn eval_two_hop_walk<D: Dataset>(
                     crate::path_timing::PathTimingBucket::Execution,
                     exec_ns,
                 );
-                // One Decode sample per request (ns already accumulated per row).
-                if decode_ns > 0 || !id_only {
+                // One Decode sample per request when rows were materialised.
+                if decode_ns > 0 {
                     crate::path_timing::bump_path_timing_sample(
                         crate::path_timing::PathTimingBucket::Decode,
                     );
@@ -1223,7 +1223,8 @@ fn eval_two_hop_walk<D: Dataset>(
         crate::path_timing::PathTimingBucket::Execution,
         exec_ns,
     );
-    if decode_ns > 0 || !id_only {
+    // One Decode sample per request when rows were materialised.
+    if decode_ns > 0 {
         crate::path_timing::bump_path_timing_sample(crate::path_timing::PathTimingBucket::Decode);
     }
 
@@ -1289,9 +1290,12 @@ fn eval_wedge_walk<D: Dataset>(
                     crate::path_timing::PathTimingBucket::Execution,
                     exec_ns,
                 );
-                crate::path_timing::bump_path_timing_sample(
-                    crate::path_timing::PathTimingBucket::Decode,
-                );
+                // One Decode sample only when rows were materialised.
+                if decode_ns > 0 {
+                    crate::path_timing::bump_path_timing_sample(
+                        crate::path_timing::PathTimingBucket::Decode,
+                    );
+                }
                 Ok(results)
             }
             Err(()) => Err(anyhow::Error::from(
@@ -1404,7 +1408,10 @@ fn eval_wedge_walk<D: Dataset>(
         crate::path_timing::PathTimingBucket::Execution,
         exec_ns,
     );
-    crate::path_timing::bump_path_timing_sample(crate::path_timing::PathTimingBucket::Decode);
+    // One Decode sample only when rows were materialised.
+    if decode_ns > 0 {
+        crate::path_timing::bump_path_timing_sample(crate::path_timing::PathTimingBucket::Decode);
+    }
 
     Ok(results)
 }

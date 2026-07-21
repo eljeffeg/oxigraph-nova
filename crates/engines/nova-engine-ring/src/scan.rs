@@ -3215,7 +3215,9 @@ impl TrieIterator for BraidedSpD1ObjectScan {
     #[inline]
     fn key(&self) -> u64 {
         if let Some(ref vals) = self.tiny {
-            return vals[self.tiny_pos];
+            return *vals
+                .get(self.tiny_pos)
+                .expect("key() on exhausted BraidedSpD1ObjectScan tiny");
         }
         let d = self
             .current
