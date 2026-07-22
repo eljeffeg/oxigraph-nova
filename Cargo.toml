@@ -14,6 +14,7 @@ members = [
     "crates/engines/nova-engine-memory",
     "crates/engines/nova-engine-louds",
     "crates/engines/nova-engine-ring",
+    "crates/engines/nova-engine-rocksdb",
     # server / product surface
     "crates/server/nova-server",
     "crates/server/nova-store",
@@ -49,8 +50,12 @@ oxrdfxml      = { version = "0.2",    features = ["rdf-12"] } # RDF/XML parser â
 oxjsonld      = { version = "0.2.5",  features = ["rdf-12"] } # JSON-LD parser/serializer â€” pins oxrdf =0.3.3, composes directly
 oxrdfio       = { version = "0.2.5",  features = ["rdf-12"] } # Unified RdfParser/RdfSerializer/RdfFormat facade over oxttl/oxrdfxml/oxjsonld
 
-spargebra     = { version = "0.4.6",  features = ["sparql-12"] }
-sparopt       = { version = "0.3.6",  features = ["sparql-12"] }  # SPARQL algebra optimizer (filter pushdown, join reordering)
+# sep-0002/sep-0006 must stay enabled workspace-wide when any crate links
+# `oxigraph` (rocksdb backend): oxigraph hard-enables those features on
+# spargebra, and Cargo feature unification would otherwise leave crates.io
+# sparopt without Lateral/ADJUST match arms (non-exhaustive).
+spargebra     = { version = "0.4.6",  features = ["sparql-12", "sep-0002", "sep-0006"] }
+sparopt       = { version = "0.3.6",  features = ["sparql-12", "sep-0002", "sep-0006"] }  # SPARQL algebra optimizer (filter pushdown, join reordering)
 
 sparesults    = { version = "0.3.3",  features = ["sparql-12"] }  # .srx / .srj / .tsv result I/O
 
@@ -193,4 +198,3 @@ split-debuginfo = "off"
 # Upstream: https://github.com/rossanoventurini/qwt @ crates.io 0.5.0
 [patch.crates-io]
 qwt = { path = "vendor/qwt" }
-

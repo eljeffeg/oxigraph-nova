@@ -204,6 +204,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use oxigraph_nova_core::{QuadStore, TextSearch};
 use oxigraph_nova_cypher::{parse_and_lower, parse_and_lower_update};
+// Backend self-registration (inventory): any binary that links this crate
+// inherits LOUDS (via ring re-export) and optionally RocksDB. Product bins
+// (nova_serve, oxigraph CLI) should not force-link engines themselves —
+// enable `rocksdb-backend` / `ring-backend` features on this crate instead.
+// Offline CLI paths that only call `open_backend` still get registration
+// because they depend on this lib (and thus these force-links).
+use oxigraph_nova_engine_ring as _;
+#[cfg(feature = "rocksdb-backend")]
+use oxigraph_nova_engine_rocksdb as _;
 use oxigraph_nova_query::{
     CancellationToken, EvalLimitError, Evaluator, PathTimingBucket, QueryOptions, QueryResult,
     ServiceHandler, Solutions, StoreDataset, add_path_timing_ns, clear_graph, execute_update,

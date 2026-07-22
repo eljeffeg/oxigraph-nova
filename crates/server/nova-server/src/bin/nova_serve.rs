@@ -61,9 +61,8 @@ use oxigraph_nova_core::{
     GraphName, NamedNode, Quad, StorageEngineExt, SyncPolicy, backend_names_csv, new_backend,
     open_backend, require_backend,
 };
-// Force-link so inventory BackendFactory registrations are present
-// (LOUDS always via storage-ring re-export; Ring when cyclic-ring is on).
-use oxigraph_nova_engine_ring as _;
+// Backend inventory registration is inherited from `oxigraph_nova_server`
+// (lib force-links ring + optional rocksdb). Do not re-force-link engines here.
 use oxigraph_nova_reasoning::{LftjFixpointEngine, ReasoningEngine};
 use oxigraph_nova_server::Server;
 use oxrdfio::{RdfFormat, RdfParser};

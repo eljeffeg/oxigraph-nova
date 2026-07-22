@@ -40,8 +40,9 @@
 //! }
 //! ```
 
-// Force-link backend crates so their `inventory::submit!` BackendFactory
-// registrations are present in any binary that depends on this crate.
+// Backend self-registration (inventory): feature-gated force-links so any
+// binary/embedding that depends on this crate inherits the selected backends.
+// Product bins should enable features here rather than force-linking engines.
 use oxigraph_nova_core::{
     GraphName, NamedNode, NamedOrBlankNode, Quad, QuadOp, StorageEngine, StorageEngineExt,
     StoredQuad, Term, default_backend_name, new_backend, open_backend,
@@ -50,6 +51,8 @@ use oxigraph_nova_core::{
 use oxigraph_nova_engine_louds as _;
 #[cfg(feature = "ring-backend")]
 use oxigraph_nova_engine_ring as _;
+#[cfg(feature = "rocksdb-backend")]
+use oxigraph_nova_engine_rocksdb as _;
 use oxigraph_nova_query::{
     Evaluator, QueryOptions, QueryResult, Solutions, StoreDataset, execute_update,
     projected_variables,

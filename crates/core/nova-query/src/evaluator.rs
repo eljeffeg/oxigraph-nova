@@ -280,7 +280,10 @@ fn contains_variable_graph(pattern: &GP) -> bool {
             ..
         } => true,
         GP::Graph { inner, .. } => contains_variable_graph(inner),
-        GP::Join { left, right } | GP::Union { left, right } | GP::Minus { left, right } => {
+        GP::Join { left, right }
+        | GP::Union { left, right }
+        | GP::Minus { left, right }
+        | GP::Lateral { left, right } => {
             contains_variable_graph(left) || contains_variable_graph(right)
         }
         GP::LeftJoin { left, right, .. } => {
@@ -710,6 +713,23 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                 path,
                 object,
             } => self.eval_path(subject, path, object, active_graph),
+
+            // SPARQL-star / SEP-0006 LATERAL (enabled via spargebra sep-0006).
+            // Evaluate `right` once per solution of `left`, with left bindings
+            // visible — implemented as nested join (correct, not optimized).
+            GP::Lateral { left, right } => {
+                let left_sols = self.eval_pattern(left, active_graph)?;
+                let mut out = Vec::new();
+                for ls in left_sols {
+                    let right_sols = self.eval_pattern(right, active_graph)?;
+                    for rs in right_sols {
+                        if let Some(merged) = ls.merge_compatible(&rs) {
+                            out.push(merged);
+                        }
+                    }
+                }
+                Ok(out)
+            }
         }
     }
 

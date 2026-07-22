@@ -35,6 +35,8 @@ ring-backend = [
     "oxigraph-nova-engine-ring/cyclic-ring",
     "oxigraph-nova-engine-ring/ring-huffman-cp",
 ]
+# Oxigraph-compatible RocksDB backend (drop-in data directories).
+rocksdb-backend = ["dep:oxigraph-nova-engine-rocksdb"]
 # Forwards to `oxigraph-nova-core`'s `mmap` feature (see its doc comment):
 # mmap-based zero-copy disk persistence, requiring `mmap-rs` (no wasm32
 # support). Default-on for native builds; `oxigraph-nova-js`'s wasm32 build
@@ -52,6 +54,7 @@ mmap = [
 oxigraph-nova-core            = { path = "../../core/nova-core", default-features = false }
 oxigraph-nova-engine-louds   = { path = "../../engines/nova-engine-louds", default-features = false, optional = true }
 oxigraph-nova-engine-ring    = { path = "../../engines/nova-engine-ring", default-features = false, optional = true }
+oxigraph-nova-engine-rocksdb = { path = "../../engines/nova-engine-rocksdb", optional = true }
 oxigraph-nova-query           = { path = "../../core/nova-query", default-features = false }
 oxigraph-nova-reasoning       = { path = "../../core/nova-reasoning", default-features = false }
 

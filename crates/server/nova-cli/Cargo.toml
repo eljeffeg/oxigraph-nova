@@ -7,9 +7,9 @@ license.workspace    = true
 repository.workspace = true
 
 [features]
-# Opt-in Tantivy full-text search, forwarded through to nova-server/
-# nova-engine-ring's own `fulltext` feature.
-fulltext = ["oxigraph-nova-server/fulltext", "oxigraph-nova-engine-ring/fulltext", "oxigraph-nova-mcp?/fulltext"]
+# Opt-in Tantivy full-text search, forwarded through product libs.
+fulltext = ["oxigraph-nova-server/fulltext", "oxigraph-nova-mcp?/fulltext"]
+
 # Opt-in outbound HTTP client, forwarded through to nova-server's own
 # `http-client` feature: unblocks SPARQL 1.1 Update's `LOAD <iri>` and gives
 # the server a default, real HTTP-backed `SERVICE` clause handler.
@@ -20,7 +20,15 @@ geosparql = ["oxigraph-nova-server/geosparql"]
 # Cyclic-QWT RingStore backend for `oxigraph serve --backend ring`
 # (forwards to nova-server's `ring-backend`, which enables cyclic-ring
 # + Huffman C_p). Supports both in-memory and persistent `--location`.
+# Inventory registration is owned by product libs (server/mcp), not this bin.
 ring-backend = ["oxigraph-nova-server/ring-backend", "oxigraph-nova-mcp?/ring-backend"]
+# Oxigraph-compatible RocksDB backend. Feature-forwards only: server (and
+# optional mcp) force-link the engine and own inventory registration.
+rocksdb-backend = [
+    "oxigraph-nova-server/rocksdb-backend",
+    "oxigraph-nova-mcp?/rocksdb-backend",
+]
+
 # Opt-in MCP (Model Context Protocol) stdio server, exposing SPARQL query/
 # update/data-model-discovery tools to LLM agents (`oxigraph mcp serve`).
 # Zero-cost when disabled: `oxigraph-nova-mcp` (and its `rmcp`/`schemars`
@@ -32,13 +40,13 @@ mcp = ["dep:oxigraph-nova-mcp", "oxigraph-nova-mcp/louds-backend"]
 
 [dependencies]
 oxigraph-nova-core         = { path = "../../core/nova-core" }
-oxigraph-nova-engine-ring = { path = "../../engines/nova-engine-ring" }
 oxigraph-nova-query        = { path = "../../core/nova-query" }
 oxigraph-nova-server       = { path = "../nova-server" }
 oxigraph-nova-shacl        = { path = "../../core/nova-shacl" }
 oxigraph-nova-reasoning    = { path = "../../core/nova-reasoning" }
 oxigraph-nova-cypher       = { path = "../../core/nova-cypher" }
 oxigraph-nova-mcp          = { path = "../nova-mcp", optional = true }
+
 
 
 oxrdf          = { workspace = true }

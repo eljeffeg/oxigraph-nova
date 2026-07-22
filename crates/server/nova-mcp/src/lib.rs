@@ -24,15 +24,15 @@
 
 use anyhow::Result as AnyResult;
 use oxigraph_nova_core::{GraphName, StorageEngine, Term, TextSearch};
-// Pull backend crates into the link so their `inventory::submit!`
-// BackendFactory registrations are present in this binary.
-#[cfg(feature = "louds-backend")]
-use oxigraph_nova_engine_louds as _;
-// Tests always need at least one backend registered.
-#[cfg(test)]
+// Backend self-registration (inventory): feature-gated force-links so any
+// binary that depends on this crate (e.g. `oxigraph mcp serve`) inherits the
+// selected backends. Tests use the dev-dep LOUDS crate (always linked).
+#[cfg(any(feature = "louds-backend", test))]
 use oxigraph_nova_engine_louds as _;
 #[cfg(feature = "ring-backend")]
 use oxigraph_nova_engine_ring as _;
+#[cfg(feature = "rocksdb-backend")]
+use oxigraph_nova_engine_rocksdb as _;
 use oxigraph_nova_query::{Evaluator, QueryOptions, QueryResult, StoreDataset, execute_update};
 use oxigraph_nova_reasoning::ReasoningState;
 use oxrdfio::{RdfFormat, RdfSerializer};

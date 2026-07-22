@@ -38,13 +38,14 @@ use clap::Parser;
 use cli::{Args, Command, CypherCommand, McpCommand};
 use mimalloc::MiMalloc;
 // All product surfaces (including serve / serve-read-only) use the registry only.
+// Backend inventory registration is inherited from `oxigraph_nova_server`
+// (always links LOUDS via ring; RocksDB when this package's `rocksdb-backend`
+// feature is enabled and forwarded). With `--features mcp`, mcp's own
+// force-links also apply. Do not re-force-link engines in this binary.
 use oxigraph_nova_core::{
     GraphName, NamedOrBlankNode, QuadStore, StorageEngineExt, SyncPolicy, Term, new_backend,
     open_backend, require_backend as core_require_backend,
 };
-// Force-link the storage crate so inventory BackendFactory registrations
-// (LOUDS always; Ring when cyclic-ring is on via ring-backend) are present.
-use oxigraph_nova_engine_ring as _;
 use oxigraph_nova_query::{Evaluator, QueryResult, StoreDataset, execute_update};
 use oxigraph_nova_server::{Server, mimalloc_tuning};
 use oxigraph_nova_shacl::{NativeValidator, ShaclValidator};

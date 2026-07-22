@@ -1,0 +1,24 @@
+[package]
+name        = "oxigraph-nova-engine-rocksdb"
+description = "Oxigraph-compatible RocksDB StorageEngine backend for Oxigraph Nova (drop-in data directories)"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+oxigraph-nova-core = { path = "../../core/nova-core", default-features = false }
+# Upstream Oxigraph store: RocksDB on-disk format + multi-index CRUD.
+# Shares oxrdf 0.3.3 with the workspace. oxigraph enables spargebra
+# sep-0002/sep-0006; workspace spargebra/sparopt must enable the same
+# features so Cargo feature unification stays exhaustive (see root Cargo.toml).
+oxigraph = { version = "0.5.7", default-features = false, features = ["rocksdb", "rdf-12"] }
+inventory = "0.3"
+oxrdf     = { workspace = true }
+anyhow    = { workspace = true }
+tracing   = { workspace = true }
+tempfile  = "3"
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3"
