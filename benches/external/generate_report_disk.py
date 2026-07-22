@@ -272,9 +272,10 @@ def main():
     if has_fluree:
         lines.append(
             "| **Fluree** | `fluree/server --storage-path` (host volume) | "
-            "File-backed persistent ledger. LeafletCache disabled "
-            "(`FLUREE_CACHE_MAX_MB=0` / `--cache-max-mb 0`) so RSS is not dominated "
-            "by Fluree's default ~35%-of-RAM cache budget. SPARQL is connection-scoped; "
+            "File-backed persistent ledger. LeafletCache disabled via "
+            "`FLUREE_CACHE_MAX_MB=0` (env; `server run` rejects `--cache-max-mb`) so "
+            "RSS is not dominated by Fluree's default ~35%-of-RAM cache budget. "
+            "SPARQL is connection-scoped; "
             "the harness injects `FROM <ledger>` into each query. |"
         )
     lines.append(

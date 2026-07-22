@@ -230,9 +230,10 @@ def main():
         "resident — consistent with QLever's published methodology. |",
         "| **Fluree** | Ephemeral container FS (`fluree/server`, no host volume) | "
         "Default file storage lives inside the container and is destroyed with it "
-        "— functionally in-memory for this bench. LeafletCache disabled "
-        "(`FLUREE_CACHE_MAX_MB=0` / `--cache-max-mb 0`) so RSS is not dominated by "
-        "Fluree's default ~35%-of-RAM cache budget. SPARQL is connection-scoped; the "
+        "— functionally in-memory for this bench. LeafletCache disabled via "
+        "`FLUREE_CACHE_MAX_MB=0` (env; `server run` rejects `--cache-max-mb`) so "
+        "RSS is not dominated by Fluree's default ~35%-of-RAM cache budget. "
+        "SPARQL is connection-scoped; the "
         "harness injects `FROM <ledger>` into each query (addressing only). |",
         "| **RDFox** | In-memory datastore (sandbox/daemon, `parallel-nn`) | "
         "Optional comparator: licensed RDFox binary + `.lic` (auto-skipped when "
