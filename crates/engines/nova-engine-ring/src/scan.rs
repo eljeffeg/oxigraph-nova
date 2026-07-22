@@ -37,8 +37,8 @@ use crate::product_path::{
 use crate::ring_nav::RingRef;
 use crate::{Col, RowRange};
 use oxigraph_nova_core::{
-    EmptyTrieIter, PreparedLeftIntersect, PreparedPhysicalOperator, PreparedPredObjectIntersect,
-    PreparedSpObjectScan, PreparedTwoHop, PreparedWedge, TrieIterator,
+    EmptyTrieIter, PreparedDirectedTriangle, PreparedLeftIntersect, PreparedPhysicalOperator,
+    PreparedPredObjectIntersect, PreparedSpObjectScan, PreparedTwoHop, PreparedWedge, TrieIterator,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -2627,6 +2627,132 @@ impl PreparedPhysicalOperator for PreparedKChainImpl {
     }
 }
 
+// ── Prepared directed triangle (3-cycle) ──────────────────────────────────────
+//
+// Shape: `?a P1 ?b . ?b P2 ?c . ?c P3 ?a`
+// Enumerate a→b under P1, b→c under P2; close via exact SPO membership (c,P3,a).
+// Mirrors KChain hop/adj machinery with a contains_external close instead of a
+// third hop enumeration. Emit `[a, b, c]`.
+
+/// Prepared directed 3-cycle body. Emits `[a, b, c]` external TermIds.
+pub struct PreparedDirectedTriangleImpl {
+    img: Arc<BraidedGraphImage>,
+    p1: u64,
+    p3: u64,
+    hop1: PreparedSpObjectScanImpl,
+    hop2: PreparedSpObjectScanImpl,
+    p2_dense: u32,
+    p2_adj: Option<PredicateAdjacency>,
+}
+
+impl PreparedDirectedTriangleImpl {
+    pub fn prepare(img: Arc<BraidedGraphImage>, p1: u64, p2: u64, p3: u64) -> Option<Self> {
+        let hop1 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p1)?;
+        let hop2 = PreparedSpObjectScanImpl::prepare(Arc::clone(&img), p2)?;
+        // Ensure P3 is densifiable (closing edge must be resolvable).
+        let _p3_dense = img.remap().to_dense(p3)?;
+        let p2_dense = hop2.pred_dense;
+        let mode = effective_pred_adjacency_mode();
+        let universe = img.universe() as usize;
+        let p2_adj = PredicateAdjacency::build(img.index().ring_ref(), p2_dense, universe, mode);
+        Some(Self {
+            img,
+            p1,
+            p3,
+            hop1,
+            hop2,
+            p2_dense,
+            p2_adj,
+        })
+    }
+
+    #[inline]
+    fn reset_hop2(
+        hop: &mut PreparedSpObjectScanImpl,
+        adj: Option<&PredicateAdjacency>,
+        range_cache: &mut [Option<RowRange>],
+        img: &BraidedGraphImage,
+        subject_ext: u64,
+        pred_dense: u32,
+    ) -> bool {
+        let Some(s_dense) = img.remap().to_dense(subject_ext) else {
+            return false;
+        };
+        let si = s_dense as usize;
+        if let Some(adj) = adj {
+            return match adj.range_for_subject(s_dense) {
+                Some(range) => hop.reset_from_range(range, true),
+                None => false,
+            };
+        }
+        if si < range_cache.len() {
+            if let Some(cached) = range_cache[si] {
+                return hop.reset_from_range(cached, true);
+            }
+            let range = range_sp(img.index().ring_ref(), s_dense, pred_dense);
+            range_cache[si] = Some(range);
+            return hop.reset_from_range(range, false);
+        }
+        hop.reset_to_subject(subject_ext)
+    }
+}
+
+impl PreparedDirectedTriangle for PreparedDirectedTriangleImpl {
+    fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
+        let mut a_scan = BraidedGraphImage::join_scan_streaming(
+            Arc::clone(&self.img),
+            None,
+            Some(self.p1),
+            None,
+            0,
+        );
+        let mut rows = 0u64;
+        let universe = self.img.universe() as usize;
+        let use_p2_adj = self.p2_adj.is_some();
+        let mut p2_cache: Vec<Option<RowRange>> = if use_p2_adj {
+            Vec::new()
+        } else {
+            vec![None; universe.max(1)]
+        };
+        let img_ref = Arc::clone(&self.img);
+        let p3 = self.p3;
+
+        while !a_scan.at_end() {
+            let a = a_scan.key();
+            if !self.hop1.reset_to_subject(a) {
+                a_scan.advance();
+                continue;
+            }
+            while !self.hop1.at_end() {
+                let b = self.hop1.key();
+                if b != a {
+                    let hop2_ok = Self::reset_hop2(
+                        &mut self.hop2,
+                        self.p2_adj.as_ref(),
+                        &mut p2_cache,
+                        &img_ref,
+                        b,
+                        self.p2_dense,
+                    );
+                    if hop2_ok {
+                        while !self.hop2.at_end() {
+                            let c = self.hop2.key();
+                            if c != a && c != b && img_ref.contains_external(c, p3, a) {
+                                emit(&[a, b, c])?;
+                                rows += 1;
+                            }
+                            self.hop2.advance();
+                        }
+                    }
+                }
+                self.hop1.advance();
+            }
+            a_scan.advance();
+        }
+        Ok(rows)
+    }
+}
+
 // ── Prepared subject-star (k=3) ───────────────────────────────────────────────
 //
 // Shape: `?s P1 ?o1 . ?s P2 ?o2 . ?s P3 ?o3`
@@ -4177,6 +4303,90 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Directed 3-cycle `a→b→c→a` under (possibly distinct) predicates.
+    ///
+    /// Fixture: mixed-P cycle 100-P1→101-P2→102-P3→100, plus noise edges.
+    #[test]
+    fn prepared_directed_triangle_matches_oracle() {
+        let p1 = 11u64;
+        let p2 = 12u64;
+        let p3 = 13u64;
+        let ext: Vec<[u64; 3]> = vec![
+            [100, p1, 101], // a→b
+            [101, p2, 102], // b→c
+            [102, p3, 100], // c→a close
+            [100, p1, 103], // second a→b'
+            [103, p2, 102], // b'→c  (cycle 100→103→102→100)
+            [101, p2, 100], // b→a under p2 — not a cycle edge for our orientation
+            [200, p1, 201], // noise: open chain, no close
+            [201, p2, 202],
+        ];
+
+        let mut img = BraidedGraphImage::from_external_triples(&ext);
+        let path = std::env::temp_dir().join(format!(
+            "braided_dtri_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        img.materialize_mapped(&path).expect("mmap");
+        let img = Arc::new(img);
+
+        let heap = Arc::new(BraidedGraphImage::from_external_triples(&ext));
+        // Hop prepare works on heap; contains_external is fine without mmap.
+        // Product prepare still densifies via remap — allow either path.
+        let mut prep = PreparedDirectedTriangleImpl::prepare(Arc::clone(&img), p1, p2, p3)
+            .expect("prepare directed triangle under mmap");
+
+        let mut got: Vec<(u64, u64, u64)> = Vec::new();
+        let n = prep
+            .execute(&mut |ids| {
+                assert_eq!(ids.len(), 3);
+                got.push((ids[0], ids[1], ids[2]));
+                Ok(())
+            })
+            .expect("execute");
+        assert_eq!(n as usize, got.len());
+
+        let edge = |s: u64, p: u64, o: u64| ext.iter().any(|t| t[0] == s && t[1] == p && t[2] == o);
+        let nodes = {
+            let mut v: Vec<u64> = ext.iter().flat_map(|t| [t[0], t[2]]).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let mut want: Vec<(u64, u64, u64)> = Vec::new();
+        for &a in &nodes {
+            for &b in &nodes {
+                if a == b || !edge(a, p1, b) {
+                    continue;
+                }
+                for &c in &nodes {
+                    if c == a || c == b {
+                        continue;
+                    }
+                    if edge(b, p2, c) && edge(c, p3, a) {
+                        want.push((a, b, c));
+                    }
+                }
+            }
+        }
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want, "prepared directed triangle vs SPO oracle");
+        assert!(
+            !got.is_empty(),
+            "fixture must contain the 100→101→102→100 and 100→103→102→100 cycles"
+        );
+        assert_eq!(got, vec![(100, 101, 102), (100, 103, 102)]);
+
+        // Silence unused heap if prepare-on-heap is not asserted.
+        let _ = heap;
         let _ = std::fs::remove_file(&path);
     }
 }

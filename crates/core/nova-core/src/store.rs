@@ -81,6 +81,7 @@ pub trait PreparedSpObjectScan: Send {
 /// Concrete product shapes today:
 /// - **two-hop** `?a P1 ?b . ?b P2 ?c` — emit `[a, b, c]`
 /// - **wedge** `?a P ?b . ?b P ?c . ?a P ?c` — emit `[a, b, c]`
+/// - **directed-triangle** `?a P1 ?b . ?b P2 ?c . ?c P3 ?a` — emit `[a, b, c]`
 /// - **sp-expansion / 2join** `?s P1 O1 . ?s P2 ?o` — emit `[s, o]`
 /// - **k-chain (k=3)** `?a P1 ?b . ?b P2 ?c . ?c P3 ?d` — emit `[a, b, c, d]`
 ///
@@ -108,6 +109,9 @@ pub use PreparedPhysicalOperator as PreparedTwoHop;
 /// Historical name for wedge/triangle prepared ops. Same as
 /// [`PreparedPhysicalOperator`].
 pub use PreparedPhysicalOperator as PreparedWedge;
+/// Directed 3-cycle prepared ops. Same as [`PreparedPhysicalOperator`]
+/// (`emit(&[a, b, c])`).
+pub use PreparedPhysicalOperator as PreparedDirectedTriangle;
 /// SP-expansion / 2join prepared ops. Same as [`PreparedPhysicalOperator`]
 /// (`emit(&[s, o])`).
 pub use PreparedPhysicalOperator as PreparedSpExpansion;
@@ -131,6 +135,7 @@ pub use PreparedPhysicalOperator as PreparedStar;
 /// ## Live variants
 ///
 /// [`TwoHop`](Self::TwoHop), [`Wedge`](Self::Wedge),
+/// [`DirectedTriangle`](Self::DirectedTriangle),
 /// [`SpExpansion`](Self::SpExpansion), [`KChain`](Self::KChain) (k = 3),
 /// [`Star`](Self::Star) (k = 3) — engines should implement prepare for these
 /// (or return `None` and let the walker use nested-scan fallback).
@@ -140,7 +145,6 @@ pub use PreparedPhysicalOperator as PreparedStar;
 /// Future constants-only binds will extend this enum when recognizers land:
 /// - **Star k>3** — more than three fixed predicates on a shared subject
 /// - **KChain k>3** — longer ordered predicate paths (k = 3 is live)
-/// - **DirectedTriangle** — three (possibly distinct) predicates on a cycle
 /// - **Diamond** — two path predicates pairs meeting at endpoints
 /// - **ObjectStar** — k fixed predicates into a shared object
 ///
@@ -152,6 +156,12 @@ pub enum PhysicalShape {
     TwoHop { p1: u64, p2: u64 },
     /// `?a P ?b . ?b P ?c . ?a P ?c` — emit `(a, b, c)`.
     Wedge { predicate: u64 },
+    /// `?a P1 ?b . ?b P2 ?c . ?c P3 ?a` — directed 3-cycle; emit `(a, b, c)`.
+    ///
+    /// Predicates may be equal or distinct. Distinct from [`Self::Wedge`]
+    /// (chordal a→b, b→c, a→c under one P). Returning `None` keeps the
+    /// walker's nested `join_scan` fallback.
+    DirectedTriangle { p1: u64, p2: u64, p3: u64 },
     /// `?s P_filter O_filter . ?s P_expand ?o` — emit `[s, o]`.
     SpExpansion {
         p_filter: u64,

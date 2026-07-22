@@ -102,7 +102,8 @@ pub use prepared_plan_cache::{
     CachedPhysicalOpGuard, CachedTwoHopGuard, CachedWedgeGuard, PREPARED_PLAN_CACHE_CAP,
     PhysicalOpKind, PhysicalOpPlanKey, PhysicalOpPreparedPlanCache, PreparedPhysicalOp,
     TwoHopPlanKey, TwoHopPreparedPlanCache, WedgePlanKey, WedgePreparedPlanCache,
-    get_or_prepare_sp_expansion, get_or_prepare_two_hop, get_or_prepare_wedge,
+    get_or_prepare_directed_triangle, get_or_prepare_sp_expansion, get_or_prepare_two_hop,
+    get_or_prepare_wedge,
 };
 #[cfg(feature = "cyclic-ring")]
 pub use product_path::{
@@ -120,8 +121,9 @@ pub use ring_nav::RingRef;
 pub use ring_store::RingStore;
 #[cfg(feature = "cyclic-ring")]
 pub use scan::{
-    BraidedJoinScan, PreparedPredD1, PreparedSpExpansionImpl, PreparedSpObjectScanImpl,
-    PreparedTwoHopImpl, PreparedWedgeImpl, WedgeOuterProfile, WedgeProfileOpts,
+    BraidedJoinScan, PreparedDirectedTriangleImpl, PreparedPredD1, PreparedSpExpansionImpl,
+    PreparedSpObjectScanImpl, PreparedTwoHopImpl, PreparedWedgeImpl, WedgeOuterProfile,
+    WedgeProfileOpts,
 };
 
 /// Compatibility alias: historical `oxigraph_nova_engine_ring::cyclic_ring::*` path.

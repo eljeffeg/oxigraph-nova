@@ -26,8 +26,9 @@
 
 use crate::image::BraidedGraphImage;
 use crate::prepared_plan_cache::{
-    PREPARED_PLAN_CACHE_CAP, PhysicalOpPreparedPlanCache, get_or_prepare_k_chain,
-    get_or_prepare_sp_expansion, get_or_prepare_star, get_or_prepare_two_hop, get_or_prepare_wedge,
+    PREPARED_PLAN_CACHE_CAP, PhysicalOpPreparedPlanCache, get_or_prepare_directed_triangle,
+    get_or_prepare_k_chain, get_or_prepare_sp_expansion, get_or_prepare_star,
+    get_or_prepare_two_hop, get_or_prepare_wedge,
 };
 use crate::product_path::{
     SPARQL_PATH, bump_mmap_ok, log_mmap_fail_once, ring_counters_log_enabled, ring_d2_enabled,
@@ -1386,6 +1387,15 @@ impl LftjSource for RingStore {
             PhysicalShape::Star { p1, p2, p3 } => {
                 get_or_prepare_star(&self.physical_op_cache, ver, graph_id, img, p1, p2, p3)
             }
+            PhysicalShape::DirectedTriangle { p1, p2, p3 } => get_or_prepare_directed_triangle(
+                &self.physical_op_cache,
+                ver,
+                graph_id,
+                img,
+                p1,
+                p2,
+                p3,
+            ),
         }
     }
 }

@@ -230,11 +230,23 @@ impl<Louds: LoudsNav, V: AsRef<[u64]>> CltjTrie<Louds, V> {
         Louds: Send + Sync + 'static,
         V: Send + Sync + 'static,
     {
+        match self.iter_d0_concrete() {
+            Some(it) => Box::new(it),
+            None => Box::new(EmptyTrieIter),
+        }
+    }
+
+    /// Concrete (non-boxed) depth-0 iterator for prepared monomorphic walks.
+    ///
+    /// Prefer this over [`Self::iter_d0`] in hot prepared-shape bodies so every
+    /// hop avoids `Box<dyn TrieIterator>` allocation and vtable dispatch.
+    #[inline]
+    pub fn iter_d0_concrete(self: &Arc<Self>) -> Option<CltjTrieIter<Louds, V>> {
         let degree = self.louds.root_degree();
         if degree == 0 {
-            return Box::new(EmptyTrieIter);
+            return None;
         }
-        Box::new(CltjTrieIter {
+        Some(CltjTrieIter {
             trie: Arc::clone(self),
             hi: degree,
             pos: 1,
@@ -272,6 +284,19 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
     /// Depth-0 `CltjTrieIter` for the given ordering.
     pub fn trie_iter(&self, ord: SortOrder) -> Box<dyn TrieIterator> {
         self.tries[Self::idx(ord)].iter_d0()
+    }
+
+    /// Concrete (non-boxed) depth-0 iterator for prepared monomorphic walks.
+    #[inline]
+    pub fn trie_iter_concrete(&self, ord: SortOrder) -> Option<CltjTrieIter<Louds, V>> {
+        self.tries[Self::idx(ord)].iter_d0_concrete()
+    }
+
+    /// Borrow the LOUDS trie for `ord` (for resettable concrete scanners).
+    #[inline]
+    #[allow(dead_code)] // reserved for resettable SP scanners on prepared bodies
+    pub fn trie(&self, ord: SortOrder) -> &Arc<CltjTrie<Louds, V>> {
+        &self.tries[Self::idx(ord)]
     }
 
     /// Number of distinct global values for the given SPO field (0=S, 1=P, 2=O).
@@ -743,14 +768,15 @@ pub(crate) struct CltjTrieIter<Louds = LoudsTrie, V = Vec<u64>> {
     depth: u8,
 }
 
-impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 'static> TrieIterator
-    for CltjTrieIter<Louds, V>
-{
+/// Monomorphic navigation API — used by prepared shape bodies and by the
+/// `TrieIterator` impl (which just boxes `open_concrete`).
+impl<Louds: LoudsNav, V: AsRef<[u64]>> CltjTrieIter<Louds, V> {
     /// Return the global term ID at the current position.
     ///
     /// O(1): direct Vec index (local_id from LOUDS L, then vocab lookup).
     #[inline]
-    fn key(&self) -> u64 {
+    pub fn key_c(&self) -> u64 {
+        debug_assert!(!self.at_end_c());
         let local_id = self.trie.louds.label_at(self.pos) as usize;
         self.trie.vocab_slice(self.depth as usize)[local_id]
     }
@@ -760,46 +786,47 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
     /// Uses `partition_point` on the vocab `&[u64]` slice for the local-ID
     /// binary search — the compiler can SIMD-vectorise this over contiguous
     /// memory.  Then `leap()` jumps to the matching L position.
-    fn seek(&mut self, target: u64) {
-        if self.at_end() {
+    #[inline]
+    pub fn seek_c(&mut self, target: u64) {
+        if self.at_end_c() {
             return;
         }
-        if target <= self.key() {
+        if target <= self.key_c() {
             return;
         }
 
         let vocab = self.trie.vocab_slice(self.depth as usize);
-        // Binary search for first local_id where vocab[local_id] >= target.
-
         let local_target = vocab.partition_point(|&v| v < target);
         if local_target >= vocab.len() {
-            // All vocab values are below target — exhaust the iterator.
             self.pos = self.hi + 1;
             return;
         }
         self.pos = self.trie.louds.leap(self.pos, self.hi, local_target as u32);
     }
 
-    fn advance(&mut self) {
-        if !self.at_end() {
+    #[inline]
+    pub fn advance_c(&mut self) {
+        if !self.at_end_c() {
             self.pos += 1;
         }
     }
 
-    fn open(&self) -> Box<dyn TrieIterator> {
+    /// Concrete (non-boxed) descent into the child level at the current key.
+    ///
+    /// Returns `None` at leaf depth or when the current node has no children.
+    #[inline]
+    pub fn open_concrete(&self) -> Option<CltjTrieIter<Louds, V>> {
         if self.depth >= 2 {
-            // Depth 2 = leaf level; no further descent.
-            return Box::new(EmptyTrieIter);
+            return None;
         }
-        // child T-position = select1(pos − 1)
         let child_v = self.trie.louds.child_from_label_pos(self.pos);
         let child_degree = self.trie.louds.degree(child_v);
         if child_degree == 0 {
-            return Box::new(EmptyTrieIter);
+            return None;
         }
         let new_lo = child_v + 1;
         let new_hi = child_v + child_degree;
-        Box::new(CltjTrieIter {
+        Some(CltjTrieIter {
             trie: Arc::clone(&self.trie),
             hi: new_hi,
             pos: new_lo,
@@ -807,8 +834,74 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
         })
     }
 
-    fn at_end(&self) -> bool {
+    /// Rebind this iterator to the children of `parent` (same trie).
+    ///
+    /// Avoids allocating a new iterator when a prepared body reuses one
+    /// child cursor across many parent keys (e.g. hop2 under successive `b`).
+    #[inline]
+    #[allow(dead_code)] // reserved for reuse-across-parent prepared scanners
+    pub fn reset_to_child_of(&mut self, parent: &CltjTrieIter<Louds, V>) -> bool {
+        if parent.depth >= 2 {
+            self.pos = self.hi + 1;
+            return false;
+        }
+        let child_v = parent.trie.louds.child_from_label_pos(parent.pos);
+        let child_degree = parent.trie.louds.degree(child_v);
+        if child_degree == 0 {
+            self.pos = self.hi + 1;
+            return false;
+        }
+        // Same backing trie — only rebind range/depth.
+        debug_assert!(Arc::ptr_eq(&self.trie, &parent.trie));
+        self.hi = child_v + child_degree;
+        self.pos = child_v + 1;
+        self.depth = parent.depth + 1;
+        true
+    }
+
+    #[inline]
+    pub fn at_end_c(&self) -> bool {
         self.pos > self.hi
+    }
+
+    /// Collect remaining keys from this cursor into `out` (does not clear).
+    #[inline]
+    pub fn collect_keys_into(&mut self, out: &mut Vec<u64>) {
+        while !self.at_end_c() {
+            out.push(self.key_c());
+            self.advance_c();
+        }
+    }
+}
+
+impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 'static> TrieIterator
+    for CltjTrieIter<Louds, V>
+{
+    #[inline]
+    fn key(&self) -> u64 {
+        self.key_c()
+    }
+
+    #[inline]
+    fn seek(&mut self, target: u64) {
+        self.seek_c(target);
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        self.advance_c();
+    }
+
+    fn open(&self) -> Box<dyn TrieIterator> {
+        match self.open_concrete() {
+            Some(it) => Box::new(it),
+            None => Box::new(EmptyTrieIter),
+        }
+    }
+
+    #[inline]
+    fn at_end(&self) -> bool {
+        self.at_end_c()
     }
 }
 

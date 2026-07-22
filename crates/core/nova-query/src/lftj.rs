@@ -70,7 +70,9 @@
 
 use crate::dataset::{Dataset, GraphSelector};
 use crate::options::CancellationToken;
-use crate::shapes::{KChainPlan, ShapePlan, SpExpansionPlan, StarPlan, TwoHopPlan, WedgePlan};
+use crate::shapes::{
+    DirectedTrianglePlan, KChainPlan, ShapePlan, SpExpansionPlan, StarPlan, TwoHopPlan, WedgePlan,
+};
 use crate::solution::{Solution, Solutions};
 use oxigraph_nova_core::{GraphName, Term, Variable};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
@@ -88,7 +90,12 @@ static SP_EXPANSION_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static WEDGE_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
 static WEDGE_SELECTED: AtomicU64 = AtomicU64::new(0);
 static WEDGE_FALLBACK: AtomicU64 = AtomicU64::new(0);
+// directed 3-cycle
+static DIRECTED_TRIANGLE_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
+static DIRECTED_TRIANGLE_SELECTED: AtomicU64 = AtomicU64::new(0);
+static DIRECTED_TRIANGLE_FALLBACK: AtomicU64 = AtomicU64::new(0);
 // path_3hop (k=3 chain)
+
 static K_CHAIN_SHAPE_SEEN: AtomicU64 = AtomicU64::new(0);
 static K_CHAIN_SELECTED: AtomicU64 = AtomicU64::new(0);
 static K_CHAIN_FALLBACK: AtomicU64 = AtomicU64::new(0);
@@ -1360,6 +1367,138 @@ fn eval_wedge_walk<D: Dataset>(
     Ok(results)
 }
 
+/// Directed 3-cycle: prepared body when available, else nested join_scan.
+///
+/// Plan orientation is a→b under P1, b→c under P2, c→a under P3. Nested
+/// fallback: enumerate `(a,b)` then `(b,c)`, close via existence of `(c,P3,a)`.
+fn eval_directed_triangle_walk<D: Dataset>(
+    dataset: &D,
+    join_vars: &Arc<[Variable]>,
+    graph: &GraphSelector,
+    plan: &DirectedTrianglePlan,
+    cancellation: Option<&CancellationToken>,
+) -> anyhow::Result<Solutions> {
+    DIRECTED_TRIANGLE_SHAPE_SEEN.fetch_add(1, Ordering::Relaxed);
+
+    let mut results: Solutions = Vec::new();
+    let mut step: u64 = 0;
+
+    if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
+        DIRECTED_TRIANGLE_SELECTED.fetch_add(1, Ordering::Relaxed);
+        let emit_result = prepared.execute(&mut |ids| {
+            debug_assert!(ids.len() >= 3);
+            let a = ids[0];
+            let b = ids[1];
+            let c = ids[2];
+            if let Some(tok) = cancellation
+                && step.is_multiple_of(4096)
+                && tok.is_cancelled()
+            {
+                return Err(());
+            }
+            step += 1;
+            LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+            emit_two_hop_solution(
+                dataset,
+                join_vars,
+                plan.a,
+                plan.b,
+                plan.c,
+                a,
+                b,
+                c,
+                &mut results,
+            );
+            Ok(())
+        });
+        return match emit_result {
+            Ok(_) => Ok(results),
+            Err(()) => Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            )),
+        };
+    }
+
+    DIRECTED_TRIANGLE_FALLBACK.fetch_add(1, Ordering::Relaxed);
+
+    // Nested: a under P1 → b under (a,P1) O → c under (b,P2) O → probe (c,P3,a).
+    let mut a_scan = match dataset.lftj_join_scan(None, Some(plan.p1), None, 0, graph) {
+        Some(s) => s,
+        None => return Ok(results),
+    };
+    LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+
+    while !a_scan.at_end() {
+        if let Some(tok) = cancellation
+            && step.is_multiple_of(4096)
+            && tok.is_cancelled()
+        {
+            return Err(anyhow::Error::from(
+                crate::options::EvalLimitError::Cancelled,
+            ));
+        }
+        step += 1;
+        let a = a_scan.key();
+        let mut b_scan = match dataset.lftj_join_scan(Some(a), Some(plan.p1), None, 2, graph) {
+            Some(s) => s,
+            None => {
+                a_scan.advance();
+                continue;
+            }
+        };
+        LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+        while !b_scan.at_end() {
+            step += 1;
+            let b = b_scan.key();
+            if b == a {
+                b_scan.advance();
+                continue;
+            }
+            let mut c_scan = match dataset.lftj_join_scan(Some(b), Some(plan.p2), None, 2, graph) {
+                Some(s) => s,
+                None => {
+                    b_scan.advance();
+                    continue;
+                }
+            };
+            LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+            while !c_scan.at_end() {
+                step += 1;
+                let c = c_scan.key();
+                if c != a && c != b {
+                    // Close cycle: does (c, P3, a) exist?
+                    // Probe objects of (c,P3) for key a via seek-capable scan.
+                    if let Some(mut close) =
+                        dataset.lftj_join_scan(Some(c), Some(plan.p3), None, 2, graph)
+                    {
+                        LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
+                        close.seek(a);
+                        if !close.at_end() && close.key() == a {
+                            LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
+                            emit_two_hop_solution(
+                                dataset,
+                                join_vars,
+                                plan.a,
+                                plan.b,
+                                plan.c,
+                                a,
+                                b,
+                                c,
+                                &mut results,
+                            );
+                        }
+                    }
+                }
+                c_scan.advance();
+            }
+            b_scan.advance();
+        }
+        a_scan.advance();
+    }
+
+    Ok(results)
+}
+
 /// Emit one decoded solution from four bound TermIds (3-hop chain).
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -1809,6 +1948,9 @@ pub fn eval_bgp_lftj_cancellable<D: Dataset>(
             ),
             ShapePlan::Wedge(wedge) => {
                 eval_wedge_walk(dataset, &join_vars, active_graph, &wedge, cancellation)
+            }
+            ShapePlan::DirectedTriangle(dt) => {
+                eval_directed_triangle_walk(dataset, &join_vars, active_graph, &dt, cancellation)
             }
             ShapePlan::KChain(k_chain) => {
                 eval_k_chain_walk(dataset, &join_vars, active_graph, &k_chain, cancellation)

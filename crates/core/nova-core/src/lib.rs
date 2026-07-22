@@ -30,9 +30,10 @@ pub use oxrdf::{
 };
 use std::sync::Arc;
 pub use store::{
-    LftjSource, PhysicalShape, PreparedKChain, PreparedLeftIntersect, PreparedPhysicalOperator,
-    PreparedPredObjectIntersect, PreparedSpExpansion, PreparedSpObjectScan, PreparedStar,
-    PreparedTwoHop, PreparedWedge, QuadOp, QuadStore, QuadStoreExt,
+    LftjSource, PhysicalShape, PreparedDirectedTriangle, PreparedKChain, PreparedLeftIntersect,
+    PreparedPhysicalOperator, PreparedPredObjectIntersect, PreparedSpExpansion,
+    PreparedSpObjectScan, PreparedStar, PreparedTwoHop, PreparedWedge, QuadOp, QuadStore,
+    QuadStoreExt,
 };
 pub use text_search::{TextMatch, TextSearch};
 pub use trie::{EmptyTrieIter, TrieIterator};

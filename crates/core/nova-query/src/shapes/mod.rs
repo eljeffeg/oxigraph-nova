@@ -17,8 +17,9 @@
 //! ## Live catalog
 //!
 //! - [`ShapeId::SpExpansion`] / [`ShapeId::TwoHop`] / [`ShapeId::Wedge`] /
-//!   [`ShapeId::KChain`] (k = 3) / [`ShapeId::Star`] (k = 3)
-//!
+//!   [`ShapeId::DirectedTriangle`] / [`ShapeId::KChain`] (k = 3) /
+//!   [`ShapeId::Star`] (k = 3)
+
 //! ## Reserved shape ids (no recognizer / walk yet)
 //!
 //! See [`ShapeId`] variants marked *reserved*. When implementing one:
@@ -30,6 +31,7 @@
 //! Nesting note: Star-with-features / chain-of-stars should become
 //! `ShapePlan` trees (`Box<ShapePlan>` children), not flattened mega-plans.
 
+mod directed_triangle;
 mod k_chain;
 mod sp_expansion;
 mod star;
@@ -37,6 +39,7 @@ mod two_hop;
 mod wedge;
 
 use crate::lftj::PatternSpec;
+pub use directed_triangle::DirectedTrianglePlan;
 pub use k_chain::KChainPlan;
 pub use sp_expansion::SpExpansionPlan;
 pub use star::StarPlan;
@@ -57,6 +60,9 @@ pub enum ShapeId {
     TwoHop,
     /// `?a P ?b . ?b P ?c . ?a P ?c` — fixed-P undirected triangle (3 patterns, 3 vars).
     Wedge,
+    /// `?a P1 ?b . ?b P2 ?c . ?c P3 ?a` — directed 3-cycle (3 patterns, 3 vars).
+    /// Predicates may be equal or distinct. Distinct from fixed-P [`Self::Wedge`].
+    DirectedTriangle,
     /// `?a P1 ?b . ?b P2 ?c . ?c P3 ?d` — 3-hop chain (3 patterns, 4 vars).
     /// Recognized for k = 3 only; longer chains would reuse this id once the
     /// plan grows variable arity.
@@ -68,9 +74,6 @@ pub enum ShapeId {
     Star,
 
     // ── Reserved (not in catalog; no ShapePlan / walk yet) ───────────────
-    /// *Reserved.* Directed 3-cycle, mixed predicates allowed:
-    /// `?a P1 ?b . ?b P2 ?c . ?c P3 ?a` (distinct from fixed-P [`Self::Wedge`]).
-    DirectedTriangle,
     /// *Reserved.* Two paths a→…→d sharing endpoints:
     /// `?a→?b→?d` and `?a→?c→?d` (diamond / multi-path meet).
     Diamond,
@@ -88,6 +91,7 @@ impl ShapeId {
             ShapeId::SpExpansion
                 | ShapeId::TwoHop
                 | ShapeId::Wedge
+                | ShapeId::DirectedTriangle
                 | ShapeId::KChain
                 | ShapeId::Star
         )
@@ -115,6 +119,7 @@ pub enum ShapePlan {
     SpExpansion(SpExpansionPlan),
     TwoHop(TwoHopPlan),
     Wedge(WedgePlan),
+    DirectedTriangle(DirectedTrianglePlan),
     KChain(KChainPlan),
     Star(StarPlan),
 }
@@ -126,6 +131,7 @@ impl ShapePlan {
             ShapePlan::SpExpansion(_) => ShapeId::SpExpansion,
             ShapePlan::TwoHop(_) => ShapeId::TwoHop,
             ShapePlan::Wedge(_) => ShapeId::Wedge,
+            ShapePlan::DirectedTriangle(_) => ShapeId::DirectedTriangle,
             ShapePlan::KChain(_) => ShapeId::KChain,
             ShapePlan::Star(_) => ShapeId::Star,
         }
@@ -138,6 +144,7 @@ impl ShapePlan {
             ShapePlan::SpExpansion(p) => p.to_physical(),
             ShapePlan::TwoHop(p) => p.to_physical(),
             ShapePlan::Wedge(p) => p.to_physical(),
+            ShapePlan::DirectedTriangle(p) => p.to_physical(),
             ShapePlan::KChain(p) => p.to_physical(),
             ShapePlan::Star(p) => p.to_physical(),
         }
@@ -170,10 +177,14 @@ fn catalog() -> &'static [&'static dyn ShapeRecognizer] {
 }
 
 /// Concrete catalog entries (order = specificity).
-static CATALOG: [&'static dyn ShapeRecognizer; 5] = [
-    &wedge::WedgeRecognizer,    // 3p/3v
-    &k_chain::KChainRecognizer, // 3p/4v chain topology
-    &star::StarRecognizer,      // 3p/4v star topology (rejects chains)
+///
+/// Wedge before DirectedTriangle: both are 3p/3v; Wedge is the chordal fixed-P
+/// motif, DirectedTriangle is the pure cycle (rejects chordal / accepts mixed P).
+static CATALOG: [&'static dyn ShapeRecognizer; 6] = [
+    &wedge::WedgeRecognizer,                        // 3p/3v chordal fixed-P
+    &directed_triangle::DirectedTriangleRecognizer, // 3p/3v directed cycle
+    &k_chain::KChainRecognizer,                     // 3p/4v chain topology
+    &star::StarRecognizer,                          // 3p/4v star topology (rejects chains)
     &sp_expansion::SpExpansionRecognizer,
     &two_hop::TwoHopRecognizer,
 ];
@@ -350,16 +361,17 @@ mod tests {
     }
 
     #[test]
-    fn wedge_rejects_two_hop_only() {
-        // Chain is not a triangle (missing closing edge).
+    fn wedge_rejects_cycle_without_chord() {
+        // Pure directed cycle (no a→c chord) is DirectedTriangle, not Wedge.
         let specs = [
             spec(jv(0), c(10), jv(1)),
             spec(jv(1), c(10), jv(2)),
-            // third edge is a reverse / non-closing shape
             spec(jv(2), c(10), jv(0)),
         ];
-        // cycle of length 3 without a→c chord — not our oriented triangle
-        assert!(recognize_shape(&specs, 3).is_none());
+        assert_eq!(
+            recognize_shape(&specs, 3).map(|p| p.id()),
+            Some(ShapeId::DirectedTriangle)
+        );
     }
 
     #[test]
@@ -552,6 +564,71 @@ mod tests {
         assert!(recognize_shape(&specs, 3).is_none());
     }
 
+    // ── Directed triangle (3-cycle) ─────────────────────────────────────────
+
+    #[test]
+    fn directed_triangle_basic_mixed_p() {
+        // ?a P1 ?b . ?b P2 ?c . ?c P3 ?a
+        let specs = [
+            spec(jv(0), c(1), jv(1)),
+            spec(jv(1), c(2), jv(2)),
+            spec(jv(2), c(3), jv(0)),
+        ];
+        let plan = recognize_shape(&specs, 3).expect("should recognize");
+        assert_eq!(plan.id(), ShapeId::DirectedTriangle);
+        match plan {
+            ShapePlan::DirectedTriangle(p) => {
+                assert_eq!((p.p1, p.p2, p.p3), (1, 2, 3));
+                assert_eq!((p.a, p.b, p.c), (0, 1, 2));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn directed_triangle_same_p_cycle() {
+        // Fixed-P cycle without chord — still DirectedTriangle (not Wedge).
+        let specs = [
+            spec(jv(0), c(10), jv(1)),
+            spec(jv(1), c(10), jv(2)),
+            spec(jv(2), c(10), jv(0)),
+        ];
+        let plan = recognize_shape(&specs, 3).expect("should recognize");
+        assert_eq!(plan.id(), ShapeId::DirectedTriangle);
+    }
+
+    #[test]
+    fn directed_triangle_permuted_pattern_order() {
+        // edges listed c→a, a→b, b→c
+        let specs = [
+            spec(jv(2), c(30), jv(0)),
+            spec(jv(0), c(10), jv(1)),
+            spec(jv(1), c(20), jv(2)),
+        ];
+        let plan = recognize_shape(&specs, 3).expect("should recognize");
+        match plan {
+            ShapePlan::DirectedTriangle(p) => {
+                assert_eq!((p.a, p.b, p.c), (0, 1, 2));
+                assert_eq!((p.p1, p.p2, p.p3), (10, 20, 30));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn directed_triangle_does_not_steal_wedge() {
+        // Chordal a→b, b→c, a→c stays Wedge.
+        let specs = [
+            spec(jv(0), c(10), jv(1)),
+            spec(jv(1), c(10), jv(2)),
+            spec(jv(0), c(10), jv(2)),
+        ];
+        assert_eq!(
+            recognize_shape(&specs, 3).map(|p| p.id()),
+            Some(ShapeId::Wedge)
+        );
+    }
+
     // ── Reserved shape ids ──────────────────────────────────────────────────
 
     #[test]
@@ -559,9 +636,9 @@ mod tests {
         assert!(ShapeId::SpExpansion.is_live());
         assert!(ShapeId::TwoHop.is_live());
         assert!(ShapeId::Wedge.is_live());
+        assert!(ShapeId::DirectedTriangle.is_live());
         assert!(ShapeId::KChain.is_live());
         assert!(ShapeId::Star.is_live());
-        assert!(!ShapeId::DirectedTriangle.is_live());
         assert!(!ShapeId::Diamond.is_live());
         assert!(!ShapeId::ObjectStar.is_live());
         // ALL lists every known id exactly once.
@@ -573,14 +650,6 @@ mod tests {
 
     #[test]
     fn reserved_motifs_fall_through_until_recognizers_land() {
-        // Directed cycle with mixed P — future ShapeId::DirectedTriangle.
-        let cycle = [
-            spec(jv(0), c(1), jv(1)),
-            spec(jv(1), c(2), jv(2)),
-            spec(jv(2), c(3), jv(0)),
-        ];
-        assert!(recognize_shape(&cycle, 3).is_none());
-
         // Diamond a→b→d, a→c→d — future ShapeId::Diamond.
         let diamond = [
             spec(jv(0), c(1), jv(1)),

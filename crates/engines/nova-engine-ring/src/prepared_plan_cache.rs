@@ -29,12 +29,12 @@ use crate::product_path::{
     effective_prepared_plan_cache_enabled,
 };
 use crate::scan::{
-    PredicateAdjacency, PreparedKChainImpl, PreparedSpExpansionImpl, PreparedSpObjectScanImpl,
-    PreparedStarImpl, PreparedTwoHopImpl, PreparedWedgeImpl,
+    PredicateAdjacency, PreparedDirectedTriangleImpl, PreparedKChainImpl, PreparedSpExpansionImpl,
+    PreparedSpObjectScanImpl, PreparedStarImpl, PreparedTwoHopImpl, PreparedWedgeImpl,
 };
 use oxigraph_nova_core::{
-    PreparedKChain, PreparedPhysicalOperator, PreparedSpExpansion, PreparedStar, PreparedTwoHop,
-    PreparedWedge,
+    PreparedDirectedTriangle, PreparedKChain, PreparedPhysicalOperator, PreparedSpExpansion,
+    PreparedStar, PreparedTwoHop, PreparedWedge,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -78,6 +78,12 @@ pub enum PhysicalOpKind {
         p2: u64,
         p3: u64,
     },
+    /// Directed 3-cycle: `?a P1 ?b . ?b P2 ?c . ?c P3 ?a`.
+    DirectedTriangle {
+        p1: u64,
+        p2: u64,
+        p3: u64,
+    },
 }
 
 /// Concrete prepared bodies owned by the cache.
@@ -87,6 +93,7 @@ pub enum PreparedPhysicalOp {
     SpExpansion(PreparedSpExpansionImpl),
     KChain(PreparedKChainImpl),
     Star(PreparedStarImpl),
+    DirectedTriangle(PreparedDirectedTriangleImpl),
 }
 
 impl PreparedPhysicalOperator for PreparedPhysicalOp {
@@ -97,6 +104,7 @@ impl PreparedPhysicalOperator for PreparedPhysicalOp {
             PreparedPhysicalOp::SpExpansion(p) => p.execute(emit),
             PreparedPhysicalOp::KChain(p) => p.execute(emit),
             PreparedPhysicalOp::Star(p) => p.execute(emit),
+            PreparedPhysicalOp::DirectedTriangle(p) => p.execute(emit),
         }
     }
 }
@@ -195,6 +203,23 @@ impl PhysicalOpPlanKey {
             snapshot_version,
             graph_id,
             kind: PhysicalOpKind::Star { p1, p2, p3 },
+            adj_mode,
+        }
+    }
+
+    #[inline]
+    pub fn directed_triangle(
+        snapshot_version: u64,
+        graph_id: u8,
+        p1: u64,
+        p2: u64,
+        p3: u64,
+        adj_mode: u8,
+    ) -> Self {
+        Self {
+            snapshot_version,
+            graph_id,
+            kind: PhysicalOpKind::DirectedTriangle { p1, p2, p3 },
             adj_mode,
         }
     }
@@ -541,5 +566,30 @@ pub fn get_or_prepare_star(
     );
     cache_lookup_or_prepare(cache, key, || {
         PreparedStarImpl::prepare(img, p1, p2, p3).map(PreparedPhysicalOp::Star)
+    })
+}
+
+/// Resolve or prepare a directed-triangle plan via the product cache.
+pub fn get_or_prepare_directed_triangle(
+    cache: &Arc<Mutex<PhysicalOpPreparedPlanCache>>,
+    snapshot_version: u64,
+    graph_id: u8,
+    img: Arc<BraidedGraphImage>,
+    p1: u64,
+    p2: u64,
+    p3: u64,
+) -> Option<Box<dyn PreparedDirectedTriangle>> {
+    let mode = effective_pred_adjacency_mode();
+    let key = PhysicalOpPlanKey::directed_triangle(
+        snapshot_version,
+        graph_id,
+        p1,
+        p2,
+        p3,
+        PhysicalOpPlanKey::adj_mode_tag(mode),
+    );
+    cache_lookup_or_prepare(cache, key, || {
+        PreparedDirectedTriangleImpl::prepare(img, p1, p2, p3)
+            .map(PreparedPhysicalOp::DirectedTriangle)
     })
 }

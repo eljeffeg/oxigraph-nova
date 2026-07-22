@@ -32,7 +32,7 @@
 //! The `TrieIterator` interface consumed by LFTJ is implemented by
 //! [`CltjTrieIter`] in `cltj.rs`.
 
-use crate::cltj::{CltjData, CltjSnapshot, VocabRepr, build_cltj_data};
+use crate::cltj::{CltjData, CltjSnapshot, CltjTrieIter, VocabRepr, build_cltj_data};
 use crate::louds::{
     BorrowedL, BorrowedLouds, BorrowedT, LoudsCore, LoudsMemBreakdown, LoudsNav, LoudsTrie,
     t_backend,
@@ -92,14 +92,33 @@ struct RingData<Louds = LoudsTrie, V = Vec<u64>> {
 ///
 /// `bound_fields` — field indices (0=S, 1=P, 2=O) that are bound (constant).
 /// `target_field` — the variable field we are scanning for.
+///
+/// Uses a fixed-size `[u8; 2]` prefix (at most 2 bound fields when targeting
+/// one free field) so hot prepared bodies pay zero heap allocation.
+#[inline]
 fn choose_array_for_lftj(bound_fields: &[usize], target_field: usize) -> SortOrder {
-    let ignored: Vec<usize> = (0..3_usize)
-        .filter(|&f| f != target_field && !bound_fields.contains(&f))
-        .collect();
-    let mut ord = bound_fields.to_vec();
-    ord.push(target_field);
-    ord.extend_from_slice(&ignored);
-    debug_assert_eq!(ord.len(), 3);
+    debug_assert!(bound_fields.len() <= 2);
+    let mut ignored_buf = [0usize; 2];
+    let mut n_ignored = 0usize;
+    for f in 0..3_usize {
+        if f != target_field && !bound_fields.contains(&f) {
+            ignored_buf[n_ignored] = f;
+            n_ignored += 1;
+        }
+    }
+    let mut ord = [0usize; 3];
+    let mut n = 0usize;
+    for &f in bound_fields {
+        ord[n] = f;
+        n += 1;
+    }
+    ord[n] = target_field;
+    n += 1;
+    for &f in ignored_buf.iter().take(n_ignored) {
+        ord[n] = f;
+        n += 1;
+    }
+    debug_assert_eq!(n, 3);
     match (ord[0], ord[1], ord[2]) {
         (0, 1, 2) => SortOrder::Spo,
         (0, 2, 1) => SortOrder::Sop,
@@ -109,6 +128,34 @@ fn choose_array_for_lftj(bound_fields: &[usize], target_field: usize) -> SortOrd
         (2, 0, 1) => SortOrder::Osp,
         _ => unreachable!("invalid field ordering {:?}", ord),
     }
+}
+
+/// Build the ordered list of bound field indices (excluding `target_field`)
+/// into a stack buffer. Returns the filled prefix length (0..=2).
+#[inline]
+fn bound_fields_excluding(
+    s: Option<u64>,
+    p: Option<u64>,
+    o: Option<u64>,
+    target_field: usize,
+) -> ([usize; 2], usize) {
+    let mut bound = [0usize; 2];
+    let mut n = 0usize;
+    // Emit in ascending field order so choose_array_for_lftj gets sorted input
+    // without a separate sort_unstable.
+    if s.is_some() && target_field != 0 {
+        bound[n] = 0;
+        n += 1;
+    }
+    if p.is_some() && target_field != 1 {
+        bound[n] = 1;
+        n += 1;
+    }
+    if o.is_some() && target_field != 2 {
+        bound[n] = 2;
+        n += 1;
+    }
+    (bound, n)
 }
 
 // ── GraphRing ─────────────────────────────────────────────────────────────────
@@ -338,44 +385,44 @@ impl<Louds: LoudsNav + Send + Sync + 'static, V: AsRef<[u64]> + Send + Sync + 's
         o: Option<u64>,
         target_field: usize,
     ) -> Box<dyn TrieIterator> {
-        let data = match &self.data {
-            None => return Box::new(EmptyTrieIter),
-            Some(d) => d,
-        };
+        match self.join_scan_concrete(s, p, o, target_field) {
+            Some(it) => Box::new(it),
+            None => Box::new(EmptyTrieIter),
+        }
+    }
 
-        let mut bound: Vec<usize> = Vec::with_capacity(2);
-        if s.is_some() && target_field != 0 {
-            bound.push(0);
-        }
-        if p.is_some() && target_field != 1 {
-            bound.push(1);
-        }
-        if o.is_some() && target_field != 2 {
-            bound.push(2);
-        }
-        bound.sort_unstable();
-
-        let sort_order = choose_array_for_lftj(&bound, target_field);
+    /// Concrete (non-boxed) join scan for prepared monomorphic shape bodies.
+    ///
+    /// Zero heap allocation in the common path: stack-only bound field lists
+    /// and monomorphic `CltjTrieIter` descent (no `Box` / vtable per hop).
+    /// Returns `None` when the pattern has no matches or the graph is empty.
+    #[inline]
+    pub fn join_scan_concrete(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        target_field: usize,
+    ) -> Option<CltjTrieIter<Louds, V>> {
+        let data = self.data.as_ref()?;
+        let (bound_buf, n_bound) = bound_fields_excluding(s, p, o, target_field);
+        let bound = &bound_buf[..n_bound];
+        let sort_order = choose_array_for_lftj(bound, target_field);
         let field_vals = [s, p, o];
-        let bound_vals: Vec<u64> = bound.iter().map(|&f| field_vals[f].unwrap()).collect();
 
-        let mut it: Box<dyn TrieIterator> = data.cltj.trie_iter(sort_order);
-        if it.at_end() {
-            return it;
-        }
-
-        for val in bound_vals {
-            it.seek(val);
-            if it.at_end() || it.key() != val {
-                return Box::new(EmptyTrieIter);
+        let mut it = data.cltj.trie_iter_concrete(sort_order)?;
+        for i in 0..n_bound {
+            let val = field_vals[bound[i]].unwrap();
+            it.seek_c(val);
+            if it.at_end_c() || it.key_c() != val {
+                return None;
             }
-            it = it.open();
-            if it.at_end() {
-                return Box::new(EmptyTrieIter);
+            it = it.open_concrete()?;
+            if it.at_end_c() {
+                return None;
             }
         }
-
-        it
+        Some(it)
     }
 }
 
