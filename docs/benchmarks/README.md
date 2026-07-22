@@ -60,7 +60,7 @@ here and again at the top of every generated `RESULTS_MEM.md`:
 
 | **Oxigraph** | `serve` run **without** `--location` → pure in-memory storage (not its default RocksDB-backed mode) |
 | **QLever** | Memory-mapped disk index — QLever has no in-memory-only mode. A mandatory warm-up pass is run before every timed measurement so the OS page cache holds the working set resident, giving steady-state RAM-speed reads, consistent with how QLever's own published benchmarks are run. |
-| **Fluree** | Ephemeral container FS (`fluree/server`, no host volume). Default file storage lives inside the container and is destroyed with it — functionally in-memory for this bench. SPARQL is connection-scoped; the harness injects `FROM <ledger>` into each query. |
+| **Fluree** | Ephemeral container FS (`fluree/server`, no host volume). Default file storage lives inside the container and is destroyed with it — functionally in-memory for this bench. **LeafletCache disabled** (`FLUREE_CACHE_MAX_MB=0` / `--cache-max-mb 0`) so measured RSS is not dominated by Fluree's default ~35%-of-RAM cache budget. SPARQL is connection-scoped; the harness injects `FROM <ledger>` into each query. |
 | **RDFox** | In-memory datastore via sandbox/endpoint (`par-complex-nn`). **Optional:** requires a licensed RDFox binary + valid `RDFox.lic`. Not shipped with the repo (`research/` is gitignored); missing install → auto-skip. |
 
 
@@ -128,6 +128,7 @@ than left implicit.
 #   --no-fluree                  skip Fluree
 #   --no-rdfox                   skip RDFox even if a local install is present
 #   NOVA_BACKENDS=...            same as --backends
+#   FLUREE_CACHE_MAX_MB=0        Fluree LeafletCache budget MB (default 0 = off)
 #   QUERY_TIMEOUT_S=60
 #   QLEVER_BIN_DIR=/path/to/qlever/build
 #   RDFOX_BIN=path/to/RDFox
@@ -202,7 +203,7 @@ All charts are labeled **lower is better**.
 | **Nova (ring)** | `nova_serve --backend ring --location <dir>` — WAL + snapshot (same product surface). CSV id: `nova-ring` |
 | **Oxigraph** | `serve --location <dir>` — RocksDB |
 | **QLever** | mmap disk index (unchanged) |
-| **Fluree** | `fluree/server --storage-path` with host volume mount |
+| **Fluree** | `fluree/server --storage-path` with host volume mount; LeafletCache disabled (`cache_max_mb=0`) |
 
 RDFox is not included on disk in this harness (mem-only sandbox path).
 Nova disk footprints are measured via `du -sk` of each backend's `--location` tree.
@@ -216,6 +217,10 @@ Nova disk footprints are measured via `du -sk` of each backend's `--location` tr
   (Fluree has no default dataset on the connection).
 - Mem: container with no host volume (ephemeral).
 - Disk: `-v <host>:/var/lib/fluree --storage-path /var/lib/fluree`.
+- **Cache:** harness sets `FLUREE_CACHE_MAX_MB=0` and `--cache-max-mb 0` (LeafletCache
+  disabled). Stock Fluree defaults to ~35% of host RAM on ≥8 GB machines, which
+  inflated RSS to multi‑GiB on an otherwise small dataset. Override with
+  `FLUREE_CACHE_MAX_MB=<n>` if a small non-zero cache is desired.
 
 ## RDFox notes
 

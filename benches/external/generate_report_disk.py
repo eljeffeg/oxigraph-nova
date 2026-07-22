@@ -272,8 +272,10 @@ def main():
     if has_fluree:
         lines.append(
             "| **Fluree** | `fluree/server --storage-path` (host volume) | "
-            "File-backed persistent ledger. SPARQL is connection-scoped; the "
-            "harness injects `FROM <ledger>` into each query. |"
+            "File-backed persistent ledger. LeafletCache disabled "
+            "(`FLUREE_CACHE_MAX_MB=0` / `--cache-max-mb 0`) so RSS is not dominated "
+            "by Fluree's default ~35%-of-RAM cache budget. SPARQL is connection-scoped; "
+            "the harness injects `FROM <ledger>` into each query. |"
         )
     lines.append(
         "| **RDFox** | N/A (In-memory only) | RDFox is not disk-backed and "
@@ -403,7 +405,7 @@ def main():
         elif eng == "fluree" and args.fluree_mem:
             lines.append(
                 f"| {label} | {args.fluree_mem} | "
-                "Container memory (file-backed ledger) |"
+                "Container memory (file-backed ledger, cache_max_mb=0) |"
             )
 
     mem_vals = {}

@@ -15,6 +15,8 @@
 #     - Oxigraph: serve WITHOUT --location (pure in-memory).
 #     - QLever: mmap index + warm-up (only mode).
 #     - Fluree: fluree/server Docker, no host volume (ephemeral container FS).
+#               LeafletCache disabled (FLUREE_CACHE_MAX_MB=0 / --cache-max-mb 0)
+#               so RSS is not dominated by the default ~35%-of-RAM cache budget.
 #     - RDFox: optional; sandbox/daemon in-memory when binary+license present
 #       (research/ is gitignored — missing install auto-skips with a note).
 #   Disk:
@@ -22,7 +24,7 @@
 #     - Nova (ring): --location WAL/snapshot path (RingStore; same product surface).
 #     - Oxigraph: serve --location (RocksDB).
 #     - QLever: same mmap index.
-#     - Fluree: --storage-path with host volume mount.
+#     - Fluree: --storage-path with host volume mount (same cache_max_mb=0).
 #
 # Usage:
 #   ./run_comparison.sh [OPTIONS] [ENTITIES] [ITERS] [WARMUP] [RESULT_FILE]
@@ -42,6 +44,8 @@
 #   NOVA_BACKENDS=both|louds|ring   Same as --backends (default: both)
 #   NOVA_RING_HUFFMAN=0             A/B only: plain QWT256 C_p (ring-backend-qwt).
 #                                  Default / unset / 1 = Huffman C_p (product).
+#   FLUREE_CACHE_MAX_MB=0           Fluree LeafletCache budget in MB (default 0 =
+#                                  disabled; stock Fluree defaults to ~35% of RAM).
 #   QUERY_TIMEOUT_S=60
 #   QLEVER_BIN_DIR=/path/to/qlever/build
 #   RDFOX_BIN=path/to/RDFox         (optional; tried in order: $RDFOX_BIN,
@@ -182,6 +186,9 @@ fi
 
 FLUREE_LEDGER="bench:main"
 FLUREE_CPU_LOG="/tmp/fluree_${MODE}_cpu_samples.txt"
+# Disable Fluree's default host-relative LeafletCache (~35% of RAM on >=8GB hosts).
+# Override with FLUREE_CACHE_MAX_MB=<n> if a small non-zero cache is desired.
+FLUREE_CACHE_MAX_MB="${FLUREE_CACHE_MAX_MB:-0}"
 RDFOX_CPU_LOG="/tmp/rdfox_${MODE}_cpu_samples.txt"
 # RDFox is fully optional. The default path under research/applications/ is
 # gitignored (local vendor tree only) — clones without research/ simply skip.
@@ -733,14 +740,16 @@ if [ "$RUN_FLUREE" = "1" ]; then
   FLUREE_LOAD_START=$(date +%s.%N)
   docker rm -f "$FLUREE_DOCKER_NAME" >/dev/null 2>&1 || true
   if [ "$MODE" = "disk" ]; then
-    echo "  Starting Fluree (file-backed --storage-path)..."
+    echo "  Starting Fluree (file-backed --storage-path, cache_max_mb=${FLUREE_CACHE_MAX_MB})..."
     docker run -d --name "$FLUREE_DOCKER_NAME" -p "$FLUREE_PORT:8090" \
+      -e "FLUREE_CACHE_MAX_MB=$FLUREE_CACHE_MAX_MB" \
       -v "$FLUREE_LOCATION_HOST:/var/lib/fluree" fluree/server:latest \
-      --storage-path /var/lib/fluree >/dev/null
+      --storage-path /var/lib/fluree --cache-max-mb "$FLUREE_CACHE_MAX_MB" >/dev/null
   else
-    echo "  Starting Fluree (ephemeral container, no host volume)..."
+    echo "  Starting Fluree (ephemeral container, cache_max_mb=${FLUREE_CACHE_MAX_MB})..."
     docker run -d --name "$FLUREE_DOCKER_NAME" -p "$FLUREE_PORT:8090" \
-      fluree/server:latest >/dev/null
+      -e "FLUREE_CACHE_MAX_MB=$FLUREE_CACHE_MAX_MB" \
+      fluree/server:latest --cache-max-mb "$FLUREE_CACHE_MAX_MB" >/dev/null
   fi
   wait_ready "http://localhost:$FLUREE_PORT/health" 180
   curl -s -X POST "http://localhost:$FLUREE_PORT/v1/fluree/create" \
