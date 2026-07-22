@@ -230,10 +230,9 @@ def main():
         "resident — consistent with QLever's published methodology. |",
         "| **Fluree** | Ephemeral container FS (`fluree/server`, no host volume) | "
         "Default file storage lives inside the container and is destroyed with it "
-        "— functionally in-memory for this bench. LeafletCache disabled via "
-        "`FLUREE_CACHE_MAX_MB=0` (env; `server run` rejects `--cache-max-mb`) so "
-        "RSS is not dominated by Fluree's default ~35%-of-RAM cache budget. "
-        "SPARQL is connection-scoped; the "
+        "— functionally in-memory for this bench. Memory footprint is **dynamic "
+        "(not measured)**: LeafletCache/import budgets are host-relative and not "
+        "comparable to pure-heap engines. SPARQL is connection-scoped; the "
         "harness injects `FROM <ledger>` into each query (addressing only). |",
         "| **RDFox** | In-memory datastore (sandbox/daemon, `parallel-nn`) | "
         "Optional comparator: licensed RDFox binary + `.lic` (auto-skipped when "
@@ -363,10 +362,12 @@ def main():
                 f"| {label} | {args.qlever_rss_kb / 1024:.1f} MiB | "
                 "Incl. memory-mapped index pages |"
             )
-        elif eng == "fluree" and args.fluree_mem:
+        elif eng == "fluree":
+            # Fluree RSS is host-relative (LeafletCache / import budgets) and not
+            # comparable to the other engines; harness does not measure it.
             lines.append(
-                f"| {label} | {args.fluree_mem} | "
-                "Ephemeral container FS (cache_max_mb=0) |"
+                f"| {label} | dynamic (not measured) | "
+                "Ephemeral container FS; cache/import budgets host-relative |"
             )
         elif eng == "rdfox" and eng in rss_kb and rss_kb[eng] is not None:
             lines.append(
@@ -381,8 +382,7 @@ def main():
             mem_vals[eng] = parse_mem_string(args.oxigraph_mem)
         elif eng == "qlever" and args.qlever_rss_kb is not None:
             mem_vals[eng] = args.qlever_rss_kb / 1024
-        elif eng == "fluree" and args.fluree_mem:
-            mem_vals[eng] = parse_mem_string(args.fluree_mem)
+        # fluree: intentionally omitted from memory chart (dynamic / not measured)
 
     lines.append("")
     lines.append(

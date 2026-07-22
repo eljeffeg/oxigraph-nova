@@ -217,11 +217,13 @@ Nova disk footprints are measured via `du -sk` of each backend's `--location` tr
   (Fluree has no default dataset on the connection).
 - Mem: container with no host volume (ephemeral).
 - Disk: `-v <host>:/var/lib/fluree --storage-path /var/lib/fluree`.
-- **Cache:** harness sets `FLUREE_CACHE_MAX_MB=0` (Docker env only). Do **not** pass
-  `--cache-max-mb` to `fluree server run` — clap rejects it and the container exits
-  with code 2 (that was why earlier runs still reported ~8 GiB). Stock Fluree defaults
-  to ~35% of host RAM on ≥8 GB machines. Override with `FLUREE_CACHE_MAX_MB=<n>` if a
-  small non-zero cache is desired.
+- **Cache / memory:** harness sets `FLUREE_CACHE_MAX_MB=0` (Docker env only — do
+  **not** pass `--cache-max-mb` to `fluree server run`; clap rejects it). **RSS is
+  not recorded** for Fluree: LeafletCache and bulk-import budgets are host-relative,
+  so a single footprint number is not comparable to Nova/Oxigraph/QLever/RDFox.
+  Reports show `dynamic (not measured)` instead. Latency and load time are still
+  collected. Override cache with `FLUREE_CACHE_MAX_MB=<n>` if needed for local runs.
+
 
 ## RDFox notes
 

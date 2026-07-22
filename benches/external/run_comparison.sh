@@ -898,10 +898,12 @@ if [ "$RUN_FLUREE" = "1" ]; then
     "http://localhost:$FLUREE_PORT/v1/fluree/query" \
     "Accept: application/sparql-results+json" \
     "FROM <$FLUREE_LEDGER>"
-  FLUREE_MEM=$(docker stats "$FLUREE_STATS_NAME" --no-stream --format '{{.MemUsage}}' | awk -F'/' '{print $1}' | tr -d ' ')
+  # Do not record Fluree RSS: LeafletCache / import budgets are host-relative and
+  # dwarf the dataset; a single number is misleading. Report as dynamic instead.
+  FLUREE_MEM=""
   stop_cpu_sampler
   FLUREE_CPU_PCT=$(avg_cpu "$FLUREE_CPU_LOG")
-  echo "  Fluree mem=${FLUREE_MEM} cpu=${FLUREE_CPU_PCT}%"
+  echo "  Fluree mem=dynamic (not measured) cpu=${FLUREE_CPU_PCT}%"
 fi
 
 # RDFox query phase
@@ -963,7 +965,7 @@ if [ "$MODE" = "disk" ]; then
     echo "QLever mem:    ${QLEVER_RSS_KB} KB | CPU ${QLEVER_CPU_PCT}% | disk ${QLEVER_DISK_KB} KB"
   fi
   if [ "$RUN_FLUREE" = "1" ]; then
-    echo "Fluree MEM:    ${FLUREE_MEM} | CPU ${FLUREE_CPU_PCT}% | disk ${FLUREE_DISK_KB:-0} KB | load ${FLUREE_LOAD_S}s"
+    echo "Fluree MEM:    dynamic (not measured) | CPU ${FLUREE_CPU_PCT}% | disk ${FLUREE_DISK_KB:-0} KB | load ${FLUREE_LOAD_S}s"
   fi
 
   set -- \
@@ -1002,7 +1004,6 @@ if [ "$MODE" = "disk" ]; then
   fi
   if [ "$RUN_FLUREE" = "1" ]; then
     set -- "$@" \
-      --fluree-mem "$FLUREE_MEM" \
       --fluree-cpu-pct "$FLUREE_CPU_PCT" \
       --fluree-load-s "$FLUREE_LOAD_S" \
       --fluree-disk-kb "${FLUREE_DISK_KB:-0}"
@@ -1025,7 +1026,7 @@ else
     echo "Nova (ring):   ${NOVA_RING_RSS_KB} KB | CPU ${NOVA_RING_CPU_PCT}% | load ${NOVA_RING_LOAD_S}s"
   fi
   if [ "$RUN_FLUREE" = "1" ]; then
-    echo "Fluree MEM:    ${FLUREE_MEM} | avg CPU: ${FLUREE_CPU_PCT}% | load ${FLUREE_LOAD_S}s"
+    echo "Fluree MEM:    dynamic (not measured) | avg CPU: ${FLUREE_CPU_PCT}% | load ${FLUREE_LOAD_S}s"
   fi
   if [ "$RUN_RDFOX" = "1" ] && [ -n "$RDFOX_RSS_KB" ]; then
     echo "RDFox mem:     ${RDFOX_RSS_KB} KB | avg CPU: ${RDFOX_CPU_PCT}% | load ${RDFOX_LOAD_S}s"
@@ -1064,7 +1065,6 @@ else
   fi
   if [ "$RUN_FLUREE" = "1" ]; then
     set -- "$@" \
-      --fluree-mem "$FLUREE_MEM" \
       --fluree-cpu-pct "$FLUREE_CPU_PCT" \
       --fluree-load-s "$FLUREE_LOAD_S"
   fi

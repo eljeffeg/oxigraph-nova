@@ -272,10 +272,9 @@ def main():
     if has_fluree:
         lines.append(
             "| **Fluree** | `fluree/server --storage-path` (host volume) | "
-            "File-backed persistent ledger. LeafletCache disabled via "
-            "`FLUREE_CACHE_MAX_MB=0` (env; `server run` rejects `--cache-max-mb`) so "
-            "RSS is not dominated by Fluree's default ~35%-of-RAM cache budget. "
-            "SPARQL is connection-scoped; "
+            "File-backed persistent ledger. Memory footprint is **dynamic "
+            "(not measured)**: LeafletCache/import budgets are host-relative and "
+            "not comparable to pure-heap engines. SPARQL is connection-scoped; "
             "the harness injects `FROM <ledger>` into each query. |"
         )
     lines.append(
@@ -403,10 +402,10 @@ def main():
                 f"| {label} | {args.qlever_rss_kb / 1024:.1f} MiB | "
                 "Incl. memory-mapped index pages |"
             )
-        elif eng == "fluree" and args.fluree_mem:
+        elif eng == "fluree":
             lines.append(
-                f"| {label} | {args.fluree_mem} | "
-                "Container memory (file-backed ledger, cache_max_mb=0) |"
+                f"| {label} | dynamic (not measured) | "
+                "File-backed ledger; cache/import budgets host-relative |"
             )
 
     mem_vals = {}
@@ -417,8 +416,7 @@ def main():
             mem_vals[eng] = parse_mem_string(args.oxigraph_mem)
         elif eng == "qlever" and args.qlever_rss_kb is not None:
             mem_vals[eng] = args.qlever_rss_kb / 1024
-        elif eng == "fluree" and args.fluree_mem:
-            mem_vals[eng] = parse_mem_string(args.fluree_mem)
+        # fluree: intentionally omitted from memory chart (dynamic / not measured)
 
     lines.append("")
     lines.append(
