@@ -116,6 +116,13 @@ rand = "0.10"   # SPARQL RAND() built-in
 # registry, fulltext writer, reasoning overlay, MemoryStore).
 parking_lot = "0.12"
 
+# ── Fast hashing ────────────────────────────────────────────────────────────
+# FxHashMap/FxHashSet for hot-path join/path maps keyed by integers or short
+# already-hashed values. ~2–4× faster than std SipHash for these key types;
+# not DoS-resistant (fine for trusted in-process query state).
+rustc-hash = "2"
+
+
 # ── Full-text search ────────────────────────────────────────────────────────
 # Opt-in via nova-engine-ring's `fulltext` cargo feature (crates/core/nova-fulltext).
 # Zero-cost when the feature is disabled: no crate in the default build graph

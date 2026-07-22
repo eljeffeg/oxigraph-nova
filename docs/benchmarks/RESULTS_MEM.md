@@ -32,12 +32,12 @@ Wall-clock time to load the identical N-Triples dataset and become ready to serv
 
 | Engine | Load time |
 |---|---|
-| Nova (louds) | 2.16 s |
-| Nova (ring) | 2.16 s |
-| Oxigraph | 1.98 s |
-| QLever | 3.04 s |
-| Fluree | 4.95 s |
-| RDFox | 1.26 s |
+| Nova (louds) | 2.15 s |
+| Nova (ring) | 2.17 s |
+| Oxigraph | 2.05 s |
+| QLever | 3.49 s |
+| Fluree | 5.20 s |
+| RDFox | 1.28 s |
 
 
 
@@ -47,11 +47,11 @@ Nova/QLever figures are macOS `vmmap -summary`'s "Physical footprint" (stable, a
 
 | Engine | Memory | Storage model |
 |---|---|---|
-| Nova (louds) | 91.3 MiB | Pure heap (LOUDS) |
+| Nova (louds) | 91.4 MiB | Pure heap (LOUDS) |
 | Nova (ring) | 74.1 MiB | Pure heap (Ring) |
-| Oxigraph | 338.6MiB | Pure heap (in-memory mode) |
-| QLever | 85.3 MiB | Incl. memory-mapped index pages |
-| Fluree | 5.497GiB | Ephemeral container FS |
+| Oxigraph | 338.4MiB | Pure heap (in-memory mode) |
+| QLever | 89.9 MiB | Incl. memory-mapped index pages |
+| Fluree | 7.873GiB | Ephemeral container FS |
 | RDFox | 69.3 MiB | Pure heap (RDFox) |
 
 
@@ -60,12 +60,12 @@ Nova/QLever figures are macOS `vmmap -summary`'s "Physical footprint" (stable, a
 
 | Engine | Avg CPU % |
 |---|---|
-| Nova (louds) | 43.6% |
-| Nova (ring) | 51.0% |
-| Oxigraph | 81.5% |
-| QLever | 60.4% |
-| Fluree | 88.0% |
-| RDFox | 57.6% |
+| Nova (louds) | 42.3% |
+| Nova (ring) | 53.4% |
+| Oxigraph | 81.8% |
+| QLever | 58.9% |
+| Fluree | 89.6% |
+| RDFox | 59.7% |
 
 
 
@@ -81,8 +81,8 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 44.34 | 37.08 | 45.38 | 93.02 | 111.07 | 15.74 |
-| p95 (ms) | 46.41 | 40.05 | 46.16 | 94.55 | 119.66 | 18.55 |
+| p50 (ms) | 47.71 | 36.27 | 45.83 | 94.26 | 111.13 | 18.37 |
+| p95 (ms) | 52.85 | 38.02 | 46.67 | 100.45 | 120.64 | 19.40 |
 
 
 
@@ -90,8 +90,8 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 1.47 | 1.32 | 2.41 | 2.70 | 6.34 | 0.56 |
-| p95 (ms) | 1.51 | 1.72 | 3.56 | 2.72 | 7.22 | 0.79 |
+| p50 (ms) | 1.80 | 1.25 | 2.57 | 2.71 | 7.82 | 0.51 |
+| p95 (ms) | 2.04 | 1.47 | 2.82 | 2.87 | 10.39 | 0.56 |
 
 
 
@@ -99,8 +99,8 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 0.67 | 0.72 | 2.45 | 1.20 | 4.09 | 0.36 |
-| p95 (ms) | 0.75 | 0.79 | 4.04 | 1.27 | 5.53 | 0.73 |
+| p50 (ms) | 0.82 | 0.72 | 3.56 | 1.09 | 3.46 | 0.36 |
+| p95 (ms) | 0.90 | 0.76 | 4.80 | 1.16 | 5.61 | 0.46 |
 
 
 
@@ -108,8 +108,8 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 13.28 | 14.60 | 16.56 | 37.85 | 44.08 | 4.81 |
-| p95 (ms) | 14.58 | 15.72 | 17.40 | 38.75 | 46.16 | 5.25 |
+| p50 (ms) | 14.81 | 14.29 | 17.26 | 38.65 | 44.36 | 4.90 |
+| p95 (ms) | 15.65 | 14.76 | 18.02 | 40.04 | 46.98 | 9.43 |
 
 
 
@@ -117,8 +117,8 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 455.30 | 511.96 | 510.93 | 1261.42 | 1413.05 | 138.04 |
-| p95 (ms) | 461.65 | 519.65 | 557.31 | 1267.30 | 1888.28 | 141.21 |
+| p50 (ms) | 463.12 | 510.31 | 512.52 | 1285.52 | 1447.65 | 137.92 |
+| p95 (ms) | 475.19 | 519.40 | 522.28 | 1325.39 | 2587.68 | 147.21 |
 
 
 
@@ -126,8 +126,8 @@ One sub-section per query, with each engine as a column and each percentile (p50
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
-| p50 (ms) | 222.28 | 237.54 | 339.40 | 421.72 | 630.00 | 72.53 |
-| p95 (ms) | 232.61 | 240.60 | 343.74 | 497.54 | 652.38 | 76.98 |
+| p50 (ms) | 224.57 | 233.17 | 335.95 | 430.94 | 642.90 | 74.47 |
+| p95 (ms) | 233.23 | 237.14 | 341.06 | 502.03 | 650.10 | 83.95 |
 
 
 
@@ -140,58 +140,58 @@ One sub-section per query, with each engine as a column and each statistic (n, m
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 44.62 | 37.27 | 45.24 | 93.07 | 112.12 | 15.98 |
-| stddev (ms) | 1.14 | 1.72 | 0.65 | 1.01 | 4.78 | 1.83 |
-| min (ms) | 43.02 | 35.42 | 44.38 | 91.76 | 107.34 | 13.44 |
-| max (ms) | 46.65 | 41.18 | 46.41 | 94.92 | 123.79 | 19.11 |
+| mean (ms) | 47.21 | 36.51 | 45.95 | 94.97 | 112.77 | 18.06 |
+| stddev (ms) | 3.88 | 1.00 | 0.51 | 3.38 | 5.28 | 1.26 |
+| min (ms) | 43.13 | 35.22 | 45.29 | 92.46 | 106.74 | 15.74 |
+| max (ms) | 56.36 | 38.61 | 46.70 | 104.08 | 121.59 | 19.75 |
 
 ### 2join
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 1.46 | 1.39 | 2.61 | 2.68 | 6.50 | 0.60 |
-| stddev (ms) | 0.05 | 0.20 | 0.54 | 0.06 | 0.45 | 0.11 |
-| min (ms) | 1.35 | 1.20 | 2.14 | 2.54 | 5.83 | 0.50 |
-| max (ms) | 1.53 | 1.88 | 3.87 | 2.73 | 7.51 | 0.82 |
+| mean (ms) | 1.85 | 1.30 | 2.56 | 2.70 | 8.26 | 0.51 |
+| stddev (ms) | 0.11 | 0.10 | 0.17 | 0.13 | 1.29 | 0.04 |
+| min (ms) | 1.72 | 1.21 | 2.32 | 2.47 | 7.02 | 0.46 |
+| max (ms) | 2.07 | 1.47 | 2.89 | 2.91 | 11.02 | 0.57 |
 
 ### feature_lookup
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 0.67 | 0.72 | 2.43 | 1.19 | 4.05 | 0.45 |
-| stddev (ms) | 0.05 | 0.05 | 1.16 | 0.07 | 1.28 | 0.16 |
-| min (ms) | 0.60 | 0.64 | 1.02 | 1.05 | 2.32 | 0.33 |
-| max (ms) | 0.78 | 0.81 | 4.24 | 1.28 | 5.64 | 0.80 |
+| mean (ms) | 0.82 | 0.70 | 3.77 | 1.08 | 3.82 | 0.37 |
+| stddev (ms) | 0.05 | 0.05 | 0.63 | 0.07 | 1.23 | 0.06 |
+| min (ms) | 0.74 | 0.62 | 3.21 | 0.98 | 2.54 | 0.32 |
+| max (ms) | 0.91 | 0.76 | 5.17 | 1.17 | 5.81 | 0.53 |
 
 ### star_with_features
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 13.48 | 14.76 | 16.69 | 38.00 | 44.44 | 4.79 |
-| stddev (ms) | 0.65 | 0.60 | 0.44 | 0.53 | 0.98 | 0.31 |
-| min (ms) | 12.98 | 13.99 | 16.36 | 37.25 | 43.50 | 4.32 |
-| max (ms) | 15.11 | 16.02 | 17.86 | 38.88 | 46.80 | 5.26 |
+| mean (ms) | 14.91 | 14.36 | 17.22 | 38.67 | 44.85 | 5.64 |
+| stddev (ms) | 0.50 | 0.30 | 0.57 | 0.85 | 1.32 | 2.36 |
+| min (ms) | 14.11 | 13.94 | 16.10 | 37.75 | 43.87 | 4.24 |
+| max (ms) | 15.98 | 14.80 | 18.15 | 40.44 | 48.31 | 12.20 |
 
 ### path_2hop
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 455.19 | 512.60 | 517.71 | 1262.23 | 1475.93 | 138.13 |
-| stddev (ms) | 4.63 | 5.32 | 26.28 | 2.95 | 247.12 | 2.21 |
-| min (ms) | 448.47 | 506.85 | 503.54 | 1259.53 | 1322.10 | 135.37 |
-| max (ms) | 461.77 | 521.64 | 591.77 | 1269.36 | 2148.06 | 142.58 |
+| mean (ms) | 463.57 | 510.16 | 512.90 | 1288.45 | 1648.97 | 139.81 |
+| stddev (ms) | 8.29 | 6.16 | 6.37 | 21.44 | 550.62 | 4.51 |
+| min (ms) | 450.83 | 499.81 | 504.76 | 1267.75 | 1349.39 | 134.87 |
+| max (ms) | 476.44 | 522.97 | 526.96 | 1341.38 | 3137.28 | 150.00 |
 
 ### triangle
 
 | Metric | Nova (louds) | Nova (ring) | Oxigraph | QLever | Fluree | RDFox |
 |---|---|---|---|---|---|---|
 | n | 10 | 10 | 10 | 10 | 10 | 10 |
-| mean (ms) | 223.38 | 237.02 | 339.21 | 434.98 | 634.13 | 72.43 |
-| stddev (ms) | 5.53 | 2.84 | 3.28 | 40.83 | 11.98 | 2.97 |
-| min (ms) | 216.69 | 231.14 | 333.15 | 417.18 | 619.80 | 68.95 |
-| max (ms) | 236.05 | 241.69 | 346.11 | 550.56 | 656.80 | 77.39 |
+| mean (ms) | 225.34 | 233.07 | 335.99 | 442.54 | 641.41 | 75.75 |
+| stddev (ms) | 5.63 | 3.07 | 3.39 | 38.71 | 8.90 | 4.86 |
+| min (ms) | 217.83 | 229.05 | 331.88 | 420.99 | 621.11 | 70.67 |
+| max (ms) | 235.35 | 238.21 | 342.50 | 550.99 | 650.83 | 83.96 |
 

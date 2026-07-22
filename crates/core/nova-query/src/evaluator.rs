@@ -33,6 +33,7 @@ use oxsdatatypes::{
     Float as XsdFloat, Integer as XsdInt, Time as XsdTime,
 };
 use regex::Regex;
+use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::Query;
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, Function, GraphPattern as GP,
@@ -40,8 +41,18 @@ use spargebra::algebra::{
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
+
+/// Content fingerprint for path-pair dedup. Uses FxHasher (non-cryptographic)
+/// — fine for trusted in-process query state and much cheaper than SipHash.
+#[inline]
+fn term_fp(t: &Term) -> u64 {
+    let mut h = rustc_hash::FxHasher::default();
+    t.hash(&mut h);
+    h.finish()
+}
 
 /// Short label for a query's top-level kind, used as a `tracing` span field
 /// in `Evaluator::evaluate` (`SELECT` / `ASK` / `CONSTRUCT` / `DESCRIBE`).
@@ -2245,26 +2256,20 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             PPE::Sequence(left, right) => {
                 let lp = self.path_pairs(left, ag)?;
                 let rp = self.path_pairs(right, ag)?;
-                // Index right by intermediate-node term content (no Display).
-                let mut right_idx: HashMap<Term, Vec<Arc<Term>>> = HashMap::new();
+                // Key by Arc<Term> — Hash/Eq are content-based via Term, so
+                // lookups stay correct while inserts only bump the refcount
+                // (no deep string clone of the intermediate node).
+                let mut right_idx: FxHashMap<Arc<Term>, Vec<Arc<Term>>> = FxHashMap::default();
                 for (m, o) in rp {
-                    right_idx.entry(m.as_ref().clone()).or_default().push(o);
+                    right_idx.entry(m).or_default().push(o);
                 }
                 let mut result = Vec::new();
-                let mut seen: std::collections::HashSet<(u64, u64)> =
-                    std::collections::HashSet::new();
-                fn fp(t: &Term) -> u64 {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut h = DefaultHasher::new();
-                    t.hash(&mut h);
-                    h.finish()
-                }
+                let mut seen: FxHashSet<(u64, u64)> = FxHashSet::default();
                 for (s, m) in lp {
-                    if let Some(os) = right_idx.get(m.as_ref()) {
-                        let sh = fp(&s);
+                    if let Some(os) = right_idx.get(&m) {
+                        let sh = term_fp(&s);
                         for o in os {
-                            if seen.insert((sh, fp(o))) {
+                            if seen.insert((sh, term_fp(o))) {
                                 result.push((Arc::clone(&s), Arc::clone(o)));
                             }
                         }
@@ -2275,36 +2280,20 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             PPE::Alternative(left, right) => {
                 let mut pairs = self.path_pairs(left, ag)?;
                 pairs.extend(self.path_pairs(right, ag)?);
-                let mut seen: std::collections::HashSet<(u64, u64)> =
-                    std::collections::HashSet::new();
-                fn fp(t: &Term) -> u64 {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut h = DefaultHasher::new();
-                    t.hash(&mut h);
-                    h.finish()
-                }
-                pairs.retain(|(s, o)| seen.insert((fp(s), fp(o))));
+                let mut seen: FxHashSet<(u64, u64)> = FxHashSet::default();
+                pairs.retain(|(s, o)| seen.insert((term_fp(s), term_fp(o))));
                 Ok(pairs)
             }
             PPE::ZeroOrOne(inner) => {
                 let mut pairs = self.path_pairs(inner, ag)?;
-                let mut seen: std::collections::HashSet<(u64, u64)> =
-                    std::collections::HashSet::new();
-                fn fp(t: &Term) -> u64 {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut h = DefaultHasher::new();
-                    t.hash(&mut h);
-                    h.finish()
-                }
+                let mut seen: FxHashSet<(u64, u64)> = FxHashSet::default();
                 for (s, o) in &pairs {
-                    seen.insert((fp(s), fp(o)));
+                    seen.insert((term_fp(s), term_fp(o)));
                 }
                 // Add (x, x) identity for all graph nodes
                 for node in self.all_terms(ag)? {
                     let arc = Arc::new(node);
-                    let h = fp(&arc);
+                    let h = term_fp(&arc);
                     if seen.insert((h, h)) {
                         pairs.push((Arc::clone(&arc), arc));
                     }
@@ -2320,28 +2309,20 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
                     object: PatternTerm::Variable,
                     graph: ag.clone(),
                 };
-                let pred_set: std::collections::HashSet<String> =
-                    preds.iter().map(|n| n.as_str().to_string()).collect();
+                let pred_set: FxHashSet<&str> = preds.iter().map(|n| n.as_str()).collect();
                 let mut pairs = Vec::new();
-                let mut seen: std::collections::HashSet<(u64, u64)> =
-                    std::collections::HashSet::new();
-                fn fp(t: &Term) -> u64 {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut h = DefaultHasher::new();
-                    t.hash(&mut h);
-                    h.finish()
-                }
+                let mut seen: FxHashSet<(u64, u64)> = FxHashSet::default();
                 for qr in self.dataset.find_quads(&qp)? {
                     let q = qr?;
                     let skip = matches!(q.predicate.as_ref(),
                         Term::NamedNode(p) if pred_set.contains(p.as_str()));
-                    if !skip && seen.insert((fp(&q.subject), fp(&q.object))) {
+                    if !skip && seen.insert((term_fp(&q.subject), term_fp(&q.object))) {
                         pairs.push((q.subject, q.object));
                     }
                 }
                 Ok(pairs)
             }
+
             #[allow(unreachable_patterns)]
             _ => Ok(vec![]),
         }
@@ -2366,42 +2347,28 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
         }
         let direct = self.path_pairs(path, ag)?;
 
-        // Forward adjacency keyed by Term content (Hash+Eq) — no Display
-        // formatting / String allocations on the BFS hot path.
-        let mut adj: HashMap<Term, Vec<Arc<Term>>> = HashMap::new();
-        let mut term_map: HashMap<Term, Arc<Term>> = HashMap::new();
+        // Forward adjacency keyed by Arc<Term> — Hash/Eq are content-based via
+        // Term, so lookups stay correct while inserts only bump the refcount
+        // (no deep string clone of the node).
+        let mut adj: FxHashMap<Arc<Term>, Vec<Arc<Term>>> = FxHashMap::default();
+        let mut term_map: FxHashMap<Arc<Term>, ()> = FxHashMap::default();
 
         for (s, o) in &direct {
-            adj.entry(s.as_ref().clone())
-                .or_default()
-                .push(Arc::clone(o));
-            term_map
-                .entry(s.as_ref().clone())
-                .or_insert_with(|| Arc::clone(s));
-            term_map
-                .entry(o.as_ref().clone())
-                .or_insert_with(|| Arc::clone(o));
+            adj.entry(Arc::clone(s)).or_default().push(Arc::clone(o));
+            term_map.entry(Arc::clone(s)).or_insert(());
+            term_map.entry(Arc::clone(o)).or_insert(());
         }
 
         // For ZeroOrMore we start from ALL nodes; for OneOrMore just path endpoints.
         let start_nodes: Vec<Arc<Term>> = if include_identity {
             self.all_terms(ag)?.into_iter().map(Arc::new).collect()
         } else {
-            term_map.values().cloned().collect()
+            term_map.into_keys().collect()
         };
 
         let mut result: Vec<(Arc<Term>, Arc<Term>)> = Vec::new();
-        // Pair dedup by content hash of (start, nbr) — avoids format! strings.
-        let mut global_seen: std::collections::HashSet<(u64, u64)> =
-            std::collections::HashSet::new();
-
-        fn term_fp(t: &Term) -> u64 {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            t.hash(&mut h);
-            h.finish()
-        }
+        // Pair dedup by content fingerprint of (start, nbr) — avoids format! strings.
+        let mut global_seen: FxHashSet<(u64, u64)> = FxHashSet::default();
 
         for start in &start_nodes {
             let start_h = term_fp(start);
@@ -2412,14 +2379,14 @@ impl<'a, D: Dataset> Evaluator<'a, D> {
             }
 
             // BFS over Arc terms, tracking visited by content fingerprint.
-            let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut visited: FxHashSet<u64> = FxHashSet::default();
             visited.insert(start_h);
             let mut queue: std::collections::VecDeque<Arc<Term>> =
                 std::collections::VecDeque::new();
             queue.push_back(Arc::clone(start));
 
             while let Some(curr) = queue.pop_front() {
-                if let Some(neighbors) = adj.get(curr.as_ref()) {
+                if let Some(neighbors) = adj.get(&curr) {
                     for nbr in neighbors {
                         let nh = term_fp(nbr);
                         if visited.insert(nh) {

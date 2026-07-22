@@ -27,8 +27,12 @@ use crate::dataset::{Dataset, GraphSelector};
 use crate::options::CancellationToken;
 use anyhow::Result;
 use oxrdf::{NamedNode, Term};
+use rustc_hash::FxHashSet;
 use spargebra::algebra::PropertyPathExpression as PPE;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
+
+// Prefer FxHashSet for u64 / (u64,u64) path-BFS sets (non-cryptographic keys).
+// Keep std HashSet available for the few sites that still use it via full path.
 
 /// Returns `true` and short-circuits with a cancellation error if `cancellation`
 /// is set and has been flipped. Shared by every BFS/traversal loop below.
@@ -124,7 +128,7 @@ pub fn ring_all_node_ids<D: Dataset>(dataset: &D, ag: &GraphSelector) -> Option<
     let mut s_iter = dataset.lftj_join_scan(None, None, None, 0, ag)?;
     let mut o_iter = dataset.lftj_join_scan(None, None, None, 2, ag)?;
 
-    let mut ids: HashSet<u64> = HashSet::new();
+    let mut ids: FxHashSet<u64> = FxHashSet::default();
     while !s_iter.at_end() {
         ids.insert(s_iter.key());
         s_iter.advance();
@@ -178,7 +182,7 @@ pub fn ring_bfs_transitive_cancellable<D: Dataset>(
 ) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
     let mut result: Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)> = Vec::new();
     // (start_id, reachable_id) deduplication across all BFS roots.
-    let mut global_seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut global_seen: FxHashSet<(u64, u64)> = FxHashSet::default();
 
     for &start_id in start_ids {
         if is_cancelled(cancellation) {
@@ -204,7 +208,7 @@ pub fn ring_bfs_transitive_cancellable<D: Dataset>(
         // each (start, nbr) pair because a neighbor may be reachable from this
         // root without being newly visited (e.g. it was already visited before we
         // reach it via a different path through a cycle).
-        let mut visited: HashSet<u64> = HashSet::new();
+        let mut visited: FxHashSet<u64> = FxHashSet::default();
         visited.insert(start_id);
         let mut queue: VecDeque<u64> = VecDeque::new();
         queue.push_back(start_id);
@@ -353,7 +357,7 @@ fn ring_bfs_transitive_backward<D: Dataset>(
 ) -> Option<Result<Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)>>> {
     let target_term = dataset.lftj_decode_term(target_id)?;
     let mut result: Vec<(std::sync::Arc<Term>, std::sync::Arc<Term>)> = Vec::new();
-    let mut seen: HashSet<u64> = HashSet::new();
+    let mut seen: FxHashSet<u64> = FxHashSet::default();
     seen.insert(target_id);
 
     if include_identity {
@@ -408,8 +412,8 @@ fn bidirectional_reachable<D: Dataset>(
     ag: &GraphSelector,
     cancellation: Option<&CancellationToken>,
 ) -> Option<Result<bool>> {
-    let mut fwd_visited: HashSet<u64> = HashSet::new();
-    let mut bwd_visited: HashSet<u64> = HashSet::new();
+    let mut fwd_visited: FxHashSet<u64> = FxHashSet::default();
+    let mut bwd_visited: FxHashSet<u64> = FxHashSet::default();
     fwd_visited.insert(source_id);
     bwd_visited.insert(target_id);
 
@@ -668,8 +672,8 @@ fn is_simple_predicate_path(path: &PPE) -> bool {
 
 /// Epsilon-closure of a set of NFA states: all states reachable via zero or
 /// more `Edge::Eps` transitions.
-fn epsilon_closure(nfa: &Nfa, states: &[usize]) -> HashSet<usize> {
-    let mut closure: HashSet<usize> = states.iter().copied().collect();
+fn epsilon_closure(nfa: &Nfa, states: &[usize]) -> FxHashSet<usize> {
+    let mut closure: FxHashSet<usize> = states.iter().copied().collect();
     let mut stack: Vec<usize> = states.to_vec();
     while let Some(s) = stack.pop() {
         for edge in &nfa.edges[s] {
@@ -702,18 +706,18 @@ fn product_bfs<D: Dataset>(
     start_id: u64,
     ag: &GraphSelector,
     cancellation: Option<&CancellationToken>,
-) -> Option<Result<HashSet<u64>>> {
-    let mut visited: HashSet<(u64, usize)> = HashSet::new();
+) -> Option<Result<FxHashSet<u64>>> {
+    let mut visited: FxHashSet<(u64, usize)> = FxHashSet::default();
     let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
-    let mut accept_ids: HashSet<u64> = HashSet::new();
+    let mut accept_ids: FxHashSet<u64> = FxHashSet::default();
 
     // Borrow states by reference so high-degree neighbor loops do not
     // allocate a fresh HashSet per edge target.
     let push = |node_id: u64,
-                states: &HashSet<usize>,
-                visited: &mut HashSet<(u64, usize)>,
+                states: &FxHashSet<usize>,
+                visited: &mut FxHashSet<(u64, usize)>,
                 queue: &mut VecDeque<(u64, usize)>,
-                accept_ids: &mut HashSet<u64>| {
+                accept_ids: &mut FxHashSet<u64>| {
         for &st in states {
             if visited.insert((node_id, st)) {
                 queue.push_back((node_id, st));
@@ -780,7 +784,7 @@ fn product_bfs<D: Dataset>(
                     }
                 }
                 Edge::NegFwd(excluded, next) => {
-                    let excluded_ids: HashSet<u64> = excluded
+                    let excluded_ids: FxHashSet<u64> = excluded
                         .iter()
                         .filter_map(|p| dataset.lftj_intern_term(&Term::NamedNode(p.clone()), ag))
                         .collect();
@@ -806,7 +810,7 @@ fn product_bfs<D: Dataset>(
                     }
                 }
                 Edge::NegRev(excluded, next) => {
-                    let excluded_ids: HashSet<u64> = excluded
+                    let excluded_ids: FxHashSet<u64> = excluded
                         .iter()
                         .filter_map(|p| dataset.lftj_intern_term(&Term::NamedNode(p.clone()), ag))
                         .collect();
@@ -932,7 +936,7 @@ pub fn ring_eval_rpq_cancellable<D: Dataset>(
                 Err(e) => return Some(Err(e)),
             };
             let mut pairs = Vec::new();
-            let mut seen: HashSet<(u64, u64)> = HashSet::new();
+            let mut seen: FxHashSet<(u64, u64)> = FxHashSet::default();
             for sid in all_ids {
                 if is_cancelled(cancellation) {
                     return Some(Err(anyhow::Error::from(
