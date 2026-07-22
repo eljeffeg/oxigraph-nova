@@ -3,50 +3,29 @@
 
 **A Rust-native RDF 1.2 / SPARQL 1.2 triple store with a novel succinct index and worst-case optimal joins.**
 
+**Includes:** `Reasoner` • `SHACL` • `openCypher` • `CLI` • `MCP` • `GeoSPARQL` • `Python` • `Javascript`
+
 Oxigraph Nova was built as a sibling to the [Oxigraph](https://github.com/oxigraph/oxigraph) project, sharing deep roots in the Rust RDF ecosystem but pursue **complementary goals**.
 
-**Oxigraph** has established itself as a production-grade, standards-compliant graph database. Its focus is on delivering a safe, correct, maintainable, and practically fast SPARQL implementation built on the mature RocksDB storage engine. It prioritizes broad ecosystem support (excellent Python and JavaScript bindings, CLI, multiple serialization formats), long-term stability, and reliable behavior for real-world workloads. The foundational crates it maintains (`oxrdf`, `oxttl`, `spargebra`, `sparesults`, `sparopt`, `oxsdatatypes`, etc.) have become trusted infrastructure across the Rust RDF community.
+**Oxigraph** has established itself as a production-grade, standards-compliant graph database. Its focus is on delivering a safe, correct, maintainable, and practically fast SPARQL implementation built on the mature RocksDB storage engine. It prioritizes broad ecosystem support (excellent Python and JavaScript bindings, CLI, multiple serialization formats), long-term stability, and reliable behavior for real-world workloads. The foundational crates it maintains have become trusted infrastructure across the Rust RDF community.
 
-**Oxigraph Nova** has a different charter: to aggressively explore the *algorithmic and standards frontier*. It targets full native support for RDF 1.2 (quoted triples, `TRIPLE()`, base direction, etc.) and SPARQL 1.2 from day one, while implementing advanced techniques from recent database research — most notably CompactLTJ (succinct LOUDS tries) combined with Leapfrog Triejoin for worst-case optimal joins. The goal is a store that is simultaneously W3C-conformant, live-writable, and competitive with the fastest static analytical engines on complex queries — a combination that is difficult to achieve when extending a codebase optimized for different constraints.
+**Oxigraph Nova** has a different charter: to aggressively explore the *algorithmic and standards frontier*. It targets full native support for RDF 1.2 (quoted triples, `TRIPLE()`, base direction, etc.) and SPARQL 1.2 from day one, while implementing advanced techniques from recent database research — most notably CompactLTJ (succinct LOUDS tries) & Cyclic-QWT Ring combined with Leapfrog Triejoin for worst-case optimal joins. The goal is a store that is simultaneously W3C-conformant, live-writable, and competitive with the fastest static analytical engines on complex queries — a combination that is difficult to achieve when extending a codebase optimized for different constraints.
 
-Because Nova reuses Oxigraph’s battle-tested parsing, serialization, and algebra crates unchanged, it inherits years of correctness investment and full ecosystem compatibility “for free.” All innovation is isolated behind clean seams (`QuadStore` and `Dataset` traits) in the storage layer and query evaluator. This design makes Nova a natural experimental platform whose successful techniques can later inform or be upstreamed into Oxigraph without compromising the latter’s stability guarantees.
+Because Nova reuses Oxigraph’s battle-tested parsing, serialization, and algebra crates unchanged, it inherits years of correctness investment and full ecosystem compatibility “for free.” All innovation is isolated behind clean seams, which makes Nova a natural experimental platform whose successful techniques can later inform or be upstreamed into Oxigraph without compromising the latter’s stability guarantees.
 
 In short:
 
 | Dimension              | Oxigraph                                      | Oxigraph Nova                                      |
 |------------------------|-----------------------------------------------|----------------------------------------------------|
 | **Primary Goal**       | Production excellence, stability, compliance  | Algorithmic innovation + latest standards          |
-| **Storage Engine**     | RocksDB (mature, battle-tested)               | CompactLTJ LOUDS (default) + Cyclic-QWT Ring; LSM delta + WAL |
+| **Storage Engine**     | RocksDB (mature, battle-tested)               | CompactLTJ LOUDS (default) + Cyclic-QWT Ring; optional Oxigraph-compatible RocksDB; LSM delta + WAL |
 | **Join Evaluation**    | Traditional (actively being optimized)        | Leapfrog Triejoin (worst-case optimal)             |
 | **RDF / SPARQL Level** | Full RDF 1.1 + preliminary 1.2                | Full RDF 1.2 / SPARQL 1.2 / openCypher             |
 | **Stability Profile**  | High — ready for production use               | Experimental / bleeding-edge                       |
 | **Ideal For**          | General deployments, broad adoption           | Research, high-performance analytics, standards work |
 
+
 I envision both projects coexisting comfortably as alternative storage backends behind a common `QuadStore` abstraction. Oxigraph continues to deliver the reliable, widely-supported option the community needs today. Nova serves as the laboratory where we can push performance boundaries, validate emerging standards, and prototype what a next-generation high-performance RDF engine could look like.
-
----
-
-## Trusted community crates at the core
-
-Oxigraph Nova does **not** re-implement RDF parsing, SPARQL parsing, result serialization, or XSD type semantics. Those are solved problems — Nova uses the same crates that Oxigraph uses:
-
-| Crate | From | Role |
-|---|---|---|
-| [`oxrdf`](https://crates.io/crates/oxrdf) | Oxigraph project | RDF term types — `NamedNode`, `Literal`, `Quad`, etc. |
-| [`oxttl`](https://crates.io/crates/oxttl) | Oxigraph project | Turtle / N-Triples / N-Quads / TriG parser and serializer |
-| [`spargebra`](https://crates.io/crates/spargebra) | Oxigraph project | SPARQL 1.1 / 1.2 parser → algebra tree |
-| [`sparesults`](https://crates.io/crates/sparesults) | Oxigraph project | SPARQL result I/O (`.srx` XML, `.srj` JSON, `.tsv`) |
-| [`oxsdatatypes`](https://crates.io/crates/oxsdatatypes) | Oxigraph project | Correct XSD typed-value semantics (decimal/double/dateTime/duration) |
-| [`sparopt`](https://crates.io/crates/sparopt) | Oxigraph project | SPARQL algebra normalizer — filter pushdown, join reordering |
-| [`axum`](https://crates.io/crates/axum) | Tokio project | Async HTTP server for the SPARQL endpoint |
-| [`sux`](https://crates.io/crates/sux) | Sebastiano Vigna | Rank9 + SelectAdapt bitvectors and `BitFieldVec` — the LOUDS trie substrate |
-| [`epserde`](https://crates.io/crates/epserde) | Sebastiano Vigna | ε-copy serialization — mmap'd, near-zero-copy load of the Ring and dictionary snapshots |
-| [`tantivy`](https://crates.io/crates/tantivy) | community | Full-text search engine |
-
-
-All `rdf-12` / `sparql-12` feature flags are enabled across the parsing stack from day one, giving full RDF-star / quoted-triple support throughout.
-
----
 
 ## Architecture
 
@@ -59,18 +38,33 @@ through a self-registering **`BackendFactory`** registry
 crate (and its dependency edge) simply removes that name from
 `--backend` / `available_backends()`; everything else keeps working.
 
+**Self-registration:** product *library* crates (`nova-server`, `nova-store`,
+`nova-mcp`) force-link the engines they expose via feature flags. Binaries
+(`nova_serve`, `oxigraph`) inherit those registrations transitively — they
+only forward features (e.g. `rocksdb-backend`) and never re-force-link engines
+themselves.
+
 | Backend | Crate | Status | Select with |
 |---|---|---|---|
 | **LOUDS** (`LoudsStore`) | `oxigraph-nova-engine-louds` | Default production: six-order CompactLTJ + LSM delta + WAL/snapshot | `--backend louds` (default) |
 | **Ring** (`RingStore`) | `oxigraph-nova-engine-ring` (`cyclic-ring`) | Cyclic-QWT with full product surface (WAL, bulk_load, fulltext, backup) | build with `--features ring-backend`, then `--backend ring` |
+| **RocksDB** (`RocksDbStore`) | `oxigraph-nova-engine-rocksdb` | Oxigraph-compatible on-disk format (drop-in data directories); Nova evaluator on top | build with `--features rocksdb-backend`, then `--backend rocksdb` |
 
 `oxigraph-nova-engine-ring` still **re-exports** the LOUDS surface so older
 `oxigraph_nova_engine_ring::LoudsStore` imports stay green during the split.
+
+The RocksDB backend opens the same on-disk layout as stock Oxigraph 0.5.x
+(`Store::open`), so you can stop `oxigraph serve --location D` and start
+`nova_serve --backend rocksdb --location D` (or `oxigraph serve …`) without
+migrating data. Queries still run through Nova's Leapfrog evaluator (not
+Oxigraph's nested-loop engine); LFTJ acceleration is not available on this
+backend yet (pattern scans use Oxigraph's multi-index iterators).
 
 The full crate layout, `StorageEngine` / registry design, CompactLTJ/LFTJ
 depth, and extension seams (`QuadStore`, `Dataset`, `TextSearch`,
 `ServiceHandler`, embedding the HTTP server) are in
 **[`ARCHITECTURE.md`](./docs/ARCHITECTURE.md)**.
+
 
 
 ---
@@ -483,8 +477,10 @@ Building the workspace also produces a standalone `oxigraph` binary
 `oxigraph-cli`'s full 9-subcommand surface — `load`, `backup`, `query`,
 `update`, `dump`, `convert`, `optimize`, `serve`, and `serve-read-only` —
 against any registered `StorageEngine` (default LOUDS; Ring with
-`--features ring-backend --backend ring`), plus Nova's own SHACL `validate`
+`--features ring-backend --backend ring`; Oxigraph-compatible RocksDB with
+`--features rocksdb-backend --backend rocksdb`), plus Nova's own SHACL `validate`
 addition, an openCypher `cypher` subcommand (`cypher query` / `cypher update`),
+
 and an opt-in `mcp` subcommand (12 top-level subcommands; `cypher` and `mcp`
 each have nested actions — `mcp serve` is gated behind the `mcp` cargo
 feature; see "MCP server (opt-in)" and "openCypher support" above),
@@ -574,15 +570,16 @@ A handful of upstream `oxigraph-cli` flags aren't implemented yet (query
 
 `nova_serve` is a standalone SPARQL 1.1 HTTP server binary. It constructs a
 `StorageEngine` via the self-registering backend registry (default LOUDS;
-Ring with `--features ring-backend --backend ring`) and serves it through
-`Server<dyn QuadStore>`. Flags match upstream Oxigraph's CLI where concepts
-overlap:
+Ring with `--features ring-backend --backend ring`; Oxigraph-compatible
+RocksDB with `--features rocksdb-backend --backend rocksdb`) and serves it
+through `Server<dyn QuadStore>`. Flags match upstream Oxigraph's CLI where
+concepts overlap:
 
 | Flag                    | Alias(es) | Meaning                                                                 |
 |-------------------------|-----------|--------------------------------------------------------------------------|
 | `--file <file>`         | `-f`      | Bulk-load an RDF dataset (matches `oxigraph load --file`) |
-| `--location <dir>`      | `-l`      | Persistent, WAL-backed store rooted at `<dir>` (matches `oxigraph serve --location`) |
-| `--backend <name>`      |           | Storage backend (`louds` default; `ring` requires `--features ring-backend`) |
+| `--location <dir>`      | `-l`      | Persistent store rooted at `<dir>` (LOUDS/Ring: WAL; RocksDB: Oxigraph on-disk format) (matches `oxigraph serve --location`) |
+| `--backend <name>`      |           | Storage backend (`louds` default; `ring` requires `--features ring-backend`; `rocksdb` requires `--features rocksdb-backend`) |
 | `--bind <addr>`         | `-b`      | Listen address, default `0.0.0.0:3030` (matches `oxigraph serve --bind`) |
 | `--compact-threshold <n>` |          | Delta-size threshold that triggers automatic inline compaction (persistent stores only) |
 | `--sync-interval-ms <n>` |          | Override the default 500ms WAL fsync/group-commit interval (persistent stores only) |
@@ -590,6 +587,7 @@ overlap:
 | `--max-results <n>` |          | Cap the number of result rows/triples a single `/sparql` query may produce; exceeding it returns `413 Payload Too Large`. Unset by default (no cap) |
 | `--max-parallel-queries <n>` |          | Bound the number of `/sparql` query evaluations running concurrently; a request arriving once `<n>` evaluations are already in flight is rejected immediately with `503 Service Unavailable`. Unset by default (unbounded) |
 | `--fulltext` |          | Enable Tantivy-backed full-text search (`text:query`/`text:contains` extension functions — see "Full-text search" above). Requires building with `cargo ... --features fulltext`; passing the flag without that feature is a hard startup error |
+
 
 
 ```sh
@@ -605,12 +603,21 @@ cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
 cargo run -p oxigraph-nova-server --release --features ring-backend --bin nova_serve -- \
     --backend ring --location ./data --file dataset.nt --bind 0.0.0.0:3030
 
+# Oxigraph-compatible RocksDB (drop-in data directory; Nova SPARQL evaluator):
+cargo run -p oxigraph-nova-server --release --features rocksdb-backend --bin nova_serve -- \
+    --backend rocksdb --location ./oxigraph-data --bind 0.0.0.0:3030
+
+# Same via the unified CLI:
+cargo run --release --bin oxigraph --features rocksdb-backend -- \
+    serve --backend rocksdb --location ./oxigraph-data --bind 0.0.0.0:3030
+
 # Persistent store, bulk-loaded from a dataset on first run only (an
 # existing WAL at --location is replayed on subsequent runs and --file
 # is then ignored):
 cargo run -p oxigraph-nova-server --release --bin nova_serve -- \
     --location ./data --file dataset.nt --bind 0.0.0.0:3030
 ```
+
 
 
 Once running, the server exposes the SPARQL 1.1 Protocol, the SPARQL 1.1
