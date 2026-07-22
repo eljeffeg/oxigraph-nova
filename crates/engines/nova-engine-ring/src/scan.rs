@@ -113,8 +113,6 @@ fn lower_bound_middle(
     lo
 }
 
-
-
 /// Contiguous (s,p) row range on T_spo (sorted by s,p,o).
 fn range_sp(ring: RingRef<'_>, s: u32, p: u32) -> RowRange {
     let r = ring.range_s(s);
@@ -897,15 +895,32 @@ impl TrieIterator for BraidedStreamingScan {
     }
 }
 
-// ── Materialized medium LastCol scan (feature_lookup kernel) ──────────
+// ── Medium LastCol scan (feature_lookup kernel) ───────────────────────
 //
-// For PO→S / SP→O ranges with |range| ∈ (16, LASTCOL_MATERIALIZE_MAX], a
-// one-shot sequential walk is cheaper as access+dedup than mapped RDI open.
-// Last columns under a bound prefix are sorted, so consecutive equals collapse.
+// feature_lookup is PO→S under (P2, feature0): ~N/N_FEATURES ≈ 500 subjects
+// on the large BSBM corpus. Shape is ≈1 distinct S per row (sorted last col).
+//
+// LOUDS POS leaf walk is O(1) pos++ over pre-materialised labels. Ring cannot
+// match that with a wavelet RDI tree walk (O(levels) per distinct). For this
+// medium-range enumerate-all shape we:
+//   1. Sequential-access the sorted last column once at open
+//   2. Keep dense u32 ids only (to_external deferred to key())
+//   3. Stream / partition_point seek over the small Vec
+//
+// This beats:
+//   • full mapped RDI open + tree walk per symbol (≈1 distinct/row pays RDI
+//     overhead with no empty-branch savings)
+//   • lazy per-row access without materialise (worse locality + more calls)
+//   • eager external materialise (remap paid for every value at open even if
+//     the consumer only walks a prefix)
+//
+// Fallback when mmap RDI is unavailable and range is medium: same kernel.
 
-/// Flat external-key scan over a medium LastCol range (one alloc at open).
+/// Flat dense-key scan over a medium LastCol range (one small alloc at open).
 struct BraidedMaterializedLastColScan {
-    vals: Vec<u64>,
+    img: Arc<BraidedGraphImage>,
+    /// Distinct dense symbols in ascending order.
+    vals: Vec<u32>,
     pos: usize,
 }
 
@@ -913,12 +928,13 @@ impl BraidedMaterializedLastColScan {
     fn open(img: Arc<BraidedGraphImage>, col: Col, range: RowRange) -> Self {
         if range.is_empty() {
             return Self {
+                img,
                 vals: Vec::new(),
                 pos: 0,
             };
         }
         let ring = img.index().ring_ref();
-        let remap = img.remap();
+        // Cap capacity to range len; consecutive-dedup may shrink.
         let mut vals = Vec::with_capacity(range.len() as usize);
         let mut prev: Option<u32> = None;
         for pos in range.start..range.end {
@@ -927,26 +943,45 @@ impl BraidedMaterializedLastColScan {
                 continue;
             }
             prev = Some(d);
-            vals.push(remap.to_external(d).unwrap_or(u64::from(d)));
+            vals.push(d);
         }
-        Self { vals, pos: 0 }
+        Self { img, vals, pos: 0 }
+    }
+
+    #[inline]
+    fn external_key(&self, dense: u32) -> u64 {
+        self.img
+            .remap()
+            .to_external(dense)
+            .unwrap_or(u64::from(dense))
     }
 }
 
 impl TrieIterator for BraidedMaterializedLastColScan {
     #[inline]
     fn key(&self) -> u64 {
-        self.vals[self.pos]
+        self.external_key(self.vals[self.pos])
     }
 
     fn seek(&mut self, target: u64) {
         if self.at_end() {
             return;
         }
-        if self.vals[self.pos] >= target {
+        if self.external_key(self.vals[self.pos]) >= target {
             return;
         }
-        self.pos = self.vals.partition_point(|&v| v < target);
+        // Dense ids assigned in ascending external order → partition on dense.
+        let dense_target = match self.img.remap().to_dense(target) {
+            Some(d) => d,
+            None => match self.img.remap().dense_ceil(target) {
+                Some(d) => d,
+                None => {
+                    self.pos = self.vals.len();
+                    return;
+                }
+            },
+        };
+        self.pos = self.vals.partition_point(|&v| v < dense_target);
     }
 
     fn advance(&mut self) {
@@ -985,7 +1020,6 @@ impl TrieIterator for BraidedMaterializedLastColScan {
 //
 // Do not rebuild RDI at range.start and rescan on every seek — that is
 // O(|distinct|) per seek and makes path_2hop ~40× slower than LOUDS.
-
 
 /// How LastCol navigation is served after open / seek.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1606,19 +1640,18 @@ impl BraidedGraphImage {
                 Box::new(BraidedStreamingScan::new(img, kind))
             }
             // Medium PO/SP/OS LastCol (feature_lookup ~500 subjects under one
-            // feature): sequential access + consecutive-dedup beats RDI open
-            // for a one-shot sequential LFTJ walk. Last columns under a bound
-            // prefix are sorted, so equal runs collapse in one pass.
-            DenseScanKind::LastCol { col, range }
-                if range.len() <= LASTCOL_MATERIALIZE_MAX =>
-            {
+            // feature, ≈1 distinct/row): sequential access + dense materialise
+            // beats mapped RDI tree walk. LOUDS POS is O(1) leaf pos++; Ring
+            // cannot match that with per-symbol RDI expands when every row is
+            // a new symbol. Dense-only vec (to_external deferred to key()).
+            DenseScanKind::LastCol { col, range } if range.len() <= LASTCOL_MATERIALIZE_MAX => {
                 if ctr {
                     SPARQL_PATH.path_heap_rnv.fetch_add(1, Ordering::Relaxed);
                 }
                 Box::new(BraidedMaterializedLastColScan::open(img, col, range))
             }
+            // Large LastCol (star / unbound lead ranges): mapped RDI.
             DenseScanKind::LastCol { col, range } if img.has_mapped() => {
-                // mapped hot RDI ( star / large lead-range kernel).
                 if ctr {
                     SPARQL_PATH.path_mapped_rdi.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1871,14 +1904,15 @@ pub fn oracle_join_scan(
 /// (and still covers degree-1 P131 2join).
 const SP_SMALL_RANGE_ACCESS: u32 = 32;
 
-/// Max LastCol row-span that materialises distinct keys via sequential `access`
-/// instead of opening a mapped RDI stack.
+/// Max LastCol row-span served by dense materialise
+/// ([`BraidedMaterializedLastColScan`]) instead of opening a mapped RDI stack.
 ///
 /// `feature_lookup` is PO→S under (P2, feature0): ~N/N_FEATURES ≈ 500 subjects
 /// on the large BSBM corpus. Opening a full mapped RDI for a one-shot sequential
-/// walk dominates LOUDS POS trie open+leaf walk. Within a PO prefix on T_pos the
-/// last column C_s is sorted, so a single access pass + consecutive dedup is
-/// O(|range| · access) and allocates one small dense vec.
+/// walk dominates LOUDS POS trie open+leaf walk when ≈1 distinct/row. Within a
+/// PO prefix on T_pos the last column C_s is sorted, so one sequential access
+/// pass + consecutive dense dedup at open (to_external deferred to `key()`)
+/// beats per-symbol RDI expands. Cap covers feature_lookup (~500) with headroom.
 const LASTCOL_MATERIALIZE_MAX: u32 = 1024;
 
 /// Body of a prepared SP→O cursor after `reset_to_subject` / `reset_from_range`.
@@ -1953,7 +1987,6 @@ impl PreparedSpObjectScanImpl {
             last_range_len: 0,
         })
     }
-
 
     /// Build a adjacency table for `predicate` (dense). Expensive
     /// intended for the store-level SP adj cache cold path only.
@@ -2080,7 +2113,6 @@ impl PreparedSpObjectScanImpl {
         true
     }
 
-
     /// Park a live mapped cursor back into `mapped_hold` so the next large-range
     /// reset can cheaply rebind instead of re-opening.
     #[inline]
@@ -2174,8 +2206,15 @@ impl PreparedSpObjectScan for PreparedSpObjectScanImpl {
 /// dense subject→SP(RowRange) table for a fixed predicate.
 ///
 /// Shared across HTTP requests via the store-level SP adj cache (`Arc`).
+///
+/// Packed as parallel `starts`/`ends` (`u32` each) rather than
+/// `Vec<Option<RowRange>>` — on 64-bit hosts `Option<RowRange>` is 12–16 B per
+/// slot vs 8 B packed, so a universe-sized table (~50k–100k subjects on BSBM)
+/// shrinks by ~40–50%. Empty range is encoded as `start >= end` (including the
+/// zero slot `(0,0)`).
 pub struct PredicateAdjacency {
-    ranges: Vec<Option<RowRange>>,
+    starts: Vec<u32>,
+    ends: Vec<u32>,
     ranges_present: u64,
     bytes: u64,
     mode: PredAdjacencyMode,
@@ -2185,15 +2224,25 @@ impl PredicateAdjacency {
     #[inline]
     fn range_for_subject(&self, s_dense: u32) -> Option<RowRange> {
         let i = s_dense as usize;
-        if i < self.ranges.len() {
-            self.ranges[i]
-        } else {
-            None
+        if i >= self.starts.len() {
+            return None;
         }
+        let start = self.starts[i];
+        let end = self.ends[i];
+        // Absent subjects stay at the zero-init (0,0) empty slot. Callers treat
+        // empty as "no objects under this subject" — same as the old None arm.
+        Some(RowRange { start, end })
+    }
+
+    #[inline]
+    fn packed_bytes(len: usize) -> u64 {
+        (len.saturating_mul(2 * std::mem::size_of::<u32>())) as u64
     }
 
     fn build_eager(ring: RingRef<'_>, pred: u32, universe: usize) -> Self {
-        let mut ranges: Vec<Option<RowRange>> = vec![None; universe.max(1)];
+        let n = universe.max(1);
+        let mut starts = vec![0u32; n];
+        let mut ends = vec![0u32; n];
         let mut present = 0u64;
         let rp = ring.range_p(pred);
         if !rp.is_empty() {
@@ -2201,8 +2250,9 @@ impl PredicateAdjacency {
             while let Some(s) = ring.range_next_value(Col::S, rp, cur) {
                 let r = range_sp(ring, s, pred);
                 let si = s as usize;
-                if si < ranges.len() {
-                    ranges[si] = Some(r);
+                if si < n {
+                    starts[si] = r.start;
+                    ends[si] = r.end;
                     if !r.is_empty() {
                         present += 1;
                     }
@@ -2213,9 +2263,10 @@ impl PredicateAdjacency {
                 cur = s.saturating_add(1);
             }
         }
-        let bytes = (ranges.capacity() * std::mem::size_of::<Option<RowRange>>()) as u64;
+        let bytes = Self::packed_bytes(starts.capacity());
         Self {
-            ranges,
+            starts,
+            ends,
             ranges_present: present,
             bytes,
             mode: PredAdjacencyMode::Eager,
@@ -2223,17 +2274,20 @@ impl PredicateAdjacency {
     }
 
     fn build_native(ring: RingRef<'_>, pred: u32, universe: usize) -> Self {
-        let mut ranges: Vec<Option<RowRange>> = vec![None; universe.max(1)];
+        let n = universe.max(1);
+        let mut starts = vec![0u32; n];
+        let mut ends = vec![0u32; n];
         let mut present = 0u64;
         let Some(a_s) = ring.col_a(Col::S) else {
             return Self {
-                ranges,
+                starts,
+                ends,
                 ranges_present: 0,
                 bytes: 0,
                 mode: PredAdjacencyMode::Native,
             };
         };
-        let n_sym = a_s.len().saturating_sub(1).min(universe.max(1));
+        let n_sym = a_s.len().saturating_sub(1).min(n);
         let p_next = pred.saturating_add(1);
         let p_is_max = pred == u32::MAX;
         for s in 0..n_sym {
@@ -2248,15 +2302,16 @@ impl PredicateAdjacency {
             } else {
                 lower_bound_middle(ring, start, end_s, p_next, middle_p_spo)
             };
-            let r = RowRange { start, end };
-            ranges[s] = Some(r);
-            if !r.is_empty() {
+            starts[s] = start;
+            ends[s] = end;
+            if start < end {
                 present += 1;
             }
         }
-        let bytes = (ranges.capacity() * std::mem::size_of::<Option<RowRange>>()) as u64;
+        let bytes = Self::packed_bytes(starts.capacity());
         Self {
-            ranges,
+            starts,
+            ends,
             ranges_present: present,
             bytes,
             mode: PredAdjacencyMode::Native,
@@ -2921,7 +2976,6 @@ impl PreparedPhysicalOperator for PreparedSpExpansionImpl {
     }
 }
 
-
 // ── fixed-P wedge (prepared D1 body) ───────────────────────────────
 //
 // Shape: `?a P ?b . ?b P ?c . ?a P ?c` under one predicate.
@@ -3524,6 +3578,71 @@ mod tests {
         let want = img.join_scan_external(None, None, None, 0);
         assert_eq!(got, want);
         assert!(!got.is_empty());
+    }
+
+    /// feature_lookup shape: PO→S with |range| in (16, LASTCOL_MATERIALIZE_MAX].
+    /// Dense materialise path must match external collect (and RNV oracle).
+    #[test]
+    fn sequential_medium_lastcol_po_s_matches_oracle() {
+        // Build a PO range with many distinct S under one (P, O).
+        // 40 subjects share (p=1, o=7) → |range_po| = 40 ∈ (16, 1024].
+        let mut triples = Vec::new();
+        for s in 0u32..40 {
+            triples.push([s, 1, 7]);
+            // noise under other objects so the lead-P range is larger.
+            triples.push([s, 1, 8]);
+        }
+        // a few other predicates
+        triples.push([0, 0, 0]);
+        triples.push([1, 2, 3]);
+
+        let ext: Vec<[u64; 3]> = triples
+            .iter()
+            .map(|x| {
+                [
+                    u64::from(x[0]) + 1000,
+                    u64::from(x[1]) + 50,
+                    u64::from(x[2]) + 2000,
+                ]
+            })
+            .collect();
+        let mut img = BraidedGraphImage::from_external_triples(&ext);
+        let path = std::env::temp_dir().join(format!(
+            "braided_seq_lastcol_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        img.materialize_mapped(&path).expect("mmap");
+        let img = Arc::new(img);
+
+        // feature_lookup: bound P=51, O=2007 → target S
+        let p = 51u64;
+        let o = 2007u64;
+        let mut it =
+            BraidedGraphImage::join_scan_streaming(Arc::clone(&img), None, Some(p), Some(o), 0);
+        let mut got = Vec::new();
+        while !it.at_end() {
+            got.push(it.key());
+            it.advance();
+        }
+        let want = img.join_scan_external(None, Some(p), Some(o), 0);
+        assert_eq!(got, want, "lazy sequential LastCol vs external collect");
+        assert_eq!(got.len(), 40, "expect 40 subjects under feature");
+
+        // seek mid-stream
+        let mut it2 =
+            BraidedGraphImage::join_scan_streaming(Arc::clone(&img), None, Some(p), Some(o), 0);
+        let mid = got[20];
+        it2.seek(mid);
+        assert!(!it2.at_end());
+        assert_eq!(it2.key(), mid);
+        it2.advance();
+        assert_eq!(it2.key(), got[21]);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -29,15 +29,15 @@
 <line class="axis" x1="56" y1="48" x2="56" y2="256"/>
 <line class="axis" x1="56" y1="256" x2="616" y2="256"/>
 <rect x="123.2" y="236.4" width="56.0" height="19.6" fill="#2563eb" rx="3"/>
-<text class="title" x="151.2" y="230.4" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">75.50 MiB</text>
+<text class="title" x="151.2" y="230.4" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">75.40 MiB</text>
 <text class="label" x="151.2" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (louds)</text>
-<rect x="246.4" y="237.6" width="56.0" height="18.4" fill="#7c3aed" rx="3"/>
-<text class="title" x="274.4" y="231.6" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">70.70 MiB</text>
+<rect x="246.4" y="237.5" width="56.0" height="18.5" fill="#7c3aed" rx="3"/>
+<text class="title" x="274.4" y="231.5" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">71.20 MiB</text>
 <text class="label" x="274.4" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (ring)</text>
-<rect x="369.6" y="100.3" width="56.0" height="155.7" fill="#dc2626" rx="3"/>
-<text class="title" x="397.6" y="94.3" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">598.9</text>
+<rect x="369.6" y="100.6" width="56.0" height="155.4" fill="#dc2626" rx="3"/>
+<text class="title" x="397.6" y="94.6" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">597.6</text>
 <text class="label" x="397.6" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Oxigraph</text>
-<rect x="492.8" y="232.9" width="56.0" height="23.1" fill="#16a34a" rx="3"/>
-<text class="title" x="520.8" y="226.9" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">88.70 MiB</text>
+<rect x="492.8" y="232.4" width="56.0" height="23.6" fill="#16a34a" rx="3"/>
+<text class="title" x="520.8" y="226.4" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">90.60 MiB</text>
 <text class="label" x="520.8" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">QLever</text>
 </svg>

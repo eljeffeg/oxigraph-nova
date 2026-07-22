@@ -486,7 +486,6 @@ pub fn path_ctr_add(counter: &std::sync::atomic::AtomicU64, delta: u64) {
     }
 }
 
-
 /// A/B: force pre-fix MiddleRuns VEO heuristic (row-span). Default **off**.
 ///
 /// A/B only: Ring old VEO vs corrected VEO vs LOUDS.
