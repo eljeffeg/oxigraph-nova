@@ -69,15 +69,39 @@ fn middle_o_pos(ring: RingRef<'_>, i: u32) -> u32 {
 }
 
 /// First index in `[lo, hi)` where `mid(i) >= target`, or `hi` if none.
+///
+/// Large lead ranges (e.g. P2 ≈ N·FAN_OUT on BSBM) make plain binary search
+/// pay ~log₂(|range|) LF middle probes even when the hit sits near `lo`.
+/// `feature_lookup` binds feature0, typically an early object under P2 —
+/// galloping finds that frontier in O(log offset) probes, then binary search
+/// finishes inside the narrowed window. Mid-range hits still cost ~2·log₂ n.
 fn lower_bound_middle(
     ring: RingRef<'_>,
-    lo: u32,
+    mut lo: u32,
     hi: u32,
     target: u32,
     mid: fn(RingRef<'_>, u32) -> u32,
 ) -> u32 {
-    let mut lo = lo;
-    let mut hi = hi;
+    if lo >= hi {
+        return lo;
+    }
+    // Already at/past target at lo → lo is the bound.
+    if mid(ring, lo) >= target {
+        return lo;
+    }
+    // Gallop: find smallest `bound` with mid(bound) >= target (or hi).
+    let mut step = 1u32;
+    let mut bound = lo.saturating_add(1);
+    while bound < hi && mid(ring, bound) < target {
+        lo = bound.saturating_add(1);
+        step = step.saturating_mul(2);
+        bound = match lo.checked_add(step) {
+            Some(v) => v.min(hi),
+            None => hi,
+        };
+    }
+    // Binary search in [lo, bound).
+    let mut hi = bound.min(hi);
     while lo < hi {
         let m = lo + (hi - lo) / 2;
         if mid(ring, m) < target {
@@ -88,6 +112,8 @@ fn lower_bound_middle(
     }
     lo
 }
+
+
 
 /// Contiguous (s,p) row range on T_spo (sorted by s,p,o).
 fn range_sp(ring: RingRef<'_>, s: u32, p: u32) -> RowRange {
@@ -871,6 +897,78 @@ impl TrieIterator for BraidedStreamingScan {
     }
 }
 
+// ── Materialized medium LastCol scan (feature_lookup kernel) ──────────
+//
+// For PO→S / SP→O ranges with |range| ∈ (16, LASTCOL_MATERIALIZE_MAX], a
+// one-shot sequential walk is cheaper as access+dedup than mapped RDI open.
+// Last columns under a bound prefix are sorted, so consecutive equals collapse.
+
+/// Flat external-key scan over a medium LastCol range (one alloc at open).
+struct BraidedMaterializedLastColScan {
+    vals: Vec<u64>,
+    pos: usize,
+}
+
+impl BraidedMaterializedLastColScan {
+    fn open(img: Arc<BraidedGraphImage>, col: Col, range: RowRange) -> Self {
+        if range.is_empty() {
+            return Self {
+                vals: Vec::new(),
+                pos: 0,
+            };
+        }
+        let ring = img.index().ring_ref();
+        let remap = img.remap();
+        let mut vals = Vec::with_capacity(range.len() as usize);
+        let mut prev: Option<u32> = None;
+        for pos in range.start..range.end {
+            let d = ring.access(col, pos);
+            if prev == Some(d) {
+                continue;
+            }
+            prev = Some(d);
+            vals.push(remap.to_external(d).unwrap_or(u64::from(d)));
+        }
+        Self { vals, pos: 0 }
+    }
+}
+
+impl TrieIterator for BraidedMaterializedLastColScan {
+    #[inline]
+    fn key(&self) -> u64 {
+        self.vals[self.pos]
+    }
+
+    fn seek(&mut self, target: u64) {
+        if self.at_end() {
+            return;
+        }
+        if self.vals[self.pos] >= target {
+            return;
+        }
+        self.pos = self.vals.partition_point(|&v| v < target);
+    }
+
+    fn advance(&mut self) {
+        if !self.at_end() {
+            self.pos += 1;
+        }
+    }
+
+    fn open(&self) -> Box<dyn TrieIterator> {
+        Box::new(EmptyTrieIter)
+    }
+
+    #[inline]
+    fn at_end(&self) -> bool {
+        self.pos >= self.vals.len()
+    }
+
+    fn remaining_count(&self) -> u64 {
+        self.vals.len().saturating_sub(self.pos) as u64
+    }
+}
+
 // ── Mapped LastCol RDI streaming scan (star kernel) ───────────────────
 //
 // Product star/scan kernel = mmap hot QWT + **stateful RDI**
@@ -887,6 +985,7 @@ impl TrieIterator for BraidedStreamingScan {
 //
 // Do not rebuild RDI at range.start and rescan on every seek — that is
 // O(|distinct|) per seek and makes path_2hop ~40× slower than LOUDS.
+
 
 /// How LastCol navigation is served after open / seek.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1492,6 +1591,7 @@ impl BraidedGraphImage {
             return Box::new(EmptyTrieIter);
         };
         let kind = dense_scan_kind(img.index().ring_ref(), sd, pd, od, target_field.min(2));
+        let ctr = ring_counters_log_enabled();
         match kind {
             DenseScanKind::Empty => Box::new(EmptyTrieIter),
             // Small SP/PO/OS ranges (typical after binding S under bound P in
@@ -1500,31 +1600,56 @@ impl BraidedGraphImage {
             // Threshold covers "one object per subject" (range len 1) through
             // modest fan-out; large star/scan lead ranges still take mapped RDI.
             DenseScanKind::LastCol { range, .. } if range.len() <= 16 => {
-                SPARQL_PATH.path_heap_rnv.fetch_add(1, Ordering::Relaxed);
+                if ctr {
+                    SPARQL_PATH.path_heap_rnv.fetch_add(1, Ordering::Relaxed);
+                }
                 Box::new(BraidedStreamingScan::new(img, kind))
+            }
+            // Medium PO/SP/OS LastCol (feature_lookup ~500 subjects under one
+            // feature): sequential access + consecutive-dedup beats RDI open
+            // for a one-shot sequential LFTJ walk. Last columns under a bound
+            // prefix are sorted, so equal runs collapse in one pass.
+            DenseScanKind::LastCol { col, range }
+                if range.len() <= LASTCOL_MATERIALIZE_MAX =>
+            {
+                if ctr {
+                    SPARQL_PATH.path_heap_rnv.fetch_add(1, Ordering::Relaxed);
+                }
+                Box::new(BraidedMaterializedLastColScan::open(img, col, range))
             }
             DenseScanKind::LastCol { col, range } if img.has_mapped() => {
                 // mapped hot RDI ( star / large lead-range kernel).
-                SPARQL_PATH.path_mapped_rdi.fetch_add(1, Ordering::Relaxed);
+                if ctr {
+                    SPARQL_PATH.path_mapped_rdi.fetch_add(1, Ordering::Relaxed);
+                }
                 match BraidedMappedLastColScan::open(Arc::clone(&img), col, range) {
                     Some(scan) => Box::new(scan),
                     None => {
-                        SPARQL_PATH.path_heap_rnv.fetch_add(1, Ordering::Relaxed);
+                        if ctr {
+                            SPARQL_PATH.path_heap_rnv.fetch_add(1, Ordering::Relaxed);
+                        }
                         Box::new(BraidedStreamingScan::new(img, kind))
                     }
                 }
             }
+
             DenseScanKind::LastCol { .. } => {
-                SPARQL_PATH.path_heap_rnv.fetch_add(1, Ordering::Relaxed);
+                if ctr {
+                    SPARQL_PATH.path_heap_rnv.fetch_add(1, Ordering::Relaxed);
+                }
                 Box::new(BraidedStreamingScan::new(img, kind))
             }
 
             DenseScanKind::MiddleRuns { .. } => {
-                SPARQL_PATH.path_middle_runs.fetch_add(1, Ordering::Relaxed);
+                if ctr {
+                    SPARQL_PATH.path_middle_runs.fetch_add(1, Ordering::Relaxed);
+                }
                 Box::new(BraidedStreamingScan::new(img, kind))
             }
             DenseScanKind::Singleton(_) => {
-                SPARQL_PATH.path_singleton.fetch_add(1, Ordering::Relaxed);
+                if ctr {
+                    SPARQL_PATH.path_singleton.fetch_add(1, Ordering::Relaxed);
+                }
                 Box::new(BraidedStreamingScan::new(img, kind))
             }
         }
@@ -1565,7 +1690,10 @@ impl BraidedGraphImage {
         s2: u64,
     ) -> Box<dyn TrieIterator> {
         use crate::product_path::ring_d2_enabled;
-        SPARQL_PATH.d2_calls.fetch_add(1, Ordering::Relaxed);
+        let ctr = ring_counters_log_enabled();
+        if ctr {
+            SPARQL_PATH.d2_calls.fetch_add(1, Ordering::Relaxed);
+        }
         if !ring_d2_enabled() || !img.has_mapped() {
             return Box::new(EmptyTrieIter);
         }
@@ -1578,7 +1706,7 @@ impl BraidedGraphImage {
         };
         match BraidedD2ObjectScan::open(img, d0, d1, d2) {
             Some(scan) => {
-                if !scan.at_end() {
+                if ctr && !scan.at_end() {
                     SPARQL_PATH.d2_hits.fetch_add(1, Ordering::Relaxed);
                 }
                 Box::new(scan)
@@ -1606,7 +1734,10 @@ impl BraidedGraphImage {
         if !ring_d2_enabled() || !img.has_mapped() || subjects.len() < 2 {
             return None;
         }
-        SPARQL_PATH.d2_calls.fetch_add(1, Ordering::Relaxed);
+        let ctr = ring_counters_log_enabled();
+        if ctr {
+            SPARQL_PATH.d2_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let mut dense = Vec::with_capacity(subjects.len());
         for &s in subjects {
             dense.push(img.remap().to_dense(s)?);
@@ -1627,7 +1758,7 @@ impl BraidedGraphImage {
             }
             _ => return None,
         };
-        if !scan.at_end() {
+        if ctr && !scan.at_end() {
             SPARQL_PATH.d2_hits.fetch_add(1, Ordering::Relaxed);
         }
         Some(scan)
@@ -1740,6 +1871,16 @@ pub fn oracle_join_scan(
 /// (and still covers degree-1 P131 2join).
 const SP_SMALL_RANGE_ACCESS: u32 = 32;
 
+/// Max LastCol row-span that materialises distinct keys via sequential `access`
+/// instead of opening a mapped RDI stack.
+///
+/// `feature_lookup` is PO→S under (P2, feature0): ~N/N_FEATURES ≈ 500 subjects
+/// on the large BSBM corpus. Opening a full mapped RDI for a one-shot sequential
+/// walk dominates LOUDS POS trie open+leaf walk. Within a PO prefix on T_pos the
+/// last column C_s is sorted, so a single access pass + consecutive dedup is
+/// O(|range| · access) and allocates one small dense vec.
+const LASTCOL_MATERIALIZE_MAX: u32 = 1024;
+
 /// Body of a prepared SP→O cursor after `reset_to_subject` / `reset_from_range`.
 ///
 /// `Mapped` holds a full RDI stack (~4KB+); boxing would allocate on every
@@ -1799,7 +1940,10 @@ impl PreparedSpObjectScanImpl {
             return None;
         }
         let pred_dense = img.remap().to_dense(predicate)?;
-        SPARQL_PATH.k9_sp_prepare.fetch_add(1, Ordering::Relaxed);
+        // Once-per-prepare (not per-row); free when counters off.
+        if ring_counters_log_enabled() {
+            SPARQL_PATH.k9_sp_prepare.fetch_add(1, Ordering::Relaxed);
+        }
         Some(Self {
             img,
             pred_dense,
@@ -1809,6 +1953,7 @@ impl PreparedSpObjectScanImpl {
             last_range_len: 0,
         })
     }
+
 
     /// Build a adjacency table for `predicate` (dense). Expensive
     /// intended for the store-level SP adj cache cold path only.
@@ -1856,12 +2001,19 @@ impl PreparedSpObjectScanImpl {
 
     #[inline]
     fn bind_range(&mut self, range: RowRange, prefer_cheap_rebind: bool) -> bool {
-        SPARQL_PATH.k9_sp_reset.fetch_add(1, Ordering::Relaxed);
+        // Production path: no Instant / no atomics. Verbose counters only when
+        // NOVA_RING_COUNTERS=1 (once-cached flag).
+        let ctr = ring_counters_log_enabled();
+        if ctr {
+            SPARQL_PATH.k9_sp_reset.fetch_add(1, Ordering::Relaxed);
+        }
         self.last_range_len = range.len() as u64;
         if range.is_empty() {
-            SPARQL_PATH
-                .k9_sp_empty_range
-                .fetch_add(1, Ordering::Relaxed);
+            if ctr {
+                SPARQL_PATH
+                    .k9_sp_empty_range
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.body = SpObjectBody::Empty;
             return false;
         }
@@ -1869,7 +2021,6 @@ impl PreparedSpObjectScanImpl {
         // Degree-1 / low-fanout: one (or few) O access(es) beats RDI open.
         // 2join BSBM P131 is exactly degree 1 per subject — Singleton avoids Vec.
         if range.len() <= SP_SMALL_RANGE_ACCESS {
-            let t_cur = std::time::Instant::now();
             let ring = self.img.index().ring_ref();
             let body = if range.len() == 1 {
                 let d = ring.access(Col::O, range.start);
@@ -1878,32 +2029,17 @@ impl PreparedSpObjectScanImpl {
                 let vals = self.materialize_small_range_dense(range);
                 if vals.is_empty() {
                     self.body = SpObjectBody::Empty;
-                    let ns = t_cur.elapsed().as_nanos() as u64;
-                    SPARQL_PATH.k9_sp_cursor_ns.fetch_add(ns, Ordering::Relaxed);
                     return false;
                 }
                 SpObjectBody::MaterializedDense { vals, pos: 0 }
             };
-            let ns = t_cur.elapsed().as_nanos() as u64;
-            SPARQL_PATH.k9_sp_cursor_ns.fetch_add(ns, Ordering::Relaxed);
-            if prefer_cheap_rebind {
-                SPARQL_PATH
-                    .k9_p2_hit_rebind_ns
-                    .fetch_add(ns, Ordering::Relaxed);
-            } else {
-                SPARQL_PATH
-                    .k9_p2_miss_rebind_ns
-                    .fetch_add(ns, Ordering::Relaxed);
-            }
-            SPARQL_PATH
-                .k9_sp_values_emitted
-                .fetch_add(1, Ordering::Relaxed);
+            // prefer_cheap_rebind only affects large-range RDI rebind path.
+            let _ = prefer_cheap_rebind;
             self.body = body;
             return true;
         }
 
         // Large range: mapped LastCol RDI.
-        let t_cur = std::time::Instant::now();
         let ok = if prefer_cheap_rebind {
             if let Some(cur) = self.mapped_hold.as_mut() {
                 cur.reset_to_range(range)
@@ -1925,23 +2061,14 @@ impl PreparedSpObjectScanImpl {
                 None => false,
             }
         };
-        let ns = t_cur.elapsed().as_nanos() as u64;
-        SPARQL_PATH.k9_sp_cursor_ns.fetch_add(ns, Ordering::Relaxed);
-        if prefer_cheap_rebind {
-            SPARQL_PATH
-                .k9_p2_hit_rebind_ns
-                .fetch_add(ns, Ordering::Relaxed);
-        } else {
-            SPARQL_PATH
-                .k9_p2_miss_rebind_ns
-                .fetch_add(ns, Ordering::Relaxed);
-        }
         if !ok {
             self.mapped_hold = None;
             self.body = SpObjectBody::Empty;
             return false;
         }
-        SPARQL_PATH.path_mapped_rdi.fetch_add(1, Ordering::Relaxed);
+        if ctr {
+            SPARQL_PATH.path_mapped_rdi.fetch_add(1, Ordering::Relaxed);
+        }
         // Move held cursor into body for iteration; keep a clone path via take+put
         // on advance end is unnecessary — we stash back on next bind.
         // Use a swap: body owns the live cursor; mapped_hold is empty while live.
@@ -1949,14 +2076,10 @@ impl PreparedSpObjectScanImpl {
             .mapped_hold
             .take()
             .expect("mapped cursor just opened/rebound");
-        if !scan.at_end() {
-            SPARQL_PATH
-                .k9_sp_values_emitted
-                .fetch_add(1, Ordering::Relaxed);
-        }
         self.body = SpObjectBody::Mapped(scan);
         true
     }
+
 
     /// Park a live mapped cursor back into `mapped_hold` so the next large-range
     /// reset can cheaply rebind instead of re-opening.
@@ -1978,44 +2101,26 @@ impl PreparedSpObjectScanImpl {
 
 impl PreparedSpObjectScan for PreparedSpObjectScanImpl {
     fn reset_to_subject(&mut self, subject: u64) -> bool {
-        let t_remap = std::time::Instant::now();
         let Some(s_dense) = self.img.remap().to_dense(subject) else {
             self.park_mapped_body();
             self.body = SpObjectBody::Empty;
             self.last_range_len = 0;
             return false;
         };
-        SPARQL_PATH
-            .k9_sp_remap_ns
-            .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // Shared adj (warm HTTP) → O(1); else live range_sp.
         let range = if let Some(adj) = self.adj.as_ref() {
             match adj.range_for_subject(s_dense) {
-                Some(r) => {
-                    SPARQL_PATH
-                        .k9_adj_direct_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    r
-                }
+                Some(r) => r,
                 None => {
-                    SPARQL_PATH
-                        .k9_sp_empty_range
-                        .fetch_add(1, Ordering::Relaxed);
                     self.park_mapped_body();
                     self.body = SpObjectBody::Empty;
                     self.last_range_len = 0;
-                    SPARQL_PATH.k9_sp_reset.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
             }
         } else {
-            let t_range = std::time::Instant::now();
-            let r = range_sp(self.img.index().ring_ref(), s_dense, self.pred_dense);
-            SPARQL_PATH
-                .k9_sp_range_ns
-                .fetch_add(t_range.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            r
+            range_sp(self.img.index().ring_ref(), s_dense, self.pred_dense)
         };
 
         // Prefer cheap rebind when a mapped cursor is parked (prior large range).
@@ -2040,21 +2145,11 @@ impl PreparedSpObjectScan for PreparedSpObjectScanImpl {
             SpObjectBody::SingletonDense(_) => {
                 self.body = SpObjectBody::Empty;
             }
-            SpObjectBody::MaterializedDense { vals, pos } => {
+            SpObjectBody::MaterializedDense { vals: _, pos } => {
                 *pos += 1;
-                if *pos < vals.len() {
-                    SPARQL_PATH
-                        .k9_sp_values_emitted
-                        .fetch_add(1, Ordering::Relaxed);
-                }
             }
             SpObjectBody::Mapped(c) => {
                 c.advance();
-                if !c.at_end() {
-                    SPARQL_PATH
-                        .k9_sp_values_emitted
-                        .fetch_add(1, Ordering::Relaxed);
-                }
             }
             SpObjectBody::Empty => {}
         }
@@ -2238,10 +2333,14 @@ impl PreparedTwoHopImpl {
 
 impl PreparedTwoHop for PreparedTwoHopImpl {
     fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
-        SPARQL_PATH
-            .k9_two_hop_execute
-            .fetch_add(1, Ordering::Relaxed);
-        let t_exec = std::time::Instant::now();
+        // Production hot path: no Instant / no per-row atomics.
+        // Event counters only when NOVA_RING_COUNTERS=1.
+        let ctr = ring_counters_log_enabled();
+        if ctr {
+            SPARQL_PATH
+                .k9_two_hop_execute
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         let mut a_scan = BraidedGraphImage::join_scan_streaming(
             Arc::clone(&self.img),
@@ -2250,7 +2349,9 @@ impl PreparedTwoHop for PreparedTwoHopImpl {
             None,
             0,
         );
-        SPARQL_PATH.join_scan_open.fetch_add(1, Ordering::Relaxed);
+        if ctr {
+            SPARQL_PATH.join_scan_open.fetch_add(1, Ordering::Relaxed);
+        }
 
         let mut rows = 0u64;
         let use_adj = self.p2_adj.is_some();
@@ -2259,15 +2360,6 @@ impl PreparedTwoHop for PreparedTwoHopImpl {
             Vec::new()
         } else {
             vec![None; universe.max(1)]
-        };
-        // Only allocate the universe-sized uniqueness bitset when verbose
-        // path counters are enabled (`NOVA_RING_COUNTERS=1`). On the warm
-        // timed path this avoids a multi-KB zero-fill per execute().
-        let track_unique_b = ring_counters_log_enabled();
-        let mut seen_b: Vec<bool> = if track_unique_b {
-            vec![false; universe.max(1)]
-        } else {
-            Vec::new()
         };
         let hop2_pred = self.p2_dense;
         let img_ref = Arc::clone(&self.img);
@@ -2278,116 +2370,43 @@ impl PreparedTwoHop for PreparedTwoHopImpl {
                 a_scan.advance();
                 continue;
             }
-            if !self.hop1.at_end() {
-                SPARQL_PATH
-                    .k9_sp_values_emitted
-                    .fetch_add(1, Ordering::Relaxed);
-            }
             while !self.hop1.at_end() {
                 // Dense hop1 body skips external→dense remap on every middle b.
                 let (b, b_dense) = if let Some(d) = self.hop1.key_dense() {
                     (self.hop1.external_of_dense(d), d)
                 } else {
                     let b = self.hop1.key();
-                    let t_remap = std::time::Instant::now();
                     let Some(d) = img_ref.remap().to_dense(b) else {
                         self.hop1.advance();
                         continue;
                     };
-                    SPARQL_PATH
-                        .k9_sp_remap_ns
-                        .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     (b, d)
                 };
-                SPARQL_PATH
-                    .k9_p2_range_lookups
-                    .fetch_add(1, Ordering::Relaxed);
                 let bi = b_dense as usize;
 
-                if bi < seen_b.len() && !seen_b[bi] {
-                    seen_b[bi] = true;
-                    SPARQL_PATH.k9_p2_unique_b.fetch_add(1, Ordering::Relaxed);
-                }
-
-                let mut from_hit = false;
                 let hop2_ok = if let Some(adj) = self.p2_adj.as_ref() {
                     match adj.range_for_subject(b_dense) {
-                        Some(range) => {
-                            SPARQL_PATH
-                                .k9_adj_direct_hits
-                                .fetch_add(1, Ordering::Relaxed);
-                            from_hit = true;
-                            SPARQL_PATH
-                                .k9_p2_range_reuse_hits
-                                .fetch_add(1, Ordering::Relaxed);
-                            self.hop2.reset_from_range(range, true)
-                        }
-                        None => {
-                            SPARQL_PATH
-                                .k9_sp_empty_range
-                                .fetch_add(1, Ordering::Relaxed);
-                            false
-                        }
+                        Some(range) => self.hop2.reset_from_range(range, true),
+                        None => false,
                     }
                 } else if bi < range_cache.len() {
                     if let Some(cached) = range_cache[bi] {
-                        SPARQL_PATH
-                            .k9_p2_range_reuse_hits
-                            .fetch_add(1, Ordering::Relaxed);
-                        from_hit = true;
                         self.hop2.reset_from_range(cached, true)
                     } else {
-                        let t_range = std::time::Instant::now();
                         let range = range_sp(img_ref.index().ring_ref(), b_dense, hop2_pred);
-                        SPARQL_PATH
-                            .k9_sp_range_ns
-                            .fetch_add(t_range.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        SPARQL_PATH
-                            .k9_p2_range_derivations
-                            .fetch_add(1, Ordering::Relaxed);
                         range_cache[bi] = Some(range);
                         self.hop2.reset_from_range(range, false)
                     }
                 } else {
-                    SPARQL_PATH
-                        .k9_p2_range_derivations
-                        .fetch_add(1, Ordering::Relaxed);
                     self.hop2.reset_to_subject(b)
                 };
 
                 if hop2_ok {
-                    let t_walk = std::time::Instant::now();
-                    let mut n_vals = 0u64;
-                    if !self.hop2.at_end() {
-                        n_vals = 1;
-                        SPARQL_PATH
-                            .k9_sp_values_emitted
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
                     while !self.hop2.at_end() {
                         let c = self.hop2.key();
                         emit(&[a, b, c])?;
                         rows += 1;
                         self.hop2.advance();
-                        if !self.hop2.at_end() {
-                            n_vals += 1;
-                        }
-                    }
-                    let walk_ns = t_walk.elapsed().as_nanos() as u64;
-                    if from_hit {
-                        SPARQL_PATH
-                            .k9_p2_hit_cursor_ns
-                            .fetch_add(walk_ns, Ordering::Relaxed);
-                        SPARQL_PATH
-                            .k9_p2_values_from_hits
-                            .fetch_add(n_vals, Ordering::Relaxed);
-                    } else {
-                        SPARQL_PATH
-                            .k9_p2_miss_cursor_ns
-                            .fetch_add(walk_ns, Ordering::Relaxed);
-                        SPARQL_PATH
-                            .k9_p2_values_from_misses
-                            .fetch_add(n_vals, Ordering::Relaxed);
                     }
                 }
                 self.hop1.advance();
@@ -2395,12 +2414,11 @@ impl PreparedTwoHop for PreparedTwoHopImpl {
             a_scan.advance();
         }
 
-        SPARQL_PATH
-            .k9_adj_execute_ns
-            .fetch_add(t_exec.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        SPARQL_PATH
-            .k9_two_hop_rows
-            .fetch_add(rows, Ordering::Relaxed);
+        if ctr {
+            SPARQL_PATH
+                .k9_two_hop_rows
+                .fetch_add(rows, Ordering::Relaxed);
+        }
         Ok(rows)
     }
 }
@@ -2492,8 +2510,6 @@ impl PreparedPhysicalOperator for PreparedKChainImpl {
             None,
             0,
         );
-        SPARQL_PATH.join_scan_open.fetch_add(1, Ordering::Relaxed);
-
         let mut rows = 0u64;
         let universe = self.img.universe() as usize;
         let use_p2_adj = self.p2_adj.is_some();
@@ -2641,8 +2657,6 @@ impl PreparedPhysicalOperator for PreparedStarImpl {
             None,
             0,
         );
-        SPARQL_PATH.join_scan_open.fetch_add(1, Ordering::Relaxed);
-
         let mut rows = 0u64;
         let universe = self.img.universe() as usize;
         let use_p2_adj = self.p2_adj.is_some();
@@ -2800,7 +2814,9 @@ impl PreparedSpExpansionImpl {
             PredicateAdjacency::build(ring, p_e, universe, mode).map(Arc::new)
         });
 
-        SPARQL_PATH.k9_sp_prepare.fetch_add(1, Ordering::Relaxed);
+        if ring_counters_log_enabled() {
+            SPARQL_PATH.k9_sp_prepare.fetch_add(1, Ordering::Relaxed);
+        }
         Some(Self {
             img,
             outer_subjects_dense: outer,
@@ -2817,137 +2833,94 @@ impl PreparedSpExpansionImpl {
             .unwrap_or(u64::from(dense))
     }
 
-    /// Objects under dense subject for expand predicate — dense ids.
-    /// Degree-1 fast path uses single O access (BSBM P131).
+    /// SP row range for expand predicate under dense subject.
     #[inline]
-    fn expand_objects_dense(&self, s_dense: u32) -> ExpandDenseBody {
-        let range = if let Some(adj) = self.expand_adj.as_ref() {
+    fn expand_range(&self, s_dense: u32) -> RowRange {
+        if let Some(adj) = self.expand_adj.as_ref() {
             match adj.range_for_subject(s_dense) {
-                Some(r) => {
-                    SPARQL_PATH
-                        .k9_adj_direct_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    r
-                }
-                None => {
-                    SPARQL_PATH
-                        .k9_sp_empty_range
-                        .fetch_add(1, Ordering::Relaxed);
-                    return ExpandDenseBody::Empty;
-                }
+                Some(r) => r,
+                None => RowRange::empty(),
             }
         } else {
-            let t_range = std::time::Instant::now();
-            let r = range_sp(self.img.index().ring_ref(), s_dense, self.expand_pred_dense);
-            SPARQL_PATH
-                .k9_sp_range_ns
-                .fetch_add(t_range.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            r
-        };
+            range_sp(self.img.index().ring_ref(), s_dense, self.expand_pred_dense)
+        }
+    }
 
-        SPARQL_PATH.k9_sp_reset.fetch_add(1, Ordering::Relaxed);
+    /// Emit objects under dense subject for expand predicate.
+    ///
+    /// Walks the SP range in-place (no per-subject `Vec`). T_spo is sorted by
+    /// o within (s,p), so consecutive equal O values collapse. Degree-1 uses a
+    /// single access (BSBM P131 / 2join).
+    #[inline]
+    fn emit_expand_objects(
+        &self,
+        s_dense: u32,
+        s_ext: u64,
+        emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>,
+    ) -> Result<u64, ()> {
+        let range = self.expand_range(s_dense);
         if range.is_empty() {
-            SPARQL_PATH
-                .k9_sp_empty_range
-                .fetch_add(1, Ordering::Relaxed);
-            return ExpandDenseBody::Empty;
+            return Ok(0);
         }
 
         let ring = self.img.index().ring_ref();
         if range.len() == 1 {
-            let d = ring.access(Col::O, range.start);
-            SPARQL_PATH
-                .k9_sp_values_emitted
-                .fetch_add(1, Ordering::Relaxed);
-            return ExpandDenseBody::Singleton(d);
+            let o_dense = ring.access(Col::O, range.start);
+            let o_ext = self.to_external(o_dense);
+            emit(&[s_ext, o_ext])?;
+            return Ok(1);
         }
 
+        // Small / medium SP: sequential O access + consecutive dedup.
+        // star_with_features expands P2 with FAN_OUT_FEATURES=20 — stays here.
         if range.len() <= SP_SMALL_RANGE_ACCESS {
-            let mut vals = Vec::with_capacity(range.len() as usize);
+            let mut rows = 0u64;
             let mut prev: Option<u32> = None;
             for pos in range.start..range.end {
-                let d = ring.access(Col::O, pos);
-                if prev == Some(d) {
+                let o_dense = ring.access(Col::O, pos);
+                if prev == Some(o_dense) {
                     continue;
                 }
-                prev = Some(d);
-                vals.push(d);
+                prev = Some(o_dense);
+                let o_ext = self.to_external(o_dense);
+                emit(&[s_ext, o_ext])?;
+                rows += 1;
             }
-            if vals.is_empty() {
-                return ExpandDenseBody::Empty;
-            }
-            SPARQL_PATH
-                .k9_sp_values_emitted
-                .fetch_add(1, Ordering::Relaxed);
-            return ExpandDenseBody::Small(vals);
+            return Ok(rows);
         }
 
-        // Large fan-out: distinct O via RNV (heap path; rare for 2join expand).
-        let mut vals = Vec::new();
+        // Large fan-out: distinct O via RNV (rare for 2join / star expand).
+        let mut rows = 0u64;
         let mut cur = ring.range_next_value(Col::O, range, 0);
-        while let Some(v) = cur {
-            vals.push(v);
-            if v == u32::MAX {
+        while let Some(o_dense) = cur {
+            let o_ext = self.to_external(o_dense);
+            emit(&[s_ext, o_ext])?;
+            rows += 1;
+            if o_dense == u32::MAX {
                 break;
             }
-            cur = ring.range_next_value(Col::O, range, v.saturating_add(1));
+            cur = ring.range_next_value(Col::O, range, o_dense.saturating_add(1));
         }
-        if vals.is_empty() {
-            ExpandDenseBody::Empty
-        } else {
-            SPARQL_PATH
-                .k9_sp_values_emitted
-                .fetch_add(1, Ordering::Relaxed);
-            ExpandDenseBody::Small(vals)
-        }
+        Ok(rows)
     }
-}
-
-/// Dense object list under one expand subject (no external remap yet).
-enum ExpandDenseBody {
-    Empty,
-    Singleton(u32),
-    Small(Vec<u32>),
 }
 
 impl PreparedPhysicalOperator for PreparedSpExpansionImpl {
     fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
-        let t_exec = std::time::Instant::now();
         let mut rows = 0u64;
         let outer = std::mem::take(&mut self.outer_subjects_dense);
 
         for &s_dense in &outer {
             let s_ext = self.to_external(s_dense);
-            match self.expand_objects_dense(s_dense) {
-                ExpandDenseBody::Empty => {}
-                ExpandDenseBody::Singleton(o_dense) => {
-                    let o_ext = self.to_external(o_dense);
-                    emit(&[s_ext, o_ext])?;
-                    rows += 1;
-                }
-                ExpandDenseBody::Small(vals) => {
-                    for (i, &o_dense) in vals.iter().enumerate() {
-                        if i > 0 {
-                            SPARQL_PATH
-                                .k9_sp_values_emitted
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        let o_ext = self.to_external(o_dense);
-                        emit(&[s_ext, o_ext])?;
-                        rows += 1;
-                    }
-                }
-            }
+            rows += self.emit_expand_objects(s_dense, s_ext, emit)?;
         }
 
         // Restore outer list for next cached execute (physical-op cache reuse).
         self.outer_subjects_dense = outer;
-        SPARQL_PATH
-            .k9_adj_execute_ns
-            .fetch_add(t_exec.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(rows)
     }
 }
+
 
 // ── fixed-P wedge (prepared D1 body) ───────────────────────────────
 //
@@ -2988,7 +2961,9 @@ impl PreparedPredD1 {
             return None;
         }
         let pred_dense = img.remap().to_dense(predicate)?;
-        SPARQL_PATH.d1_pred_prepare.fetch_add(1, Ordering::Relaxed);
+        if ring_counters_log_enabled() {
+            SPARQL_PATH.d1_pred_prepare.fetch_add(1, Ordering::Relaxed);
+        }
         Some(Self {
             img,
             pred_dense,
@@ -3000,21 +2975,11 @@ impl PreparedPredD1 {
     fn sp_range(&self, s_dense: u32) -> RowRange {
         if let Some(adj) = self.adj.as_ref() {
             match adj.range_for_subject(s_dense) {
-                Some(r) => {
-                    SPARQL_PATH
-                        .k9_adj_direct_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    r
-                }
+                Some(r) => r,
                 None => RowRange::empty(),
             }
         } else {
-            let t = std::time::Instant::now();
-            let r = range_sp(self.img.index().ring_ref(), s_dense, self.pred_dense);
-            SPARQL_PATH
-                .d1_range_sp_ns
-                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            r
+            range_sp(self.img.index().ring_ref(), s_dense, self.pred_dense)
         }
     }
 }
@@ -3037,12 +3002,7 @@ impl PreparedLeftD1 {
     fn right_range(&self, s_dense: u32) -> RowRange {
         if let Some(adj) = self.adj.as_ref() {
             match adj.range_for_subject(s_dense) {
-                Some(r) => {
-                    SPARQL_PATH
-                        .k9_adj_direct_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    r
-                }
+                Some(r) => r,
                 None => RowRange::empty(),
             }
         } else {
@@ -3053,22 +3013,18 @@ impl PreparedLeftD1 {
 
 impl PreparedLeftIntersect for PreparedLeftD1 {
     fn intersect_right(&self, subject_b: u64) -> Option<Box<dyn TrieIterator>> {
-        let t_remap = std::time::Instant::now();
         let b_dense = self.img.remap().to_dense(subject_b)?;
-        SPARQL_PATH
-            .d1_remap_ns
-            .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let r1 = self.right_range(b_dense);
         if self.left_range.is_empty() || r1.is_empty() {
             return None;
         }
-        SPARQL_PATH
-            .d1_left_range_reuse
-            .fetch_add(1, Ordering::Relaxed);
 
         if let Some(ref left_vals) = self.left_tiny {
             let t = effective_wedge_left_once_threshold().max(effective_d1_tiny_merge_threshold());
             if t > 0 && r1.len() <= t {
+                if ring_counters_log_enabled() {
+                    SPARQL_PATH.d1_open_calls.fetch_add(1, Ordering::Relaxed);
+                }
                 let right_vals = materialize_sp_o_dense(&self.img, r1);
                 let commons = merge_dense_sorted_to_external(&self.img, left_vals, &right_vals);
                 return Some(Box::new(TinyMergeScan {
@@ -3088,14 +3044,15 @@ impl PreparedLeftIntersect for PreparedLeftD1 {
 
 impl PreparedPredObjectIntersect for PreparedPredD1 {
     fn bind_left(&self, subject_a: u64) -> Option<Box<dyn PreparedLeftIntersect>> {
-        let t_remap = std::time::Instant::now();
         let a_dense = self.img.remap().to_dense(subject_a)?;
-        SPARQL_PATH
-            .d1_remap_ns
-            .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let left_range = self.sp_range(a_dense);
         if left_range.is_empty() {
             return None;
+        }
+        if ring_counters_log_enabled() {
+            SPARQL_PATH
+                .d1_left_range_reuse
+                .fetch_add(1, Ordering::Relaxed);
         }
         let t = effective_wedge_left_once_threshold().max(effective_d1_tiny_merge_threshold());
         let left_tiny = if t > 0 && left_range.len() <= t {
@@ -3113,12 +3070,8 @@ impl PreparedPredObjectIntersect for PreparedPredD1 {
     }
 
     fn intersect2(&self, subject_a: u64, subject_b: u64) -> Option<Box<dyn TrieIterator>> {
-        let t_remap = std::time::Instant::now();
         let a_dense = self.img.remap().to_dense(subject_a)?;
         let b_dense = self.img.remap().to_dense(subject_b)?;
-        SPARQL_PATH
-            .d1_remap_ns
-            .fetch_add(t_remap.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let r0 = self.sp_range(a_dense);
         let r1 = self.sp_range(b_dense);
         if r0.is_empty() || r1.is_empty() {
@@ -3161,8 +3114,9 @@ impl BraidedSpD1ObjectScan {
         if !img.has_mapped() || r0.is_empty() || r1.is_empty() {
             return None;
         }
-        SPARQL_PATH.d1_open_calls.fetch_add(1, Ordering::Relaxed);
-        let t0 = std::time::Instant::now();
+        if ring_counters_log_enabled() {
+            SPARQL_PATH.d1_open_calls.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Product wedge left-once default (4) OR global tiny-merge threshold.
         // Take the max so either gate can activate the short-c path.
@@ -3172,9 +3126,6 @@ impl BraidedSpD1ObjectScan {
         let max_len = r0.len().max(r1.len());
         if t > 0 && max_len <= t {
             let commons = materialize_sp_d1_tiny_merge(&img, r0, r1);
-            SPARQL_PATH
-                .d1_open_ns
-                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             return Some(Self {
                 img,
                 r0,
@@ -3193,14 +3144,7 @@ impl BraidedSpD1ObjectScan {
             tiny: None,
             tiny_pos: 0,
         };
-        let t_first = std::time::Instant::now();
         scan.current = scan.next_from(0);
-        SPARQL_PATH
-            .d1_first_next_ns
-            .fetch_add(t_first.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        SPARQL_PATH
-            .d1_open_ns
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Some(scan)
     }
 
@@ -3415,7 +3359,7 @@ impl PreparedWedgeImpl {
 
 impl PreparedWedge for PreparedWedgeImpl {
     fn execute(&mut self, emit: &mut dyn FnMut(&[u64]) -> Result<(), ()>) -> Result<u64, ()> {
-        let t_exec = std::time::Instant::now();
+        // Production hot path: no Instant / no per-row atomics.
         let mut rows = 0u64;
 
         // Outer subjects of P.
@@ -3426,7 +3370,6 @@ impl PreparedWedge for PreparedWedgeImpl {
             None,
             0,
         );
-        SPARQL_PATH.join_scan_open.fetch_add(1, Ordering::Relaxed);
 
         while !a_scan.at_end() {
             let a = a_scan.key();
@@ -3458,9 +3401,6 @@ impl PreparedWedge for PreparedWedgeImpl {
             a_scan.advance();
         }
 
-        SPARQL_PATH
-            .k9_adj_execute_ns
-            .fetch_add(t_exec.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(rows)
     }
 }
@@ -3742,8 +3682,11 @@ mod tests {
         common.sort_unstable();
         common.dedup();
         assert_eq!(got, common, "D1 multi-subject must match pairwise object ∩");
-        let snap = crate::product_path::SPARQL_PATH.snapshot();
-        assert!(snap.d2_calls >= 1, "W4b counter d2_calls must bump");
+        // d2_calls only bumps when NOVA_RING_COUNTERS=1.
+        if crate::product_path::ring_counters_log_enabled() {
+            let snap = crate::product_path::SPARQL_PATH.snapshot();
+            assert!(snap.d2_calls >= 1, "W4b counter d2_calls must bump");
+        }
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4059,6 +4002,7 @@ mod tests {
         let mut prep =
             PreparedWedgeImpl::prepare(Arc::clone(&img), 10).expect("prepare wedge under mmap");
 
+        crate::product_path::SPARQL_PATH.reset();
         let mut got: Vec<(u64, u64, u64)> = Vec::new();
         let n = prep
             .execute(&mut |ids| {
@@ -4102,12 +4046,17 @@ mod tests {
             "fixture must contain at least one oriented triangle"
         );
 
-        // SP-restricted D1 (not unbound multi_subject) must have opened.
-        let snap = crate::product_path::SPARQL_PATH.snapshot();
-        assert!(
-            snap.d1_open_calls >= 1 || snap.d1_left_range_reuse >= 1,
-            "wedge execute should exercise SP-restricted D1"
-        );
+        // SP-restricted D1 counters only fire when NOVA_RING_COUNTERS=1.
+        // Correctness is asserted above; counters are an optional path probe.
+        if crate::product_path::ring_counters_log_enabled() {
+            let snap = crate::product_path::SPARQL_PATH.snapshot();
+            assert!(
+                snap.d1_open_calls >= 1 || snap.d1_left_range_reuse >= 1,
+                "wedge execute should exercise SP-restricted D1 (got open={} left_reuse={})",
+                snap.d1_open_calls,
+                snap.d1_left_range_reuse
+            );
+        }
 
         let _ = std::fs::remove_file(&path);
     }

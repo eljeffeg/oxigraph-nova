@@ -28,19 +28,22 @@
 <text class="muted" x="48" y="52.0" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="11">4.00 ms</text>
 <line class="axis" x1="56" y1="48" x2="56" y2="256"/>
 <line class="axis" x1="56" y1="256" x2="616" y2="256"/>
-<rect x="123.2" y="213.5" width="31.4" height="42.5" fill="#2563eb" rx="3"/>
-<text class="title" x="138.9" y="207.5" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">0.82</text>
-<text class="label" x="138.9" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (louds)</text>
-<rect x="221.8" y="206.7" width="31.4" height="49.3" fill="#7c3aed" rx="3"/>
-<text class="title" x="237.4" y="200.7" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">0.95</text>
-<text class="label" x="237.4" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (ring)</text>
-<rect x="320.3" y="193.4" width="31.4" height="62.6" fill="#dc2626" rx="3"/>
-<text class="title" x="336.0" y="187.4" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">1.20</text>
-<text class="label" x="336.0" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Oxigraph</text>
-<rect x="418.9" y="196.6" width="31.4" height="59.4" fill="#16a34a" rx="3"/>
-<text class="title" x="434.6" y="190.6" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">1.14</text>
-<text class="label" x="434.6" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">QLever</text>
-<rect x="517.4" y="85.7" width="31.4" height="170.3" fill="#ea580c" rx="3"/>
-<text class="title" x="533.1" y="79.7" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">3.27</text>
-<text class="label" x="533.1" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Fluree</text>
+<rect x="123.2" y="220.5" width="24.0" height="35.5" fill="#2563eb" rx="3"/>
+<text class="title" x="135.2" y="214.5" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">0.68</text>
+<text class="label" x="135.2" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (louds)</text>
+<rect x="214.4" y="216.9" width="24.0" height="39.1" fill="#7c3aed" rx="3"/>
+<text class="title" x="226.4" y="210.9" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">0.75</text>
+<text class="label" x="226.4" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Nova (ring)</text>
+<rect x="305.6" y="58.5" width="24.0" height="197.5" fill="#dc2626" rx="3"/>
+<text class="title" x="317.6" y="52.5" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">3.80</text>
+<text class="label" x="317.6" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Oxigraph</text>
+<rect x="396.8" y="197.0" width="24.0" height="59.0" fill="#16a34a" rx="3"/>
+<text class="title" x="408.8" y="191.0" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">1.13</text>
+<text class="label" x="408.8" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">QLever</text>
+<rect x="488.0" y="131.5" width="24.0" height="124.5" fill="#ea580c" rx="3"/>
+<text class="title" x="500.0" y="125.5" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">2.39</text>
+<text class="label" x="500.0" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">Fluree</text>
+<rect x="579.2" y="234.1" width="24.0" height="21.9" fill="#0891b2" rx="3"/>
+<text class="title" x="591.2" y="228.1" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600">0.42 ms</text>
+<text class="label" x="591.2" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12">RDFox</text>
 </svg>

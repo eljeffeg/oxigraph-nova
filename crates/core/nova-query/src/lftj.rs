@@ -1046,11 +1046,11 @@ fn eval_sp_expansion_walk<D: Dataset>(
     Ok(results)
 }
 
-/// Emit one decoded solution from three bound TermIds (two-hop path).
+/// Emit one decoded solution from three bound TermIds (two-hop / wedge).
 ///
-/// Returns nanoseconds spent in decode+materialize for path timing.
-/// Does **not** bump the Decode sample counter — callers accumulate ns then
-/// record one Decode sample per request (path-breakdown means stay per-query).
+/// Production path: no per-row Instant / atomics. Path-timing buckets were
+/// removed from the emit hot loop (dev-only instrumentation must not ship
+/// in the row-producing path).
 #[inline]
 fn emit_two_hop_solution<D: Dataset>(
     dataset: &D,
@@ -1062,29 +1062,22 @@ fn emit_two_hop_solution<D: Dataset>(
     b: u64,
     c: u64,
     results: &mut Solutions,
-) -> u64 {
-    let t_dec = std::time::Instant::now();
+) {
     let mut values: Vec<Option<std::sync::Arc<oxigraph_nova_core::Term>>> =
         vec![None; join_vars.len()];
     values[a_idx] = dataset.lftj_decode_term(a);
     values[b_idx] = dataset.lftj_decode_term(b);
     values[c_idx] = dataset.lftj_decode_term(c);
     if values[a_idx].is_none() || values[b_idx].is_none() || values[c_idx].is_none() {
-        return t_dec.elapsed().as_nanos() as u64;
+        return;
     }
     results.push(Solution::positional(Arc::clone(join_vars), values));
-    let ns = t_dec.elapsed().as_nanos() as u64;
-    crate::path_timing::acc_path_timing_ns(crate::path_timing::PathTimingBucket::Decode, ns);
-    ns
 }
 
 /// physical two-hop: prepared scanners when available, else nested join_scan.
 ///
 /// Always returns `Some` once the shape is recognized (specialized nested
 /// fallback still beats generic VEO LFTJ on this shape).
-///
-/// Path timing: Execution = operator walk only; Decode = term materialize.
-/// The two buckets are non-overlapping (decode ns is subtracted from wall).
 fn eval_two_hop_walk<D: Dataset>(
     dataset: &D,
     join_vars: &Arc<[Variable]>,
@@ -1098,12 +1091,10 @@ fn eval_two_hop_walk<D: Dataset>(
     let empty_vals: Vec<Option<std::sync::Arc<Term>>> = vec![None; join_vars.len()];
     let mut results: Solutions = Vec::new();
     let mut step: u64 = 0;
-    let mut decode_ns: u64 = 0;
 
     // Prefer prepared two-hop body ( + resettable SP scanners).
     if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
         TWO_HOP_SELECTED.fetch_add(1, Ordering::Relaxed);
-        let t_wall = std::time::Instant::now();
         let emit_result = prepared.execute(&mut |ids| {
             debug_assert!(ids.len() >= 3);
             let a = ids[0];
@@ -1123,7 +1114,7 @@ fn eval_two_hop_walk<D: Dataset>(
                     empty_vals.clone(),
                 ));
             } else {
-                decode_ns = decode_ns.saturating_add(emit_two_hop_solution(
+                emit_two_hop_solution(
                     dataset,
                     join_vars,
                     plan.a,
@@ -1133,26 +1124,12 @@ fn eval_two_hop_walk<D: Dataset>(
                     b,
                     c,
                     &mut results,
-                ));
+                );
             }
             Ok(())
         });
         match emit_result {
-            Ok(_) => {
-                let wall_ns = t_wall.elapsed().as_nanos() as u64;
-                let exec_ns = wall_ns.saturating_sub(decode_ns);
-                crate::path_timing::add_path_timing_ns(
-                    crate::path_timing::PathTimingBucket::Execution,
-                    exec_ns,
-                );
-                // One Decode sample per request when rows were materialised.
-                if decode_ns > 0 {
-                    crate::path_timing::bump_path_timing_sample(
-                        crate::path_timing::PathTimingBucket::Decode,
-                    );
-                }
-                return Ok(results);
-            }
+            Ok(_) => return Ok(results),
             Err(()) => {
                 return Err(anyhow::Error::from(
                     crate::options::EvalLimitError::Cancelled,
@@ -1168,7 +1145,6 @@ fn eval_two_hop_walk<D: Dataset>(
         None => return Ok(results),
     };
     LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
-    let t_wall = std::time::Instant::now();
 
     while !a_scan.at_end() {
         if let Some(tok) = cancellation
@@ -1204,7 +1180,7 @@ fn eval_two_hop_walk<D: Dataset>(
                             empty_vals.clone(),
                         ));
                     } else {
-                        decode_ns = decode_ns.saturating_add(emit_two_hop_solution(
+                        emit_two_hop_solution(
                             dataset,
                             join_vars,
                             plan.a,
@@ -1214,7 +1190,7 @@ fn eval_two_hop_walk<D: Dataset>(
                             b,
                             c,
                             &mut results,
-                        ));
+                        );
                     }
                     c_scan.advance();
                 }
@@ -1222,17 +1198,6 @@ fn eval_two_hop_walk<D: Dataset>(
             b_scan.advance();
         }
         a_scan.advance();
-    }
-
-    let wall_ns = t_wall.elapsed().as_nanos() as u64;
-    let exec_ns = wall_ns.saturating_sub(decode_ns);
-    crate::path_timing::add_path_timing_ns(
-        crate::path_timing::PathTimingBucket::Execution,
-        exec_ns,
-    );
-    // One Decode sample per request when rows were materialised.
-    if decode_ns > 0 {
-        crate::path_timing::bump_path_timing_sample(crate::path_timing::PathTimingBucket::Decode);
     }
 
     Ok(results)
@@ -1257,12 +1222,10 @@ fn eval_wedge_walk<D: Dataset>(
 
     let mut results: Solutions = Vec::new();
     let mut step: u64 = 0;
-    let mut decode_ns: u64 = 0;
 
     // Prefer prepared wedge body when the engine implements it.
     if let Some(mut prepared) = dataset.lftj_prepare_shape(plan.to_physical(), graph) {
         WEDGE_SELECTED.fetch_add(1, Ordering::Relaxed);
-        let t_wall = std::time::Instant::now();
         let emit_result = prepared.execute(&mut |ids| {
             debug_assert!(ids.len() >= 3);
             let a = ids[0];
@@ -1276,7 +1239,7 @@ fn eval_wedge_walk<D: Dataset>(
             }
             step += 1;
             LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
-            decode_ns = decode_ns.saturating_add(emit_two_hop_solution(
+            emit_two_hop_solution(
                 dataset,
                 join_vars,
                 plan.a,
@@ -1286,25 +1249,11 @@ fn eval_wedge_walk<D: Dataset>(
                 b,
                 c,
                 &mut results,
-            ));
+            );
             Ok(())
         });
         return match emit_result {
-            Ok(_) => {
-                let wall_ns = t_wall.elapsed().as_nanos() as u64;
-                let exec_ns = wall_ns.saturating_sub(decode_ns);
-                crate::path_timing::add_path_timing_ns(
-                    crate::path_timing::PathTimingBucket::Execution,
-                    exec_ns,
-                );
-                // One Decode sample only when rows were materialised.
-                if decode_ns > 0 {
-                    crate::path_timing::bump_path_timing_sample(
-                        crate::path_timing::PathTimingBucket::Decode,
-                    );
-                }
-                Ok(results)
-            }
+            Ok(_) => Ok(results),
             Err(()) => Err(anyhow::Error::from(
                 crate::options::EvalLimitError::Cancelled,
             )),
@@ -1320,7 +1269,6 @@ fn eval_wedge_walk<D: Dataset>(
         None => return Ok(results),
     };
     LFTJ_SCAN_OPEN.fetch_add(1, Ordering::Relaxed);
-    let t_wall = std::time::Instant::now();
 
     while !a_scan.at_end() {
         if let Some(tok) = cancellation
@@ -1355,7 +1303,7 @@ fn eval_wedge_walk<D: Dataset>(
                     // objects of a and b under P. Skip a==b==c degenerate if any.
                     if c != a && c != b {
                         LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
-                        decode_ns = decode_ns.saturating_add(emit_two_hop_solution(
+                        emit_two_hop_solution(
                             dataset,
                             join_vars,
                             plan.a,
@@ -1365,7 +1313,7 @@ fn eval_wedge_walk<D: Dataset>(
                             b,
                             c,
                             &mut results,
-                        ));
+                        );
                     }
                     c_scan.advance();
                 }
@@ -1389,7 +1337,7 @@ fn eval_wedge_walk<D: Dataset>(
                     let c = c_scan.key();
                     if c != a && c != b && b_objs.binary_search(&c).is_ok() {
                         LFTJ_DEPTH_LEAF.fetch_add(1, Ordering::Relaxed);
-                        decode_ns = decode_ns.saturating_add(emit_two_hop_solution(
+                        emit_two_hop_solution(
                             dataset,
                             join_vars,
                             plan.a,
@@ -1399,7 +1347,7 @@ fn eval_wedge_walk<D: Dataset>(
                             b,
                             c,
                             &mut results,
-                        ));
+                        );
                     }
                     c_scan.advance();
                 }
@@ -1407,17 +1355,6 @@ fn eval_wedge_walk<D: Dataset>(
             b_scan.advance();
         }
         a_scan.advance();
-    }
-
-    let wall_ns = t_wall.elapsed().as_nanos() as u64;
-    let exec_ns = wall_ns.saturating_sub(decode_ns);
-    crate::path_timing::add_path_timing_ns(
-        crate::path_timing::PathTimingBucket::Execution,
-        exec_ns,
-    );
-    // One Decode sample only when rows were materialised.
-    if decode_ns > 0 {
-        crate::path_timing::bump_path_timing_sample(crate::path_timing::PathTimingBucket::Decode);
     }
 
     Ok(results)

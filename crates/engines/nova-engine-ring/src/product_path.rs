@@ -447,17 +447,45 @@ pub fn ring_d2_enabled() -> bool {
     env_flag_default_on("NOVA_RING_D2")
 }
 
-/// Optional verbose counter logging.
+/// Optional verbose counter logging (`NOVA_RING_COUNTERS=1`).
+///
+/// Cached after the first read so hot kernels only pay a single atomic load
+/// (not an env lookup) when deciding whether to bump `SPARQL_PATH` counters.
+/// Default is **off** — production path pays nothing beyond that load when
+/// callers gate counter writes behind this flag.
 #[inline]
 pub fn ring_counters_log_enabled() -> bool {
-    match std::env::var("NOVA_RING_COUNTERS") {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0 = unset, 1 = off, 2 = on
+    static CACHED: AtomicU8 = AtomicU8::new(0);
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = match std::env::var("NOVA_RING_COUNTERS") {
+                Ok(v) => {
+                    let v = v.trim();
+                    v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+                }
+                Err(_) => false,
+            };
+            CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
         }
-        Err(_) => false,
     }
 }
+
+/// Bump a path counter only when [`ring_counters_log_enabled`] is on.
+///
+/// Prefer this (or a local `let ctr = ring_counters_log_enabled()` + `if ctr`)
+/// over unconditional `SPARQL_PATH.*.fetch_add` in per-row / per-hop loops.
+#[inline]
+pub fn path_ctr_add(counter: &std::sync::atomic::AtomicU64, delta: u64) {
+    if ring_counters_log_enabled() {
+        counter.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 
 /// A/B: force pre-fix MiddleRuns VEO heuristic (row-span). Default **off**.
 ///
