@@ -15,9 +15,8 @@
 #     - Oxigraph: serve WITHOUT --location (pure in-memory).
 #     - QLever: mmap index + warm-up (only mode).
 #     - Fluree: fluree/server Docker, no host volume (ephemeral container FS).
-#               LeafletCache disabled via FLUREE_CACHE_MAX_MB=0 (env only —
-#               `fluree server run` does not accept --cache-max-mb and exits 2).
-#               so RSS is not dominated by the default ~35%-of-RAM cache budget.
+#               Stock LeafletCache defaults (host-relative). RSS not recorded —
+#               reported as dynamic (not measured); see docs/benchmarks/README.md.
 #     - RDFox: optional; sandbox/daemon in-memory when binary+license present
 #       (research/ is gitignored — missing install auto-skips with a note).
 #   Disk:
@@ -25,7 +24,7 @@
 #     - Nova (ring): --location WAL/snapshot path (RingStore; same product surface).
 #     - Oxigraph: serve --location (RocksDB).
 #     - QLever: same mmap index.
-#     - Fluree: --storage-path with host volume mount (same cache_max_mb=0).
+#     - Fluree: --storage-path with host volume mount (stock cache; RSS not measured).
 #
 # Usage:
 #   ./run_comparison.sh [OPTIONS] [ENTITIES] [ITERS] [WARMUP] [RESULT_FILE]
@@ -45,9 +44,6 @@
 #   NOVA_BACKENDS=both|louds|ring   Same as --backends (default: both)
 #   NOVA_RING_HUFFMAN=0             A/B only: plain QWT256 C_p (ring-backend-qwt).
 #                                  Default / unset / 1 = Huffman C_p (product).
-#   FLUREE_CACHE_MAX_MB=0           Fluree LeafletCache budget in MB (default 0 =
-#                                  disabled via env; stock ~35% of RAM. Do NOT pass
-#                                  --cache-max-mb to `server run` — it rejects it).
 #   QUERY_TIMEOUT_S=60
 #   QLEVER_BIN_DIR=/path/to/qlever/build
 #   RDFOX_BIN=path/to/RDFox         (optional; tried in order: $RDFOX_BIN,
@@ -188,11 +184,6 @@ fi
 
 FLUREE_LEDGER="bench:main"
 FLUREE_CPU_LOG="/tmp/fluree_${MODE}_cpu_samples.txt"
-# Disable Fluree's default host-relative LeafletCache (~35% of RAM on >=8GB hosts).
-# Must be set via env (or config.toml): `fluree server run` rejects --cache-max-mb
-# and the container exits immediately (harness would then fall back / fail oddly).
-# Override with FLUREE_CACHE_MAX_MB=<n> if a small non-zero cache is desired.
-FLUREE_CACHE_MAX_MB="${FLUREE_CACHE_MAX_MB:-0}"
 RDFOX_CPU_LOG="/tmp/rdfox_${MODE}_cpu_samples.txt"
 # RDFox is fully optional. The default path under research/applications/ is
 # gitignored (local vendor tree only) — clones without research/ simply skip.
@@ -743,27 +734,20 @@ fi
 if [ "$RUN_FLUREE" = "1" ]; then
   FLUREE_LOAD_START=$(date +%s.%N)
   docker rm -f "$FLUREE_DOCKER_NAME" >/dev/null 2>&1 || true
-  # NOTE: pass cache only via FLUREE_CACHE_MAX_MB. `fluree server run` does not
-  # accept --cache-max-mb (clap error → container exit 2 → stock defaults if
-  # something else is left running, or a dead bench). Verified on fluree/server:4.1.1.
+  # Stock fluree/server defaults (host-relative LeafletCache). Do not set
+  # FLUREE_CACHE_MAX_MB=0 here — zero cache starves heavy queries (path_2hop).
+  # RSS is intentionally not measured (reported as dynamic); see README.
   if [ "$MODE" = "disk" ]; then
-    echo "  Starting Fluree (file-backed --storage-path, cache_max_mb=${FLUREE_CACHE_MAX_MB})..."
+    echo "  Starting Fluree (file-backed --storage-path)..."
     docker run -d --name "$FLUREE_DOCKER_NAME" -p "$FLUREE_PORT:8090" \
-      -e "FLUREE_CACHE_MAX_MB=$FLUREE_CACHE_MAX_MB" \
       -v "$FLUREE_LOCATION_HOST:/var/lib/fluree" fluree/server:latest \
       --storage-path /var/lib/fluree >/dev/null
   else
-    echo "  Starting Fluree (ephemeral container, cache_max_mb=${FLUREE_CACHE_MAX_MB})..."
+    echo "  Starting Fluree (ephemeral container, no host volume)..."
     docker run -d --name "$FLUREE_DOCKER_NAME" -p "$FLUREE_PORT:8090" \
-      -e "FLUREE_CACHE_MAX_MB=$FLUREE_CACHE_MAX_MB" \
       fluree/server:latest >/dev/null
   fi
   wait_ready "http://localhost:$FLUREE_PORT/health" 180
-  # Confirm LeafletCache budget took effect (logs "cache_budget_mb=N").
-  if ! docker logs "$FLUREE_DOCKER_NAME" 2>&1 | grep -q "cache_budget_mb=${FLUREE_CACHE_MAX_MB}"; then
-    echo "Warning: Fluree log does not show cache_budget_mb=${FLUREE_CACHE_MAX_MB}; check docker logs $FLUREE_DOCKER_NAME" >&2
-    docker logs "$FLUREE_DOCKER_NAME" 2>&1 | grep -iE 'cache_budget|LeafletCache|error|unexpected' | tail -5 >&2 || true
-  fi
   curl -s -X POST "http://localhost:$FLUREE_PORT/v1/fluree/create" \
     -H "Content-Type: application/json" \
     -d "{\"ledger\": \"$FLUREE_LEDGER\"}" -o /dev/null
